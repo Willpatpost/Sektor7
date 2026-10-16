@@ -6,6 +6,8 @@ var head: Node3D
 var body: Node3D
 var leg_l: MeshInstance3D
 var leg_r: MeshInstance3D
+var arm_l: MeshInstance3D
+var arm_r: MeshInstance3D
 var body_head: MeshInstance3D
 var hp := 100
 var max_hp := 100
@@ -40,21 +42,6 @@ func setup(g, camera: Camera3D) -> void:
 	shape.position = Vector3(0, 0.875, 0)
 	add_child(shape)
 	_build_body()
-	var rain := CPUParticles3D.new()
-	rain.emitting = true
-	rain.amount = 600
-	rain.lifetime = 1.3
-	rain.emission_shape = CPUParticles3D.EMISSION_SHAPE_BOX
-	rain.emission_box_extents = Vector3(26, 16, 26)
-	rain.direction = Vector3(0.12, -1, 0)
-	rain.spread = 5.0
-	rain.gravity = Vector3(0, -22, 0)
-	rain.initial_velocity_min = 10.0
-	rain.initial_velocity_max = 16.0
-	var rmesh := BoxMesh.new()
-	rmesh.size = Vector3(0.02, 0.55, 0.02)
-	rain.mesh = rmesh
-	add_child(rain)
 	add_to_group("player")
 
 func _box(parent: Node3D, size: Vector3, pos: Vector3, mat: StandardMaterial3D) -> MeshInstance3D:
@@ -70,20 +57,30 @@ func _box(parent: Node3D, size: Vector3, pos: Vector3, mat: StandardMaterial3D) 
 func _build_body() -> void:
 	body = Node3D.new()
 	var cloth := StandardMaterial3D.new()
-	cloth.albedo_color = Color(0.12, 0.17, 0.21)
+	cloth.albedo_color = Color(0.1, 0.16, 0.2)
+	cloth.roughness = 0.8
 	var dark := StandardMaterial3D.new()
-	dark.albedo_color = Color(0.07, 0.09, 0.11)
+	dark.albedo_color = Color(0.06, 0.075, 0.09)
+	dark.metallic = 0.3
+	dark.roughness = 0.55
 	var glow := StandardMaterial3D.new()
 	glow.emission_enabled = true
 	glow.emission = Color(0.24, 0.95, 1.0)
 	glow.emission_energy_multiplier = 2.0
-	leg_l = _box(body, Vector3(0.16, 0.85, 0.2), Vector3(-0.12, 0.42, 0), dark)
-	leg_r = _box(body, Vector3(0.16, 0.85, 0.2), Vector3(0.12, 0.42, 0), dark)
+	leg_l = _box(body, Vector3(0.17, 0.85, 0.22), Vector3(-0.13, 0.42, 0), dark)
+	leg_r = _box(body, Vector3(0.17, 0.85, 0.22), Vector3(0.13, 0.42, 0), dark)
+	_box(body, Vector3(0.46, 0.24, 0.27), Vector3(0, 0.78, 0), dark)
 	_box(body, Vector3(0.5, 0.62, 0.28), Vector3(0, 1.12, 0), cloth)
-	_box(body, Vector3(0.52, 0.06, 0.3), Vector3(0, 1.32, 0), glow)
+	_box(body, Vector3(0.52, 0.06, 0.3), Vector3(0, 1.33, 0), glow)
+	arm_l = _box(body, Vector3(0.13, 0.55, 0.16), Vector3(-0.33, 1.02, 0), dark)
+	arm_r = _box(body, Vector3(0.13, 0.55, 0.16), Vector3(0.33, 1.02, 0), dark)
+	_box(arm_l, Vector3(0.14, 0.06, 0.17), Vector3(0, -0.24, 0.02), glow)
+	_box(arm_r, Vector3(0.14, 0.06, 0.17), Vector3(0, -0.24, 0.02), glow)
+	_box(body, Vector3(0.05, 0.5, 0.02), Vector3(-0.24, 1.12, 0.15), glow)
+	_box(body, Vector3(0.05, 0.5, 0.02), Vector3(0.24, 1.12, 0.15), glow)
+	_box(body, Vector3(0.34, 0.42, 0.14), Vector3(0, 1.16, -0.2), dark)
 	body_head = _box(body, Vector3(0.24, 0.26, 0.26), Vector3(0, 1.58, 0), dark)
 	_box(body_head, Vector3(0.26, 0.06, 0.06), Vector3(0, 0.02, 0.14), glow)
-	_box(body, Vector3(0.08, 0.1, 0.5), Vector3(0.3, 1.08, 0.25), dark)
 	body.visible = false
 	add_child(body)
 
@@ -111,6 +108,8 @@ func _physics_process(delta: float) -> void:
 		var amp := 0.55 if moving else 0.0
 		leg_l.rotation.x = sin(walk_phase) * amp
 		leg_r.rotation.x = -sin(walk_phase) * amp
+		arm_l.rotation.x = -sin(walk_phase) * amp * 0.7
+		arm_r.rotation.x = sin(walk_phase) * amp * 0.7
 		body_head.rotation.x = head.rotation.x * 0.6
 
 func damage(n: int) -> bool:

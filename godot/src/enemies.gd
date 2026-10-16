@@ -3,6 +3,7 @@ extends Node
 var game
 var list := []
 var pickups := []
+var _fx := []
 var rng := RandomNumberGenerator.new()
 
 class Merc extends CharacterBody3D:
@@ -119,6 +120,40 @@ func _merc_mesh(e: Node3D, visor: Color) -> void:
 	vmat.emission_energy_multiplier = 2.0
 	vis.material_override = vmat
 	e.add_child(vis)
+	var hip := MeshInstance3D.new()
+	var hipm := BoxMesh.new()
+	hipm.size = Vector3(0.4, 0.22, 0.24)
+	hip.mesh = hipm
+	hip.position = Vector3(0, -0.14, 0)
+	hip.material_override = tmat
+	e.add_child(hip)
+	for sx in [-0.11, 0.11]:
+		var leg := MeshInstance3D.new()
+		var lm := BoxMesh.new()
+		lm.size = Vector3(0.15, 0.62, 0.18)
+		leg.mesh = lm
+		leg.position = Vector3(sx, -0.55, 0)
+		leg.material_override = tmat
+		e.add_child(leg)
+	for sx in [-0.34, 0.34]:
+		var arm := MeshInstance3D.new()
+		var am2 := BoxMesh.new()
+		am2.size = Vector3(0.12, 0.5, 0.14)
+		arm.mesh = am2
+		arm.position = Vector3(sx, 0.18, 0)
+		arm.material_override = tmat
+		e.add_child(arm)
+	var pads := MeshInstance3D.new()
+	var padm := BoxMesh.new()
+	padm.size = Vector3(0.52, 0.05, 0.28)
+	pads.mesh = padm
+	pads.position = Vector3(0, 0.54, 0)
+	var padmat := StandardMaterial3D.new()
+	padmat.emission_enabled = true
+	padmat.emission = visor
+	padmat.emission_energy_multiplier = 1.6
+	pads.material_override = padmat
+	e.add_child(pads)
 
 func spawn_drone(x: float, z: float) -> Drone:
 	var d := Drone.new()
@@ -132,14 +167,52 @@ func spawn_drone(x: float, z: float) -> Drone:
 	cs.shape = bs
 	d.add_child(cs)
 	var mi := MeshInstance3D.new()
-	var om := PrismMesh.new()
-	om.size = Vector3(0.9, 1.0, 0.9)
+	var om := CylinderMesh.new()
+	om.top_radius = 0.55
+	om.bottom_radius = 0.55
+	om.height = 0.26
+	om.radial_segments = 8
 	mi.mesh = om
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.1, 0.125, 0.17)
-	mat.metallic = 0.7
+	mat.metallic = 0.8
+	mat.roughness = 0.35
 	mi.material_override = mat
 	d.add_child(mi)
+	for off in [Vector3(0.55, 0, 0.55), Vector3(-0.55, 0, 0.55), Vector3(0.55, 0, -0.55), Vector3(-0.55, 0, -0.55)]:
+		var pod := MeshInstance3D.new()
+		var pb := BoxMesh.new()
+		pb.size = Vector3(0.26, 0.12, 0.26)
+		pod.mesh = pb
+		pod.position = off
+		pod.material_override = mat
+		d.add_child(pod)
+		var rotor := MeshInstance3D.new()
+		var rb := CylinderMesh.new()
+		rb.top_radius = 0.22
+		rb.bottom_radius = 0.22
+		rb.height = 0.02
+		rotor.mesh = rb
+		rotor.position = off + Vector3(0, 0.09, 0)
+		var rmat := StandardMaterial3D.new()
+		rmat.emission_enabled = true
+		rmat.emission = Color(0.4, 0.75, 1.0)
+		rmat.emission_energy_multiplier = 1.4
+		rotor.material_override = rmat
+		d.add_child(rotor)
+	var ring := MeshInstance3D.new()
+	var rg := CylinderMesh.new()
+	rg.top_radius = 0.42
+	rg.bottom_radius = 0.42
+	rg.height = 0.03
+	ring.mesh = rg
+	ring.position = Vector3(0, -0.15, 0)
+	var rgmat := StandardMaterial3D.new()
+	rgmat.emission_enabled = true
+	rgmat.emission = Color(1.0, 0.2, 0.27)
+	rgmat.emission_energy_multiplier = 1.8
+	ring.material_override = rgmat
+	d.add_child(ring)
 	var eye := MeshInstance3D.new()
 	var eb := BoxMesh.new()
 	eb.size = Vector3(0.2, 0.2, 0.2)
@@ -161,7 +234,40 @@ func on_death(e) -> void:
 	game.on_enemy_killed(kind)
 	list.erase(e)
 	_spawn_pickups(e.position, kind)
+	_explode(e.position + Vector3(0, 0.8, 0))
 	e.queue_free()
+
+func _explode(pos: Vector3) -> void:
+	var p := CPUParticles3D.new()
+	p.one_shot = true
+	p.emitting = true
+	p.amount = 42
+	p.lifetime = 0.85
+	p.explosiveness = 1.0
+	p.emission_shape = CPUParticles3D.EMISSION_SHAPE_SPHERE
+	p.emission_sphere_radius = 0.35
+	p.spread = 180.0
+	p.gravity = Vector3(0, -9, 0)
+	p.initial_velocity_min = 4.0
+	p.initial_velocity_max = 9.0
+	var m := BoxMesh.new()
+	m.size = Vector3(0.09, 0.09, 0.09)
+	var mat := StandardMaterial3D.new()
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.55, 0.2)
+	mat.emission_energy_multiplier = 3.0
+	mat.albedo_color = Color(0.1, 0.06, 0.03)
+	m.material = mat
+	p.mesh = m
+	p.position = pos
+	add_child(p)
+	var light := OmniLight3D.new()
+	light.position = pos
+	light.light_color = Color(1.0, 0.6, 0.3)
+	light.light_energy = 4.0
+	light.omni_range = 12.0
+	add_child(light)
+	_fx.append({"p": p, "light": light, "t": 0.9})
 
 func _spawn_pickups(pos: Vector3, kind: String) -> void:
 	var val := 40
@@ -227,6 +333,14 @@ func toast_g(text: String, col: Color) -> void:
 	game.hud.toast(text, col)
 
 func _physics_process(delta: float) -> void:
+	for f in _fx.duplicate():
+		f["t"] = float(f["t"]) - delta
+		var fl: OmniLight3D = f["light"]
+		fl.light_energy = 4.0 * maxf(0.0, float(f["t"]) / 0.9)
+		if float(f["t"]) <= 0.0:
+			f["p"].queue_free()
+			fl.queue_free()
+			_fx.erase(f)
 	if game == null or game.state != "playing":
 		return
 	for pk in pickups:

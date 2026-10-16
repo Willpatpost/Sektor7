@@ -16,6 +16,9 @@ var quests: Node3D
 var audio: Node
 
 func _ready() -> void:
+	var ui_font := FontFile.new()
+	ui_font.load_dynamic_font("res://assets/fonts/DejaVuSans-Bold.ttf")
+	ThemeDB.fallback_font = ui_font
 	_setup_input()
 	city = preload("res://src/city.gd").new()
 	add_child(city)

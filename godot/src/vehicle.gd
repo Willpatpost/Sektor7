@@ -5,6 +5,9 @@ var cars := []
 var vels := {}
 var active: CharacterBody3D = null
 var driving := false
+var _t := 0.0
+var _lights := {}
+var _underglows := {}
 
 const ACC := 18.0
 const DRAG := 1.1
@@ -42,28 +45,74 @@ func _car_mesh(car: Node3D, body_col: Color, glow: Color) -> void:
 	hull.position = Vector3(0, 0.55, 0)
 	var hmat := StandardMaterial3D.new()
 	hmat.albedo_color = body_col
-	hmat.metallic = 0.7
-	hmat.roughness = 0.35
+	hmat.metallic = 0.8
+	hmat.roughness = 0.3
+	hmat.clearcoat_enabled = true
+	hmat.clearcoat = 0.7
+	hmat.clearcoat_roughness = 0.15
 	hull.material_override = hmat
 	car.add_child(hull)
+	for step in [
+		{"size": Vector3(1.6, 0.3, 1.0), "pos": Vector3(0, 0.38, 1.85)},
+		{"size": Vector3(1.2, 0.2, 0.5), "pos": Vector3(0, 0.28, 2.15)}
+	]:
+		var nose := MeshInstance3D.new()
+		var nm := BoxMesh.new()
+		nm.size = step["size"]
+		nose.mesh = nm
+		nose.position = step["pos"]
+		nose.material_override = hmat
+		car.add_child(nose)
 	var cabin := MeshInstance3D.new()
 	var cm := BoxMesh.new()
 	cm.size = Vector3(1.68, 0.52, 2.1)
 	cabin.mesh = cm
 	cabin.position = Vector3(0, 1.05, -0.25)
 	var cmat := StandardMaterial3D.new()
-	cmat.albedo_color = Color(0.04, 0.06, 0.09)
+	cmat.albedo_color = Color(0.05, 0.09, 0.14, 0.55)
 	cmat.metallic = 0.9
-	cmat.roughness = 0.1
+	cmat.roughness = 0.08
+	cmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	cabin.material_override = cmat
 	car.add_child(cabin)
 	_glow(car, Vector3(0, 0.62, 2.22), Vector3(1.7, 0.1, 0.08), Color(0.87, 0.96, 1.0))
 	_glow(car, Vector3(0, 0.68, -2.22), Vector3(1.8, 0.12, 0.08), Color(1.0, 0.13, 0.2))
-	_glow(car, Vector3(0, 0.1, 0), Vector3(1.6, 0.05, 3.6), glow)
+	var under := _glow(car, Vector3(0, 0.1, 0), Vector3(1.6, 0.05, 3.6), glow)
+	_underglows[car] = under
 	for pz in [1.4, -1.4]:
 		_glow(car, Vector3(0, 0.04, pz), Vector3(1.4, 0.06, 0.6), glow)
+	var lights := []
+	for sx in [-0.55, 0.55]:
+		var spot := SpotLight3D.new()
+		spot.position = Vector3(sx, 0.72, 2.05)
+		spot.rotation = Vector3(deg_to_rad(-6), PI, 0)
+		spot.set("spot_range", 26.0)
+		spot.set("spot_angle", 24.0)
+		spot.set("light_energy", 3.5)
+		spot.set("light_color", Color(0.9, 0.95, 1.0))
+		spot.visible = false
+		car.add_child(spot)
+		lights.append(spot)
+	_lights[car] = lights
+	for dx in [-0.6, 0.6]:
+		var disc := MeshInstance3D.new()
+		var qm := QuadMesh.new()
+		qm.size = Vector2(1.5, 2.4)
+		var dmat := StandardMaterial3D.new()
+		dmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		dmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		dmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		dmat.albedo_color = Color(glow.r, glow.g, glow.b, 0.16)
+		dmat.emission_enabled = true
+		dmat.emission = glow
+		dmat.emission_energy_multiplier = 1.2
+		qm.material = dmat
+		disc.mesh = qm
+		disc.rotation.x = -PI / 2
+		disc.position = Vector3(dx, 0.06, 0)
+		car.add_child(disc)
 
-func _glow(parent: Node3D, pos: Vector3, size: Vector3, col: Color) -> void:
+func _glow(parent: Node3D, pos: Vector3, size: Vector3, col: Color) -> StandardMaterial3D:
 	var mi := MeshInstance3D.new()
 	var bm := BoxMesh.new()
 	bm.size = size
@@ -76,6 +125,7 @@ func _glow(parent: Node3D, pos: Vector3, size: Vector3, col: Color) -> void:
 	mat.albedo_color = Color(0.03, 0.03, 0.05)
 	mi.material_override = mat
 	parent.add_child(mi)
+	return mat
 
 func _nearest_car() -> CharacterBody3D:
 	var p: Vector3 = game.player.position
@@ -98,6 +148,9 @@ func enter_car(car: CharacterBody3D) -> void:
 	game.hud.toast("THRUSTERS ONLINE — " + str(car.get_meta("name")), Color(0.24, 0.95, 1.0))
 	game.audio.engine_on()
 	game.audio.sfx("ui")
+	if _lights.has(car):
+		for l in _lights[car]:
+			l.visible = true
 
 func exit_car() -> void:
 	if not driving:
@@ -109,6 +162,9 @@ func exit_car() -> void:
 	game.player.velocity = Vector3.ZERO
 	game.player.in_car = false
 	game.player.set_collisions_enabled(true)
+	if _lights.has(car):
+		for l in _lights[car]:
+			l.visible = false
 	driving = false
 	active = null
 	game.audio.engine_off()
@@ -116,6 +172,7 @@ func exit_car() -> void:
 func _physics_process(delta: float) -> void:
 	if game == null or game.state != "playing":
 		return
+	_t += delta
 	if Input.is_action_just_pressed("interact") and not game.hud.dialogue_active():
 		if driving:
 			exit_car()
@@ -169,4 +226,6 @@ func _physics_process(delta: float) -> void:
 	if hs > 2.0:
 		car.rotation.y = lerp_angle(car.rotation.y, atan2(vel.x, vel.z), minf(1.0, delta * 4.0))
 	game.player.position = car.position + car.transform.basis.x * -0.45 + car.transform.basis.z * 0.1 + Vector3(0, -0.55, 0)
+	if _underglows.has(car):
+		_underglows[car].emission_energy_multiplier = 2.2 + 0.7 * sin(_t * 9.0)
 	game.audio.engine_speed(vel.length() / MAXS)
