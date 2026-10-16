@@ -292,6 +292,7 @@ func build(g) -> void:
 	_build_rain()
 	_build_arch()
 	_build_terminal()
+	game.landmarks.build()
 	game.props.scatter()
 
 func _building(x: float, z: float, w: float, d: float, h: float) -> void:
@@ -451,9 +452,14 @@ func _build_environment() -> void:
 	var we := WorldEnvironment.new()
 	env = Environment.new()
 	var sky := Sky.new()
-	var sky_mat := ShaderMaterial.new()
-	sky_mat.shader = _sky_shader
-	sky.sky_material = sky_mat
+	if ResourceLoader.exists("res://assets/hdris/modern_buildings_night_2k.hdr"):
+		var pano := PanoramaSkyMaterial.new()
+		pano.panorama = load("res://assets/hdris/modern_buildings_night_2k.hdr")
+		sky.sky_material = pano
+	else:
+		var sky_mat := ShaderMaterial.new()
+		sky_mat.shader = _sky_shader
+		sky.sky_material = sky_mat
 	env.set("background", Environment.BG_SKY)
 	env.set("tone_mapper", Environment.TONE_MAPPER_AGX)
 	env.set("glow_blend_mode", Environment.GLOW_BLEND_MODE_SOFTLIGHT)
@@ -491,7 +497,9 @@ func _build_environment() -> void:
 	moon.set("directional_shadow_blend_splits", true)
 	moon.set("shadow_blur", 1.0)
 	add_child(moon)
-	sky_mat.set_shader_parameter("moon_dir", moon.global_transform.basis.z)
+	if sky.sky_material is ShaderMaterial:
+		var sm: ShaderMaterial = sky.sky_material
+		sm.set_shader_parameter("moon_dir", moon.global_transform.basis.z)
 	_flash_light = DirectionalLight3D.new()
 	_flash_light.rotation = Vector3(deg_to_rad(-70), deg_to_rad(120), 0)
 	_flash_light.light_color = Color(0.85, 0.9, 1.0)

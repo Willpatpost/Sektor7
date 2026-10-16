@@ -157,8 +157,8 @@ func _tracer(a: Vector3, b: Vector3) -> void:
 	bm.material = mat
 	mi.mesh = bm
 	mi.position = (a + b) / 2.0
-	mi.look_at(b, Vector3.UP)
 	add_child(mi)
+	mi.look_at(b, Vector3.UP)
 	_tracers.append({"n": mi, "t": 0.07})
 
 func _sparks(pos: Vector3) -> void:

@@ -17,6 +17,7 @@ var audio: Node
 var menu: CanvasLayer
 var materials: Node
 var props: Node
+var landmarks: Node
 var settings := {}
 
 func _ready() -> void:
@@ -32,6 +33,9 @@ func _ready() -> void:
 	props = preload("res://src/props.gd").new()
 	add_child(props)
 	props.setup(self)
+	landmarks = preload("res://src/landmarks.gd").new()
+	add_child(landmarks)
+	landmarks.setup(self)
 	city = preload("res://src/city.gd").new()
 	add_child(city)
 	city.build(self)
