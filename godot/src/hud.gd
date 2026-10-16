@@ -45,7 +45,9 @@ func setup(g) -> void:
 	osb.content_margin_top = 10.0
 	osb.content_margin_bottom = 10.0
 	obj_panel.add_theme_stylebox_override("panel", osb)
-	obj_label = _label(Vector2(0, 0), 15, Color(0.8, 0.86, 0.92))
+	obj_label = Label.new()
+	obj_label.add_theme_font_size_override("font_size", 15)
+	obj_label.add_theme_color_override("font_color", Color(0.8, 0.86, 0.92))
 	obj_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	obj_label.custom_minimum_size = Vector2(360, 0)
 	obj_panel.add_child(obj_label)
@@ -61,7 +63,6 @@ func setup(g) -> void:
 	pov_label = _label(Vector2(0, 0), 18, Color(0.62, 0.85, 1.0))
 	pov_label.visible = false
 	pov_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	add_child(pov_label)
 	pov_label.anchor_left = 0.5
 	pov_label.anchor_right = 0.5
 	pov_label.anchor_top = 1.0

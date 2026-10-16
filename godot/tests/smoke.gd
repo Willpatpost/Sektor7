@@ -53,6 +53,7 @@ func _run() -> void:
 	var city: Node3D = game.city
 	ok(city.colliders.size() > 80, "city built (%d colliders)" % city.colliders.size())
 	ok(game.materials.set_count() >= 3, "PBR texture sets loaded (%d/4)" % game.materials.set_count())
+	ok(game.props.placed_count() > 300, "density pass scattered props (%d instances)" % game.props.placed_count())
 	var player: CharacterBody3D = game.player
 	ok(player.position.distance_to(city.pois.spawn) < 1.5, "player spawns at POI")
 

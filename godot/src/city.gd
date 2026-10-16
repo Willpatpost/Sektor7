@@ -7,6 +7,8 @@ const HALF := 200.0
 var pois := {}
 var terminal := Vector3(10, 0, 131)
 var colliders := []
+var occupied := []
+var lamp_spots := []
 var rng := RandomNumberGenerator.new()
 var game
 
@@ -290,6 +292,7 @@ func build(g) -> void:
 	_build_rain()
 	_build_arch()
 	_build_terminal()
+	game.props.scatter()
 
 func _building(x: float, z: float, w: float, d: float, h: float) -> void:
 	var body := StaticBody3D.new()
@@ -530,6 +533,7 @@ func _build_lamps() -> void:
 		for lz in lines:
 			var lamp := Node3D.new()
 			lamp.position = Vector3(lx + 8.5, 0, lz + 8.5)
+			lamp_spots.append(lamp.position)
 			_glow_box(lamp, Vector3(0, 5.6, 0), Vector3(0.12, 0.12, 1.5), Color(0.6, 0.85, 1.0))
 			var pole := MeshInstance3D.new()
 			var pm := BoxMesh.new()
@@ -579,6 +583,7 @@ func _build_props() -> void:
 			_barrier(p.x + [-2.8, 0.0, 2.8][j], p.z + 2.6, [0.0, 0.0, 0.0][j])
 
 func _vending(x: float, z: float, side: float) -> void:
+	occupied.append(Vector3(x, 0, z))
 	var root := Node3D.new()
 	root.position = Vector3(x, 0, z)
 	root.rotation.y = -PI / 2.0 if side > 0.0 else PI / 2.0
@@ -605,6 +610,7 @@ func _vending(x: float, z: float, side: float) -> void:
 	add_child(root)
 
 func _barrier(x: float, z: float, ry: float) -> void:
+	occupied.append(Vector3(x, 0, z))
 	var root := Node3D.new()
 	root.position = Vector3(x, 0, z)
 	root.rotation.y = ry
@@ -710,6 +716,8 @@ func _build_rain() -> void:
 	_rain = rain
 
 func _build_arch() -> void:
+	occupied.append(Vector3(-7.0, 0, 150.0))
+	occupied.append(Vector3(7.0, 0, 150.0))
 	for s in [-7.0, 7.0]:
 		var body := StaticBody3D.new()
 		body.position = Vector3(s, 4.5, 150)
@@ -730,6 +738,7 @@ func _build_arch() -> void:
 	_sign(0, 9.9, 149.55, PI, "SEKTOR 7", Color(0.24, 0.95, 1.0))
 
 func _build_terminal() -> void:
+	occupied.append(terminal)
 	var body := StaticBody3D.new()
 	body.position = Vector3(10, 0.6, 131)
 	var shape := CollisionShape3D.new()
