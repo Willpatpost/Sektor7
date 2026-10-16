@@ -4,6 +4,9 @@ var game
 var hp_label: Label
 var ammo_label: Label
 var obj_label: Label
+var obj_panel: PanelContainer
+var pov_label: Label
+var pov_t := 0.0
 var toast_label: Label
 var win_label: Label
 var toast_t := 0.0
@@ -25,9 +28,48 @@ const UPGRADES := [
 func setup(g) -> void:
 	game = g
 	layer = 10
-	hp_label = _label(Vector2(20, 16), 18, Color(0.6, 0.95, 1.0))
-	ammo_label = _label(Vector2(20, 48), 18, Color(1.0, 0.84, 0.1))
-	obj_label = _label(Vector2(20, 80), 15, Color(0.8, 0.86, 0.92))
+	hp_label = _label(Vector2(20, 640), 18, Color(0.6, 0.95, 1.0))
+	hp_label.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT, Control.PRESET_MODE_MINSIZE, 20)
+	ammo_label = _label(Vector2(20, 672), 18, Color(1.0, 0.84, 0.1))
+	ammo_label.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT, Control.PRESET_MODE_MINSIZE, 20)
+	ammo_label.offset_top -= 34.0
+	ammo_label.offset_bottom -= 34.0
+	obj_panel = PanelContainer.new()
+	var osb := StyleBoxFlat.new()
+	osb.bg_color = Color(0.02, 0.03, 0.05, 0.62)
+	osb.border_color = Color(0.24, 0.95, 1.0, 0.35)
+	osb.set_border_width_all(1)
+	osb.set_corner_radius_all(4)
+	osb.content_margin_left = 14.0
+	osb.content_margin_right = 14.0
+	osb.content_margin_top = 10.0
+	osb.content_margin_bottom = 10.0
+	obj_panel.add_theme_stylebox_override("panel", osb)
+	obj_label = _label(Vector2(0, 0), 15, Color(0.8, 0.86, 0.92))
+	obj_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	obj_label.custom_minimum_size = Vector2(360, 0)
+	obj_panel.add_child(obj_label)
+	add_child(obj_panel)
+	obj_panel.anchor_left = 1.0
+	obj_panel.anchor_right = 1.0
+	obj_panel.anchor_top = 0.0
+	obj_panel.anchor_bottom = 0.0
+	obj_panel.offset_left = -420.0
+	obj_panel.offset_right = -16.0
+	obj_panel.offset_top = 16.0
+	obj_panel.offset_bottom = 16.0
+	pov_label = _label(Vector2(0, 0), 18, Color(0.62, 0.85, 1.0))
+	pov_label.visible = false
+	pov_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	add_child(pov_label)
+	pov_label.anchor_left = 0.5
+	pov_label.anchor_right = 0.5
+	pov_label.anchor_top = 1.0
+	pov_label.anchor_bottom = 1.0
+	pov_label.offset_left = -320.0
+	pov_label.offset_right = 320.0
+	pov_label.offset_top = -68.0
+	pov_label.offset_bottom = -40.0
 	toast_label = _label(Vector2(340, 110), 22, Color(1, 1, 1))
 	toast_label.visible = false
 	win_label = _label(Vector2(300, 230), 32, Color(0.9, 1.0, 1.0))
@@ -205,6 +247,11 @@ func toast(text: String, col: Color) -> void:
 	toast_t = 2.2
 	toast_label.visible = true
 
+func toast_bottom(text: String) -> void:
+	pov_label.text = text
+	pov_t = 2.0
+	pov_label.visible = true
+
 func _process(delta: float) -> void:
 	if game == null or game.player == null:
 		return
@@ -223,7 +270,10 @@ func _process(delta: float) -> void:
 	var in_game: bool = game.state != "menu"
 	hp_label.visible = in_game
 	ammo_label.visible = in_game
-	obj_label.visible = in_game
+	obj_panel.visible = in_game
+	if pov_t > 0.0:
+		pov_t -= delta
+		pov_label.visible = pov_t > 0.0
 	if not dlg.is_empty():
 		dlg["chars"] = float(dlg["chars"]) + 55.0 * delta
 		var line: String = dlg["lines"][dlg["i"]]

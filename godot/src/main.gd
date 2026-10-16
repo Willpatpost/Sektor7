@@ -57,6 +57,7 @@ func _ready() -> void:
 	menu = preload("res://src/menu.gd").new()
 	add_child(menu)
 	menu.setup(self)
+	menu.process_mode = Node.PROCESS_MODE_ALWAYS
 	menu.open_main()
 	_apply_video_settings()
 
@@ -173,6 +174,7 @@ func pause_game() -> void:
 		return
 	state = "paused"
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	get_tree().paused = true
 	menu.open_pause()
 
 func resume_game() -> void:
@@ -181,6 +183,7 @@ func resume_game() -> void:
 	menu.close_all()
 	state = "playing"
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	get_tree().paused = false
 
 func on_player_death() -> void:
 	state = "dead"
@@ -328,6 +331,7 @@ func _apply_window_mode(mode: int) -> void:
 
 func return_to_main_menu() -> void:
 	save_settings()
+	get_tree().paused = false
 	if get_tree().current_scene == null:
 		state = "menu"
 		menu.open_main()

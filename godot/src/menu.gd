@@ -81,16 +81,20 @@ func consume_esc() -> bool:
 	return false
 
 func _input(event: InputEvent) -> void:
-	if _capture_action == "":
+	if _capture_action != "":
+		if event is InputEventKey and event.pressed and not event.echo:
+			if event.keycode == KEY_ESCAPE:
+				_cancel_capture()
+			else:
+				_commit_remap(_capture_action, event.keycode)
+			get_viewport().set_input_as_handled()
+		elif event is InputEventJoypadButton and event.pressed:
+			_commit_remap_pad(_capture_action, event.button_index)
+			get_viewport().set_input_as_handled()
 		return
-	if event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ESCAPE:
-			_cancel_capture()
-		else:
-			_commit_remap(_capture_action, event.keycode)
-		get_viewport().set_input_as_handled()
-	elif event is InputEventJoypadButton and event.pressed:
-		_commit_remap_pad(_capture_action, event.button_index)
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE and game.state == "paused":
+		if not consume_esc():
+			game.resume_game()
 		get_viewport().set_input_as_handled()
 
 func _cancel_capture() -> void:
@@ -160,8 +164,7 @@ func set_sens(key: String, v: float) -> void:
 
 func _build_main() -> void:
 	main_root = _root_ctrl()
-	var panel := _panel(430.0)
-	main_root.add_child(panel)
+	var panel := _centered_panel(main_root, 430.0)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 10)
 	panel.add_child(vb)
@@ -184,8 +187,7 @@ func _build_main() -> void:
 
 func _build_pause() -> void:
 	pause_root = _root_ctrl()
-	var panel := _panel(430.0)
-	pause_root.add_child(panel)
+	var panel := _centered_panel(pause_root, 430.0)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 10)
 	panel.add_child(vb)
@@ -200,8 +202,7 @@ func _build_pause() -> void:
 
 func _build_settings() -> void:
 	settings_root = _root_ctrl()
-	var panel := _panel(680.0)
-	settings_root.add_child(panel)
+	var panel := _centered_panel(settings_root, 680.0)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 8)
 	panel.add_child(vb)
@@ -290,8 +291,7 @@ func _build_settings() -> void:
 
 func _build_howto() -> void:
 	howto_root = _root_ctrl()
-	var panel := _panel(660.0)
-	howto_root.add_child(panel)
+	var panel := _centered_panel(howto_root, 660.0)
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 8)
 	panel.add_child(vb)
@@ -326,7 +326,6 @@ func _root_ctrl() -> Control:
 
 func _panel(w: float) -> PanelContainer:
 	var p := PanelContainer.new()
-	p.set_anchors_preset(Control.PRESET_CENTER)
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0.02, 0.03, 0.055, 0.92)
 	sb.border_color = Color(0.24, 0.95, 1.0, 0.4)
@@ -338,6 +337,15 @@ func _panel(w: float) -> PanelContainer:
 	sb.content_margin_bottom = 22.0
 	p.add_theme_stylebox_override("panel", sb)
 	p.custom_minimum_size = Vector2(w, 0)
+	return p
+
+func _centered_panel(root: Control, w: float) -> PanelContainer:
+	var cc := CenterContainer.new()
+	cc.set_anchors_preset(Control.PRESET_FULL_RECT)
+	cc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(cc)
+	var p := _panel(w)
+	cc.add_child(p)
 	return p
 
 func _mk_btn(parent: Control, text: String, cb: Callable) -> Button:

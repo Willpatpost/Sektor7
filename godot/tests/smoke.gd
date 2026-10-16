@@ -266,10 +266,22 @@ func _run() -> void:
 		await physics_frame
 	ok(game.weapons.vm.visible, "viewmodel returns in first person")
 
+	await _press_key(KEY_V)
+	ok(game.hud.pov_label.visible, "POV switch shows bottom-center toast")
+	ok(game.hud.hp_label.anchor_top == 1.0, "vitals anchored bottom-left")
+	ok(game.hud.obj_panel.anchor_left == 1.0, "objective anchored top-right")
+
 	await _press_key(KEY_ESCAPE)
 	ok(game.state == "paused" and game.menu.pause_root.visible, "ESC opens pause menu")
+	ok(paused, "pause freezes the scene tree")
+	var tnode: Node3D = game.city._traffic[0]["node"]
+	var tpos := tnode.position
+	for i in 20:
+		await physics_frame
+	ok(tpos == tnode.position, "hover traffic frozen while paused")
 	await _press_key(KEY_ESCAPE)
 	ok(game.state == "playing" and not game.menu.pause_root.visible, "ESC resumes")
+	ok(not paused, "resume unfreezes the scene tree")
 	game.menu.set_fov(90.0)
 	ok(absf(game.cam.fov - 90.0) < 0.5, "fov setting applies live")
 	game.menu.set_brightness(1.3)

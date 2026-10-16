@@ -20,7 +20,7 @@ func mode() -> String:
 
 func cycle() -> void:
 	idx = (idx + 1) % modes.size()
-	game.hud.toast("POV — " + modes[idx]["label"], Color(0.62, 0.85, 1.0))
+	game.hud.toast_bottom("POV — " + modes[idx]["label"])
 	game.audio.sfx("ui")
 
 func _physics_process(delta: float) -> void:
