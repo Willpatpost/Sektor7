@@ -1,0 +1,19 @@
+{
+  "name": "sektor7",
+  "version": "0.1.0",
+  "description": "SEKTOR 7 — a browser cyberpunk FPS-RPG vertical slice (Three.js)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0",
+    "vite-plugin-singlefile": "^2.3.0"
+  }
+}
