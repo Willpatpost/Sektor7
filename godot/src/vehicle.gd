@@ -10,7 +10,7 @@ const ACC := 18.0
 const DRAG := 1.1
 const MAXS := 26.0
 
-func setup(g: Node3D) -> void:
+func setup(g) -> void:
 	game = g
 	var spots := [
 		{"x": 2.5, "z": 138.0, "name": "QUADRA JINXIE", "body": Color(0.48, 0.12, 0.63), "glow": Color(1.0, 0.16, 0.43)},
@@ -96,6 +96,8 @@ func enter_car(car: CharacterBody3D) -> void:
 	game.player.in_car = true
 	game.player.set_collisions_enabled(false)
 	game.hud.toast("THRUSTERS ONLINE — " + str(car.get_meta("name")), Color(0.24, 0.95, 1.0))
+	game.audio.engine_on()
+	game.audio.sfx("ui")
 
 func exit_car() -> void:
 	if not driving:
@@ -109,11 +111,12 @@ func exit_car() -> void:
 	game.player.set_collisions_enabled(true)
 	driving = false
 	active = null
+	game.audio.engine_off()
 
 func _physics_process(delta: float) -> void:
 	if game == null or game.state != "playing":
 		return
-	if Input.is_action_just_pressed("interact"):
+	if Input.is_action_just_pressed("interact") and not game.hud.dialogue_active():
 		if driving:
 			exit_car()
 			return
@@ -134,7 +137,7 @@ func _physics_process(delta: float) -> void:
 	if Input.is_action_pressed("move_left"): ix -= 1.0
 	if Input.is_action_pressed("fly_up"): vert += 1.0
 	if Input.is_action_pressed("fly_down"): vert -= 1.0
-	var fwd: Vector3 = -game.player.cam.global_transform.basis.z
+	var fwd: Vector3 = -game.player.head.global_transform.basis.z
 	var right: Vector3 = game.player.global_transform.basis.x
 	var acc := Vector3.ZERO
 	if iz != 0.0:
@@ -156,6 +159,7 @@ func _physics_process(delta: float) -> void:
 		var n := col.get_normal()
 		if vel.dot(n) < -8.0:
 			game.hud.toast("IMPACT", Color(1.0, 0.4, 0.4))
+			game.audio.sfx("boom", 0.6)
 		vel = vel.slide(n)
 	vels[car] = vel
 	car.position.y = clampf(car.position.y, 0.55, 95.0)
@@ -165,3 +169,4 @@ func _physics_process(delta: float) -> void:
 	if hs > 2.0:
 		car.rotation.y = lerp_angle(car.rotation.y, atan2(vel.x, vel.z), minf(1.0, delta * 4.0))
 	game.player.position = car.position + car.transform.basis.x * -0.45 + car.transform.basis.z * 0.1 + Vector3(0, -0.55, 0)
+	game.audio.engine_speed(vel.length() / MAXS)

@@ -17,13 +17,24 @@ func _initialize() -> void:
 	call_deferred("_watchdog")
 
 func _watchdog() -> void:
-	for i in 3600:
+	for i in 7000:
 		if _done:
 			return
 		await physics_frame
 	if not _done:
 		print("FAIL  smoke watchdog timeout")
 		quit(2)
+
+func _press_key(code: Key) -> void:
+	var k := InputEventKey.new()
+	k.keycode = code
+	k.pressed = true
+	Input.parse_input_event(k)
+	await physics_frame
+	var k2 := InputEventKey.new()
+	k2.keycode = code
+	k2.pressed = false
+	Input.parse_input_event(k2)
 
 func _run() -> void:
 	var game: Node3D = load("res://main.tscn").instantiate()
@@ -52,15 +63,7 @@ func _run() -> void:
 	ok(player.is_on_floor(), "player stays on floor")
 
 	var y0 := player.position.y
-	var jkey := InputEventKey.new()
-	jkey.keycode = KEY_SPACE
-	jkey.pressed = true
-	Input.parse_input_event(jkey)
-	await physics_frame
-	var jrel := InputEventKey.new()
-	jrel.keycode = KEY_SPACE
-	jrel.pressed = false
-	Input.parse_input_event(jrel)
+	await _press_key(KEY_SPACE)
 	var peak := y0
 	for i in 40:
 		await physics_frame
@@ -78,7 +81,8 @@ func _run() -> void:
 	e.position = Vector3(player.position.x, 0.9, player.position.z - 12.0)
 	e.velocity = Vector3.ZERO
 	var hp0: float = e.hp
-	weapons.mag = 12
+	weapons.mags[0] = 12
+	weapons.current = 0
 	weapons.cooldown = 0.0
 	weapons.reloading = false
 	var fbtn := InputEventMouseButton.new()
@@ -101,23 +105,135 @@ func _run() -> void:
 		await process_frame
 	vehicles.enter_car(car)
 	ok(vehicles.driving and player.in_car, "enter hovercar")
-
 	var start := car.position
 	Input.action_press("move_forward")
 	for i in 240:
 		await physics_frame
 	Input.action_release("move_forward")
 	ok(car.position.distance_to(start) > 2.0, "hovercar flies (%.1fm)" % car.position.distance_to(start))
-
 	Input.action_press("fly_up")
 	for i in 120:
 		await physics_frame
 	Input.action_release("fly_up")
 	ok(car.position.y > 1.5, "hovercar climbs (%.1fm altitude)" % car.position.y)
-
 	vehicles.exit_car()
 	ok(not player.in_car and not vehicles.driving, "exit hovercar")
 	ok(player.position.y >= 0.0, "player exits above ground")
+
+	player.hp = 100000
+	var quests: Node3D = game.quests
+	quests.begin(0)
+	await physics_frame
+	ok(game.hud.dialogue_active(), "intro dialogue opens")
+	var guard := 0
+	while game.hud.dialogue_active() and guard < 60:
+		await _press_key(KEY_E)
+		guard += 1
+	ok(not game.hud.dialogue_active(), "dialogue advances and closes")
+
+	guard = 0
+	while quests.idx == 0 and guard < 500:
+		for en in enemies.list.duplicate():
+			if en.kind == "merc":
+				en.damage(99999.0)
+		if game.hud.dialogue_active():
+			await _press_key(KEY_E)
+		await physics_frame
+		guard += 1
+	ok(quests.idx == 1, "job 1 completes on kills (idx %d)" % quests.idx)
+	while game.hud.dialogue_active():
+		await _press_key(KEY_E)
+
+	var shard = quests.get("shard")
+	ok(shard != null, "job 2 spawns the data shard")
+	if shard != null:
+		player.position = Vector3(shard.position.x, 0, shard.position.z)
+		guard = 0
+		while quests.idx == 1 and guard < 400:
+			if game.hud.dialogue_active():
+				await _press_key(KEY_E)
+			await physics_frame
+			guard += 1
+		ok(quests.idx == 2, "shard collection advances job 2 (idx %d)" % quests.idx)
+	while game.hud.dialogue_active():
+		await _press_key(KEY_E)
+
+	guard = 0
+	while quests.idx == 2 and guard < 500:
+		for en in enemies.list.duplicate():
+			if en.kind == "drone":
+				en.damage(99999.0)
+		if game.hud.dialogue_active():
+			await _press_key(KEY_E)
+		await physics_frame
+		guard += 1
+	ok(quests.idx == 3, "job 3 completes on drone kills (idx %d)" % quests.idx)
+	while game.hud.dialogue_active():
+		await _press_key(KEY_E)
+
+	guard = 0
+	while quests.idx == 3 and not quests.all_done and guard < 500:
+		for en in enemies.list.duplicate():
+			if en.kind == "boss" or en.kind == "merc":
+				en.damage(999999.0)
+		if game.hud.dialogue_active():
+			await _press_key(KEY_E)
+		await physics_frame
+		guard += 1
+	ok(quests.all_done, "boss kill completes the chain")
+	ok(game.state == "won", "win state reached")
+	await _press_key(KEY_ENTER)
+	ok(game.state == "playing", "ENTER resumes free roam after win")
+
+	player.position = game.city.terminal + Vector3(0, 0, 1.5)
+	player.velocity = Vector3.ZERO
+	for i in 6:
+		await process_frame
+	await _press_key(KEY_E)
+	await physics_frame
+	ok(game.state == "shop", "E at terminal opens the shop")
+	var edd0: int = player.eddies
+	var hpmax0: int = player.max_hp
+	game.hud.buy("plating")
+	ok(player.max_hp == hpmax0 + 25 and player.eddies < edd0, "upgrade purchase applies (max hp %d -> %d)" % [hpmax0, player.max_hp])
+	game.close_shop()
+	await physics_frame
+	ok(game.state == "playing", "shop closes back to playing")
+
+	var cam: Camera3D = game.cam
+	var cam_dist: Callable = func() -> float:
+		return cam.position.distance_to(player.head.global_position)
+	for i in 60:
+		await physics_frame
+	var pv0: float = cam_dist.call()
+	ok(pv0 < 0.8, "starts first person (%.2fm)" % pv0)
+	var pov_specs := [
+		{"label": "behind-close", "lo": 1.6, "hi": 3.6},
+		{"label": "behind-far", "lo": 4.2, "hi": 6.9},
+		{"label": "front-close", "lo": 1.4, "hi": 3.6},
+		{"label": "front-far", "lo": 3.8, "hi": 6.5}
+	]
+	for spec in pov_specs:
+		await _press_key(KEY_V)
+		for i in 40:
+			await physics_frame
+		var dd: float = cam_dist.call()
+		ok(dd > float(spec["lo"]) and dd < float(spec["hi"]), "POV %s offset %.2fm" % [spec["label"], dd])
+		if spec["label"] == "behind-close":
+			ok(player.body.visible, "body visible in third person")
+	await _press_key(KEY_V)
+	for i in 40:
+		await physics_frame
+	ok(cam_dist.call() < 0.8, "POV cycles back to first person")
+	ok(not player.body.visible, "body hidden in first person")
+
+	var edd1: int = player.eddies
+	enemies._spawn_pickup(player.position + Vector3(0, 0.6, 3), "eddies", 55)
+	await physics_frame
+	player.position = Vector3(player.position.x, 0, player.position.z + 3)
+	for i in 12:
+		await physics_frame
+	ok(player.eddies > edd1, "eddies pickup collected (+%d)" % (player.eddies - edd1))
 
 	print("\n%d passed, %d failed" % [passes, fails])
 	_done = true

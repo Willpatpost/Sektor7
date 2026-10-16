@@ -5,6 +5,7 @@ const GRID := 8
 const HALF := 200.0
 
 var pois := {}
+var terminal := Vector3(10, 0, 131)
 var colliders := []
 var rng := RandomNumberGenerator.new()
 var _mat_cache := {}
@@ -33,6 +34,7 @@ func build(_game: Node3D) -> void:
 	_build_perimeter()
 	_build_lamps()
 	_build_arch()
+	_build_terminal()
 	pois = {
 		"spawn": Vector3(0, 0, 146),
 		"plaza": Vector3(75, 0, 25),
@@ -216,3 +218,35 @@ func _build_arch() -> void:
 		body.add_child(shape)
 		add_child(body)
 	_sign(0, 9.6, 150.4, 0.0, "SEKTOR 7", Color(0.24, 0.95, 1.0))
+
+func _build_terminal() -> void:
+	var body := StaticBody3D.new()
+	body.position = Vector3(10, 0.6, 131)
+	var shape := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(0.9, 1.2, 0.6)
+	shape.shape = box
+	body.add_child(shape)
+	var mi := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(0.9, 1.2, 0.6)
+	mi.mesh = bm
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.09, 0.11, 0.16)
+	mat.metallic = 0.5
+	mi.material_override = mat
+	body.add_child(mi)
+	var screen := MeshInstance3D.new()
+	var sb := BoxMesh.new()
+	sb.size = Vector3(0.7, 0.5, 0.08)
+	screen.mesh = sb
+	screen.position = Vector3(0, 0.55, 0.2)
+	screen.rotation.x = -0.3
+	var smat := StandardMaterial3D.new()
+	smat.emission_enabled = true
+	smat.emission = Color(0.24, 0.95, 1.0)
+	smat.emission_energy_multiplier = 1.8
+	screen.material_override = smat
+	body.add_child(screen)
+	add_child(body)
+	_sign(10, 3.4, 131.2, 0.0, "RIPPERDOC", Color(1.0, 0.16, 0.43))

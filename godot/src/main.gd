@@ -3,12 +3,17 @@ extends Node3D
 var state := "menu"
 var time := 0.0
 var stats := {"kills": 0, "eddies": 0}
+var upgrade_tiers := {}
 var city: Node3D
 var player: CharacterBody3D
+var cam: Camera3D
 var hud: CanvasLayer
 var enemies: Node
 var vehicles: Node
 var weapons: Node
+var pov: Node
+var quests: Node3D
+var audio: Node
 
 func _ready() -> void:
 	_setup_input()
@@ -17,10 +22,10 @@ func _ready() -> void:
 	city.build(self)
 	player = preload("res://src/player.gd").new()
 	add_child(player)
-	player.setup(self)
-	hud = preload("res://src/hud.gd").new()
-	add_child(hud)
-	hud.setup(self)
+	cam = Camera3D.new()
+	cam.fov = 75
+	add_child(cam)
+	player.setup(self, cam)
 	enemies = preload("res://src/enemies.gd").new()
 	add_child(enemies)
 	enemies.setup(self)
@@ -30,6 +35,18 @@ func _ready() -> void:
 	weapons = preload("res://src/weapons.gd").new()
 	add_child(weapons)
 	weapons.setup(self)
+	hud = preload("res://src/hud.gd").new()
+	add_child(hud)
+	hud.setup(self)
+	pov = preload("res://src/pov.gd").new()
+	add_child(pov)
+	pov.setup(self, cam)
+	quests = preload("res://src/quests.gd").new()
+	add_child(quests)
+	quests.setup(self)
+	audio = preload("res://src/audio.gd").new()
+	add_child(audio)
+	audio.setup(self)
 
 func _setup_input() -> void:
 	_key("move_forward", KEY_W)
@@ -52,6 +69,9 @@ func _setup_input() -> void:
 	_joy_btn("interact", JOY_BUTTON_B)
 	_key("reload", KEY_R)
 	_joy_btn("reload", JOY_BUTTON_X)
+	_key("weapon_1", KEY_1)
+	_key("weapon_2", KEY_2)
+	_joy_btn("weapon_cycle", JOY_BUTTON_Y)
 	_mouse("fire", MOUSE_BUTTON_LEFT)
 	_joy_motion("fire", JOY_AXIS_TRIGGER_RIGHT, 1.0)
 
@@ -91,21 +111,38 @@ func _unhandled_input(event: InputEvent) -> void:
 		if state == "menu":
 			start_game()
 	elif event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ESCAPE:
+		var code: Key = event.keycode
+		if code == KEY_ESCAPE:
 			if state == "playing":
 				pause_game()
 			elif state == "paused":
 				resume_game()
-		elif event.keycode == KEY_ENTER:
+			elif state == "shop":
+				close_shop()
+		elif code == KEY_ENTER:
 			if state == "menu":
 				start_game()
 			elif state == "dead":
 				respawn()
+			elif state == "won":
+				resume_from_win()
+			elif state == "shop":
+				close_shop()
+		elif code == KEY_E and state == "shop":
+			close_shop()
+		elif code == KEY_V and state == "playing":
+			pov.cycle()
 
 func start_game() -> void:
 	state = "playing"
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-	hud.toast("SEKTOR 7 — GODOT PORT MILESTONE 1", Color(0.24, 0.95, 1.0))
+	hud.toast("SEKTOR 7 — GODOT PORT MILESTONE 2", Color(0.24, 0.95, 1.0))
+	_begin_first_job()
+
+func _begin_first_job() -> void:
+	await get_tree().create_timer(0.9).timeout
+	if state == "playing" and quests.idx == -1:
+		quests.begin(0)
 
 func pause_game() -> void:
 	if state != "playing":
@@ -121,9 +158,36 @@ func on_player_death() -> void:
 	state = "dead"
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	hud.toast("FLATLINED — press ENTER to respawn", Color(1, 0.28, 0.34))
+	audio.sfx("boom")
 
 func respawn() -> void:
 	player.reset()
+	state = "playing"
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+func open_shop() -> void:
+	if state != "playing":
+		return
+	state = "shop"
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	hud.open_shop()
+	audio.sfx("ui")
+
+func close_shop() -> void:
+	if state != "shop":
+		return
+	hud.close_shop()
+	state = "playing"
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+func win() -> void:
+	state = "won"
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	hud.show_win(stats["kills"], stats["eddies"], player.level)
+	audio.sfx("level")
+
+func resume_from_win() -> void:
+	hud.hide_win()
 	state = "playing"
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
@@ -131,11 +195,22 @@ func add_eddies(n: int) -> void:
 	player.eddies += n
 	stats["eddies"] += n
 
-func on_enemy_killed(_e: Node) -> void:
+func on_enemy_killed(kind: String) -> void:
 	stats["kills"] += 1
-	player.add_xp(50)
-	add_eddies(40)
+	var xp := 50
+	if kind == "drone":
+		xp = 40
+	elif kind == "boss":
+		xp = 300
+	player.add_xp(xp)
+	quests.on_kill(kind)
+	audio.sfx("boom", 0.6)
 
 func _physics_process(delta: float) -> void:
 	if state == "playing":
 		time += delta
+		if Input.is_action_just_pressed("interact"):
+			if hud.dialogue_active():
+				hud.advance_dialogue()
+			elif vehicles._nearest_car() == null and player.position.distance_to(city.terminal) < 2.9:
+				open_shop()
