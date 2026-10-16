@@ -14,9 +14,18 @@ var reloading := false
 var reload_t := 0.0
 var _flashes := []
 var _tracers := []
+var vm: Node3D
+var vm_pistol: Node3D
+var vm_smg: Node3D
+var _flash: MeshInstance3D
+var _kick := 0.0
+var _raise := 0.0
+
+const VM_POS := Vector3(0.3, -0.26, -0.55)
 
 func setup(g) -> void:
 	game = g
+	_build_viewmodel()
 
 func _def() -> Dictionary:
 	return defs[current]
@@ -34,6 +43,7 @@ func switch_to(i: int) -> void:
 		return
 	reloading = false
 	current = i
+	_raise = 1.0
 	game.audio.sfx("ui")
 
 func _physics_process(delta: float) -> void:
@@ -54,6 +64,22 @@ func _physics_process(delta: float) -> void:
 			_tracers.erase(tr)
 	if game == null or game.state != "playing":
 		return
+	if vm != null:
+		var pov_first: bool = game.pov == null or game.pov.mode() == "first"
+		vm.visible = pov_first and not game.player.in_car
+		vm_pistol.visible = current == 0
+		vm_smg.visible = current == 1
+		_kick = maxf(0.0, _kick - delta * 9.0)
+		_raise = maxf(0.0, _raise - delta * 4.0)
+		_flash.visible = _kick > 0.55
+		var speed01 := clampf(Vector2(game.player.velocity.x, game.player.velocity.z).length() / 8.0, 0.0, 1.0)
+		var bob := Vector3(cos(game.player.walk_phase * 0.5) * 0.006, sin(game.player.walk_phase) * 0.009, 0.0) * speed01
+		vm.position = VM_POS + bob + Vector3(0.0, -_raise * 0.18, _kick * 0.06)
+		vm.rotation = Vector3(_kick * 0.13 - _raise * 0.7, 0.06, 0.0)
+		if reloading:
+			var rp := clampf(1.0 - reload_t / float(_def()["reload"]), 0.0, 1.0)
+			vm.rotation.x -= sin(PI * rp) * 0.85
+			vm.position.y -= sin(PI * rp) * 0.1
 	cooldown -= delta
 	if reloading:
 		reload_t -= delta
@@ -86,6 +112,7 @@ func reload() -> void:
 func fire() -> void:
 	mags[current] -= 1
 	cooldown = float(_def()["rate"])
+	_kick = 1.0
 	var head: Node3D = game.player.head
 	var from: Vector3 = head.global_position
 	var to: Vector3 = from + (-head.global_transform.basis.z) * 140.0
@@ -156,3 +183,69 @@ func _sparks(pos: Vector3) -> void:
 	p.position = pos
 	add_child(p)
 	get_tree().create_timer(0.7).timeout.connect(p.queue_free)
+
+func _build_viewmodel() -> void:
+	vm = Node3D.new()
+	vm.position = VM_POS
+	vm.rotation = Vector3(0.0, 0.06, 0.0)
+	vm.visible = false
+	game.cam.add_child(vm)
+	vm_pistol = _gun_mesh(false)
+	vm_smg = _gun_mesh(true)
+	vm_smg.visible = false
+	vm.add_child(vm_pistol)
+	vm.add_child(vm_smg)
+	_flash = MeshInstance3D.new()
+	var fm := QuadMesh.new()
+	fm.size = Vector2(0.16, 0.16)
+	var fmat := StandardMaterial3D.new()
+	fmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	fmat.emission_enabled = true
+	fmat.emission = Color(1.0, 0.82, 0.45)
+	fmat.emission_energy_multiplier = 5.0
+	fmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	fmat.albedo_color = Color(1.0, 0.82, 0.45, 0.9)
+	fmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	fm.material = fmat
+	_flash.mesh = fm
+	_flash.position = Vector3(0, 0.03, -0.44)
+	_flash.visible = false
+	vm.add_child(_flash)
+
+func _gun_mesh(smg: bool) -> Node3D:
+	var root := Node3D.new()
+	var metal := StandardMaterial3D.new()
+	metal.albedo_color = Color(0.085, 0.09, 0.105)
+	metal.metallic = 0.85
+	metal.roughness = 0.38
+	var dark := StandardMaterial3D.new()
+	dark.albedo_color = Color(0.04, 0.045, 0.055)
+	dark.metallic = 0.6
+	dark.roughness = 0.6
+	var glow := StandardMaterial3D.new()
+	glow.emission_enabled = true
+	glow.emission = Color(0.24, 0.95, 1.0)
+	glow.emission_energy_multiplier = 2.4
+	if smg:
+		_vm_box(root, Vector3(0.07, 0.1, 0.52), Vector3(0, 0, -0.1), metal)
+		_vm_box(root, Vector3(0.05, 0.05, 0.3), Vector3(0, 0.06, -0.28), metal)
+		_vm_box(root, Vector3(0.045, 0.16, 0.06), Vector3(0, -0.12, -0.16), dark)
+		_vm_box(root, Vector3(0.05, 0.05, 0.14), Vector3(0, -0.04, -0.34), dark)
+		_vm_box(root, Vector3(0.06, 0.09, 0.16), Vector3(0, -0.02, 0.16), dark)
+		_vm_box(root, Vector3(0.012, 0.012, 0.26), Vector3(0, 0.1, -0.2), glow)
+	else:
+		_vm_box(root, Vector3(0.07, 0.075, 0.34), Vector3(0, 0.02, -0.05), metal)
+		_vm_box(root, Vector3(0.06, 0.05, 0.28), Vector3(0, -0.04, -0.03), dark)
+		_vm_box(root, Vector3(0.055, 0.16, 0.085), Vector3(0, -0.13, 0.07), dark)
+		_vm_box(root, Vector3(0.014, 0.014, 0.014), Vector3(0, 0.07, -0.19), glow)
+		_vm_box(root, Vector3(0.03, 0.014, 0.012), Vector3(0, 0.07, 0.09), glow)
+	return root
+
+func _vm_box(parent: Node3D, size: Vector3, pos: Vector3, mat: StandardMaterial3D) -> void:
+	var mi := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = size
+	mi.mesh = bm
+	mi.position = pos
+	mi.material_override = mat
+	parent.add_child(mi)

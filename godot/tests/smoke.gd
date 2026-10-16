@@ -235,6 +235,34 @@ func _run() -> void:
 		await physics_frame
 	ok(player.eddies > edd1, "eddies pickup collected (+%d)" % (player.eddies - edd1))
 
+	var look_ok := false
+	for evx in InputMap.action_get_events("look_right"):
+		var jm := evx as InputEventJoypadMotion
+		if jm != null and jm.axis == JOY_AXIS_RIGHT_X and jm.axis_value > 0.5:
+			look_ok = true
+	ok(look_ok, "right stick bound to look_right")
+	var yaw0 := player.rotation.y
+	Input.action_press("look_right", 1.0)
+	for i in 30:
+		await physics_frame
+	Input.action_release("look_right")
+	ok(yaw0 - player.rotation.y > 0.05, "gamepad look yaws right (%.2f rad)" % (yaw0 - player.rotation.y))
+	var pitch0: float = player.head.rotation.x
+	Input.action_press("look_down", 1.0)
+	for i in 30:
+		await physics_frame
+	Input.action_release("look_down")
+	ok(pitch0 - player.head.rotation.x > 0.02, "gamepad look pitches down (%.2f rad)" % (pitch0 - player.head.rotation.x))
+	ok(game.weapons.vm.visible, "weapon viewmodel visible in first person")
+	await _press_key(KEY_V)
+	for i in 40:
+		await physics_frame
+	ok(not game.weapons.vm.visible, "viewmodel hidden in third person")
+	game.pov.idx = 0
+	for i in 40:
+		await physics_frame
+	ok(game.weapons.vm.visible, "viewmodel returns in first person")
+
 	print("\n%d passed, %d failed" % [passes, fails])
 	_done = true
 	game.free()

@@ -77,6 +77,10 @@ func _setup_input() -> void:
 	_joy_btn("weapon_cycle", JOY_BUTTON_Y)
 	_mouse("fire", MOUSE_BUTTON_LEFT)
 	_joy_motion("fire", JOY_AXIS_TRIGGER_RIGHT, 1.0)
+	_joy_motion("look_left", JOY_AXIS_RIGHT_X, -1.0, 0.12)
+	_joy_motion("look_right", JOY_AXIS_RIGHT_X, 1.0, 0.12)
+	_joy_motion("look_up", JOY_AXIS_RIGHT_Y, -1.0, 0.12)
+	_joy_motion("look_down", JOY_AXIS_RIGHT_Y, 1.0, 0.12)
 
 func _key(action: String, code: Key) -> void:
 	_ensure(action)
@@ -90,8 +94,8 @@ func _mouse(action: String, btn: MouseButton) -> void:
 	ev.button_index = btn
 	InputMap.action_add_event(action, ev)
 
-func _joy_motion(action: String, axis: int, value: float) -> void:
-	_ensure(action)
+func _joy_motion(action: String, axis: int, value: float, dz := -1.0) -> void:
+	_ensure(action, dz)
 	var ev := InputEventJoypadMotion.new()
 	ev.axis = axis
 	ev.axis_value = value
@@ -103,9 +107,12 @@ func _joy_btn(action: String, btn: JoyButton) -> void:
 	ev.button_index = btn
 	InputMap.action_add_event(action, ev)
 
-func _ensure(action: String) -> void:
+func _ensure(action: String, dz := -1.0) -> void:
 	if not InputMap.has_action(action):
-		InputMap.add_action(action)
+		if dz >= 0.0:
+			InputMap.add_action(action, dz)
+		else:
+			InputMap.add_action(action)
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -212,6 +219,12 @@ func on_enemy_killed(kind: String) -> void:
 func _physics_process(delta: float) -> void:
 	if state == "playing":
 		time += delta
+		var lx := Input.get_action_strength("look_right") - Input.get_action_strength("look_left")
+		var ly := Input.get_action_strength("look_down") - Input.get_action_strength("look_up")
+		var lmag := Vector2(lx, ly).length()
+		if lmag > 0.001:
+			var curved := pow(lmag, 1.7)
+			player.on_look(lx / lmag * curved * delta * 1500.0, ly / lmag * curved * delta * 1200.0)
 		if Input.is_action_just_pressed("interact"):
 			if hud.dialogue_active():
 				hud.advance_dialogue()
