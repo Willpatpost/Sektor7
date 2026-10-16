@@ -37,6 +37,9 @@ func _press_key(code: Key) -> void:
 	Input.parse_input_event(k2)
 
 func _run() -> void:
+	var cfg_path := ProjectSettings.globalize_path("user://settings.cfg")
+	if FileAccess.file_exists(cfg_path):
+		DirAccess.remove_absolute(cfg_path)
 	var game: Node3D = load("res://main.tscn").instantiate()
 	root.add_child(game)
 	for i in 12:
@@ -262,6 +265,32 @@ func _run() -> void:
 	for i in 40:
 		await physics_frame
 	ok(game.weapons.vm.visible, "viewmodel returns in first person")
+
+	await _press_key(KEY_ESCAPE)
+	ok(game.state == "paused" and game.menu.pause_root.visible, "ESC opens pause menu")
+	await _press_key(KEY_ESCAPE)
+	ok(game.state == "playing" and not game.menu.pause_root.visible, "ESC resumes")
+	game.menu.set_fov(90.0)
+	ok(absf(game.cam.fov - 90.0) < 0.5, "fov setting applies live")
+	game.menu.set_brightness(1.3)
+	ok(absf(float(game.city.env.get("adjustment_brightness")) - 1.3) < 0.05, "brightness applies live")
+	game.menu.set_volume("sfx", 0.5)
+	ok(absf(AudioServer.get_bus_volume_db(AudioServer.get_bus_index("SFX")) - linear_to_db(0.5)) < 0.1, "sfx slider routes to audio bus")
+	ok(FileAccess.file_exists(cfg_path), "settings persist to file")
+	game.menu._commit_remap("interact", KEY_F)
+	var has_f := false
+	for ev in InputMap.action_get_events("interact"):
+		if ev is InputEventKey and ev.keycode == KEY_F:
+			has_f = true
+	ok(has_f, "key remap applies to InputMap")
+	game.menu.open_settings_from("pause")
+	ok(game.menu.settings_root.visible, "settings panel opens")
+	await _press_key(KEY_ESCAPE)
+	ok(game.state == "paused" and game.menu.pause_root.visible and not game.menu.settings_root.visible, "ESC in settings backs out to pause")
+	await _press_key(KEY_ESCAPE)
+	ok(game.state == "playing", "ESC resumes after settings")
+	ok(game.menu.btn_main_menu != null, "main menu return button present")
+	DirAccess.remove_absolute(cfg_path)
 
 	print("\n%d passed, %d failed" % [passes, fails])
 	_done = true

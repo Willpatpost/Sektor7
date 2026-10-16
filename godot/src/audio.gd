@@ -8,6 +8,7 @@ func setup(g) -> void:
 	engine_player = AudioStreamPlayer.new()
 	engine_player.stream = _engine_loop()
 	engine_player.volume_db = -14.0
+	engine_player.set("bus", "SFX")
 	add_child(engine_player)
 
 func _pcm(samples: int, gen: Callable) -> AudioStreamWAV:
@@ -66,6 +67,7 @@ func sfx(name: String, vol := 1.0) -> void:
 	var p := AudioStreamPlayer.new()
 	p.stream = wav
 	p.volume_db = linear_to_db(0.4 * vol)
+	p.set("bus", "SFX")
 	add_child(p)
 	p.play()
 	p.finished.connect(p.queue_free)

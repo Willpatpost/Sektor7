@@ -5,7 +5,6 @@ var hp_label: Label
 var ammo_label: Label
 var obj_label: Label
 var toast_label: Label
-var menu_label: Label
 var win_label: Label
 var toast_t := 0.0
 var dlg := {}
@@ -31,8 +30,6 @@ func setup(g) -> void:
 	obj_label = _label(Vector2(20, 80), 15, Color(0.8, 0.86, 0.92))
 	toast_label = _label(Vector2(340, 110), 22, Color(1, 1, 1))
 	toast_label.visible = false
-	menu_label = _label(Vector2(330, 250), 36, Color(0.24, 0.95, 1.0))
-	menu_label.text = "SEKTOR 7\n\nCLICK OR PRESS ENTER TO START\nGODOT PORT — MILESTONE 2"
 	win_label = _label(Vector2(300, 230), 32, Color(0.9, 1.0, 1.0))
 	win_label.visible = false
 	_build_dialogue()
@@ -223,7 +220,10 @@ func _process(delta: float) -> void:
 	if game.quests != null:
 		var info: Dictionary = game.quests.objective_info()
 		obj_label.text = "%s\n%s\n%s" % [info["title"], info["task"], info["prog"]]
-	menu_label.visible = game.state == "menu"
+	var in_game: bool = game.state != "menu"
+	hp_label.visible = in_game
+	ammo_label.visible = in_game
+	obj_label.visible = in_game
 	if not dlg.is_empty():
 		dlg["chars"] = float(dlg["chars"]) + 55.0 * delta
 		var line: String = dlg["lines"][dlg["i"]]

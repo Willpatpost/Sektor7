@@ -14,12 +14,16 @@ var weapons: Node
 var pov: Node
 var quests: Node3D
 var audio: Node
+var menu: CanvasLayer
+var settings := {}
 
 func _ready() -> void:
 	var ui_font := FontFile.new()
 	ui_font.load_dynamic_font("res://assets/fonts/DejaVuSans-Bold.ttf")
 	ThemeDB.fallback_font = ui_font
 	_setup_input()
+	_load_settings()
+	_setup_audio_buses()
 	city = preload("res://src/city.gd").new()
 	add_child(city)
 	city.build(self)
@@ -50,6 +54,11 @@ func _ready() -> void:
 	audio = preload("res://src/audio.gd").new()
 	add_child(audio)
 	audio.setup(self)
+	menu = preload("res://src/menu.gd").new()
+	add_child(menu)
+	menu.setup(self)
+	menu.open_main()
+	_apply_video_settings()
 
 func _setup_input() -> void:
 	_key("move_forward", KEY_W)
@@ -75,6 +84,7 @@ func _setup_input() -> void:
 	_key("weapon_1", KEY_1)
 	_key("weapon_2", KEY_2)
 	_joy_btn("weapon_cycle", JOY_BUTTON_Y)
+	_key("pov_cycle", KEY_V)
 	_mouse("fire", MOUSE_BUTTON_LEFT)
 	_joy_motion("fire", JOY_AXIS_TRIGGER_RIGHT, 1.0)
 	_joy_motion("look_left", JOY_AXIS_RIGHT_X, -1.0, 0.12)
@@ -126,7 +136,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			if state == "playing":
 				pause_game()
 			elif state == "paused":
-				resume_game()
+				if not menu.consume_esc():
+					resume_game()
 			elif state == "shop":
 				close_shop()
 		elif code == KEY_ENTER:
@@ -140,10 +151,13 @@ func _unhandled_input(event: InputEvent) -> void:
 				close_shop()
 		elif code == KEY_E and state == "shop":
 			close_shop()
-		elif code == KEY_V and state == "playing":
+		elif event.is_action_pressed("pov_cycle") and state == "playing":
 			pov.cycle()
 
 func start_game() -> void:
+	if state != "menu":
+		return
+	menu.close_all()
 	state = "playing"
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	hud.toast("SEKTOR 7 — GODOT PORT MILESTONE 2", Color(0.24, 0.95, 1.0))
@@ -159,8 +173,12 @@ func pause_game() -> void:
 		return
 	state = "paused"
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	menu.open_pause()
 
 func resume_game() -> void:
+	if state != "paused":
+		return
+	menu.close_all()
 	state = "playing"
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
@@ -216,6 +234,106 @@ func on_enemy_killed(kind: String) -> void:
 	quests.on_kill(kind)
 	audio.sfx("boom", 0.6)
 
+func _load_settings() -> void:
+	settings = {
+		"master": 1.0, "music": 1.0, "sfx": 1.0,
+		"fov": 75.0, "brightness": 1.0, "window_mode": 0,
+		"mouse_sens": 1.0, "stick_sens": 1.0
+	}
+	var cfg := ConfigFile.new()
+	if cfg.load("user://settings.cfg") == OK:
+		settings["master"] = float(cfg.get_value("audio", "master", 1.0))
+		settings["music"] = float(cfg.get_value("audio", "music", 1.0))
+		settings["sfx"] = float(cfg.get_value("audio", "sfx", 1.0))
+		settings["fov"] = float(cfg.get_value("video", "fov", 75.0))
+		settings["brightness"] = float(cfg.get_value("video", "brightness", 1.0))
+		settings["window_mode"] = int(cfg.get_value("video", "window_mode", 0))
+		settings["mouse_sens"] = float(cfg.get_value("controls", "mouse_sens", 1.0))
+		settings["stick_sens"] = float(cfg.get_value("controls", "stick_sens", 1.0))
+		_apply_saved_binds(cfg)
+
+func _apply_saved_binds(cfg: ConfigFile) -> void:
+	if cfg.has_section("binds"):
+		for action in cfg.get_section_keys("binds"):
+			var kc: int = int(cfg.get_value("binds", action, 0))
+			if kc > 0 and InputMap.has_action(action):
+				_replace_key(action, kc)
+	if cfg.has_section("pad_binds"):
+		for action in cfg.get_section_keys("pad_binds"):
+			var bi: int = int(cfg.get_value("pad_binds", action, -1))
+			if bi >= 0 and InputMap.has_action(action):
+				_replace_pad(action, bi)
+
+func _replace_key(action: String, kc: int) -> void:
+	for ev in InputMap.action_get_events(action):
+		if ev is InputEventKey:
+			InputMap.action_erase_event(action, ev)
+	var ev := InputEventKey.new()
+	ev.keycode = kc
+	InputMap.action_add_event(action, ev)
+
+func _replace_pad(action: String, btn: int) -> void:
+	for ev in InputMap.action_get_events(action):
+		if ev is InputEventJoypadButton:
+			InputMap.action_erase_event(action, ev)
+	var ev := InputEventJoypadButton.new()
+	ev.button_index = btn
+	InputMap.action_add_event(action, ev)
+
+func save_settings() -> void:
+	var cfg := ConfigFile.new()
+	cfg.set_value("audio", "master", settings["master"])
+	cfg.set_value("audio", "music", settings["music"])
+	cfg.set_value("audio", "sfx", settings["sfx"])
+	cfg.set_value("video", "fov", settings["fov"])
+	cfg.set_value("video", "brightness", settings["brightness"])
+	cfg.set_value("video", "window_mode", settings["window_mode"])
+	cfg.set_value("controls", "mouse_sens", settings["mouse_sens"])
+	cfg.set_value("controls", "stick_sens", settings["stick_sens"])
+	cfg.save("user://settings.cfg")
+
+func _setup_audio_buses() -> void:
+	if AudioServer.get_bus_index("SFX") == -1:
+		AudioServer.add_bus()
+		AudioServer.set_bus_name(AudioServer.bus_count - 1, "SFX")
+		AudioServer.set_bus_send(AudioServer.bus_count - 1, "Master")
+	if AudioServer.get_bus_index("Music") == -1:
+		AudioServer.add_bus()
+		AudioServer.set_bus_name(AudioServer.bus_count - 1, "Music")
+		AudioServer.set_bus_send(AudioServer.bus_count - 1, "Master")
+	for pair in [["Master", "master"], ["SFX", "sfx"], ["Music", "music"]]:
+		AudioServer.set_bus_volume_linear(AudioServer.get_bus_index(pair[0]), float(settings[pair[1]]))
+
+func _apply_video_settings() -> void:
+	cam.fov = float(settings["fov"])
+	if city != null and city.env != null:
+		city.env.set("adjustment_brightness", float(settings["brightness"]))
+	_apply_window_mode(int(settings["window_mode"]))
+
+func _apply_window_mode(mode: int) -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	match mode:
+		1:
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+		2:
+			DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, false)
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+			DisplayServer.window_set_size(DisplayServer.screen_get_size(DisplayServer.SCREEN_PRIMARY))
+			DisplayServer.window_set_position(Vector2i(0, 0))
+			DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
+		_:
+			DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, false)
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+
+func return_to_main_menu() -> void:
+	save_settings()
+	if get_tree().current_scene == null:
+		state = "menu"
+		menu.open_main()
+		return
+	get_tree().reload_current_scene()
+
 func _physics_process(delta: float) -> void:
 	if state == "playing":
 		time += delta
@@ -224,9 +342,12 @@ func _physics_process(delta: float) -> void:
 		var lmag := Vector2(lx, ly).length()
 		if lmag > 0.001:
 			var curved := pow(lmag, 1.7)
-			player.on_look(lx / lmag * curved * delta * 1500.0, ly / lmag * curved * delta * 1200.0)
+			var ss := float(settings.get("stick_sens", 1.0))
+			player.on_look(lx / lmag * curved * delta * 1500.0 * ss, ly / lmag * curved * delta * 1200.0 * ss)
 		if Input.is_action_just_pressed("interact"):
 			if hud.dialogue_active():
 				hud.advance_dialogue()
 			elif vehicles._nearest_car() == null and player.position.distance_to(city.terminal) < 2.9:
 				open_shop()
+	elif state == "menu":
+		player.rotation.y += delta * 0.04

@@ -16,6 +16,7 @@ var _signs := []
 var _blinkers := []
 var _traffic := []
 var _rain: CPUParticles3D
+var env: Environment
 var _flash_light: DirectionalLight3D
 var _flash := 0.0
 var _next_flash := 7.0
@@ -428,7 +429,7 @@ func _holo(x: float, y: float, z: float, w: float, h: float, ry: float) -> void:
 
 func _build_environment() -> void:
 	var we := WorldEnvironment.new()
-	var env := Environment.new()
+	env = Environment.new()
 	var sky := Sky.new()
 	var sky_mat := ShaderMaterial.new()
 	sky_mat.shader = _sky_shader

@@ -85,8 +85,11 @@ func _build_body() -> void:
 	add_child(body)
 
 func on_look(rel_x: float, rel_y: float) -> void:
-	rotate_y(-rel_x * 0.0021)
-	head.rotation.x = clampf(head.rotation.x - rel_y * 0.0021, -1.45, 1.45)
+	var ms := 1.0
+	if game != null and game.settings != null:
+		ms = float(game.settings.get("mouse_sens", 1.0))
+	rotate_y(-rel_x * 0.0021 * ms)
+	head.rotation.x = clampf(head.rotation.x - rel_y * 0.0021 * ms, -1.45, 1.45)
 
 func _physics_process(delta: float) -> void:
 	if game == null or game.state != "playing" or in_car:

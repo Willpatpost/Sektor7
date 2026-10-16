@@ -17,17 +17,27 @@ func _run() -> void:
 	root.add_child(game)
 	for i in 10:
 		await process_frame
-	game.state = "playing"
+	var st := _arg("state", "playing")
 	var p: CharacterBody3D = game.player
-	p.position = Vector3(float(_arg("x", "0")), float(_arg("y", "0")), float(_arg("z", "146")))
-	p.velocity = Vector3.ZERO
-	p.rotation.y = deg_to_rad(float(_arg("yaw", "0")))
-	p.head.rotation.x = deg_to_rad(float(_arg("pitch", "-4")))
-	match _arg("pov", "first"):
-		"behind_close": game.pov.idx = 1
-		"behind_far": game.pov.idx = 2
-		"front_close": game.pov.idx = 3
-		"front_far": game.pov.idx = 4
+	if st != "menu":
+		game.state = "playing"
+		p.position = Vector3(float(_arg("x", "0")), float(_arg("y", "0")), float(_arg("z", "146")))
+		p.velocity = Vector3.ZERO
+		p.rotation.y = deg_to_rad(float(_arg("yaw", "0")))
+		p.head.rotation.x = deg_to_rad(float(_arg("pitch", "-4")))
+		match _arg("pov", "first"):
+			"behind_close": game.pov.idx = 1
+			"behind_far": game.pov.idx = 2
+			"front_close": game.pov.idx = 3
+			"front_far": game.pov.idx = 4
+	if st == "paused":
+		game.pause_game()
+		var panel := _arg("panel", "")
+		if panel == "settings":
+			game.menu.open_settings_from("pause")
+			game.menu._show_tab(_arg("tab", "audio"))
+		elif panel == "howto":
+			game.menu.open_howto_from("pause")
 	if _arg("hud", "1") == "0":
 		game.hud.visible = false
 	for i in int(_arg("frames", "12")):
