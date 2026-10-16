@@ -27,14 +27,19 @@ const NEON := [Color(0.24, 0.95, 1.0), Color(1.0, 0.16, 0.43), Color(1.0, 0.84, 
 const FACADE_SRC := "
 shader_type spatial;
 
+uniform sampler2D wall_albedo : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2D wall_normal : hint_normal, filter_linear_mipmap, repeat_enable;
+uniform sampler2D wall_rough : filter_linear_mipmap, repeat_enable;
+uniform float tex_scale = 3.0;
 uniform vec4 aux;
 uniform vec2 fl;
-uniform vec3 wall_col : source_color = vec3(0.055, 0.06, 0.075);
+uniform vec3 wall_col : source_color = vec3(0.7, 0.73, 0.78);
 uniform float lit_ratio = 0.34;
 uniform float glow_energy = 2.4;
 
 varying vec3 wpos;
 varying vec3 mnrm;
+varying vec2 tuv;
 
 float hash12(vec2 p) {
 	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -52,13 +57,22 @@ float vnoise(vec2 p) {
 void vertex() {
 	wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	mnrm = NORMAL;
+	if (abs(NORMAL.y) > 0.5) {
+		tuv = VERTEX.xz / tex_scale;
+	} else if (abs(NORMAL.x) > 0.5) {
+		tuv = vec2(VERTEX.z, VERTEX.y) / tex_scale;
+	} else {
+		tuv = vec2(VERTEX.x, VERTEX.y) / tex_scale;
+	}
 }
 
 void fragment() {
 	float concrete_n = vnoise(wpos.xz * 0.35 + wpos.y * 0.6);
+	float base_rough = clamp(texture(wall_rough, tuv).r, 0.05, 1.0);
 	if (abs(mnrm.y) > 0.5) {
-		ALBEDO = wall_col * (0.55 + 0.25 * concrete_n);
-		ROUGHNESS = 0.95;
+		ALBEDO = texture(wall_albedo, tuv).rgb * wall_col * (0.6 + 0.25 * concrete_n);
+		ROUGHNESS = base_rough;
+		NORMAL_MAP = texture(wall_normal, tuv).rgb;
 	} else {
 		bool xf = abs(mnrm.x) > 0.5;
 		float u0 = xf ? aux.y : aux.x;
@@ -92,9 +106,10 @@ void fragment() {
 			flick = 0.55 + 0.45 * step(0.5, fract(TIME * 6.0 + h3 * 90.0));
 		}
 		EMISSION = room * bright * lit * glow_energy * flick * win;
-		ALBEDO = wall_col * (0.8 + 0.35 * concrete_n);
-		ROUGHNESS = mix(0.9, 0.18, win * (1.0 - lit));
+		ALBEDO = texture(wall_albedo, tuv).rgb * wall_col * (0.85 + 0.3 * concrete_n);
+		ROUGHNESS = mix(base_rough, 0.18, win * (1.0 - lit));
 		METALLIC = win * (1.0 - lit) * 0.7;
+		NORMAL_MAP = texture(wall_normal, tuv).rgb;
 	}
 }
 "
@@ -102,14 +117,22 @@ void fragment() {
 const GROUND_SRC := "
 shader_type spatial;
 
-uniform vec3 asphalt : source_color = vec3(0.065, 0.07, 0.09);
-uniform vec3 concrete : source_color = vec3(0.11, 0.115, 0.13);
+uniform sampler2D road_albedo : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2D road_normal : hint_normal, filter_linear_mipmap, repeat_enable;
+uniform sampler2D road_rough : filter_linear_mipmap, repeat_enable;
+uniform sampler2D walk_albedo : source_color, filter_linear_mipmap, repeat_enable;
+uniform sampler2D walk_normal : hint_normal, filter_linear_mipmap, repeat_enable;
+uniform sampler2D walk_rough : filter_linear_mipmap, repeat_enable;
+uniform float tex_scale = 3.5;
+uniform vec3 asphalt_tint : source_color = vec3(0.55, 0.58, 0.62);
+uniform vec3 concrete_tint : source_color = vec3(0.62, 0.64, 0.68);
 uniform vec3 line_col : source_color = vec3(0.95, 0.78, 0.3);
 uniform float road_half = 8.0;
 uniform float grid = 50.0;
 
 varying vec3 wpos;
 varying vec3 mnrm;
+varying vec2 tuv;
 
 float hash12(vec2 p) {
 	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -127,11 +150,12 @@ float vnoise(vec2 p) {
 void vertex() {
 	wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	mnrm = NORMAL;
+	tuv = VERTEX.xz / tex_scale;
 }
 
 void fragment() {
 	if (mnrm.y < 0.5) {
-		ALBEDO = asphalt * 0.4;
+		ALBEDO = texture(road_albedo, tuv).rgb * asphalt_tint * 0.4;
 		ROUGHNESS = 0.9;
 	} else {
 		float dx = abs(wpos.x - grid * floor(wpos.x / grid + 0.5));
@@ -140,18 +164,18 @@ void fragment() {
 		float roadz = 1.0 - step(road_half, dz);
 		float road = max(roadx, roadz);
 		float inter = roadx * roadz;
-		float n1 = vnoise(wpos.xz * 0.13);
 		float n2 = vnoise(wpos.xz * 0.05 + 31.7);
 		vec2 tile = abs(fract(wpos.xz / 2.0) - 0.5);
 		float grout = smoothstep(0.44, 0.5, max(tile.x, tile.y));
-		vec3 walk = mix(concrete * (0.9 + 0.25 * n1), concrete * 0.45, grout);
-		vec3 asph = asphalt * (0.8 + 0.45 * n1);
-		vec3 alb = mix(walk, asph, road);
-		float base_rough = mix(0.85, 0.3 + 0.3 * n1, road);
+		vec3 walk_alb = texture(walk_albedo, tuv).rgb * concrete_tint * mix(1.0, 0.5, grout);
+		vec3 road_alb = texture(road_albedo, tuv).rgb * asphalt_tint;
+		vec3 alb = mix(walk_alb, road_alb, road);
+		float base_rough = mix(clamp(texture(walk_rough, tuv).r, 0.05, 1.0), clamp(texture(road_rough, tuv).r, 0.05, 1.0), road);
 		float pud = smoothstep(0.62, 0.74, n2 + road * 0.06);
 		ALBEDO = mix(alb, alb * 0.4, pud);
 		ROUGHNESS = mix(base_rough, 0.05, pud);
 		METALLIC = pud * 0.92;
+		NORMAL_MAP = mix(texture(walk_normal, tuv).rgb, texture(road_normal, tuv).rgb, road);
 		float center_x = (1.0 - step(0.16, dx)) * step(fract(wpos.z / 7.0), 0.55);
 		float center_z = (1.0 - step(0.16, dz)) * step(fract(wpos.x / 7.0), 0.55);
 		float edge_x = (1.0 - step(0.14, abs(dx - (road_half - 0.7)))) * roadx;
@@ -309,15 +333,14 @@ func _facade_material(x: float, z: float, w: float, d: float, h: float) -> Shade
 	mat.set_shader_parameter("aux", Vector4(x - w / 2.0, z - d / 2.0, p_x, p_z))
 	mat.set_shader_parameter("fl", Vector2(p_y, rng.randf() * 97.0))
 	mat.set_shader_parameter("lit_ratio", rng.randf_range(0.26, 0.42))
-	mat.set_shader_parameter("wall_col", Vector3(0.045, 0.05, 0.068) * rng.randf_range(0.8, 1.25))
+	mat.set_shader_parameter("wall_col", Vector3(0.58, 0.62, 0.68) * rng.randf_range(0.75, 1.15))
+	mat.set_shader_parameter("tex_scale", rng.randf_range(2.4, 3.6))
+	game.materials.apply(mat, "facade", "wall_")
 	return mat
 
 func _roof_clutter(parent: Node3D, x: float, z: float, w: float, d: float, h: float) -> void:
 	var n := 1 + rng.randi() % 3
-	var cmat := StandardMaterial3D.new()
-	cmat.albedo_color = Color(0.08, 0.09, 0.11)
-	cmat.metallic = 0.4
-	cmat.roughness = 0.7
+	var cmat: StandardMaterial3D = game.materials.std_mat("metal", Color(0.5, 0.52, 0.58), 0.7, 0.4)
 	for i in n:
 		var cw := rng.randf_range(1.1, 1.9)
 		var chh := rng.randf_range(0.7, 1.3)
@@ -339,9 +362,7 @@ func _roof_clutter(parent: Node3D, x: float, z: float, w: float, d: float, h: fl
 		var ax := x + w / 2.0 - 0.8
 		var az := z - d / 2.0 + 0.8
 		ant.position = Vector3(ax - parent.position.x, h - parent.position.y + am.height / 2.0, az - parent.position.z)
-		var amat := StandardMaterial3D.new()
-		amat.albedo_color = Color(0.1, 0.1, 0.12)
-		ant.material_override = amat
+		ant.material_override = game.materials.std_mat("metal", Color(0.45, 0.46, 0.5), 0.5, 0.8)
 		parent.add_child(ant)
 		var beacon := MeshInstance3D.new()
 		var bb := BoxMesh.new()
@@ -380,11 +401,7 @@ func _sign(x: float, y: float, z: float, ry: float, text: String, col: Color, fl
 	bm.size = Vector3(wdt, 1.25, 0.12)
 	back.mesh = bm
 	back.position = Vector3(0, 0, -0.07)
-	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.05, 0.05, 0.07)
-	bmat.metallic = 0.5
-	bmat.roughness = 0.6
-	back.material_override = bmat
+	back.material_override = game.materials.std_mat("metal", Color(0.38, 0.4, 0.46), 0.6, 0.5)
 	root.add_child(back)
 	for ey in [0.58, -0.58]:
 		var strip := MeshInstance3D.new()
@@ -493,6 +510,8 @@ func _build_ground() -> void:
 	mi.mesh = bm
 	var mat := ShaderMaterial.new()
 	mat.shader = _ground_shader
+	game.materials.apply(mat, "asphalt", "road_")
+	game.materials.apply(mat, "sidewalk", "walk_")
 	mi.material_override = mat
 	body.add_child(mi)
 	add_child(body)
@@ -517,9 +536,7 @@ func _build_lamps() -> void:
 			pm.size = Vector3(0.14, 5.6, 0.14)
 			pole.mesh = pm
 			pole.position = Vector3(0, 2.8, 0)
-			var pmat := StandardMaterial3D.new()
-			pmat.albedo_color = Color(0.1, 0.12, 0.16)
-			pole.material_override = pmat
+			pole.material_override = game.materials.std_mat("metal", Color(0.42, 0.44, 0.5), 0.6, 0.8)
 			lamp.add_child(pole)
 			var pool := MeshInstance3D.new()
 			var pq := QuadMesh.new()
@@ -570,11 +587,7 @@ func _vending(x: float, z: float, side: float) -> void:
 	bm.size = Vector3(0.95, 1.9, 0.75)
 	body.mesh = bm
 	body.position = Vector3(0, 0.95, 0)
-	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.09, 0.1, 0.13)
-	bmat.metallic = 0.6
-	bmat.roughness = 0.45
-	body.material_override = bmat
+	body.material_override = game.materials.std_mat("metal", Color(0.55, 0.57, 0.62), 0.45, 0.6)
 	root.add_child(body)
 	var panel := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
@@ -600,10 +613,7 @@ func _barrier(x: float, z: float, ry: float) -> void:
 	bm.size = Vector3(2.0, 0.55, 0.35)
 	body.mesh = bm
 	body.position = Vector3(0, 0.28, 0)
-	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.1, 0.1, 0.12)
-	bmat.roughness = 0.6
-	body.material_override = bmat
+	body.material_override = game.materials.std_mat("metal", Color(0.6, 0.62, 0.66), 0.6, 0.2)
 	root.add_child(body)
 	var strip := MeshInstance3D.new()
 	var sb := BoxMesh.new()
@@ -714,11 +724,7 @@ func _build_arch() -> void:
 	bm.size = Vector3(15.2, 0.55, 0.9)
 	beam.mesh = bm
 	beam.position = Vector3(0, 9.4, 150)
-	var bmat := StandardMaterial3D.new()
-	bmat.albedo_color = Color(0.08, 0.09, 0.12)
-	bmat.metallic = 0.6
-	bmat.roughness = 0.5
-	beam.material_override = bmat
+	beam.material_override = game.materials.std_mat("metal", Color(0.48, 0.5, 0.56), 0.5, 0.7)
 	add_child(beam)
 	_sign(0, 9.9, 150.45, 0.0, "SEKTOR 7", Color(0.24, 0.95, 1.0))
 	_sign(0, 9.9, 149.55, PI, "SEKTOR 7", Color(0.24, 0.95, 1.0))
@@ -735,10 +741,7 @@ func _build_terminal() -> void:
 	var bm := BoxMesh.new()
 	bm.size = Vector3(0.9, 1.2, 0.6)
 	mi.mesh = bm
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.09, 0.11, 0.16)
-	mat.metallic = 0.5
-	mi.material_override = mat
+	mi.material_override = game.materials.std_mat("metal", Color(0.52, 0.55, 0.62), 0.45, 0.5)
 	body.add_child(mi)
 	var screen := MeshInstance3D.new()
 	var sb := BoxMesh.new()

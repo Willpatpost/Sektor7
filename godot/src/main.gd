@@ -15,6 +15,7 @@ var pov: Node
 var quests: Node3D
 var audio: Node
 var menu: CanvasLayer
+var materials: Node
 var settings := {}
 
 func _ready() -> void:
@@ -24,6 +25,9 @@ func _ready() -> void:
 	_setup_input()
 	_load_settings()
 	_setup_audio_buses()
+	materials = preload("res://src/materials.gd").new()
+	add_child(materials)
+	materials.setup(self)
 	city = preload("res://src/city.gd").new()
 	add_child(city)
 	city.build(self)
