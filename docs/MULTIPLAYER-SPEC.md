@@ -1,10 +1,10 @@
 # MULTIPLAYER SPECIFICATION — Shared Campaigns
 
-> **Status:** Design specification v0.1 · 2026-10-16 · Captures decisions reached in the project-lead/ChatGPT multiplayer design discussions after `VISION.md` v0.5. **Design approved in principle; implementation not authorized.**
+> **Status:** Multiplayer gameplay specification v0.2 · 2026-10-16 · Consolidated after the shared-campaign and governance discussions. Game/engine implementation is **not authorized**.
 >
-> **Authority:** Human project lead. This document is the detailed source of truth for **the first RPG's multiplayer gameplay policy**. `VISION.md` owns the overarching ambitions and launch commitments; `CUSTOM-ENGINE-RESEARCH.md` owns technology investigation. `DESIGN-BIBLE.md` references this document for multiplayer rather than duplicating it. **Do not assume this document has already been merged into the repository.**
+> **Ownership:** This file defines **the RPG's multiplayer gameplay policies**: campaign roster and access, host neutrality, votes, shared reputation, reward eligibility, saves/checkpoints, waiting/transitions, incapacitation, disconnect grace and session recovery. [`VISION.md`](VISION.md) defines the ambition; [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns general/solo mechanics; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns technical choices; [`DECISIONS.md`](DECISIONS.md) is the decision registry. A future technical `SAVE-ARCHITECTURE.md` may define snapshot implementation without changing player-facing policies here.
 >
-> **Status vocabulary:** **DECIDED** = explicitly chosen gameplay requirement; **WORKING PREFERENCE** = favored, not final; **PROPOSAL** = assistant-origin suggestion requiring approval; **OPEN** = unresolved; **SUPERSEDED** = earlier direction replaced by a later decision. Technology choices and measurements remain research topics, even when gameplay behavior is decided.
+> **Status rules:** Use [`VISION.md`](VISION.md)'s vocabulary. No prior assistant proposal or example is automatically a project decision.
 
 ## 0. At a glance — the experience we are building
 
@@ -16,7 +16,7 @@
 - **DECIDED:** Frontier consequences persist **within the frontier** but do not independently rewrite the authored world's **major reputation or narrative state**.
 - **DECIDED:** The authored world has **one shared campaign reputation**, affected by actions of any participating player, not individually averaged reputation scores.
 - **DECIDED:** Quest XP and currency are granted **equally to connected, eligible group members**, irrespective of their physical location or direct participation. Quest equipment rewards are rolled **per eligible character**. In frontier sessions, **offline members receive nothing**.
-- **DECIDED:** Connected players can propose group waiting, saving/loading, and transitions for a vote; the host gets **no special voting authority**.
+- **DECIDED:** Connected players can propose group waiting, saving/loading, and transitions for a vote; the host gets **no special voting authority**. Permanent involuntary roster removal requires unanimous approval of the **remaining registered members**, excluding the member proposed for removal. The departing member may retire voluntarily.
 - **DECIDED:** A disconnection during an authored-world session suspends that session for **15 minutes**. If unrecovered, preserve a distinct **recovery snapshot** and return to lobby. With the full roster restored, resume at the **precise suspended authoritative gameplay state**, even mid-combat, after a brief reorientation countdown.
 - **DECIDED:** Launch multiplayer **must not require developer-funded dedicated game servers or recurring hosting costs**. A player-hosted listen-server is the current **WORKING PREFERENCE**, not a selected networking implementation.
 - **WORKING PREFERENCE:** Any registered participant who has the latest valid campaign state should be able to host future sessions. **OPEN:** The safe mechanism for distributing, validating, and reconciling campaign saves across different hosts.
@@ -56,16 +56,17 @@ Main menu
 - Single-player worlds and characters remain single-player experiences; they have no social-roster requirement.
 - Multiplayer campaigns retain their own characters, quests, money/inventories, progression, reputation, world history, and saves. **No portable character importing** between unrelated campaigns or between solo and multiplayer by default.
 - **WORKING PREFERENCE:** Each participant can potentially have multiple character slots within the same campaign, choose an eligible character on joining, and be identified by a stable player identity plus a separately displayed character name. **OPEN:** Maximum slots and whether switchable characters share any character-level rewards.
-- A stable account identifier, rather than a mutable username, should establish roster membership and character ownership (**PROPOSAL**, not an authentication technology selection).
+- **PROPOSED technical requirement (not yet explicitly ratified):** Roster membership and character ownership should use a stable player identity that does not depend on a mutable display name or character name. **OPEN implementation:** Account provider, offline identities, authentication, mapping to platform IDs, privacy and recovery. Steam account IDs are a research possibility, not a hardcoded engine assumption.
 
-### 2.2 Democratic campaign membership — DECIDED in principle
+### 2.2 Democratic campaign membership — DECIDED
 
-- Campaign registration controls access; joining is not the same as importing a character from another world.
-- The group, not the active host alone, governs **permanent roster additions, removals, and replacements**.
-- The group must be able to continue if an original member leaves permanently; **permanent roster lock-in is SUPERSEDED**.
-- **OPEN:** Unanimity vs. majority, the voting rights of the departing member, absent-player votes, deadlines, re-invitation, bans, and participant retirement/archiving.
-- **PROPOSAL:** Archive retired members' characters instead of destroying them; replacement members create their own characters.
-- Host moderation and an immediate kick from a live session are **OPEN**; do not assume they confer a unilateral right to erase a player from the campaign.
+- **DECIDED:** The campaign has a registered roster of up to four participants. Membership is collectively governed; merely operating the host computer confers no unilateral permanent membership authority.
+- **DECIDED:** **Involuntary permanent removal requires unanimous approval of all *other* registered members** (the removal target is excluded from that vote). If any eligible remaining member rejects the removal, it fails. The exact implementation of absent-member ballot collection remains **OPEN**; absence is not implicit consent.
+- **DECIDED:** A participant may **voluntarily retire** from the campaign; their departure must not permanently lock everyone else out of the authored-world campaign. Exact retirement confirmation, archive and rejoin procedure remains **OPEN**.
+- **DECIDED:** Permanent roster lock-in is **SUPERSEDED**. The roster size after retirement governs the future full-roster requirement.
+- **DECIDED principle:** The group governs admissions/replacements too. **OPEN:** Whether adding/replacing someone needs unanimity, a different quorum, and what happens to archived characters. Do not silently borrow the removal threshold for admissions.
+- **PROPOSAL:** Archive retired characters without permitting a replacement to appropriate their character identity/progression; replacements ordinarily create a campaign-bound character. Reinstatement and slot rules remain **OPEN**.
+- **OPEN:** Immediate host powers to kick a disruptive person from the current *session* (distinct from permanent removal); invitations, bans, absences/AFK, unusual 1-member roster cases and voter authentication.
 
 ### 2.3 Hosting and ownership — DECIDED goals, open implementation
 
@@ -86,7 +87,8 @@ Main menu
 - Main narrative and major faction decisions are shared and voted on; one lone member cannot advance the authored campaign's major branching story through ordinary menu decisions.
 - All four players in a 4-member campaign, or all three in a 3-member campaign, are required. The rule scales to the **actual registered roster**, not a hardcoded four-person party.
 - Normal world simulation, NPC decisions, and combat remain active during play, including far-reaching and potentially irreversible consequences.
-- **OPEN:** Whether an individual's emergent action (such as killing a quest-important NPC) may bypass a formal group vote. Preserve the decided NPC mortality and player-agency goals; don't silently mark all such actions unkillable or vote-gated.
+- **DECIDED:** Ordinary **emergent gameplay actions remain individually actionable**, including attacking or killing normally killable quest-important NPCs without first triggering a formal party vote. Resulting consequences affect the shared authored campaign. Formal major branching dialogue and designated story decisions still require voting. A small number of protected NPC exceptions remains permitted.
+- **OPEN:** Which actions are classified as formal story decisions rather than ordinary emergent play, and how players receive clear warnings before irreversible consequences.
 
 ### 3.2 Procedural frontier — DECIDED
 
@@ -95,7 +97,8 @@ Main menu
 - Frontier discoveries and consequences remain persistent within that environment and campaign.
 - Frontier actions **must not independently rewrite the handcrafted world's major shared reputation or storyline**. This is a *boundary of authority*, not a declaration that frontier play has no lasting significance.
 - Existing singular shared reputation for the authored campaign remains; a separate numeric frontier reputation is **not decided**.
-- **OPEN:** Which frontier-generated economic resources, items, discoveries, or minor effects are allowed to influence the authored world, and how these are represented without circumventing protected story decisions.
+- **DECIDED:** Frontier-earned **character XP/skills/perks, money, equipment and inventory** follow eligible world-bound characters into authored-world play. Frontier local discoveries and consequences persist in the frontier but do not independently change the major authored story or shared reputation.
+- **OPEN:** Whether frontier-generated minor economic changes beyond player-owned money/items affect the authored world’s wider economy, and how to ensure no transaction bypasses protected narrative outcomes.
 
 ### 3.3 Entry, transfers, and location choice
 
@@ -112,7 +115,8 @@ Main menu
 - **DECIDED:** Meaningful and far-reaching player choices can change NPC relationships, factions, quests, and the world. Redemption/reconciliation can repair many bad relationships, but some outcomes are genuinely irreversible.
 - **DECIDED:** Most NPCs are killable, including many important story NPCs. Quest systems adapt to deaths where possible; limited protected/essential exceptions exist. Death can lock or alter a quest and need not be reversible.
 - A single numeric reputation does **not** preclude NPC-specific memories, quest flags, consequences, or relationship dialogue. **OPEN:** How these are represented without unintentionally recreating unapproved multiple hidden reputation systems.
-- **OPEN:** Attribution for crimes and irreversible emergent actions, shared legal consequences, and which authored decisions count as mandatory democratic votes.
+- **DECIDED:** Individual emergent acts can change the shared authored reputation and world even when other connected companions disagree; those ordinary acts are not pre-voted.
+- **OPEN:** Crime attribution, legal/wanted responses, warnings, and the boundary between ordinary emergent actions and major formal voting decisions.
 
 ## 5. Group democracy: voting and authority
 
@@ -121,16 +125,16 @@ Main menu
 - Any connected roster participant can **propose** a vote for player-initiated saving/loading, waiting, or a group transition.
 - Important **branching narrative decisions** are resolved through a group vote rather than decided unilaterally by the active host.
 - Host runs authoritative validation/execution of the chosen action, but **hosting does not grant privileged voting power**.
-- Permanent roster governance is democratic (§2.2).
-- **OPEN:** Voting eligibility during temporary disconnects, whether every roster member or every connected member must cast a ballot for routine actions, and the ballot/quorum threshold for each action type.
+- Permanent roster governance is democratic (§2.2); involuntary removal requires unanimity among remaining registered members, and voluntary retirement is available. Admissions/replacements remain governed by the group with their exact quorum **OPEN**.
+- **OPEN:** Voting eligibility during temporary disconnects, how many connected members must vote for routine actions, and quorum/threshold for formal story choices and roster admissions. **Not open:** Involuntary removal requires the unanimous votes of remaining registered members; neither the target nor the host gets special voting privilege.
 
 ### 5.2 Voting mechanics — unselected
 
 - **PROPOSAL from lead:** First-choice and second-choice preferences (a ranked ballot) for multi-option dialogue; on a deadlock, transparently choose at random among tied choices (up to four, at most 25% per choice in a four-way equal tie).
-- **OPEN:** Exact ranked-choice counting method, ties, revotes, abstention, AFK behavior, timeout, voting notification, initiator cooldown, cooldown bypass for emergencies, and whether any action requires unanimous consent.
+- **OPEN:** Exact ranked-choice counting method, ties, revotes, abstention, AFK behavior, timeout, voting notification, initiator cooldown and emergency overrides. Membership removal unanimity is already decided; do not treat that particular threshold as open.
 - **PROPOSAL:** Random tiebreaks for *story choices* could be acceptable, but must **not** decide catastrophic administrative actions such as world deletion or irreversible save-history restoration.
 - **OPEN:** Whether votes on major authored-world decisions always require all registered members to *vote*, versus only to be present. Full-roster presence for authored-world access is decided; a specific ballot threshold is not.
-- **OPEN:** Whether ordinary NPC interactions, quest acceptance, or routine dialogue can occur without a vote. Do not force every shopkeeper exchange to a ballot.
+- **DECIDED principle:** Ordinary player-initiated gameplay and emergent acts are individually actionable; votes apply to significant formal narrative branches and shared campaign operations, not every shopkeeper exchange. The exact list of vote-gated quest decisions remains **OPEN**.
 
 ## 6. Quest and reward rules
 
@@ -167,7 +171,7 @@ Main menu
 
 ## 8. Saving, loading, checkpoints, and waiting
 
-> **Document ownership:** This section is the authoritative *gameplay policy* for group saves/waiting at present. Exact serialization, storage, snapshot atomicity, replication, file formats, and backup technology belong in future technical architecture research. **Do not create an independent SAVE-SYSTEM.md that contradicts these rules.** Split into a dedicated spec only when it becomes operationally large, and then replace this section with a link.
+> **Document ownership:** This section is the authoritative *gameplay policy* for group saves/waiting at present. Exact serialization, storage, snapshot atomicity, replication, file formats, and backup technology belong in future technical architecture research. **Do not create a competing player-facing save-policy document.** A future dedicated technical `SAVE-ARCHITECTURE.md` may own serialization, snapshots, integrity and distributed persistence; it must reference rather than override these gameplay policies. If this policy section grows unwieldy, move it explicitly and update the links.
 
 ### 8.1 Save categories — DECIDED intent
 
@@ -240,11 +244,11 @@ Main menu
 |---|---|---|
 | **P0** | **Canonical save/host rotation:** How is the latest shared save distributed, authenticated, fork-detected, backed up, and chosen when multiple players host on different days? | Coherent campaign timeline, anti-duplication, rollback. |
 | **P0** | **Save/character rewind:** Can a full group vote load an older save after members earned new frontier progression, and does it rewind every character? | Persistence invariants, possible conflicts. |
-| **P0** | **Vote policy:** What quorum and approval method for major story, routine transitions/waits/saves, and administrative membership changes? | Democracy must work when players are unavailable or AFK. |
+| **P0** | **Vote policy:** What quorum/method for major story, routine transitions/waits/saves and *admissions*? Involuntary removal unanimity is already decided; voluntary retirement is allowed. | Democracy must work when players are unavailable or AFK. |
 | **P0** | **Disconnected authored session:** What happens on host crash versus guest disconnect, and how to persist/reconstruct all critical mid-combat state? | Recovery technology, correctness. |
 | **P1** | **Late joining:** Can a registered member join a frontier mission mid-progress, and when does eligibility begin? | Rewards and quest state. |
 | **P1** | **Character slots:** One or many characters per member per campaign, switching timing, shared vs per-character achievements? | Ownership schema and reward rules. |
-| **P1** | **Reputation/world events:** Which consequences need voting, and can one member kill a quest-critical NPC in a full-roster session outside dialogue? | Narrative agency and group governance. |
+| **P1** | **Reputation/world events:** How are ordinary emergent actions distinguished from vote-gated *formal* story choices? Individual attacks on killable quest NPCs are permitted. | Narrative agency and group governance. |
 | **P1** | **Loot/economy:** World drops, chests, trading, economic resource transfer frontier→city, item reroll resistance. | Shared versus individual resources. |
 | **P1** | **Encounter scaling:** Player count vs nearby active participants and level disparity, including disconnect grace. | Difficulty and progression balance. |
 | **P1** | **Pause/wait/transition:** Combat checks, voting timeouts, full-roster disconnect behavior, in-flight/vehicle participants. | Session coordination. |
@@ -262,7 +266,7 @@ Main menu
 | Only the host can determine major dialogue choices, save/load, wait, or transition | **SUPERSEDED:** Connected players propose; collective voting governs the action. Host merely executes the authoritative result. |
 | Every registered roster member must be online for *any* multiplayer play | **SUPERSEDED:** Full roster required for authored world; any subset can use procedural frontier. |
 | Only the original designated world host can ever host the campaign | **WORKING PREFERENCE replaced:** Investigate any registered member hosting a later session with the latest valid save. |
-| Fixed roster cannot change when someone quits | **SUPERSEDED:** Group-governed retirement/replacement must be possible; voting details open. |
+| Fixed roster cannot change when someone quits | **SUPERSEDED:** Voluntary retirement allowed; involuntary removal requires unanimous approval of other registered members. Admission/replacement threshold open. |
 | Every member automatically receives rewards when any campaign member farms solo | **SUPERSEDED for frontier:** Only connected/eligible frontier players receive rewards; offline members get none. |
 | Disconnected authored session restarts the fight or reloads an ordinary checkpoint | **SUPERSEDED:** Exact-state resumption from dedicated recovery snapshot is the default. |
 
@@ -285,13 +289,12 @@ Main menu
 11. A randomized quest reward does not trivially change merely by reloading immediately before an ordinary reward hand-in (final mechanism open).
 12. Existing code/prototypes are read-only evidence, not authority over any of the above design rules.
 
-## 14. Required follow-up for GLM 5.3
+## 14. Maintainer and AI-agent handoff
 
-1. Review for conflicts against `VISION.md` v0.5 and `CUSTOM-ENGINE-RESEARCH.md` v0.2. Those older files predate these multiplayer decisions.
-2. Propose concise **cross-references and decision-ledger updates**, not parallel, inconsistent descriptions of multiplayer policy.
-3. Mark the old portable-character/host-only/all-roster-for-everything rules **SUPERSEDED** wherever they survive.
-4. Surface contradictions and P0 open decisions to the human lead; don't decide technologies or gameplay policies without approval.
-5. Do not modify implementation, saves, code, assets, or prototype behavior until explicitly authorized.
+- Use this document as the source of truth for multiplayer gameplay behavior and keep cross-document summaries brief. See [`DECISIONS.md`](DECISIONS.md) for the canonical registry.
+- Do not reopen ratified positions—including the full-roster authored-world rule, frontier partial-roster play, shared reputation, 15-minute exact-state authored recovery, ten-minute frontier grace, and unanimous remaining-member removal—without the project lead's direction.
+- Important open research: save distribution and conflict detection for rotating hosts, snapshot/rewind correctness, host-crash recovery, vote details, and session security. Do not invent working solutions or silently select a networking technology.
+- Design/test proposals must distinguish game-specific policy from reusable engine primitives. No code/saves/assets modifications are authorized by this document.
 
 ---
 

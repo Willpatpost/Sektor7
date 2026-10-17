@@ -2,12 +2,11 @@
 
 # CUSTOM ENGINE — ARCHITECTURE & TECHNOLOGY RESEARCH FRAMEWORK
 
-> **Status:** Research framework, v0.2 — 2026-10-16. Repurposed from `ENGINE-EVALUATION.md` (v0.2) after alignment round 1 (engine direction decided; selection competition retired). v0.2 incorporates alignment round 2: networking constraints with a listen-server working preference, subsystem-definition-before-selection discipline, the research-guided vertical development strategy, Windows-first/Linux-second platform priority, mechanics-before-lore design sequencing, and the authorized read-only Stage 0 inventory.
-> **Authority:** Human project lead. **Engine direction: DECIDED** — an original, reusable game creation engine. **Subsystem technologies: ALL OPEN** — no rendering backend, graphics API, simulation framework, networking model, editor technology, scripting language, asset pipeline, or other engine-internal choice has been selected.
-> **Companion:** Read [`VISION.md`](VISION.md) first — especially §0 (our agreement), §1 (Twin Summits), §2 (identity), §8 (technology ownership), §10 (multiplayer commitment), and §12 (agent collaboration). The vision takes precedence over any convenience recommendation in this framework.
-> **Evidence key:** **Known capability** = established in relevant documentation but not yet validated in our project; **Observed** = measured in our own experiment; **Hypothesis** = proposed mechanism or expected advantage; **Open** = not yet investigated or decided.
-
----
+> **Status:** Research framework v0.3 · 2026-10-16 · Consolidated after Stage 0 audit report and subsequent game/multiplayer decisions. No implementation authorized.
+>
+> **Ownership:** This file defines **engine research methodology, domain boundaries, staged experiments and evidence standards**. [`VISION.md`](VISION.md) owns the Twin Summits and original-engine mandate; [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns gameplay; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns multiplayer policy; [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) is reconstructed evidence; [`DECISIONS.md`](DECISIONS.md) is the canonical decision registry.
+>
+> **Authority:** Human project lead. **Original reusable engine: DECIDED.** No rendering backend, graphics API, language, simulation, networking stack, editor framework, scripting or asset-pipeline technology has been selected. Evidence key: **documented elsewhere**, **observed in project (with artifacts)**, **reported by an agent**, **hypothesis**, and **open**. Do not conflate them.
 
 ## 0. Mandate and anti-misinterpretation rules
 
@@ -89,8 +88,8 @@ Rules for lessons: neither assume a reference engine's approach is necessary for
 | 2 | **Graphics architecture** | Render graph; light transport (GI, shadows, reflections); virtualized geometry/textures; transparency; upscaling and temporal techniques | Path to CP2077-class *interactive* quality at unusually low cost per frame; which innovations are ours to invent |
 | 3 | **Character & animation rendering** | Skin/hair/eyes; cloth; crowds; animation runtimes | Fidelity in real motion; DCC pipeline; crowd scale |
 | 4 | **Simulation framework** | Data-oriented layouts; ECS variants; event-driven and hierarchical fidelity; fixed-step and determinism; scheduling | RCT-class throughput; hundreds of persistent agents; replication-friendliness for co-op |
-| 5 | **Networking** | Peer-to-peer / listen-server / dedicated-server; authority; replication; prediction; interest management | 1–4 players at launch; persistent world with multiple players; divergence handling |
-| 6 | **Editor & tooling** | Editor architecture; tool scripting; iteration speed; profiling, replay, validation | Minimum workflow that makes AI-assisted solo + agent content production fast |
+| 5 | **Networking** | Authority; relayed/P2P transport; listen-server; player identity; voting; replication; prediction; interest management; save ownership | 1–4 launch players without developer-funded servers; democratic world-bound campaigns, rotating eligible hosts, snapshot consistency and divergent-history detection |
+| 6 | **Editor & tooling** | Editor architecture; programmatic and GUI interfaces; tool scripting; profiling/replay/validation | Investigate usable internal world/material/asset tooling for game one with agent-accessible automation; public engine distribution/polish is a separate OPEN milestone |
 | 7 | **Scripting** | Language(s); hot reload; performance; safety | Gameplay and tool authoring; scripted-vs-native boundary; agent authoring |
 | 8 | **Asset pipeline** | Formats; importers; DCC integration; content-addressed caching; validation | Provenance and licensing; determinism; streaming-friendly builds |
 | 9 | **World infrastructure** | Streaming; large-world representation; origin precision; interiors; save/load | Fast vertical traversal; persistent-world continuity; co-op state |
@@ -114,19 +113,15 @@ Each domain accumulates evidence in `TECHNOLOGY-RESEARCH.md` (the external compo
 
 ## 4. Research program: staged, fair, ambitious
 
-### Stage 0 — Align and inventory (documentation, not new production)
+### Stage 0 — Align and inventory (reported completed; no production code changes)
 
-**Authorized 2026-10-16 (read-only):** after document alignment, the lead approved the inventory of the existing `godot/` prototype — verify functionality, tests, implementation claims, dependencies, assets, and reusable technical knowledge. **Do not refactor, migrate, or implement anything.** The prototype provides evidence, not architectural authority.
+**Status reported by GLM 5.3:** The authorized read-only `godot/` audit was completed: **4,273 lines** across **16 `.gd` files** (3,901 source + 372 test), **60/60 headless checks passing**, clean import, no project addons, and a clean `godot/` working tree. The claim and methods are summarized in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md); the underlying repository/source inventory document was **not provided** with this document set, so the claims are reported audit findings rather than independently reproduced results. The prototype supplies calibration evidence, not architectural authority.
 
-Before implementation:
+**Completed or reported completed:** Stage 0 prototype inspection and the initial vision/strategy alignment. The earlier estimates of ~3.3k lines and ~60 checks have been superseded by the reported audit counts. No code, asset or save modifications were authorized or reported.
 
-- Confirm constraints and open questions with the lead (this framework is part of that alignment).
-- Inventory the existing `godot/` prototype: source, features, systems, tests, assets, licenses, and actual benchmark evidence. Earlier documents described ~3.3k lines of code and ~60 headless checks; **verify against the repository** rather than accepting historical estimates.
-- Map each reference implementation's source rights, renderer/control boundaries, and debug/profiling facilities — as lessons, not bids.
-- Establish an asset and camera reference pack usable lawfully and fairly across experiments.
-- Decide which experiments are needed **before** anyone assumes their outcome. Obtain explicit go-ahead before substantial coding.
+**Still needed before implementation:** Confirm candidate experiment workloads and lawful comparison assets; record platform/API/library capability evidence; define subsystem boundaries; design objective success metrics; review the unresolved multiplayer persistence questions; obtain explicit lead approval for each research spike. Stage 0 completion is not permission to begin coding.
 
-**Output:** experiment charter, workload specification, technology capability matrix, current evidence inventory, outstanding decisions.
+**Output references:** [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md), [`DECISIONS.md`](DECISIONS.md), and future experiment charter / technology matrices.
 
 ### Stage 1 — Research spikes (bounded, meaningful, per domain)
 
@@ -235,16 +230,16 @@ Test **optimized standalone builds** under the same capture protocol. Record eng
 
 ## 6. Multiplayer as a foundational capability
 
-**DECIDED (VISION §10):** 1–4 simultaneous players at launch; solo fully supported; cooperative play functional and reasonably playable in the launch release; perfect polish and advanced features are not launch requirements; multiplayer cannot be deferred entirely post-launch. The engine treats multiplayer as **foundational**: world simulation, persistence, entity ownership, synchronization, and gameplay systems account for multiple simultaneous players by design.
+**DECIDED (VISION §10):** 1–4 simultaneous players at launch, separate solo and multiplayer worlds, full-roster authored-world access, any-subset frontier access, democratic campaign policy and world-bound characters. The engine treats multiplayer, identity, consistent save/restore and session authority as foundational **capabilities** without hardcoding these particular RPG rules into every future game. Formal player-facing policy is in [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
 
-**Committed constraint (2026-10-16):** launch multiplayer must not depend on developer-funded dedicated-server infrastructure or recurring hosting costs. **Working preference:** a player-hosted listen-server model. **Open research (domain 5):** Steam Networking Sockets, P2P connectivity, relay services, the authoritative-simulation split, shared persistence, host migration, replication, prediction, interest management, and divergence detection/replay. The requirement is the multiplayer experience, not a predetermined implementation — and the engine must remain flexible enough to support different networking architectures for future games. Determinism remains a **WORKING HYPOTHESIS** (VISION §10), not a mandate; do not silently turn an event-driven simulator, deterministic core, ECS, or network architecture into a requirement.
+**Committed constraint (2026-10-16):** launch multiplayer must not depend on developer-funded dedicated-server infrastructure or recurring hosting costs. Any registered participant hosting a later session with the newest valid campaign save is a **WORKING PREFERENCE** requiring save provenance, integrity, authorization and conflict research; seamless host handoff during a live session is not a launch requirement. Unanimous remaining-member removal and voluntary retirement are player-facing rules, not host privileges. **Working preference:** a player-hosted listen-server model. **Open research (domain 5):** Steam Networking Sockets, P2P connectivity, relay services, the authoritative-simulation split, shared persistence, host migration, replication, prediction, interest management, and divergence detection/replay. The requirement is the multiplayer experience, not a predetermined implementation — and the engine must remain flexible enough to support different networking architectures for future games. Determinism remains a **WORKING HYPOTHESIS** (VISION §10), not a mandate; do not silently turn an event-driven simulator, deterministic core, ECS, or network architecture into a requirement.
 
 ## 7. Near-term deliverables
 
 1. `TECHNOLOGY-RESEARCH.md` — external components/libraries/APIs matrix with dated references and explicit unknowns (succeeds the previously planned `CANDIDATE-RESEARCH.md`; "candidates" are now technologies, not engines).
 2. `PROVING-GROUND-SPEC.md` — scene, simulation workload, streaming benchmark, camera/capture scripts, assets and settings.
 3. `PERFORMANCE-BENCHMARKS.md` — exact machine specs and measurement protocol.
-4. `DECISIONS.md` — approval and re-evaluation log; architectural hypotheses are recorded, never quietly locked.
+4. [`DECISIONS.md`](DECISIONS.md) — **existing** single decision registry and prioritized open decisions; update it when the lead ratifies changes.
 5. `ENGINE-ROADMAP.md` (per VISION §11) — module build order, dependencies, editor/tooling needs, integration contracts, once research justifies sequencing.
 
 These can be consolidated if duplication becomes unhelpful.
@@ -300,4 +295,4 @@ Store new technical research, additional sources, version numbers, and dated ben
 
 ---
 
-**Working conclusion:** The engine direction is decided — an original, reusable game creation engine, built strategically on chosen external components, with the cyberpunk RPG as its first major game. This framework governs how its architecture and subsystem technologies are researched, measured, and eventually selected. Nothing subsystem-level is chosen yet. The next step is alignment on this framework — then authorized, time-boxed research spikes.
+**Working conclusion:** The engine direction is decided — an original, reusable game creation engine, built strategically on chosen external components, with the cyberpunk RPG as its first major game. This framework governs how its architecture and subsystem technologies are researched, measured, and eventually selected. Nothing subsystem-level is chosen yet. The next step is to resolve architecture-shaping game questions and research hypotheses, obtain the lead's approval of specific time-boxed research spikes, and only then begin implementation.

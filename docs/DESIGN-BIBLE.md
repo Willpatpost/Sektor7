@@ -1,20 +1,16 @@
 # DESIGN BIBLE — Core Gameplay Decisions
 
-> **Status:** Early design bible v0.1 · 2026-10-16 · Consolidates game-design choices the project lead made after `VISION.md` v0.5, **without** locking speculative details. **No gameplay implementation authorized.**
+> **Status:** Gameplay design bible v0.2 · 2026-10-16 · Integrates subsequently approved roster and emergent-action decisions, and identifies the solo-design owner. No game/engine implementation authorized.
 >
-> **Authority and document map:** [`VISION.md`](VISION.md) owns project-level aspirations, Twin Summits, original engine direction, and product identity; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns research methodology; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns all detailed multiplayer rules, saving, waiting, voting, session recovery, and roster policy. This document owns game-mechanics decisions outside that multiplayer detail. The first RPG's rules are not automatically hardcoded requirements of the reusable creation engine.
+> **Ownership:** This document owns **gamewide and single-player gameplay requirements** for the first RPG. [`VISION.md`](VISION.md) owns product vision; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns detailed co-op governance, saving, waiting, rewards and recovery; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns architecture research; [`DECISIONS.md`](DECISIONS.md) records decisions. Do not hardcode this game's policies as general-purpose engine behavior.
 >
-> **Decision tags:** **DECIDED** = explicitly accepted by lead; **WORKING PREFERENCE** = favored direction; **PROPOSAL** = idea not yet approved; **OPEN** = intentionally unanswered; **SUPERSEDED** = replaced by later lead decision. Distinguish an intended feature from a demonstrated capability. Design work does not select technologies.
+> **Decision labels:** Shared glossary in [`VISION.md`](VISION.md). DECIDED means approved by lead, WORKING PREFERENCE means favored, PROPOSAL means unapproved, OPEN DECISION means unresolved, SUPERSEDED means replaced.
 
-## 0. Project identity and design philosophy
+## 0. Scope and sources of authority
 
-**DECIDED vision:** A large open-world, futuristic/cyberpunk RPG developed on **our original, reusable game creation engine**, which should eventually enable other games too. At least one large handcrafted map with districts, interior locations, and a separately accessible procedural frontier; hundreds of persistent NPCs; full day/night and weather cycles; random encounters; hover/flying vehicles; jetpacks; extensive role-playing freedom including crime as a choice. Intended Steam price roughly $20, final name and final price not locked.
+The RPG is the first title planned for an original reusable creation engine. The Twin Summits, large open-world/cyberpunk RPG ambition, solo/AI-agent development philosophy, Windows→Linux platform priority, and no implementation authorization are defined by [`VISION.md`](VISION.md). This bible describes **gameplay** rather than duplicating those strategic statements.
 
-**Twin Summits (VISION COMMITMENTS):** Match or exceed the **technical interactive graphical fidelity** of Cyberpunk 2077 (not its specific art direction) and pursue computational efficiency as impressive as or better than RollerCoaster Tycoon relative to meaningful workload. Do not silently bargain down either goal; measure, research, and invent new techniques where necessary. No particular reference machine defines a design ceiling or floor; recorded hardware is an experimental measurement anchor.
-
-**DECIDED production approach:** Research-guided vertical development of the engine. Define subsystem responsibilities/boundaries before picking technologies. Windows first, Linux second, further systems later. Study existing engines as reference implementations. Strategically reuse external tools/libraries while owning the differentiating engine architecture. Research and documentation first; substantial implementation still requires project-lead authorization.
-
-**Game inspirations (not licenses to imitate):** Skyrim, Starfield, Cyberpunk 2077, Borderlands, GTA, Red Dead Redemption, RollerCoaster Tycoon, The Sims/SimCity, Terraria, Minecraft, others. Cyberpunk is a *visual quality* comparator, not an aesthetic blueprint. Borderlands' exact feature influences are still **OPEN**.
+Core inspirations include Skyrim, Starfield, Terraria, Borderlands, Cyberpunk 2077, GTA, Red Dead Redemption, RollerCoaster Tycoon, The Sims/SimCity, and Minecraft. Each is a reference for selected qualities, not an instruction to copy its protected content or necessarily imitate all its mechanics. Borderlands' specific influences remain an **OPEN DECISION**.
 
 ## 1. Camera and perspective
 
@@ -73,7 +69,8 @@
 - **DECIDED:** Some events, actions, and relationships are **irreparable/irreversible**. Full skill mastery does **not** mean a single playthrough can see every mutually exclusive narrative outcome.
 - **DECIDED:** **Most NPCs are killable**, including many important quest characters. The quest/world model adapts to deaths where possible; some quests may permanently fail or change. A smaller number of protected/essential NPCs are permitted as deliberate exceptions.
 - **PROPOSED design patterns:** Leadership succession, substitute quest contacts, evidence/records surviving a deceased NPC, faction fragmentation, reparations, trust restoration without amnesia. These are examples, not promised universal quest fallback logic.
-- **OPEN:** Exact essential-NPC criteria, conditions for irreversible consequences, personal relationship mechanics, law/wanted response, economic effects, NPC memory, solo-world reputation, and reconciling emergent irreversible acts with democratic authored-world decisions.
+- **DECIDED multiplayer distinction:** Formal major branching narrative options require collective voting, but ordinary emergent acts—including one player attacking or killing an unprotected quest-important NPC—are individually possible and produce shared consequences. Choosing companions wisely is part of the social contract. See multiplayer spec for group implications.
+- **OPEN:** Exact essential-NPC criteria, conditions for irreversible consequences, personal relationship mechanics, law/wanted response, economic effects, NPC memory, solo-world reputation, and which interactions count as formal narrative choices.
 - **Later multiplayer revision:** A single **shared authored-world group reputation** replaced earlier discussions of individual and nearby-companion reputation scoring. The procedural frontier has persistent consequences, but does not independently rewrite major authored-world reputation/story state. See [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md). **Do not revive old multi-score formulas silently.**
 
 ## 7. World model, persistence, and activities
@@ -86,13 +83,21 @@
 - **OPEN:** Map scale, district count, interior count, frontier biome variety, transitions between the two worlds, authored-to-procedural state influence in *single-player*, schedule/economy/faction/law systems, world chronology during waiting/loads, world-generation algorithms, save representation.
 - **Multiplayer rule:** Full roster for handcrafted/story world; any subset for procedural frontier, with protected main narrative state. See [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
 
-## 8. Multiplayer summary — linked authority, not duplicated
+## 8. Single-player design ownership
 
-**DECIDED:** Functional 1–4 player cooperative gameplay at launch alongside entirely separate single-player campaigns. Multiplayer is world-bound, democratically governed, generally listen-server-oriented for research, and does not depend on developer-funded dedicated servers. The authored/story world requires the complete registered roster; the procedural frontier allows independent sessions with subsets of that roster. Shared quest XP/money and separately randomized equipment, voting, shared reputation, incapacitation, checkpoints, waiting, reconnect grace, and exact mid-combat recovery are specified exclusively in [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
+**DECIDED:** The main menu offers a single-player mode with separate world-bound characters and solo saves. Solo worlds have no campaign roster, multiplayer voting, player-host approval, or full-roster restriction. A solo player may play the authored city and procedural frontier as intended. The general classless progression, NPC mortality, narrative consequences, quest systems and movement rules also apply.
 
-**OPEN:** How the engine implements networking, canonical save exchange between eligible hosts, authority isolation and conflict resolution. These are not invitations to select specific technologies before approval.
+**WORKING DIRECTION / OPEN DETAILS:** The RPG should support solo saving, loading, waiting/time advancement, and death/retry, but the precise solo rules are **not yet explicitly approved**. The multiplayer conversation established autosave, quicksave, manual-save, and cell-checkpoint rules in the co-op context; do not silently transplant every multiplayer voting, checkpoint priority, or full-party wipe rule to solo play. Potential shared engine primitives are a technical topic; exact solo player-facing policy will be designed here.
 
-## 9. What is explicitly **not** decided
+**Solo questions to resolve:** Whether solo uses the same rolling two-prior-checkpoint history and 15-minute autosave cadence; quicksave and manual-save semantics; death/reload target; safety restrictions on waiting; solo law/reputation state; whether solo choices can ever affect other independent saves (not currently planned); independent character slots; local backup and corruption recovery.
+
+## 9. Multiplayer boundary — linked authority
+
+**DECIDED:** Functional 1–4 player cooperative play at launch alongside independent solo campaigns. Multiplayer characters are bound to a specific campaign; the handcrafted/story world requires the complete registered roster, and the procedural frontier allows a subset. The group has a single shared authored-world reputation, democratically governs major dialogue and group actions, and can unanimously (among remaining registered members) remove a participant involuntarily; voluntary retirement is permitted. Rewards, saves, waiting, reconnect grace, and exact mid-combat recovery are defined **only** in [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
+
+**OPEN:** Actual networking and persistence implementations belong in [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md). No particular transport, serialization format, ECS or deterministic algorithm has been selected.
+
+## 10. What is explicitly **not** decided
 
 | Domain | Open issues |
 |---|---|
@@ -104,7 +109,7 @@
 | **Engine technology** | Programming languages, graphics backends, renderer structure, ECS/data model, physics, scripting, editor/toolchain, asset/animation formats, networking stack. |
 | **Production/business** | Schedule, release date, production budget, hiring/outsourcing, final Steam price, engine commercialization/distribution. |
 
-## 10. Superseded and modified choices
+## 11. Superseded and modified choices
 
 | Prior thought | Current direction |
 |---|---|
@@ -116,7 +121,7 @@
 | Portable character progression between unrelated multiplayer worlds | **SUPERSEDED:** World-bound multiplayer campaign characters. |
 | Only the host controls campaign choices | **SUPERSEDED:** Democratic governance; hosting is a technical role. |
 
-## 11. Suggested next planning order
+## 12. Suggested next planning order
 
 1. **Preserve and validate decisions in this document and `MULTIPLAYER-SPEC.md`** before more game-mechanics discussion. Do not label proposals as decided.
 2. **Resolve architecture-shaping gameplay questions** that impact reusable engine subsystem contracts: camera/animation, systemic interaction, traversal/streaming, world state and NPC persistence, save/restore, co-op authority.
@@ -124,13 +129,12 @@
 4. **Develop detailed quests, factions, art direction, lore, balance and asset specifications** after the relevant mechanic contracts are clear.
 5. **Implement only when expressly authorized** by the human project lead; current docs are not a coding instruction.
 
-### GLM 5.3 synchronization request
+### Documentation and implementation handoff
 
-- Cross-reference this file from `VISION.md` rather than pasting every detailed rule into the vision foundation.
-- Add a few high-signal decision-ledger updates: first/third person, systemic combat, tiered unlimited endgame flight, classless mastery, skill-use/perk gates and quest XP, three quest types, meaningful consequences/redemption, killable NPCs with limited protection, and democratic two-destination multiplayer.
-- Reconcile older conflicting statements (especially the old multi-score reputation and host-authority policies). See the definitive multiplayer spec.
-- Retain the verified `godot/` inventory as **existing experiment evidence**, not implementation authority. A separate `PROTOTYPE-INVENTORY.md` is appropriate for that audit.
-- List genuinely unresolved questions; do not independently invent mechanics, choose engine subsystem technologies, or modify code/saves/assets without authorization.
+- This file is the source of truth for the first game's mechanical intentions; detailed multiplayer behavior is defined in its owning specification.
+- The Stage 0 Godot audit is recorded separately in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) as **reported experimental evidence**, not an engine choice.
+- Log explicitly ratified changes in [`DECISIONS.md`](DECISIONS.md) and mark superseded directions. Ask the project lead before selecting technologies, inventing new gameplay commitments, or editing code/assets.
+- Future solo-mode decisions belong in §8 until the gameplay rules grow large enough to justify a separate authoritative solo specification.
 
 ---
 

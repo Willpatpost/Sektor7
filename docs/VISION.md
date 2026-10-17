@@ -1,12 +1,12 @@
 # PROJECT VISION — Working Title: SEKTOR 7
 
-> **Status:** Vision foundation, revised draft v0.5 — 2026-10-16. Incorporates both 2026-10-16 alignment rounds. Round 1: original-engine direction, launch co-op commitment, hardware/benchmarking stance, external-technology stance, CP2077's benchmark role. Round 2: networking constraints with a listen-server working preference, subsystem-definition before implementation selection, research-guided vertical development strategy, Windows-first/Linux-second platform priority, mechanics-before-lore design sequencing, and the authorized read-only Stage 0 prototype inventory.
-> **Authority:** The human project lead owns the vision, priorities, and final decisions. GLM 5.3 and other AI collaborators are research, design, engineering, and implementation partners—not independent owners of the vision.
-> **Read with:** [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md). This document establishes **what we are trying to create and how we approach unsolved problems**. The companion document establishes **how we research the architecture and technologies of our original engine without shrinking the ambition**.
-> **Project name:** “SEKTOR 7” is an expendable placeholder. Not a locked brand, title, setting, or technical identity.  
-> **Status convention:** **VISION COMMITMENT** = committed requirement or destination; **WORKING PREFERENCE** = preferred direction pending research and validation, never silently treated as committed; **WORKING HYPOTHESIS** = a technical idea needing proof; **OPEN DECISION** = undecided; **EXISTING EXPERIMENT** = prototype evidence, not a commitment.
-
----
+> **Status:** Consolidated vision foundation v0.7 · 2026-10-16. This edition integrates the four supplied Markdown files, decisions from the subsequent design conversation, and GLM 5.3's reported Stage 0 audit. The reported repository v0.6 and original `PROTOTYPE-INVENTORY.md` were not supplied for direct comparison. No implementation authorized.
+>
+> **Authority / ownership:** The human project lead sets the vision and ratifies decisions. This document owns the product goals, creative/engineering philosophy, and high-level constraints. [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns first-game mechanics; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns multiplayer gameplay policy; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns research methodology; [`DECISIONS.md`](DECISIONS.md) is the decision registry; [`README.md`](README.md) maps the folder.
+>
+> **Name:** “SEKTOR 7” is a disposable working title for the game, not a finalized game or engine brand.
+>
+> **Shared status vocabulary:** **VISION COMMITMENT** (non-negotiable destination/launch requirement), **DECIDED** (explicitly chosen design or process rule), **WORKING PREFERENCE** (favored but unratified approach), **WORKING HYPOTHESIS** (requires technical validation), **PROPOSAL** (suggested, not approved), **OPEN DECISION** (unresolved), **EXISTING EXPERIMENT** (evidence, not architectural authority), **SUPERSEDED** (formerly discussed, replaced). An externally reported result must identify its source; it is not independently verified unless the underlying evidence was examined.
 
 ## 0. Read this first: our agreement
 
@@ -22,7 +22,7 @@ This document is a statement of ambition **and** a disciplined research charter.
 
 **Alignment record:** On 2026-10-16 the lead, with AI collaborators, resolved the previously open framework questions: the **original reusable game creation engine** is the chosen direction; **co-op for 1–4 players is a launch commitment**; no specific hardware dictates design; external technology is used strategically; Cyberpunk 2077 is a technical benchmark, not an aesthetic template. These decisions are reflected throughout this document and in the §13 decision ledger. Newly surfaced questions return to the lead before becoming commitments.
 
-**Alignment record, round 2 (2026-10-16):** networking economics — no developer-funded dedicated-server infrastructure or recurring hosting costs, with a player-hosted listen-server as a **working preference**; subsystem-definition before implementation selection; a research-guided vertical engine development strategy; Windows-first/Linux-second platform priority; gameplay mechanics and technical requirements before story, lore, and naming; and authorization of a **read-only Stage 0 inventory** of the godot prototype (no refactoring, migration, or implementation). The long-term technology horizon — exceptionally realistic graphics, extraordinary efficiency, broad portability, advanced distributed networking, and a creation engine competitive with the best — is recorded as research ambition, not claimed capability; practical constraints (such as avoiding recurring server costs) are legitimate project decisions. Committed requirements, working preferences, working hypotheses, and open decisions are recorded separately per the status convention and the §13 ledger.
+**Alignment record, round 2 (2026-10-16):** networking economics — no developer-funded dedicated-server infrastructure or recurring hosting costs, with a player-hosted listen-server as a **working preference**; subsystem-definition before implementation selection; a research-guided vertical engine development strategy; Windows-first/Linux-second platform priority; gameplay mechanics and technical requirements before story, lore, and naming; and authorization of a **read-only Stage 0 inventory** of the godot prototype (no refactoring, migration, or implementation). Subsequent gameplay alignment defined a fully classless, systemic, first/third-person RPG and the democratic two-destination multiplayer campaign. Its detailed rules live in the owning documents. The long-term technology horizon — exceptionally realistic graphics, extraordinary efficiency, broad portability, advanced distributed networking, and a creation engine competitive with the best — is recorded as research ambition, not claimed capability; practical constraints (such as avoiding recurring server costs) are legitimate project decisions. Committed requirements, working preferences, working hypotheses, and open decisions are recorded separately per the status convention and the §13 ledger.
 
 ## 1. The Twin Summits — simultaneous, not tradeable by default
 
@@ -96,43 +96,31 @@ The pitch describes the intended completed experience. It does not dictate the o
 
 ## 4. Confirmed intent vs open design questions
 
-### 4.1 Confirmed intended features (as of 2026-10-16)
+### 4.1 Confirmed product and design direction
 
-- At least one large open-world map with authored districts.
-- Multiple interior locations/cells.
-- Hundreds of NPCs plus other computationally demanding systems.
-- Persistent, meaningful offscreen world progression.
-- Day/night and weather cycles, including daytime gameplay.
-- Random encounters/events in the spirit of Skyrim.
-- Futuristic systems, notably hover/flying cars and jetpacks.
-- Broad RPG freedom, including but not limited to the option of crime.
-- Distinct procedurally generated regions for exploration and XP/combat farming.
-- AAA-quality ambition, Steam commercialization, and approximately $20 positioning.
-- Co-op supporting **1–4 simultaneous players, functional and reasonably playable at launch** (networking model open).
-- An **original, reusable game creation engine** as the chosen direction—a project objective in its own right, with the cyberpunk RPG as its first major game and the platform designed to support many future games.
-- Ownership of the engine's distinguishing architecture, rendering, simulation, editor, asset pipeline, and creation workflows, with **strategic use of external tools, libraries, standards, and dependencies**.
-- Exceptional computational efficiency **across hardware**: no specific GPU, CPU, handheld, or PC specification dictates design; known hardware serves benchmarking and measurement; Steam Deck is not a mandatory design target.
-- Cyberpunk 2077 as a **technical fidelity benchmark, not an aesthetic template**.
-- **Networking economics:** launch multiplayer must not require developer-funded dedicated servers or recurring hosting costs; player-hosted listen-server is the working preference.
-- **Platform priority:** Windows first, Linux second, additional platforms subsequently; cross-platform architectural boundaries from the beginning; Steam Deck compatibility optional.
-- **Process decisions:** define every engine subsystem's responsibilities, boundaries, dependencies, and interfaces **before** selecting implementations; research-guided vertical engine development prioritizing architectural coherence, modularity, profiling, and maintainability.
-- **Design sequencing:** gameplay mechanics and technical requirements are established **before** story, lore, naming, and individual content details; architecture-affecting questions (camera, combat, traversal, world simulation, multiplayer, procedural generation, persistence) take priority.
-- A willingness to reset existing prototype work completely; the project name remains a placeholder.
+- The authored districts, interiors, procedural frontier, hundreds of persistent NPCs, day/night and weather, random encounters, vehicles/jetpacks, and broad RPG freedom in §2 remain **VISION COMMITMENTS**.
+- Both first-person and third-person are full gameplay perspectives. Combat is highly systemic: weapons, abilities, hacking, physics, vehicles, and environment interact. Refer to [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) for the authoritative mechanics decisions.
+- Character growth is classless from the beginning, eventually permitting mastery of every skill category. Skills develop through use; increasing skills and completing quests contribute to overall progression; level-ups grant perk points gated by the skill's required proficiency.
+- Progression combines skills with acquired equipment, and can ultimately unlock unrestricted personal flight. Quests include authored narrative, persistent-world dynamic, and repeatable procedural missions. Choices carry durable consequences, redemption exists, some outcomes are irreversible, and most NPCs—including many quest characters—can be killed.
+- Separate solo worlds and world-bound multiplayer campaigns are planned. The launch multiplayer game supports 1–4 players, governed democratically, with separate handcrafted (full registered roster required) and procedural (any nonempty subset) destinations. Detailed save, reward, reputation, voting, and reconnection rules are exclusively in [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
+- The multiplayer group may play frontier without all members, but frontier activity cannot rewrite the major authored narrative/reputation state. Frontier XP, money, and equipment are rewarded only to connected eligible players.
+- The engine is an original, reusable game creation platform. External components may be strategically used; no specific internal technology has been selected. Windows is the first platform priority, Linux second, with future systems afterward.
+- No particular CPU/GPU is a mandatory design floor or ceiling. Controlled, recorded hardware benchmarks measure our progress. No developer-funded dedicated server or recurring hosting requirement at launch; a player-hosted listen-server is the current working preference.
+- Mechanics/architecture requirements precede detailed lore, naming, and content production. Research-guided vertical development is the chosen process; no major code implementation is yet authorized.
 
 ### 4.2 Open questions (do not silently decide)
 
-- Final project name, world fiction, setting, lore, narrative structure, tone, and art direction.
-- Camera perspective(s), combat mechanics, skill systems, classes, progression, loot, and whether Borderlands inspiration specifically means FPS/RPG combat, loot, co-op, tone, or some mixture.
-- Number, size, and density of authored districts; number and kinds of interiors; total world scale.
-- Travel/transition mechanism to procedural zones and whether they share a persistent timeline/state.
-- How autonomous NPC lives, economies, factions, player reputation, law, and quest consequences work.
-- Networking implementation within the decided constraints (no developer-funded dedicated servers; listen-server working preference): Steam Networking Sockets vs. other transports, relay usage, the authoritative-simulation split, shared-persistence format, and whether host migration is a launch requirement.
-- Platform rollout beyond the decided Windows-first/Linux-second priority: which additional platforms, and when (Steam Deck remains optional).
-- Benchmark and measurement hardware beyond the known high-end reference rig, and the frame-time/fidelity thresholds we measure against; these are measurement anchors, not design constraints.
-- Engine subsystem technologies within the decided original-engine direction: rendering backend and graphics API, simulation framework, networking implementation, editor technology, scripting language(s), asset pipeline and formats, external-component licensing, outsourcing, and toolchain (see [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md)).
-- Development schedule, release date, budget, final price, and business model.
+**Game design:** The final names, lore, art direction, faction identities, economy and law mechanics, actual map size/biome content, detailed camera controls, weapon/damage/hacking rules, NPC relationship implementation, detailed traversal and perk catalogs, and precisely which Borderlands characteristics inspire the game. The overall camera, combat, progression, quests, and NPC mortality *directions are decided*; only details remain open.
 
-**Do not interpret an open question as permission to pick a permanent default.** Temporary assumptions are allowed for experiments if labeled and documented.
+**Multiplayer policy:** Democratic vote thresholds/tally methods for most actions (involuntary roster removal is unanimously approved by the remaining registered members); new/replacement member admission; character-slot policy; conflict handling when multiple hosts possess divergent campaign saves; offline/connected and grace-period edge cases; host-crash recovery; exact rules for rewinding world-bound characters; encounter scaling and ordinary loot. See [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md).
+
+**Solo gameplay:** Specific saving/death/waiting/reputation mechanics beyond the decided single-player separation; refer to [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md).
+
+**Technology and research:** Rendering APIs, engine language and architecture, simulation representation, network protocol, save/snapshot architecture, editor implementation, scripting, asset handling, benchmark acceptance thresholds, and deployment details. See [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md).
+
+**Operations/business:** Release date, budget, final price, broader engine distribution model, and other platform support beyond Windows/Linux priority.
+
+For current priorities and exact question ownership, see [`DECISIONS.md`](DECISIONS.md). Never interpret an open question as permission to lock a permanent default.
 
 ## 5. World model: authored, procedural, interior, persistent
 
@@ -208,39 +196,39 @@ A new technology is valuable when it measurably improves our goals; novelty alon
 | Existing line | Status and meaning |
 |---|---|
 | `browser/` | Retired experimental line: a one-night browser-based cyberpunk prompt to GLM 5.3. It is not a product or architecture commitment. |
-| `godot/` | An active experimental prototype, previously described as milestone 2. Useful evidence, reusable ideas, and architectural lessons may exist; Godot is **not** selected—the prototype now serves the original-engine research as evidence and a reference implementation, not a candidate foundation. A **read-only Stage 0 inventory** was authorized 2026-10-16 (verify functionality, tests, claims, dependencies, assets; no refactoring or migration). |
+| `godot/` | An active experimental prototype, previously described as milestone 2. Useful evidence, reusable ideas, and architectural lessons may exist; Godot is **not** selected—the prototype now serves the original-engine research as evidence and a reference implementation, not a candidate foundation. GLM reported completing the authorized read-only Stage 0 audit. A structured reconstruction of that report appears in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md); the actual audit source file was not supplied in this handoff. |
 | Existing code, tests, art, documents | Reuse selectively if they advance the new plan. Audit rather than assume compatibility. |
 | Project name `SEKTOR 7` | Placeholder to revisit in an early naming pass. |
 
-**Full reset is explicitly permitted.** Past investment is information, not an obligation. Before deciding what to preserve, inventory actual working features, dependencies, code ownership, asset provenance, test coverage, and measured performance.
+**Full reset is explicitly permitted.** Past investment is information, not an obligation. The Stage 0 report documents what GLM observed; inspect its source evidence before basing implementation decisions on specific numbers or claims.
 
-## 10. Multiplayer: a launch commitment with an open implementation
+## 10. Multiplayer: launch promise and governance
 
-**DECIDED (2026-10-16): the game must support 1–4 simultaneous players at launch.** A player can experience the game entirely alone; two, three, or four players can play cooperatively. Cooperative play must be **functional and reasonably playable in the launch release**—perfect multiplayer polish and advanced features are not launch requirements, but multiplayer cannot be deferred entirely to a post-launch update. The original engine must therefore treat multiplayer as a **foundational capability**: world simulation, persistence, entity ownership, synchronization, and gameplay systems account for multiple simultaneous players by design.
+**VISION COMMITMENT:** Functional and reasonably playable 1–4 player cooperative gameplay is required at launch alongside entirely separate single-player world/character saves. A developer-funded dedicated-server fleet or recurring game-server hosting cost is not required or budgeted. A listen-server remains a **WORKING PREFERENCE**, not a selected technology. The creation engine must provide a robust foundation for multiplayer without hardcoding this RPG's party rules as universal engine behavior.
 
-**Committed constraint (2026-10-16):** launch multiplayer must not depend on developer-funded dedicated-server infrastructure or recurring hosting costs. **Working preference:** a player-hosted listen-server model. **Open for research:** Steam Networking Sockets, P2P connectivity, relay services, the authoritative-simulation split, shared persistence, host migration, replication, prediction, and interest management. The requirement is the multiplayer experience, not a predetermined implementation—and the engine remains flexible enough to support different networking architectures for future games.
+**DECIDED product structure:** A multiplayer campaign has world-bound characters and a registered roster. The handcrafted/story world is accessible only with its complete roster; the procedural frontier permits any nonempty subset to play and grow independently. Important formal narrative decisions and group actions are democratic; hosting is a technical role without an extra vote. Involuntary removal requires unanimity among the other registered members; voluntary retirement is allowed. Most gameplay acts—including attacks on important NPCs—remain individually actionable within the normal rules and may have group-wide consequences.
 
-**Working hypothesis:** a clean simulation model, possibly deterministic in its authoritative subsystems, could ease repeatability, testing, and network replication. **Not established:** that all simulation must be deterministic, that deterministic lockstep is necessarily optimal, or that determinism alone makes multiplayer cheap. Explore server authority, prediction, interest management, snapshots, divergence detection, replay, and practical development cost as separate questions—and avoid over-engineering a network stack before evaluating the appropriate design.
+**DECIDED recovery:** An unexpected guest disconnect during authored play suspends the session for 15 minutes, then saves an exact-state recovery snapshot for later full-roster resumption if reconnection fails. Frontier players have a separate approximately 10-minute unexpected-disconnect grace rule. Live host migration is not a launch commitment.
 
-## 11. Process: alignment, research, then development
+**Authoritative detail:** [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns the exact definitions, save/checkpoint policies, quest reward mechanics, frontier protection, roster voting, reconnection and open cases. [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns implementation research. Avoid reproducing detailed policies here or inventing a fully distributed save solution.
 
-We are **not** entering full production merely because a prototype exists. The current priority is achieving deep alignment and comprehensive documentation, then moving into targeted experiments and technical research. Development begins in earnest when the lead deliberately authorizes it.
+## 11. Process and living documentation map
 
-Suggested planning deliverables (subject to amendment):
+We remain in research and design alignment. GLM’s reported Godot prototype audit is reference evidence, not the selected engine. No new implementation of the original engine or game has been authorized. Research plans and small experiments require explicit lead approval before substantive coding.
 
-1. `VISION.md` — ambition, game identity, principles, intent, open questions (this file).
-2. `CUSTOM-ENGINE-RESEARCH.md` — custom-engine architecture and technology research framework (repurposed 2026-10-16 from ENGINE-EVALUATION.md after the engine-direction decision).
-3. `DESIGN-BIBLE.md` — systems, loops, player roles, encounters, progression, world rules, co-op concept.
-4. `WORLD-DESIGN.md` — districts, interiors, procedural areas, vertical traversal, living-world requirements.
-5. `TECH-ARCHITECTURE.md` — simulation state, renderer, threading, tools, saves, networking, platform separation.
-6. `RENDERING-RESEARCH.md` and `SIMULATION-RESEARCH.md` — hypotheses, literature, prototypes, evidence.
-7. `ENGINE-ROADMAP.md` — for the original engine: modules, build order, dependencies, editor/tooling needs, integration contracts.
-8. `ASSETS.md` — provenance, licenses, scans, characters, animation, photogrammetry, procedural and commissioned content.
-9. `PERFORMANCE-BENCHMARKS.md` — machines, scenes, capture settings, frame metrics, simulation metrics, repeatability.
-10. `DECISIONS.md` — decisions, alternatives, assumptions, tradeoffs, re-evaluation triggers.
-11. `PRODUCTION-PLAN.md` — milestones, agent workflow, QA, release process, budget, platform targets.
+| File | Owns | Status |
+|---|---|---|
+| [`README.md`](README.md) | Folder navigation and document ownership rules | Exists |
+| [`VISION.md`](VISION.md) | Non-negotiable goals, product identity, high-level constraints | Exists |
+| [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) | RPG mechanics and single-player gameplay | Exists |
+| [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) | Multiplayer gameplay policy, votes, saves, waiting, recovery | Exists |
+| [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) | Technical research domains, experiments, and process | Exists |
+| [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) | Reported Stage 0 findings and source limitations | Exists (reconstructed) |
+| [`DECISIONS.md`](DECISIONS.md) | Canonical decision registry and unresolved questions | Exists |
 
-This is an organizing proposal, **not a mandated document count or schedule**. Consolidate where useful; keep single sources of truth and avoid contradictory instructions.
+**Possible future documents only when needed:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `ENGINE-ROADMAP.md`, `TECHNOLOGY-RESEARCH.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`, plus a technical `SAVE-ARCHITECTURE.md` when implementation research warrants it. A technical save architecture may coexist with, but must not override, player-facing save policy in `MULTIPLAYER-SPEC.md`.
+
+New docs must declare exactly what they own and defer. Update this map and `README.md` when creating another document; record human-approved changes in `DECISIONS.md`. Do not multiply near-duplicate decision ledgers.
 
 ## 12. Collaboration protocol for GLM 5.3 and other agents
 
@@ -249,7 +237,7 @@ This is an organizing proposal, **not a mandated document count or schedule**. C
 1. **Preserve the ambitious objective verbatim.** Do not quietly change “equal or better than CP2077 / RCT” into “good for an indie game.”
 2. **Explore solutions before concessions.** When encountering a bottleneck, identify its cause, possible innovations, concrete experiments, and evidence needed.
 3. **Do not mistake aspiration for proof.** Tag claims as demonstrated, hypothesized, unknown, or disproven under tested conditions. Cite sources and record exact environment/version where it matters.
-4. **Respect open decisions.** No engine, language, renderer, art pipeline, multiplayer model, name, or prototype branch is final until explicitly decided by the human lead.
+4. **Respect open decisions.** The original-engine direction is already decided. No *internal technology* (language, renderer/backend, physics, network implementation, asset pipeline), final name, or prototype reuse plan is selected without the human lead.
 5. **Honor the custom-engine decision.** The original engine is the chosen direction (2026-10-16). Research its architecture and technologies with rigor and genuine curiosity; neither treat the decision as provisional nor hide evidence that a subsystem choice deserves reconsideration—course corrections go to the lead, with evidence.
 6. **Use honest comparisons.** Define matched workloads, quality, measurement methodology, and development effort. Fairly account for any existing prototype head start.
 7. **Propose changes explicitly.** Never quietly rewrite commitments, delete requirements, or turn an exploratory suggestion into a fixed architecture.
@@ -263,34 +251,12 @@ This is an organizing proposal, **not a mandated document count or schedule**. C
 
 For every major technical proposal, aim to document: **goal → constraints → current evidence → approaches → novel opportunities → test plan → risks/unknowns → decision needed**. If an approach fails, record what was learned and the next hypothesis.
 
-## 13. Decision ledger (current)
+## 13. Decision registry
 
-| Item | Position | Type |
-|---|---|---|
-| Visual target | Equal/exceed Cyberpunk 2077 in interactive-game visual quality | **VISION COMMITMENT** |
-| Optimization target | Equal/exceed the extraordinary efficiency exemplified by RCT | **VISION COMMITMENT** |
-| Game type | Large open-world futuristic RPG with freedom of role | **VISION COMMITMENT** |
-| World | Authored districts, multiple interiors, separate procedural regions | **VISION COMMITMENT** |
-| Systems | Hundreds of NPCs, persistent world, cycles, encounters, futuristic traversal | **VISION COMMITMENT** |
-| Commercial intent | Steam, approximately $20 | **VISION COMMITMENT / price provisional** |
-| Co-op | **1–4 simultaneous players, functional and reasonably playable at launch**; solo fully supported; listen-server working preference | **VISION COMMITMENT** (decided 2026-10-16) |
-| Networking economics | No developer-funded dedicated-server infrastructure or recurring hosting costs; engine flexible enough for multiple networking architectures | **VISION COMMITMENT** (decided 2026-10-16) |
-| Networking model | Player-hosted listen-server preferred; Steam Networking Sockets, relays, host migration under research | **WORKING PREFERENCE** (2026-10-16) |
-| Platform priority | Windows first, Linux second, additional platforms later; cross-platform boundaries from the start; Deck optional | **DECIDED** (2026-10-16) |
-| Development strategy | Research-guided vertical engine development: foundations → small coherent engine → integrate experimental tech → expand to reusable platform | **DECIDED** (2026-10-16; implementation not yet authorized) |
-| Subsystem process | Define responsibilities/boundaries/dependencies/interfaces before selecting implementations; no premature technology commits | **DECIDED** (2026-10-16) |
-| Design sequencing | Gameplay mechanics + technical requirements before story, lore, naming, content details | **DECIDED** (2026-10-16) |
-| Godot prototype | Read-only Stage 0 inventory authorized after document alignment; no refactor/migrate/implement; evidence, not architectural authority | **AUTHORIZED** (2026-10-16) |
-| Custom engine | Build an **original, reusable game creation engine**—a project objective in its own right; cyberpunk RPG is its first major game; engine subsystem technologies not yet selected | **VISION COMMITMENT** (direction decided 2026-10-16; subsystem selections OPEN) |
-| Godot / Unreal / Unity / hybrid | Reference implementations, benchmarks, and architectural lessons—not candidates for selection | **DECIDED (role)** (2026-10-16) |
-| External technology | Strategic use of external tools, libraries, standards, dependencies; ownership of differentiating architecture and technologies | **DECIDED** (2026-10-16) |
-| CP2077 role | Technical graphical-fidelity benchmark, not an aesthetic template | **DECIDED** (2026-10-16) |
-| Engine-independent deterministic simulation | Promising research direction, **not already decided** | **WORKING HYPOTHESIS** |
-| Hardware stance | Exceptional efficiency **across hardware**; no specific spec dictates design; known hardware for benchmarking and measurement only | **VISION COMMITMENT** (decided 2026-10-16; measurement anchors OPEN) |
-| Steam Deck | Not a mandatory design target; optional compatibility research | **DECIDED (not required)** |
-| Existing prototypes | Evidence, not sunk-cost commitments | **EXISTING EXPERIMENT** |
-| Name | “SEKTOR 7” placeholder | **OPEN DECISION** |
+The canonical, updateable decision registry is [`DECISIONS.md`](DECISIONS.md). This avoids maintaining divergent tables here and inside the multiplayer and design documents. Major established decisions include both Twin Summits; the original reusable engine; 1–4 player cooperative launch support; the separate solo and multiplayer worlds; democratic shared campaigns; the full-roster authored-world rule; frontier access for smaller groups; the classless skill-use/quest-XP progression; and the Windows-then-Linux platform priority.
+
+The document owners contain detailed acceptance rules. If a proposed change conflicts with a decision, amend the owning document **and** the registry after explicit lead approval rather than silently treating the latest AI suggestion as policy.
 
 ---
 
-**Alignment checkpoint:** This document is a comprehensive proposed restatement of the project lead's intention. It is not self-ratifying. GLM 5.3, ChatGPT, and other collaborators should identify discrepancies or unaddressed choices for the lead **before** treating exploratory architectural statements as decisions. The 2026-10-16 alignment decisions are incorporated throughout and recorded in the §13 ledger; questions that surface during continued review return to the lead before becoming commitments.
+**Alignment checkpoint:** This document is a consolidated restatement of the project lead's intention. It is not self-ratifying. GLM 5.3, ChatGPT, and other collaborators should identify discrepancies or unaddressed choices for the lead **before** treating exploratory architectural statements as decisions. The 2026-10-16 alignment decisions are incorporated throughout, with their canonical register in `DECISIONS.md`; questions that surface during continued review return to the lead before becoming commitments.
