@@ -1,6 +1,6 @@
 # MULTIPLAYER SPECIFICATION — Shared Campaigns
 
-> **Status:** Multiplayer gameplay specification v0.2 · 2026-10-16 · Consolidated after the shared-campaign and governance discussions. Game/engine implementation is **not authorized**.
+> **Status:** Multiplayer gameplay specification v0.3 · 2026-10-17 · Incorporates the lead-ratified 2026-10-17 requirements: central hub, one authoritative session, automatic progress-based persistence with canonical-storage acknowledgment, encounter transactions, roster governance, ranked-choice story votes, shared-clock waiting, planned host handoff, and authority-loss suspension. Technical mechanisms remain research ([`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md), unapproved). Game/engine implementation is **not authorized**.
 >
 > **Ownership:** This file defines **the RPG's multiplayer gameplay policies**: campaign roster and access, host neutrality, votes, shared reputation, reward eligibility, saves/checkpoints, waiting/transitions, incapacitation, disconnect grace and session recovery. [`VISION.md`](VISION.md) defines the ambition; [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns general/solo mechanics; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns technical choices; [`DECISIONS.md`](DECISIONS.md) is the decision registry. A future technical `SAVE-ARCHITECTURE.md` may define snapshot implementation without changing player-facing policies here.
 >
@@ -16,10 +16,14 @@
 - **DECIDED:** Frontier consequences persist **within the frontier** but do not independently rewrite the authored world's **major reputation or narrative state**.
 - **DECIDED:** The authored world has **one shared campaign reputation**, affected by actions of any participating player, not individually averaged reputation scores.
 - **DECIDED:** Quest XP and currency are granted **equally to connected, eligible group members**, irrespective of their physical location or direct participation. Quest equipment rewards are rolled **per eligible character**. In frontier sessions, **offline members receive nothing**.
-- **DECIDED:** Connected players can propose group waiting, saving/loading, and transitions for a vote; the host gets **no special voting authority**. Permanent involuntary roster removal requires unanimous approval of the **remaining registered members**, excluding the member proposed for removal. The departing member may retire voluntarily.
+- **DECIDED:** Connected players can propose group waiting and transitions for a vote; the host gets **no special voting authority**. Deliberate time skipping requires **unanimous approval of currently connected participants**. Permanent involuntary roster removal requires unanimous approval of the **remaining registered members**, excluding the member proposed for removal. The departing member may retire voluntarily; **permanent admission requires unanimous approval by existing members**; governance votes may be cast **asynchronously**.
 - **DECIDED:** A disconnection during an authored-world session suspends that session for **15 minutes**. If unrecovered, preserve a distinct **recovery snapshot** and return to lobby. With the full roster restored, resume at the **precise suspended authoritative gameplay state**, even mid-combat, after a brief reorientation countdown.
 - **DECIDED:** Launch multiplayer **must not require developer-funded dedicated game servers or recurring hosting costs**. A player-hosted listen-server is the current **WORKING PREFERENCE**, not a selected networking implementation.
 - **WORKING PREFERENCE:** Any registered participant who has the latest valid campaign state should be able to host future sessions. **OPEN:** The safe mechanism for distributing, validating, and reconciling campaign saves across different hosts.
+- **DECIDED (2026-10-17):** Every session begins in a **central hub** providing access to the handcrafted story city and the procedural frontier. There is **one shared campaign clock** and **one authoritative session per campaign**; unverified or outdated campaign data cannot start authoritative gameplay.
+- **DECIDED (2026-10-17):** **Automatic progress-based persistence** replaces manually selected save slots, quicksaves, and arbitrary-state reloads. Meaningful character progression, completed milestones, world consequences, and frontier history persist; temporary simulation situations do not require exact restoration across terminated sessions. A milestone counts as saved only when **shared canonical storage acknowledges a complete, recoverable revision**; gameplay continues while commits are pending, the UI distinguishes pending from confirmed progress, irreversible actions depending on an unconfirmed milestone are gated until it commits, and commit retries must not duplicate rewards. Internal backups and emergency recovery data remain necessary.
+- **DECIDED (2026-10-17):** **Encounter failure** restores pre-encounter ammunition, consumables, and equipment condition; removes uncommitted loot; and preserves use-earned skill proficiency and previously committed progress.
+- **DECIDED (2026-10-17):** **Planned host handoff is required:** connected eligible players volunteer, the departing host nominates a willing successor, and that successor accepts. Seamless migration after an unexpected host crash is not a launch requirement. When an active host can no longer maintain verified authority, gameplay progression suspends and a **local emergency recovery copy** is preserved; resumption requires renewed validation.
 
 **Not launch requirements:** Large-population shared online servers, MMO-like open-world concurrency, and PvP modes (e.g. team deathmatch, FFA, CTF) are **future ambitions only**. A seamless live host migration system is not currently a launch commitment.
 
@@ -64,20 +68,23 @@ Main menu
 - **DECIDED:** **Involuntary permanent removal requires unanimous approval of all *other* registered members** (the removal target is excluded from that vote). If any eligible remaining member rejects the removal, it fails. The exact implementation of absent-member ballot collection remains **OPEN**; absence is not implicit consent.
 - **DECIDED:** A participant may **voluntarily retire** from the campaign; their departure must not permanently lock everyone else out of the authored-world campaign. Exact retirement confirmation, archive and rejoin procedure remains **OPEN**.
 - **DECIDED:** Permanent roster lock-in is **SUPERSEDED**. The roster size after retirement governs the future full-roster requirement.
-- **DECIDED principle:** The group governs admissions/replacements too. **OPEN:** Whether adding/replacing someone needs unanimity, a different quorum, and what happens to archived characters. Do not silently borrow the removal threshold for admissions.
-- **PROPOSAL:** Archive retired characters without permitting a replacement to appropriate their character identity/progression; replacements ordinarily create a campaign-bound character. Reinstatement and slot rules remain **OPEN**.
+- **DECIDED (2026-10-17):** **Permanent roster admission requires unanimous approval by existing members** (replacements included). Ballot mechanics for absent members remain **OPEN**; absence is not implicit consent.
+- **DECIDED (2026-10-17):** **Retired characters and their progression are archived**, not destroyed; a replacement does not appropriate a retired character's identity/progression and ordinarily creates a campaign-bound character. Reinstatement and slot rules remain **OPEN**.
+- **DECIDED (2026-10-17):** **Governance votes may be cast asynchronously**; collection windows and notification mechanics remain **OPEN**.
 - **OPEN:** Immediate host powers to kick a disruptive person from the current *session* (distinct from permanent removal); invitations, bans, absences/AFK, unusual 1-member roster cases and voter authentication.
 
 ### 2.3 Hosting and ownership — DECIDED goals, open implementation
 
 - **DECIDED:** Hosting is a technical service. The current host has no casting bonus or unilateral story control.
 - **WORKING PREFERENCE:** Any eligible registered member can host the shared campaign using its newest valid authoritative save.
+- **DECIDED (2026-10-17):** **Only one session may authoritatively advance a campaign at a time.** Any eligible registered member may host a subsequent session using **verified current campaign data**; unverified or outdated data cannot start authoritative gameplay.
+- **DECIDED (2026-10-17):** **Planned host handoff** (connected eligible players volunteer → departing host nominates a willing successor → successor accepts) is required for an in-session transfer of authority; the technical mechanism is research.
 - **DECIDED constraint:** No developer-funded dedicated-server fleet or recurring game-server hosting budget for launch. Existing third-party connectivity services may be researched for terms, availability, and cost.
 - **WORKING PREFERENCE:** Player-hosted listen-server with session authority on the host machine; transport, lobby, NAT traversal, relay, authentication, and engine API are **OPEN**.
 - **SUPERSEDED:** A permanent host who alone owns all story decisions/saves/transitions; a permanent requirement that every member be online for **all** gameplay.
 - **OPEN:** Whether the save is distributed to all participants automatically, transferred on request, or backed up through an opt-in provider. Steam Cloud does **not** by itself establish a shared cross-account canonical save; don't invent that capability.
 - **OPEN:** How to avoid conflicting off-network sessions. Without a central coordinator or guaranteed communication, we can detect divergent save histories, but must not promise perfect prevention of simultaneous forks.
-- If the *active* host leaves during a live session, the old rule is to disconnect/end the current session. A different member hosting **a future session** is distinct from seamless *live* host migration. Actual crash recovery is covered in §9.
+- **SUPERSEDED (2026-10-17):** "When the active host leaves, the session ends." Planned host handoff (above) now governs an intentional departure; an *unexpected* host crash still ends the session at launch (no seamless migration), with local emergency recovery copies preserved. Crash recovery is covered in §9.
 
 ## 3. Destination access, world continuity, and independent progression
 
@@ -102,7 +109,7 @@ Main menu
 
 ### 3.3 Entry, transfers, and location choice
 
-- **WORKING PREFERENCE:** Choose authored world vs. frontier before entering a session. UI and actual load/transfer semantics are not selected.
+- **DECIDED (2026-10-17):** Every session begins in a **central hub**; the authored-world-vs-frontier choice is made there. Hub UI and load/transfer semantics are not selected.
 - The two environments belong to **one campaign history**, with world-bound characters and appropriate progression persisting between them.
 - **DECIDED:** Group transitions between cells/locations are coordinated; everyone involved in that session transitions together, and current health values carry over.
 - **DECIDED:** A group transition is blocked when any participating player is currently pursued/engaged by enemies, police, or comparable threats.
@@ -122,15 +129,15 @@ Main menu
 
 ### 5.1 Core rules — DECIDED
 
-- Any connected roster participant can **propose** a vote for player-initiated saving/loading, waiting, or a group transition.
+- Any connected roster participant can **propose** a vote for waiting or a group transition. (Player-initiated saving/loading votes are superseded by automatic progress-based persistence, §8.)
 - Important **branching narrative decisions** are resolved through a group vote rather than decided unilaterally by the active host.
 - Host runs authoritative validation/execution of the chosen action, but **hosting does not grant privileged voting power**.
-- Permanent roster governance is democratic (§2.2); involuntary removal requires unanimity among remaining registered members, and voluntary retirement is available. Admissions/replacements remain governed by the group with their exact quorum **OPEN**.
-- **OPEN:** Voting eligibility during temporary disconnects, how many connected members must vote for routine actions, and quorum/threshold for formal story choices and roster admissions. **Not open:** Involuntary removal requires the unanimous votes of remaining registered members; neither the target nor the host gets special voting privilege.
+- Permanent roster governance is democratic (§2.2); involuntary removal requires unanimity among remaining registered members, voluntary retirement is available, and admission requires unanimity of existing members. **DECIDED (2026-10-17):** Major authored narrative decisions use **ranked-choice voting with all registered members participating**; ballots may be cast asynchronously, and remaining ballot thresholds/windows are **OPEN**.
+- **OPEN:** Voting eligibility during temporary disconnects, how many connected members must vote for routine actions, and the ballot window for formal story choices. **Not open:** Involuntary removal (unanimous, remaining members), admission (unanimous, existing members), and deliberate time skipping (unanimous, currently connected); neither the target nor the host gets special voting privilege.
 
 ### 5.2 Voting mechanics — unselected
 
-- **PROPOSAL from lead:** First-choice and second-choice preferences (a ranked ballot) for multi-option dialogue; on a deadlock, transparently choose at random among tied choices (up to four, at most 25% per choice in a four-way equal tie).
+- **DECIDED (2026-10-17):** Ranked ballots (first- and second-choice preferences) for multi-option dialogue; on a deadlock, transparently choose at random among tied choices (up to four, at most 25% per choice in a four-way equal tie). Exact counting method, ties, revotes, abstention, AFK behavior, timeout, notification, and cooldowns remain **OPEN**.
 - **OPEN:** Exact ranked-choice counting method, ties, revotes, abstention, AFK behavior, timeout, voting notification, initiator cooldown and emergency overrides. Membership removal unanimity is already decided; do not treat that particular threshold as open.
 - **PROPOSAL:** Random tiebreaks for *story choices* could be acceptable, but must **not** decide catastrophic administrative actions such as world deletion or irreversible save-history restoration.
 - **OPEN:** Whether votes on major authored-world decisions always require all registered members to *vote*, versus only to be present. Full-roster presence for authored-world access is decided; a specific ballot threshold is not.
@@ -154,8 +161,8 @@ Main menu
 
 ### 6.3 Reward reroll protection
 
-- **DECIDED GOAL:** Prevent trivial save/reload exploitation to repeatedly reroll randomized quest equipment.
-- **PROPOSAL from lead:** Resolve loot at or before an important pre-completion step, rather than only on the final hand-in action. By itself this does not stop reloading an earlier checkpoint.
+- **DECIDED GOAL:** Prevent trivial exploitation to repeatedly reroll randomized quest equipment.
+- **PROPOSAL from lead:** Resolve loot at or before an important pre-completion step, rather than only on the final hand-in action. With arbitrary-state reloads superseded (§8.1), the residual reroll vector is replaying quest instances.
 - **RESEARCH OPTION:** Stable, recorded reward identities/seeds by campaign + quest instance + character so that replaying the same quest instance produces the same reward; legitimate new repeatable instances can roll new rewards.
 - **OPEN:** The final rule when an authorized full save predates reward generation, when a character changes, or when a quest is truly repeated. No absolute anti-tamper claim for player-controlled saves.
 
@@ -163,8 +170,8 @@ Main menu
 
 - **DECIDED:** Enemies/NPC opponents scale HP and offensive capability with player count. Scaling should be evaluated for cooperative fun, not merely inflated health pools.
 - **OPEN:** Party-wide vs nearby-participant scaling, how to account for level disparity, player joining/leaving during a fight, enemy quantity/AI scaling, and boss-specific policies.
-- **DECIDED:** In multiplayer group play, a defeated player becomes **incapacitated** and can be revived. When **every active party member is incapacitated**, the party wipes and returns to an eligible previous save.
-- **OPEN:** Exact incapacitation movement, bleedout/timer (if any), revive time, revive items/skills, treatment of a disconnected or absent player, downed player in an occupied vehicle, and which prior save has priority after a wipe.
+- **DECIDED:** In multiplayer group play, a defeated player becomes **incapacitated** and can be revived. When **every active party member is incapacitated**, the encounter fails and rolls back as a transaction (2026-10-17): pre-encounter ammunition, consumables, and equipment condition are restored; uncommitted loot is removed; use-earned skill proficiency and previously committed progress are preserved.
+- **OPEN:** Exact incapacitation movement, bleedout/timer (if any), revive time, revive items/skills, treatment of a disconnected or absent player, downed player in an occupied vehicle, and the encounter-transaction boundary (what counts as pre-encounter state and which world effects are encounter-local versus milestone-committed).
 - **DECIDED:** A cell transition preserves health values, rather than resetting the party to full health.
 - **OPEN:** Friendly fire, kill credit/assist assignment, PvE loot drops, player-to-player trading, and physical separation across multiple simultaneously relevant regions.
 - Solo gameplay death-and-load rules are to be designed in the broader game design, not silently inferred from multiplayer incapacitation.
@@ -173,35 +180,28 @@ Main menu
 
 > **Document ownership:** This section is the authoritative *gameplay policy* for group saves/waiting at present. Exact serialization, storage, snapshot atomicity, replication, file formats, and backup technology belong in future technical architecture research. **Do not create a competing player-facing save-policy document.** A future dedicated technical `SAVE-ARCHITECTURE.md` may own serialization, snapshots, integrity and distributed persistence; it must reference rather than override these gameplay policies. If this policy section grows unwieldy, move it explicitly and update the links.
 
-### 8.1 Save categories — DECIDED intent
+### 8.1 Progress-based persistence — DECIDED (2026-10-17)
 
-| Save | Required behavior | Outstanding detail |
-|---|---|---|
-| **Cell checkpoint** | Entering a new cell/location creates a loadable checkpoint; rolling previous-load history reaches back approximately **two prior loads**. | Exact two-slot vs two-prior-plus-current semantics and what qualifies as a cell entry. |
-| **Periodic autosave** | Autosave every **15 minutes** and allow it to serve as a previous-load recovery point. | Whether it shares the same rolling history with cell checkpoints, and which clocks/paused time count. |
-| **Quicksave** | A **single** quicksave slot, overwritten by the next quicksave. | Conditions and permissions for creating/loading it. |
-| **Full/manual save** | Standalone durable saves available for manual loading and retained unless explicitly deleted. | Limits, confirmation, branch histories, deletion authority. |
-| **Recovery snapshot** | Separate special-purpose snapshot for an interrupted authored-world session, including mid-combat resume. **Must not overwrite the above saves.** | Format, retention/cleanup, exactly-once resume and abuse resistance. |
-
-- **DECIDED:** Player-initiated save/load actions in a multiplayer session should be proposed by **any connected participant** and decided by **group vote**, not host fiat.
-- **WORKING INTERPRETATION:** Periodic automated autosaves/checkpoints operate as safety mechanisms without interrupting players with a vote; the exact automation/vote policy is **OPEN** and should be ratified before implementation.
-- **DECIDED:** A complete multiplayer save must keep the world and participating campaign-bound characters consistent on rollback; a world-only rewind with duplicated character items/XP is not acceptable.
-- **OPEN:** Whether manual saves are shared globally across all eligible hosts and how a shared full-save history behaves with rotating hosts.
-- **OPEN:** Snapshot consistency boundaries and how an authoritative rollback interacts with a participant who has played a different frontier session since the targeted save.
+- **DECIDED:** Saving is **automatic and progress-based**; there are no manually selected save slots, quicksaves, or arbitrary-state reloads. (The former save-category table — cell checkpoints, 15-minute autosaves, single quicksave, manual saves — is **SUPERSEDED** and preserved in §12.)
+- **DECIDED:** What persists: meaningful character progression, completed milestones, world consequences, and frontier history. What does **not** require exact restoration across terminated sessions: temporary simulation situations (entity transforms, AI micro-state, projectiles, physics, weather).
+- **DECIDED:** A milestone is considered safely saved only after **shared canonical storage acknowledges a complete, recoverable revision**. While authority remains valid, gameplay continues during pending commits. The UI distinguishes **pending** progress from **confirmed durable** progress. Irreversible actions that depend on an unconfirmed milestone are gated until that milestone commits. Commit retries must not duplicate rewards or other effects.
+- **DECIDED:** Internal backups and emergency recovery data are necessary; a **local emergency recovery copy** is preserved when verified authority is lost (§2.3, §9.3).
+- **DECIDED:** A committed revision must keep the world and participating campaign-bound characters consistent; a world-only rewind with duplicated character items/XP is not acceptable.
+- **OPEN (mechanism, not policy):** What constitutes the shared canonical storage, the acknowledgment threshold, revision formats, and distribution — all under active research in [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md); nothing there is approved.
 
 ### 8.2 Waiting and group transitions
 
 - **DECIDED:** The game includes a Skyrim-like **waiting/time advancement** mechanic.
-- **DECIDED:** Any connected player can propose waiting or a party transition; the group votes.
+- **DECIDED:** Any connected player can propose waiting or a party transition; the group votes. **Deliberate time skipping requires unanimous approval of currently connected participants** (2026-10-17), and the campaign has **one shared clock**.
 - **DECIDED:** Waiting or a group transition is disallowed when **any relevant connected party member** is actively pursued or in combat with enemies/police. **OPEN:** Exact danger-state definitions (alert, wanted, nearby hostile, damage-over-time, etc.).
 - **DECIDED:** Group transitions take the relevant group together, and health is preserved.
 - **OPEN:** How waiting advances persistent NPC schedules/weather/events, what happens to offline members and frontier vs authored state, and how to avoid exploiting world events with repeated waiting.
-- **OPEN:** Vote quorum, cooldown, rejection behavior, emergency overrides, and whether save/load votes are permitted in active combat.
+- **OPEN:** Vote quorum for ordinary waiting, cooldown, rejection behavior, and emergency overrides. (Save/load votes are superseded by automatic persistence.)
 
 ### 8.3 Save-history continuity with portable hosting
 
-- **REQUIRED DESIGN PROBLEM:** If any roster member may host on different days, there must be a way to validate the campaign's latest authoritative revision, synchronize complete world + character history, avoid silent overwrites, and detect forked histories.
-- **RESEARCH OPTIONS:** Content-addressed revisions, immutable snapshot IDs, generation counters, signatures/checksums, save exchange over peer connections, replicated backup snapshots, and explicit conflict-resolution UX.
+- **DECIDED REQUIREMENT (2026-10-17):** If any roster member may host on different days, the system must validate the campaign's latest authoritative revision, synchronize complete world + character history, avoid silent overwrites, and detect forked histories — unverified or outdated data cannot start authoritative gameplay.
+- **RESEARCH (unapproved):** Candidate mechanisms — content-addressed revisions, immutable snapshot IDs, generation counters, signatures/checksums, peer exchange, replicated backups, third-party-assisted canonical storage — are analyzed in [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md). **Fail-closed policy:** no authoritative progression on unverified data; divergent histories are never silently merged.
 - **Do not claim** that local player-hosted sessions without always-online coordination can absolutely prevent two isolated users from producing divergent progress. Define safe detection and handling instead.
 
 ## 9. Unexpected disconnections and exact-state recovery
@@ -212,8 +212,8 @@ Main menu
 2. Start a **15-minute reconnection window**. The group remains suspended; the disconnected participant can rejoin their campaign-bound character.
 3. If they reconnect in time, resynchronize everyone, present a brief restart countdown, and **resume from the frozen game state**.
 4. If the window expires, preserve a distinct, consistent **recovery snapshot**, then return connected players to the multiplayer lobby.
-5. Once the **entire registered roster** is present again, resume that campaign from the recovery snapshot at the **exact suspended authoritative logical moment**, even halfway through a boss fight—not from the encounter start by default.
-6. A later option to **vote to restart the encounter instead** is a **FUTURE IDEA**, not a launch requirement.
+5. Once the **entire registered roster** is present again, resume that campaign from the emergency recovery copy. Within a still-live suspension, resume at the **exact suspended authoritative logical moment**; after session termination, resume at the **encounter boundary** — temporary simulation situations do not require exact restoration across terminated sessions (2026-10-17).
+6. Encounter-boundary resumption is the terminated-session default; encounter-restart options are encounter-policy questions, not save-policy ones.
 
 **State fidelity requirement:** Preserve enough authoritative information to reconstruct player/entity transforms, health, incapacitation, active projectiles, attack timing and cooldowns, buffs/status, relevant physics state, NPC AI state, encounter phase, quest flags, random state or equivalent, pending events, and other gameplay-critical facts. Purely cosmetic transient effects may be reconstructed rather than byte-identically frozen, provided the observable play state is preserved. Exact serialization architecture is **OPEN**.
 
@@ -227,7 +227,7 @@ Main menu
 
 ### 9.3 Host loss — separate unsolved case
 
-- **DECIDED baseline from previous discussion:** When the *active host* ends their session, other participants disconnect. The roster can reconvene later with a different eligible host if save transfer is implemented.
+- **SUPERSEDED (2026-10-17):** "When the active host ends their session, other participants disconnect." An intentional departure now uses **planned host handoff** (§2.3). An *unexpected* host crash still ends the session at launch (seamless live migration is not a launch requirement); each client preserves a **local emergency recovery copy**, and resumption requires renewed validation.
 - An **unexpected host crash** cannot guarantee a snapshot created *after* the crash. Research ongoing durable snapshots, replication to peers, graceful host exit, and recovery from the most recent safely preserved authoritative state.
 - Seamless live host migration is **not decided for launch**. Do not imply that rotating hosts between sessions solves a crash while the simulation is running.
 
@@ -242,9 +242,9 @@ Main menu
 
 | Priority | Decision needed | Why it affects architecture |
 |---|---|---|
-| **P0** | **Canonical save/host rotation:** How is the latest shared save distributed, authenticated, fork-detected, backed up, and chosen when multiple players host on different days? | Coherent campaign timeline, anti-duplication, rollback. |
-| **P0** | **Save/character rewind:** Can a full group vote load an older save after members earned new frontier progression, and does it rewind every character? | Persistence invariants, possible conflicts. |
-| **P0** | **Vote policy:** What quorum/method for major story, routine transitions/waits/saves and *admissions*? Involuntary removal unanimity is already decided; voluntary retirement is allowed. | Democracy must work when players are unavailable or AFK. |
+| **P0** | **Canonical save/host rotation (mechanism):** What constitutes shared canonical storage; how revisions are transmitted, authenticated, fork-detected, and chosen when multiple players host on different days — including the solo-player acknowledgment case — without developer-funded infrastructure. (Requirements ratified 2026-10-17 as one-authoritative-session + canonical acknowledgment.) | Coherent campaign timeline, anti-duplication, rollback. |
+| **P0** | **Governed rollback (reframed 2026-10-17):** whether any explicit mechanism restores a prior canonical revision (e.g., catastrophic-bug recovery), what it does to every world-bound character, and what the recoverable atomic state is. (Arbitrary/voted loads are superseded by automatic persistence.) | Persistence invariants, possible conflicts. |
+| **P0** | **Vote policy (remaining mechanics):** Counting method, ties, deadlines, and AFK/reconnection ballots. Thresholds for removal, admission, time-skip, and ranked-choice story votes are decided (2026-10-17). | Democracy must work when players are unavailable or AFK. |
 | **P0** | **Disconnected authored session:** What happens on host crash versus guest disconnect, and how to persist/reconstruct all critical mid-combat state? | Recovery technology, correctness. |
 | **P1** | **Late joining:** Can a registered member join a frontier mission mid-progress, and when does eligibility begin? | Rewards and quest state. |
 | **P1** | **Character slots:** One or many characters per member per campaign, switching timing, shared vs per-character achievements? | Ownership schema and reward rules. |
@@ -268,7 +268,14 @@ Main menu
 | Only the original designated world host can ever host the campaign | **WORKING PREFERENCE replaced:** Investigate any registered member hosting a later session with the latest valid save. |
 | Fixed roster cannot change when someone quits | **SUPERSEDED:** Voluntary retirement allowed; involuntary removal requires unanimous approval of other registered members. Admission/replacement threshold open. |
 | Every member automatically receives rewards when any campaign member farms solo | **SUPERSEDED for frontier:** Only connected/eligible frontier players receive rewards; offline members get none. |
-| Disconnected authored session restarts the fight or reloads an ordinary checkpoint | **SUPERSEDED:** Exact-state resumption from dedicated recovery snapshot is the default. |
+| Disconnected authored session restarts the fight or reloads an ordinary checkpoint | **SUPERSEDED:** Live suspensions may resume exactly; terminated sessions resume at the encounter boundary (2026-10-17 refinement). |
+| Manually selected save slots, quicksaves, cell-checkpoint/autosave categories, and group-voted save/load | **SUPERSEDED (2026-10-17):** Automatic progress-based persistence; milestones saved on shared-canonical-storage acknowledgment. |
+| Party wipe returns the group to an eligible previous save | **SUPERSEDED (2026-10-17):** Encounter-failure transactional rollback (restore pre-encounter consumables, drop uncommitted loot, keep use-earned proficiency). |
+| Active host leaving ends the current session | **SUPERSEDED (2026-10-17):** Planned host handoff (volunteer → nominate → accept) required; unexpected crash still ends the session with emergency copies preserved. |
+| Exact-state restoration across terminated sessions | **SUPERSEDED (2026-10-17):** Live suspensions may resume exactly; terminated sessions resume at the encounter boundary. |
+| Admission/replacement quorum undecided | **SUPERSEDED (2026-10-17):** Permanent admission requires unanimous approval by existing members. |
+| Retirement archival was a proposal | **CONFIRMED (2026-10-17):** Retired characters and progression are archived. |
+| Ranked-choice story voting was a proposal | **CONFIRMED (2026-10-17):** Ranked-choice with all registered members participating; async ballots allowed. |
 
 ## 13. Engineering handoff, examples and acceptance scenarios
 
@@ -280,11 +287,11 @@ Main menu
 2. In a 3-member campaign, all **3** suffice to enter the authored world.
 3. Solo frontier exploration increases only connected participants' XP/money/loot; the absent roster member receives none; main-story reputation remains unchanged.
 4. A mission ends while connected members stand in different regions; all eligible members receive equal quest XP/cash and individual equipment rolls.
-5. A participant without hosting authority proposes a major dialogue decision, group transition, or player-initiated save; their proposal can be voted on and executed.
+5. A participant without hosting authority proposes a major dialogue decision or group transition; their proposal can be voted on and executed.
 6. Transition fails if **any relevant participant** is pursued; a successful transition preserves health.
-7. All but one participant are downed; the remaining participant can revive them. Full-party down triggers rewind to the appropriate earlier campaign save (priority remains open).
+7. All but one participant are downed; the remaining participant can revive them. Full-party down triggers the encounter-failure rollback: pre-encounter resources restored, uncommitted loot removed, use-earned proficiency kept.
 8. A player loses connection mid-boss fight. The authored world freezes; on reconnect within 15 minutes it resumes after countdown without an encounter reset.
-9. The same incident exceeds 15 minutes; a separate recovery snapshot is created and the group returns to lobby. When all rejoin, the encounter resumes at the suspended logical state and the ordinary save slots remain intact.
+9. The same incident exceeds 15 minutes; a separate emergency recovery copy is created and the group returns to hub. When all rejoin, the terminated session resumes at the encounter boundary and committed milestones remain intact.
 10. A campaign revision hosted by one member can later be opened by another *only if* the state is complete and known-valid; contradictory revisions are not silently merged.
 11. A randomized quest reward does not trivially change merely by reloading immediately before an ordinary reward hand-in (final mechanism open).
 12. Existing code/prototypes are read-only evidence, not authority over any of the above design rules.

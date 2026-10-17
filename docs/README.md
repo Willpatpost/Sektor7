@@ -24,6 +24,7 @@
 | `MULTIPLAYER-SPEC.md` | Multiplayer player-facing rules, governance, rewards, saving, waiting and recovery | Technical persistence and network implementation |
 | `CUSTOM-ENGINE-RESEARCH.md` | Research methodology, subsystem questions, staged experiments, evidence standards | Game-design policy and lead's decisions |
 | `DECISIONS.md` | Status/decision index, change log, priorities | Full wording in owning docs |
+| `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` | Unapproved research: authority/persistence/synchronization architectures and experiments | MULTIPLAYER-SPEC policy, DECISIONS registry, lead approval |
 | `PROTOTYPE-INVENTORY.md` | Reported existing-experiment evidence and source limitations | Technical validation and new tests |
 | `README.md` | Folder map, maintenance rules | All substantive owners above |
 
@@ -56,4 +57,4 @@ The four provided sources were `VISION(3).md` (v0.5), `DESIGN-BIBLE(1).md` (v0.1
 
 **Recommended handoff to GLM:** Read all seven files; compare with the repository backup; report discrepancies instead of automatically overwriting authorizations, implementations, licenses or unprovided evidence. Keep a clean diff, preserve any raw audit/test provenance, and obtain confirmation before executing any code modifications or Stage 1 research spikes.
 
-**Suggested future files, only as work warrants:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `TECHNOLOGY-RESEARCH.md`, `ENGINE-ROADMAP.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`, possibly `SAVE-ARCHITECTURE.md`. Do not create empty scaffolds simply to increase document count.
+**Suggested future files, only as work warrants:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `TECHNOLOGY-RESEARCH.md`, `ENGINE-ROADMAP.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`. The anticipated `SAVE-ARCHITECTURE.md` territory is covered by the unapproved research study `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` while under review. Do not create empty scaffolds simply to increase document count.

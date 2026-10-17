@@ -225,8 +225,9 @@ We remain in research and design alignment. GLM’s reported Godot prototype aud
 | [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) | Technical research domains, experiments, and process | Exists |
 | [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) | Reported Stage 0 findings and source limitations | Exists (reconstructed) |
 | [`DECISIONS.md`](DECISIONS.md) | Canonical decision registry and unresolved questions | Exists |
+| [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) | Research study: co-op authority, persistence, synchronization — unapproved proposal | Exists (research) |
 
-**Possible future documents only when needed:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `ENGINE-ROADMAP.md`, `TECHNOLOGY-RESEARCH.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`, plus a technical `SAVE-ARCHITECTURE.md` when implementation research warrants it. A technical save architecture may coexist with, but must not override, player-facing save policy in `MULTIPLAYER-SPEC.md`.
+**Possible future documents only when needed:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `ENGINE-ROADMAP.md`, `TECHNOLOGY-RESEARCH.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`. The anticipated technical `SAVE-ARCHITECTURE.md` territory (serialization, snapshots, distribution, crash consistency) is covered by `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` while that study is under review; any later split must not override player-facing save policy in `MULTIPLAYER-SPEC.md`.
 
 New docs must declare exactly what they own and defer. Update this map and `README.md` when creating another document; record human-approved changes in `DECISIONS.md`. Do not multiply near-duplicate decision ledgers.
 
