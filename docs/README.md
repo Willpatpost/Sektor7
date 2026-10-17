@@ -26,6 +26,7 @@
 | `DECISIONS.md` | Status/decision index, change log, priorities | Full wording in owning docs |
 | `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` | Unapproved research: authority/persistence/synchronization architectures and experiments | MULTIPLAYER-SPEC policy, DECISIONS registry, lead approval |
 | `E5-CANONICAL-MEDIUM-FEASIBILITY.md` | Unapproved E5 research annex: medium feasibility, deployment alternatives, cost models | MULTIPLAYER-ARCHITECTURE-RESEARCH, DECISIONS registry, lead approval |
+| `SIMULATION-ARCHITECTURE-RESEARCH.md` | Unapproved research: living-world simulation architecture and experiments | DESIGN-BIBLE gameplay rules, MULTIPLAYER-SPEC policy, MULTIPLAYER-ARCHITECTURE-RESEARCH state taxonomy, DECISIONS registry, lead approval |
 | `PROTOTYPE-INVENTORY.md` | Reported existing-experiment evidence and source limitations | Technical validation and new tests |
 | `README.md` | Folder map, maintenance rules | All substantive owners above |
 
