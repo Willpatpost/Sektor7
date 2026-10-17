@@ -1,0 +1,51 @@
+{
+  "determinism": {
+    "fingerprint": "527220de7c202777",
+    "note": "sha256 of canonical suite results (tests+stats), compared across two full in-process runs",
+    "pass": true
+  },
+  "meta": {
+    "authorization": "lead, 2026-10-17 \u2014 local-only, headless; no live providers, no cloud resources, no credentials, no charges, no network",
+    "medium": "deterministic in-process simulation (conditional-append contract)",
+    "python": "3.12.3",
+    "run_date": "2026-10-17"
+  },
+  "stats": {
+    "t1_chain_length": 101,
+    "t3_keys": 50,
+    "t4_keys": 30,
+    "t5_faults": 5
+  },
+  "tests": [
+    {
+      "detail": "100 rounds x 2 simultaneous appends at the same head: 100 accepted / 100 rejected; no round produced two winners; losing records never entered the chain (length 101)",
+      "name": "T1 CAS contention",
+      "pass": true
+    },
+    {
+      "detail": "20/20 appends with a stale expected-head were rejected by CAS; chain unchanged",
+      "name": "T2a stale-parent fencing",
+      "pass": true
+    },
+    {
+      "detail": "epoch-blind medium accepts a fresh-parent/stale-epoch record; chain validation rejects it ('stale-epoch' at index 6); last-valid-prefix fallback returns the pre-injection head",
+      "name": "T2b stale-epoch fencing",
+      "pass": true
+    },
+    {
+      "detail": "50/50 idempotency keys committed exactly once under apply-then-drop-ack / drop-then-timeout ambiguity; resolution by chain re-read; chain valid",
+      "name": "T3 ambiguous retries",
+      "pass": true
+    },
+    {
+      "detail": "writer destroyed after an unacknowledged accepted append; restarted writer re-read the chain, found its key already committed (no duplicate), opened a valid successor session (epoch 2), and completed all 30 keys \u2014 no gaps, no duplicates",
+      "name": "T4 crash recovery",
+      "pass": true
+    },
+    {
+      "detail": "good chain validates; 5/5 injected faults (tampered payload, forged signature, duplicate idem-key, stale epoch, parent mismatch) rejected with the correct reasons",
+      "name": "T5 revision validation",
+      "pass": true
+    }
+  ]
+}
