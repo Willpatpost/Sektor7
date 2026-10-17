@@ -226,6 +226,7 @@ We remain in research and design alignment. GLM’s reported Godot prototype aud
 | [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) | Reported Stage 0 findings and source limitations | Exists (reconstructed) |
 | [`DECISIONS.md`](DECISIONS.md) | Canonical decision registry and unresolved questions | Exists |
 | [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) | Research study: co-op authority, persistence, synchronization — unapproved proposal | Exists (research) |
+| [`E5-CANONICAL-MEDIUM-FEASIBILITY.md`](E5-CANONICAL-MEDIUM-FEASIBILITY.md) | E5 feasibility research annex — provider matrix, deployment alternatives, cost models | Exists (research) |
 
 **Possible future documents only when needed:** `TECH-ARCHITECTURE.md`, `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `ENGINE-ROADMAP.md`, `TECHNOLOGY-RESEARCH.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`. The anticipated technical `SAVE-ARCHITECTURE.md` territory (serialization, snapshots, distribution, crash consistency) is covered by `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` while that study is under review; any later split must not override player-facing save policy in `MULTIPLAYER-SPEC.md`.
 
