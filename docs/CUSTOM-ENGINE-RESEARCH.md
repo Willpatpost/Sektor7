@@ -115,7 +115,7 @@ Each domain accumulates evidence in `TECHNOLOGY-RESEARCH.md` (the external compo
 
 ### Stage 0 — Align and inventory (reported completed; no production code changes)
 
-**Status reported by GLM 5.3:** The authorized read-only `godot/` audit was completed: **4,273 lines** across **16 `.gd` files** (3,901 source + 372 test), **60/60 headless checks passing**, clean import, no project addons, and a clean `godot/` working tree. The claim and methods are summarized in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md); the underlying repository/source inventory document was **not provided** with this document set, so the claims are reported audit findings rather than independently reproduced results. The prototype supplies calibration evidence, not architectural authority.
+**Status reported by GLM 5.3:** The authorized read-only `godot/` audit was completed: **4,273 lines** across **16 `.gd` files** (3,901 source + 372 test), **60/60 headless checks passing**, clean import, no project addons, and a clean `godot/` working tree. The claim and methods are summarized in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md). The audit was executed directly in this repository; its original record was subsequently recovered from the pre-sync stash and reconciled with a first-hand verification record ([`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md) §7) — every reported figure matched. The prototype supplies calibration evidence, not architectural authority.
 
 **Completed or reported completed:** Stage 0 prototype inspection and the initial vision/strategy alignment. The earlier estimates of ~3.3k lines and ~60 checks have been superseded by the reported audit counts. No code, asset or save modifications were authorized or reported.
 

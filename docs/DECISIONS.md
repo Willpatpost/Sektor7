@@ -74,7 +74,7 @@
 
 | ID | Status | Record | Owner |
 |---|---|---|---|
-| E-01 | EXISTING EXPERIMENT (GLM-reported) | Godot `godot/` Stage 0 read-only inventory: 16 GDScript files, 4,273 lines, 60/60 tests, clean import, no project addons. Not independently reproduced in this handoff | [PROTOTYPE INVENTORY](PROTOTYPE-INVENTORY.md) |
+| E-01 | EXISTING EXPERIMENT (verified in-repo) | Godot `godot/` Stage 0 read-only inventory: 16 GDScript files, 4,273 lines, 60/60 tests, clean import, no project addons. Audit executed directly in this repository 2026-10-16; reconstruction reconciled 2026-10-17 against the recovered original — all figures matched (PROTOTYPE-INVENTORY.md §7) | [PROTOTYPE INVENTORY](PROTOTYPE-INVENTORY.md) |
 | E-02 | DECIDED | Retain existing Godot prototype as read-only calibration evidence, not a chosen engine; old browser prototype retired | [PROTOTYPE INVENTORY](PROTOTYPE-INVENTORY.md) |
 | E-03 | WORKING HYPOTHESIS | Deterministic and/or data-oriented/event-driven simulation may benefit efficiency, testing or replication, not automatically guaranteed | [ENGINE RESEARCH](CUSTOM-ENGINE-RESEARCH.md) |
 | E-04 | OPEN DECISION | Quantified workload-specific success thresholds, calibrated render/agent benchmarks and their settings | [ENGINE RESEARCH](CUSTOM-ENGINE-RESEARCH.md) |

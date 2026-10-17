@@ -196,7 +196,7 @@ A new technology is valuable when it measurably improves our goals; novelty alon
 | Existing line | Status and meaning |
 |---|---|
 | `browser/` | Retired experimental line: a one-night browser-based cyberpunk prompt to GLM 5.3. It is not a product or architecture commitment. |
-| `godot/` | An active experimental prototype, previously described as milestone 2. Useful evidence, reusable ideas, and architectural lessons may exist; Godot is **not** selected—the prototype now serves the original-engine research as evidence and a reference implementation, not a candidate foundation. GLM reported completing the authorized read-only Stage 0 audit. A structured reconstruction of that report appears in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md); the actual audit source file was not supplied in this handoff. |
+| `godot/` | An active experimental prototype, previously described as milestone 2. Useful evidence, reusable ideas, and architectural lessons may exist; Godot is **not** selected—the prototype now serves the original-engine research as evidence and a reference implementation, not a candidate foundation. GLM reported completing the authorized read-only Stage 0 audit, which was executed directly in this repository. A structured reconstruction of that report appears in [`PROTOTYPE-INVENTORY.md`](PROTOTYPE-INVENTORY.md); the original audit record was subsequently recovered from the repository's pre-sync stash and reconciled with a first-hand verification record (PROTOTYPE-INVENTORY.md §7 — all figures matched). |
 | Existing code, tests, art, documents | Reuse selectively if they advance the new plan. Audit rather than assume compatibility. |
 | Project name `SEKTOR 7` | Placeholder to revisit in an early naming pass. |
 
