@@ -1,0 +1,212 @@
+{
+  "checks": [
+    {
+      "detail": "9 narrative flag writes, all during open city sessions; frontier-epoch flag snapshots unchanged",
+      "name": "G1 frontier never rewrites narrative state (M-07)",
+      "pass": true
+    },
+    {
+      "detail": "zero fired/rejected/superseded transitions during frontier-only epochs across 47 transitions; m05 (dead precondition) remained held through 21 frontier days, resolved only at re-entry (rejected)",
+      "name": "G2 held milestones never fire or expire (frontier)",
+      "pass": true
+    },
+    {
+      "detail": "17 fired milestones checked against their prerequisites; violations: 0",
+      "name": "G3 dependency ordering (no early dependents)",
+      "pass": true
+    },
+    {
+      "detail": "17 firings, 17 unique; every effect applied once; duplicate revalidation + repeated city epoch produced zero new firings",
+      "name": "G4 exactly-once across repeated skips/re-entries",
+      "pass": true
+    },
+    {
+      "detail": "4 rejected (precondition-dead), 1 superseded (dependency-dead); m05 fallback m05f state: fired",
+      "name": "G5 rejection and safe supersession",
+      "pass": true
+    },
+    {
+      "detail": "2 votes fired (each after grant + revalidation, effects in city session); 3 still awaiting at end",
+      "name": "G6 votes fire only after authorization (in session)",
+      "pass": true
+    },
+    {
+      "detail": "outcomes True; flags True; resolved ticks True; routine events 125803==125803; pipeline keys True",
+      "name": "G7 independent reference model agreement",
+      "pass": true
+    }
+  ],
+  "cost_curve": [
+    {
+      "active_regions": 8,
+      "elapsed_ms": 12.27,
+      "elapsed_world_days": 1.0,
+      "name": "skip_24h",
+      "routine_events": 3905,
+      "ticks": 1440,
+      "us_per_event": 3.1426
+    },
+    {
+      "active_regions": 8,
+      "elapsed_ms": 87.42,
+      "elapsed_world_days": 7.0,
+      "name": "skip_7d",
+      "routine_events": 27218,
+      "ticks": 10080,
+      "us_per_event": 3.2117
+    },
+    {
+      "active_regions": 8,
+      "elapsed_ms": 382.03,
+      "elapsed_world_days": 30.0,
+      "name": "skip_30d",
+      "routine_events": 116655,
+      "ticks": 43200,
+      "us_per_event": 3.2749
+    },
+    {
+      "active_regions": 1,
+      "elapsed_ms": 13.05,
+      "elapsed_world_days": 7.0,
+      "name": "skip_7d_quiet_1_region",
+      "routine_events": 3380,
+      "ticks": 10080,
+      "us_per_event": 3.8596
+    }
+  ],
+  "cost_vs_workload_note": "cost is reported against MEASURED event counts: 24h/7d/30d scale event count ~linearly with world time at fixed population; the 7d-quiet control holds elapsed time constant at 7 days with 1/8 of the population scheduled \u2014 its cost drops with the event count, not the elapsed time. No proportionality is claimed from the priority queue alone.",
+  "counts": {
+    "emergent_frontier_captures": 3,
+    "fired": 17,
+    "grants": 3,
+    "milestones_held_total": 16,
+    "rejected_canceled": 4,
+    "revalidations": 20,
+    "routine_events": 125803,
+    "superseded_canceled": 1,
+    "ticks_simulated": 46801,
+    "votes_entered_awaiting": 6
+  },
+  "determinism": {
+    "fingerprint": "bb85bc46a12f4490",
+    "note": "sha256 of canonical logical-state results compared across two full in-process scenario runs; timings excluded and NOT bit-identical",
+    "pass": true
+  },
+  "failures": [],
+  "meta": {
+    "authorization": "lead, 2026-10-18 \u2014 S4-lite narrative gate semantics; governance modeled as an authorization stub (no voting-system redesign)",
+    "durability_caveat": "the S1/S6-lite host-loss test (and this harness) does NOT establish durability of local emergency recovery copies \u2014 separate persistence concern",
+    "machine": {
+      "cpu_count": 96,
+      "cpu_model": "Intel(R) Xeon(R) Platinum 8268 CPU @ 2.90GHz",
+      "implementation": "CPython",
+      "machine": "x86_64",
+      "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+      "python": "3.12.3"
+    },
+    "npcs": 1000,
+    "regions": 8,
+    "run_date": "2026-10-18",
+    "seeds": {
+      "milestones": 44005,
+      "world": 1337
+    }
+  },
+  "op_log": [
+    [
+      "frontier_epoch",
+      2880
+    ],
+    [
+      "emergent_frontier",
+      "f0"
+    ],
+    [
+      "city_epoch",
+      720
+    ],
+    [
+      "grant",
+      "v00"
+    ],
+    [
+      "frontier_epoch",
+      10080
+    ],
+    [
+      "emergent_frontier",
+      "f1"
+    ],
+    [
+      "grant_frontier",
+      "v01"
+    ],
+    [
+      "city_epoch",
+      1440
+    ],
+    [
+      "duplicate_revalidation"
+    ],
+    [
+      "city_epoch",
+      1
+    ],
+    [
+      "frontier_epoch",
+      30240
+    ],
+    [
+      "emergent_frontier",
+      "f2"
+    ],
+    [
+      "grant_frontier",
+      "v02"
+    ],
+    [
+      "city_epoch",
+      1440
+    ]
+  ],
+  "outcomes": {
+    "d10": "fired",
+    "d11": "fired",
+    "d12": "superseded",
+    "d13": "fired",
+    "e0": "fired",
+    "e1": "rejected",
+    "e2": "fired",
+    "e3": "fired",
+    "m00": "fired",
+    "m01": "fired",
+    "m02": "fired",
+    "m03": "fired",
+    "m04": "fired",
+    "m05": "rejected",
+    "m05f": "fired",
+    "m06": "rejected",
+    "m07": "fired",
+    "m08": "fired",
+    "m09": "fired",
+    "v00": "fired",
+    "v01": "fired",
+    "v02": "rejected",
+    "v03": "awaiting",
+    "v04": "awaiting",
+    "v05": "awaiting"
+  },
+  "revalidation_measurements": {
+    "passes_ms": {
+      "count": 6,
+      "total_ms": 0.148,
+      "us_per_unit": 24.7078
+    },
+    "revalidated_event_count": 20
+  },
+  "scheduler_calibration": {
+    "note": "no due events at all \u2014 pure per-tick loop overhead (clock, pipeline pump, empty scans)",
+    "scheduler_us_per_tick": 0.2662,
+    "ticks": 2000
+  }
+}
