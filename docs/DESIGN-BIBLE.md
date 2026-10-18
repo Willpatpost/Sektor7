@@ -1,6 +1,6 @@
 # DESIGN BIBLE — Core Gameplay Decisions
 
-> **Status:** Gameplay design bible v0.2 · 2026-10-16 · Integrates subsequently approved roster and emergent-action decisions, and identifies the solo-design owner. No game/engine implementation authorized.
+> **Status:** Gameplay design bible v0.3 · 2026-10-18 · Integrates subsequently approved roster and emergent-action decisions, identifies the solo-design owner, and records the previously approved solo encounter-checkpoint reset principle (§8). No game/engine implementation authorized.
 >
 > **Ownership:** This document owns **gamewide and single-player gameplay requirements** for the first RPG. [`VISION.md`](VISION.md) owns product vision; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns detailed co-op governance, saving, waiting, rewards and recovery; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns architecture research; [`DECISIONS.md`](DECISIONS.md) records decisions. Do not hardcode this game's policies as general-purpose engine behavior.
 >
@@ -87,9 +87,11 @@ Core inspirations include Skyrim, Starfield, Terraria, Borderlands, Cyberpunk 20
 
 **DECIDED:** The main menu offers a single-player mode with separate world-bound characters and solo saves. Solo worlds have no campaign roster, multiplayer voting, player-host approval, or full-roster restriction. A solo player may play the authored city and procedural frontier as intended. The general classless progression, NPC mortality, narrative consequences, quest systems and movement rules also apply.
 
-**WORKING DIRECTION / OPEN DETAILS:** The RPG should support solo saving, loading, waiting/time advancement, and death/retry, but the precise solo rules are **not yet explicitly approved**. The co-op context now uses **automatic progress-based persistence with canonical-storage acknowledgment and encounter transactions** ([MULTIPLAYER-SPEC](MULTIPLAYER-SPEC.md) §8, 2026-10-17); the former autosave/quicksave/manual-save/checkpoint categories are superseded there. Do not silently transplant multiplayer acknowledgment thresholds, encounter-transaction boundaries, or governance rules to solo play. Potential shared engine primitives are a technical topic; exact solo player-facing policy will be designed here.
+**WORKING DIRECTION / OPEN DETAILS:** The RPG should support solo saving, loading, waiting/time advancement, and death/retry, but the precise solo persistence rules are **not yet explicitly approved**. The co-op context now uses **automatic progress-based persistence with canonical-storage acknowledgment and encounter transactions** ([MULTIPLAYER-SPEC](MULTIPLAYER-SPEC.md) §8, 2026-10-17); the former autosave/quicksave/manual-save/checkpoint categories are superseded there. Do not silently transplant multiplayer acknowledgment thresholds, encounter-transaction boundaries, or governance rules to solo play. Potential shared engine primitives are a technical topic; exact solo player-facing policy will be designed here.
 
-**Solo questions to resolve:** Whether solo uses the same progress-based persistence and acknowledgment model (and what acknowledges a solo milestone); death/encounter-failure semantics; safety restrictions on waiting; solo law/reputation state; whether solo choices can ever affect other independent saves (not currently planned); independent character slots; local backup and corruption recovery.
+**DECIDED (documented 2026-10-18; previously approved principle):** Solo **encounter failure** (defeat/death inside an encounter) uses the **encounter-checkpoint reset principle**, consistent with the co-op encounter transaction ([MULTIPLAYER-SPEC](MULTIPLAYER-SPEC.md) §7, M-30): pre-encounter ammunition, consumables, and equipment condition are restored; uncommitted loot is removed; use-earned skill proficiency and previously committed progress persist. **Still open:** the solo persistence and durability model — whether and how solo milestones are acknowledged and stored — plus the edge cases below.
+
+**Solo questions to resolve:** Whether solo uses the same progress-based persistence and acknowledgment model (and what acknowledges a solo milestone); non-encounter death edge cases and death outside a definable encounter; safety restrictions on waiting; solo law/reputation state; whether solo choices can ever affect other independent saves (not currently planned); independent character slots; local backup and corruption recovery.
 
 ## 9. Multiplayer boundary — linked authority
 
@@ -105,7 +107,7 @@ Core inspirations include Skyrim, Starfield, Terraria, Borderlands, Cyberpunk 20
 | **Combat** | Weapon taxonomy, hacking details, enemy/vehicle AI, stealth, combat economy, player-versus-player mechanics. |
 | **Progression** | Skill-tree catalog, exact numbers/formulas, respec rules, XP rates, perks, itemization and rarity. |
 | **World** | District/world dimensions, procedural generation technology, detailed economies, travel interfaces and environmental systems. |
-| **Multiplayer** | See the P0/P1 open decision table in `MULTIPLAYER-SPEC.md`. Do not infer final quorum, loot, host transfer technology, or save conflict policy. |
+| **Multiplayer** | See the P0/P1 open decision table in `MULTIPLAYER-SPEC.md`. Do not infer remaining ballot mechanics (counting method, ties, deadlines), loot, host transfer technology, or save conflict policy; the removal/admission/time-skip unanimity and ranked-choice thresholds are decided (M-12, M-32–M-34). |
 | **Engine technology** | Programming languages, graphics backends, renderer structure, ECS/data model, physics, scripting, editor/toolchain, asset/animation formats, networking stack. |
 | **Production/business** | Schedule, release date, production budget, hiring/outsourcing, final Steam price, engine commercialization/distribution. |
 
@@ -120,6 +122,7 @@ Core inspirations include Skyrim, Starfield, Terraria, Borderlands, Cyberpunk 20
 | Individual player/faction reputation averaged with party presence | **SUPERSEDED for multiplayer:** Single shared authored-world group reputation; details in `MULTIPLAYER-SPEC.md`. |
 | Portable character progression between unrelated multiplayer worlds | **SUPERSEDED:** World-bound multiplayer campaign characters. |
 | Only the host controls campaign choices | **SUPERSEDED:** Democratic governance; hosting is a technical role. |
+| Solo death/encounter-failure semantics left fully open | **DECIDED (2026-10-18):** encounter-checkpoint reset on solo encounter failure (resources restored, uncommitted loot removed, proficiency/committed progress kept); solo persistence/durability mechanisms remain open (§8). |
 
 ## 12. Suggested next planning order
 

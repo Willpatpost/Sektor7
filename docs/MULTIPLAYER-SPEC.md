@@ -1,6 +1,6 @@
 # MULTIPLAYER SPECIFICATION — Shared Campaigns
 
-> **Status:** Multiplayer gameplay specification v0.3 · 2026-10-17 · Incorporates the lead-ratified 2026-10-17 requirements: central hub, one authoritative session, automatic progress-based persistence with canonical-storage acknowledgment, encounter transactions, roster governance, ranked-choice story votes, shared-clock waiting, planned host handoff, and authority-loss suspension. Technical mechanisms remain research ([`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md), unapproved). Game/engine implementation is **not authorized**.
+> **Status:** Multiplayer gameplay specification v0.4 · 2026-10-18 · Incorporates the lead-ratified 2026-10-17 requirements: central hub, one authoritative session, automatic progress-based persistence with canonical-storage acknowledgment, encounter transactions, roster governance, ranked-choice story votes, shared-clock waiting, planned host handoff, and authority-loss suspension. The 2026-10-18 revision corrects §0/§9.1 recovery wording (exact mid-encounter restoration applies to still-live suspensions; terminated sessions restart at the encounter boundary from the hub), documents the previously approved voluntary-departure rule (§9.4), and removes the stale claim that asynchronous ballots are a future enhancement. Technical mechanisms remain research ([`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md), unapproved). Game/engine implementation is **not authorized**.
 >
 > **Ownership:** This file defines **the RPG's multiplayer gameplay policies**: campaign roster and access, host neutrality, votes, shared reputation, reward eligibility, saves/checkpoints, waiting/transitions, incapacitation, disconnect grace and session recovery. [`VISION.md`](VISION.md) defines the ambition; [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns general/solo mechanics; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns technical choices; [`DECISIONS.md`](DECISIONS.md) is the decision registry. A future technical `SAVE-ARCHITECTURE.md` may define snapshot implementation without changing player-facing policies here.
 >
@@ -17,13 +17,14 @@
 - **DECIDED:** The authored world has **one shared campaign reputation**, affected by actions of any participating player, not individually averaged reputation scores.
 - **DECIDED:** Quest XP and currency are granted **equally to connected, eligible group members**, irrespective of their physical location or direct participation. Quest equipment rewards are rolled **per eligible character**. In frontier sessions, **offline members receive nothing**.
 - **DECIDED:** Connected players can propose group waiting and transitions for a vote; the host gets **no special voting authority**. Deliberate time skipping requires **unanimous approval of currently connected participants**. Permanent involuntary roster removal requires unanimous approval of the **remaining registered members**, excluding the member proposed for removal. The departing member may retire voluntarily; **permanent admission requires unanimous approval by existing members**; governance votes may be cast **asynchronously**.
-- **DECIDED:** A disconnection during an authored-world session suspends that session for **15 minutes**. If unrecovered, preserve a distinct **recovery snapshot** and return to lobby. With the full roster restored, resume at the **precise suspended authoritative gameplay state**, even mid-combat, after a brief reorientation countdown.
+- **DECIDED:** A disconnection during an authored-world session suspends that session for **15 minutes**. A **still-live suspension resumes at the precise suspended authoritative gameplay state**, even mid-combat, after a brief reorientation countdown. If the window expires, the session **terminates**: a distinct **recovery snapshot** — committed durable state plus the encounter checkpoint, not an exact mid-combat scene (§1) — is preserved, connected players return to the **hub**, and a later full-roster session begins at the hub and **restarts the unfinished encounter at an appropriate encounter boundary** with committed progress intact. Exact post-termination combat reconstruction is not required.
 - **DECIDED:** Launch multiplayer **must not require developer-funded dedicated game servers or recurring hosting costs**. A player-hosted listen-server is the current **WORKING PREFERENCE**, not a selected networking implementation.
 - **WORKING PREFERENCE:** Any registered participant who has the latest valid campaign state should be able to host future sessions. **OPEN:** The safe mechanism for distributing, validating, and reconciling campaign saves across different hosts.
 - **DECIDED (2026-10-17):** Every session begins in a **central hub** providing access to the handcrafted story city and the procedural frontier. There is **one shared campaign clock** and **one authoritative session per campaign**; unverified or outdated campaign data cannot start authoritative gameplay.
 - **DECIDED (2026-10-17):** **Automatic progress-based persistence** replaces manually selected save slots, quicksaves, and arbitrary-state reloads. Meaningful character progression, completed milestones, world consequences, and frontier history persist; temporary simulation situations do not require exact restoration across terminated sessions. A milestone counts as saved only when **shared canonical storage acknowledges a complete, recoverable revision**; gameplay continues while commits are pending, the UI distinguishes pending from confirmed progress, irreversible actions depending on an unconfirmed milestone are gated until it commits, and commit retries must not duplicate rewards. Internal backups and emergency recovery data remain necessary.
 - **DECIDED (2026-10-17):** **Encounter failure** restores pre-encounter ammunition, consumables, and equipment condition; removes uncommitted loot; and preserves use-earned skill proficiency and previously committed progress.
 - **DECIDED (2026-10-17):** **Planned host handoff is required:** connected eligible players volunteer, the departing host nominates a willing successor, and that successor accepts. Seamless migration after an unexpected host crash is not a launch requirement. When an active host can no longer maintain verified authority, gameplay progression suspends and a **local emergency recovery copy** is preserved; resumption requires renewed validation.
+- **DECIDED (documented 2026-10-18; previously approved):** A participant **voluntarily departing** an authored-world session ends city play for the group: remaining players return to the hub, the unfinished encounter resets under the party-wipe resource rules (§7, §9.4), committed progress and use-earned skill proficiency persist, and **no unexpected-disconnect grace applies**. This is distinct from a planned host handoff, which transfers the technical hosting role while the session continues.
 
 **Not launch requirements:** Large-population shared online servers, MMO-like open-world concurrency, and PvP modes (e.g. team deathmatch, FFA, CTF) are **future ambitions only**. A seamless live host migration system is not currently a launch commitment.
 
@@ -39,7 +40,7 @@
 | **Procedural frontier** | Separately accessible procedurally generated exploration/farming/mission environment with its own persistent consequences. |
 | **World-bound character** | A character belonging to one single-player world or multiplayer campaign, not imported into unrelated worlds. |
 | **Full roster** | Every registered campaign participant currently connected, subject to explicit short disconnection recovery rules. |
-| **Recovery snapshot** | Special resumable simulation checkpoint for an interrupted authored-world session; separate from ordinary save slots. |
+| **Recovery snapshot** | The state preserved for an interrupted authored-world session after its recovery window expires: committed durable progress plus the appropriate encounter checkpoint for restarting the unfinished encounter. It is **not** an exact mid-combat restoration — exact scene resumption applies only within a still-live suspension (§9.1). |
 
 **Engine/product distinction:** The original creation engine should expose reusable identity, authority, serialization, voting, and networking primitives where appropriate. Rules such as *full-roster authored-city access* and *equal quest XP* are policies of **this game**, not universal requirements for every game built with the engine.
 
@@ -78,7 +79,7 @@ Main menu
 - **DECIDED:** Hosting is a technical service. The current host has no casting bonus or unilateral story control.
 - **WORKING PREFERENCE:** Any eligible registered member can host the shared campaign using its newest valid authoritative save.
 - **DECIDED (2026-10-17):** **Only one session may authoritatively advance a campaign at a time.** Any eligible registered member may host a subsequent session using **verified current campaign data**; unverified or outdated data cannot start authoritative gameplay.
-- **DECIDED (2026-10-17):** **Planned host handoff** (connected eligible players volunteer → departing host nominates a willing successor → successor accepts) is required for an in-session transfer of authority; the technical mechanism is research.
+- **DECIDED (2026-10-17):** **Planned host handoff** (connected eligible players volunteer → departing host nominates a willing successor → successor accepts) is required for an in-session transfer of authority; the technical mechanism is research. A handoff transfers the **hosting role** while the session and its participants continue; a participant **leaving play** in the authored city is a different event — a voluntary departure governed by §9.4.
 - **DECIDED constraint:** No developer-funded dedicated-server fleet or recurring game-server hosting budget for launch. Existing third-party connectivity services may be researched for terms, availability, and cost.
 - **WORKING PREFERENCE:** Player-hosted listen-server with session authority on the host machine; transport, lobby, NAT traversal, relay, authentication, and engine API are **OPEN**.
 - **SUPERSEDED:** A permanent host who alone owns all story decisions/saves/transitions; a permanent requirement that every member be online for **all** gameplay.
@@ -156,7 +157,7 @@ Main menu
 
 - **DECIDED:** A frontier participant suffering an unexpected disconnect has approximately **10 minutes** of reconnection/reward-protection grace. A quest that resolves while the participant is protected may retain their reward entitlement; rejoining restores appropriate state.
 - **DECIDED:** Authored-world unexpected disconnects use the distinct **15-minute session suspension** policy (§9), rather than continuing the major fight while the full roster is absent.
-- **OPEN:** Precise eligibility at the moment a player joins, leaves intentionally, disconnects just as a quest completes, swaps characters, or loses the ability to rejoin. Deliberate departures should not be silently treated as indefinite protected disconnects.
+- **OPEN:** Precise eligibility at the moment a player joins, disconnects just as a quest completes, swaps characters, or loses the ability to rejoin. Deliberate departures are governed by §9.4 and are not protected disconnects.
 - **OPEN:** Whether an inactive character in the same campaign receives anything when its player selects a different character. No reward duplication between character slots is assumed.
 
 ### 6.3 Reward reroll protection
@@ -204,18 +205,18 @@ Main menu
 - **RESEARCH (unapproved):** Candidate mechanisms — content-addressed revisions, immutable snapshot IDs, generation counters, signatures/checksums, peer exchange, replicated backups, third-party-assisted canonical storage — are analyzed in [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md). **Fail-closed policy:** no authoritative progression on unverified data; divergent histories are never silently merged.
 - **Do not claim** that local player-hosted sessions without always-online coordination can absolutely prevent two isolated users from producing divergent progress. Define safe detection and handling instead.
 
-## 9. Unexpected disconnections and exact-state recovery
+## 9. Unexpected disconnections, recovery, and voluntary departure
 
 ### 9.1 Authored world — DECIDED
 
 1. If a registered player disconnects unexpectedly, **suspend the authoritative story-world simulation** and freeze the active session, including mid-encounter.
 2. Start a **15-minute reconnection window**. The group remains suspended; the disconnected participant can rejoin their campaign-bound character.
 3. If they reconnect in time, resynchronize everyone, present a brief restart countdown, and **resume from the frozen game state**.
-4. If the window expires, preserve a distinct, consistent **recovery snapshot**, then return connected players to the multiplayer lobby.
-5. Once the **entire registered roster** is present again, resume that campaign from the emergency recovery copy. Within a still-live suspension, resume at the **exact suspended authoritative logical moment**; after session termination, resume at the **encounter boundary** — temporary simulation situations do not require exact restoration across terminated sessions (2026-10-17).
+4. If the window expires, preserve a distinct, consistent **recovery snapshot** — committed durable state plus the appropriate encounter checkpoint, not an exact mid-combat scene (§1) — then return connected players to the hub; the next full-roster session begins at the central hub (M-27).
+5. Once the **entire registered roster** is present again, resume that campaign from the preserved **recovery snapshot** (§1). Within a still-live suspension, resume at the **exact suspended authoritative logical moment**; after session termination, resume at the **encounter boundary** — temporary simulation situations do not require exact restoration across terminated sessions (2026-10-17).
 6. Encounter-boundary resumption is the terminated-session default; encounter-restart options are encounter-policy questions, not save-policy ones.
 
-**State fidelity requirement:** Preserve enough authoritative information to reconstruct player/entity transforms, health, incapacitation, active projectiles, attack timing and cooldowns, buffs/status, relevant physics state, NPC AI state, encounter phase, quest flags, random state or equivalent, pending events, and other gameplay-critical facts. Purely cosmetic transient effects may be reconstructed rather than byte-identically frozen, provided the observable play state is preserved. Exact serialization architecture is **OPEN**.
+**State fidelity requirement (still-live suspensions):** Within the 15-minute window, preserve enough authoritative information to reconstruct player/entity transforms, health, incapacitation, active projectiles, attack timing and cooldowns, buffs/status, relevant physics state, NPC AI state, encounter phase, quest flags, random state or equivalent, pending events, and other gameplay-critical facts. Purely cosmetic transient effects may be reconstructed rather than byte-identically frozen, provided the observable play state is preserved. **After termination, exact combat reconstruction is not required:** the recovery snapshot preserves committed progress and the encounter-boundary state needed to restart the unfinished encounter; new sessions begin at the hub (M-27). Exact serialization architecture is **OPEN**.
 
 **Snapshot timing:** If possible, capture a consistent state at suspension and safeguard it; do not rely solely on the end-of-window write surviving crashes. This is an **engineering recommendation**, not an established implementation.
 
@@ -231,12 +232,22 @@ Main menu
 - An **unexpected host crash** cannot guarantee a snapshot created *after* the crash. Research ongoing durable snapshots, replication to peers, graceful host exit, and recovery from the most recent safely preserved authoritative state.
 - Seamless live host migration is **not decided for launch**. Do not imply that rotating hosts between sessions solves a crash while the simulation is running.
 
+### 9.4 Voluntary departure from an authored-world session — DECIDED (documented 2026-10-18; previously approved)
+
+- A registered participant may **deliberately leave** an in-progress authored-world session. Because the authored city requires the full registered roster, the departure ends authored-city play for the group.
+- Remaining connected players **return to the hub**; from there they may continue in the procedural frontier under the ordinary subset rule (§3.2), or end the session.
+- The **unfinished encounter resets using the party-wipe resource rules** (§7): pre-encounter ammunition, consumables, and equipment condition are restored; uncommitted loot is removed; use-earned skill proficiency and previously committed progress persist.
+- **No unexpected-disconnect grace applies.** A deliberate departure is not a protected disconnect: it does not trigger the 15-minute suspension, does not confer reward protection, and must not be treated as an indefinite grace case (cf. §6.2).
+- **Distinct from planned host handoff (§2.3, M-31):** a handoff transfers the technical hosting role while the session continues with the same participants; a voluntary departure removes a participant from play and ends the authored-city session for the group.
+- **Departing host (settled 2026-10-18):** when the departing participant is the active host, the group **attempts the approved planned handoff** if an eligible successor is available (§2.3, M-31); if the host actually leaves the handcrafted city, the remaining participants return to the hub under this section's rules.
+- **OPEN:** How the system reliably distinguishes a deliberate departure from an unexpected disconnect (confirmation UX, anti-gaming), and **technical failure handling** when a handoff attempt fails mid-transfer (recovery path per §9.3 remains research).
+
 ## 10. Later expansions — not launch obligations
 
 - Larger shared servers with unrelated players present in the same open world (Destiny-/GTA Online-like social presence) may be revisited after dedicated infrastructure becomes acceptable.
 - PvP playlists such as team deathmatch, free-for-all, capture the flag, or other modes may come later.
 - A public reusable-engine networking framework may support multiple authority models beyond the first RPG's listen-server preference.
-- Sophisticated live host migration, asynchronous off-session voting, and encounter restart-by-vote are candidate enhancements, not currently committed launch features.
+- Sophisticated live (crash-time) host migration and encounter restart-by-vote are candidate enhancements, not currently committed launch features. **Asynchronous governance ballots are ratified** (M-32): ballots may be cast while other members are offline; only their collection windows and notification mechanics remain open.
 
 ## 11. Priority open questions — do **not** silently settle these
 
@@ -292,14 +303,15 @@ Main menu
 7. All but one participant are downed; the remaining participant can revive them. Full-party down triggers the encounter-failure rollback: pre-encounter resources restored, uncommitted loot removed, use-earned proficiency kept.
 8. A player loses connection mid-boss fight. The authored world freezes; on reconnect within 15 minutes it resumes after countdown without an encounter reset.
 9. The same incident exceeds 15 minutes; a separate emergency recovery copy is created and the group returns to hub. When all rejoin, the terminated session resumes at the encounter boundary and committed milestones remain intact.
-10. A campaign revision hosted by one member can later be opened by another *only if* the state is complete and known-valid; contradictory revisions are not silently merged.
-11. A randomized quest reward does not trivially change merely by reloading immediately before an ordinary reward hand-in (final mechanism open).
-12. Existing code/prototypes are read-only evidence, not authority over any of the above design rules.
+10. A registered member deliberately leaves mid-encounter in the authored city. Remaining players return to the hub; the unfinished encounter resets under the party-wipe resource rules; committed progress and use-earned skill proficiency persist; no disconnect grace or reward protection applies; no host handoff is involved.
+11. A campaign revision hosted by one member can later be opened by another *only if* the state is complete and known-valid; contradictory revisions are not silently merged.
+12. A randomized quest reward does not trivially change merely by reloading immediately before an ordinary reward hand-in (final mechanism open).
+13. Existing code/prototypes are read-only evidence, not authority over any of the above design rules.
 
 ## 14. Maintainer and AI-agent handoff
 
 - Use this document as the source of truth for multiplayer gameplay behavior and keep cross-document summaries brief. See [`DECISIONS.md`](DECISIONS.md) for the canonical registry.
-- Do not reopen ratified positions—including the full-roster authored-world rule, frontier partial-roster play, shared reputation, 15-minute exact-state authored recovery, ten-minute frontier grace, and unanimous remaining-member removal—without the project lead's direction.
+- Do not reopen ratified positions—including the full-roster authored-world rule, frontier partial-roster play, shared reputation, the 15-minute authored-world suspension (exact resume within a live suspension; encounter-boundary restart after termination), the voluntary-departure rules (§9.4), ten-minute frontier grace, and the unanimity rules for removal, admission, and deliberate time skipping—without the project lead's direction.
 - Important open research: save distribution and conflict detection for rotating hosts, snapshot/rewind correctness, host-crash recovery, vote details, and session security. Do not invent working solutions or silently select a networking technology.
 - Design/test proposals must distinguish game-specific policy from reusable engine primitives. No code/saves/assets modifications are authorized by this document.
 

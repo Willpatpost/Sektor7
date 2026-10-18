@@ -1,6 +1,6 @@
 # DECISIONS — Canonical Project Decision Registry
 
-> **Status:** Consolidated decision registry v0.2 · 2026-10-17. Incorporates the lead-ratified 2026-10-17 multiplayer round (M-27–M-35; M-11/15/17/18/21/23 modified) per the update protocol in §7. No engine/game implementation authorized.
+> **Status:** Consolidated decision registry v0.3 · 2026-10-18. Incorporates the lead-ratified 2026-10-17 multiplayer round (M-27–M-35; M-11/15/17/18/21/23 modified) and the 2026-10-18 documentation-reconciliation round (M-36 and G-12 recorded; M-21 consolidated into M-31) per the update protocol in §7. No engine/game implementation authorized.
 >
 > **Ownership:** This is the **single index of decisions, preferences, hypotheses, supersessions and unresolved approvals**. Detailed requirement wording lives in [`VISION.md`](VISION.md), [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md), [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) and [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md). If conflicts arise, preserve evidence and return to the lead; do not silently declare a new winner.
 >
@@ -36,8 +36,9 @@
 | G-07 | DECIDED | Player decisions have lasting consequences; meaningful redemption possible; certain events are irreparable | [DESIGN BIBLE](DESIGN-BIBLE.md) |
 | G-08 | DECIDED | Most NPCs (including many story-important ones) killable; some deliberately protected; quests adapt/fail where appropriate | [DESIGN BIBLE](DESIGN-BIBLE.md) |
 | G-09 | DECIDED | Single-player campaigns/world-bound characters separate from multiplayer; no co-op roster/voting requirements in solo mode | [DESIGN BIBLE](DESIGN-BIBLE.md) |
-| G-10 | OPEN DECISION | Detailed solo death/reload, waiting and reputation/save rules; exact Borderlands influence | [DESIGN BIBLE](DESIGN-BIBLE.md) |
+| G-10 | OPEN DECISION (narrowed 2026-10-18) | Solo persistence/durability and acknowledgment model, waiting, reputation, non-encounter death edge cases; exact Borderlands influence. Solo encounter-failure reset is decided (G-12) | [DESIGN BIBLE](DESIGN-BIBLE.md) |
 | G-11 | OPEN DECISION | Combat math, NPC lives/economy/law, exact world size, progression rates, equipment catalog, quest/story content | [DESIGN BIBLE](DESIGN-BIBLE.md) |
+| G-12 | DECIDED (documented 2026-10-18; previously approved) | Solo encounter failure uses the encounter-checkpoint reset principle, consistent with M-30: restore pre-encounter resources, remove uncommitted loot, preserve use-earned proficiency and committed progress | [DESIGN BIBLE](DESIGN-BIBLE.md) |
 
 ## 3. Multiplayer and campaign governance
 
@@ -63,7 +64,7 @@
 | M-18 | DECIDED (modified 2026-10-17) | Authored-world disconnect: freeze session up to 15 minutes; live suspensions may resume at the exact logical moment; terminated sessions resume at the encounter boundary | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-19 | DECIDED | Frontier unexpected disconnect: roughly 10-minute reconnect/reward protection; other players may keep playing | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-20 | DECIDED | Quest reward system should resist trivial reload rerolls; mechanism open | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
-| M-21 | DECIDED (modified 2026-10-17) | Planned host handoff required (volunteer → nominate → accept); seamless migration after an unexpected crash is not a launch requirement | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
+| M-21 | DECIDED (consolidated into M-31, 2026-10-18) | Planned host handoff — full ratified statement lives in M-31; see also the voluntary-departure distinction (M-36) | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-22 | OPEN DECISION | Exact save divergence prevention/detection/recovery, world+character rollback semantics, crash consistency | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-23 | OPEN DECISION (narrowed 2026-10-17) | Remaining ballot mechanics: counting method, ties, deadlines, AFK/reconnection ballots. Resolved: removal unanimity (M-12), admission unanimity (M-32), ranked-choice confirmed (M-33), time-skip unanimity (M-34) | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-24 | PROPOSAL | Platform-independent stable account identity bound to roster/characters (implementation TBD); multiple characters per member | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
@@ -78,6 +79,7 @@
 | M-33 | DECIDED (2026-10-17) | Ranked-choice voting for major narrative decisions with all registered members participating | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-34 | DECIDED (2026-10-17) | Deliberate time skipping requires unanimous approval of currently connected participants | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 | M-35 | DECIDED (2026-10-17) | Fail-closed authority policy: no provisional authoritative progression, no automatic divergent-history merging, no silently weakened durability guarantees | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
+| M-36 | DECIDED (documented 2026-10-18; previously approved; host sequence settled 2026-10-18) | Voluntary departure from an authored-world session: remaining players return to the hub; unfinished encounter resets under party-wipe resource rules (M-30); committed progress and skill proficiency persist; no disconnect grace applies; distinct from planned host handoff (M-31). Departing host: attempt planned handoff first when an eligible successor is available; actual city departure returns the remaining participants to the hub | [MULTIPLAYER](MULTIPLAYER-SPEC.md) |
 
 ## 4. Engineering evidence and constraints
 
@@ -104,7 +106,7 @@
 
 **P1 — Design-detail decisions**
 
-6. Define exact solo saves, death and wait behavior in the design bible.
+6. Define the solo persistence/durability model, waiting, and non-encounter death edge cases in the design bible (encounter-failure reset is decided — G-12).
 7. Choose the relationship between formal voted narrative branches and free emergent actions, including UX of irreversible consequences; core freedom to attack remains decided.
 8. Specify world drops, reward eligibility on frontier reconnect/late join, optional character slots, party scaling across unequal levels, friendly fire, trading and basic anti-grief mechanisms.
 9. Clarify whether frontier economic side effects beyond character gear/money reach authored services; major story and reputation protection is already decided.
@@ -133,5 +135,7 @@
 For an approved change, record the date, user authorization, decision ID, the superseded prior state, why the change was made, and update the **owning document** in the same revision. Retain superseded decision history, including originally competing AI recommendations where materially relevant. Do not create an independent duplicate ledger in VISION or the design bible.
 
 **Change log:** 2026-10-17 — lead-ratified round 3 incorporated (authorization: lead review message, "update the approved gameplay documentation and central DECISIONS registry"). Added M-27–M-35; modified M-11/15/17/18/21/23; supersessions recorded in §6. Architecture hypotheses remain unapproved: the member-replicated "Architecture D" from the v0.1 study was explicitly NOT approved by the lead; the revised research direction is in [MULTIPLAYER-ARCHITECTURE-RESEARCH.md](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) v0.2.
+
+**Change log:** 2026-10-18 — documentation-reconciliation round (authorization: lead directive — "corrections reflecting previous approval, not new product decisions"), incorporating ChatGPT's independent full-archive review. No product decision changed: M-36 and G-12 record previously approved rules now documented; M-21 consolidated into M-31 (duplicate wording); G-10 and P1-6 narrowed. Owning-document corrections: VISION v0.8 (§4.2 open-list refresh; §10 recovery summary corrected to live-suspension-exact/termination-at-encounter-boundary), MULTIPLAYER-SPEC v0.4 (§0/§9.1 recovery wording scoped to still-live suspensions; §9.4 voluntary departure added; §10 async-ballot future-enhancement claim removed), DESIGN-BIBLE v0.3 (§8 solo encounter-checkpoint reset), README v0.2 (provenance refresh, reading order, boundaries), CUSTOM-ENGINE-RESEARCH v0.4 (§6 host-handoff wording aligned with M-31). SIMULATION-ARCHITECTURE-RESEARCH revised to v0.2 per the lead's research corrections — still UNAPPROVED. Review precision pass (same date, three-way-review authorization): recovery-snapshot semantics fixed to committed durable state + encounter checkpoint (VISION §10, SPEC §1/§0/§9.1); simulation pending-delta survival across LOD deactivation with exactly-once reactivation specified (SIM §3–§4, I1, S6); voluntary host-departure sequence recorded as settled (M-36).
 
 **A design proposal in an AI chat is not authorization to edit production code.** Every new research spike/implementation milestone requires its own express approval.

@@ -1,6 +1,6 @@
 # SIMULATION-ARCHITECTURE-RESEARCH — Living-World Simulation for the Original Engine
 
-> **Status:** Research study v0.1 · 2026-10-17 · **UNAPPROVED RESEARCH for three-way review.** No simulation code exists or is authorized; no ECS framework, programming language, storage format, or engine backend is selected; no ratified requirement is changed by this file.
+> **Status:** Research study v0.2 · 2026-10-18 · **UNAPPROVED RESEARCH for three-way review.** v0.2 incorporates the lead-directed corrections after ChatGPT's independent full-archive review: live authoritative state composition (committed + pending + provisional — §3) with asynchronous commit acknowledgment; deterministic replay scoped to represented events vs. labeled plausibility synthesis (§4, §6); memory–reputation decoupling (§5, I8); four-lane event classification with held-event revalidation (§6); S7 acceptance revised to predictable (not mandated-sublinear) scaling (§10); unsupported project-evidence claims corrected (§3). No simulation code exists or is authorized; no ECS framework, programming language, storage format, or engine backend is selected; no ratified requirement is changed by this file.
 >
 > **Ownership:** Research and analysis of the engine's **living-world simulation subsystem** — simulation models, level-of-detail (LOD), persistent-NPC state, shared chronology, scheduling, streaming/multiplayer interaction, and experiments. It **defers** to: [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) (gameplay rules — encounters, NPC mortality, quest systems), [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) (player-facing multiplayer policy), [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) (the canonical state taxonomy, commit pipeline, and session authority — consumed here, never redefined), [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) (research methodology; this study expands its domain 4), and [`DECISIONS.md`](DECISIONS.md) (the registry — nothing here is ratified).
 >
@@ -27,14 +27,14 @@ Ratified anchors this study must respect (never modify):
 | One authoritative session; host runs the sim (M-28) | Simulation is single-writer on the host; guests replicate — no co-simulation |
 | Progress-based persistence, canonical acknowledgment, encounter transactions (M-29/M-30) | Simulation durable deltas ride the existing commit pipeline; encounter-local state is provisional |
 | Frontier consequences must not rewrite authored-city major narrative state (M-07) | **Narrative gating** under clock advance (§6) |
-| Shared campaign reputation; NPC-specific memories allowed (M-08, SPEC §4) | NPC memory model must feed a single shared reputation |
+| Shared campaign reputation; NPC-specific memories allowed (M-08, SPEC §4) | NPC memory model must not create a second reputation; reputation-relevant events feed the single shared score (§5, I8) |
 | Emergent acts individually actionable; most NPCs killable (M-13, G-08) | Deaths are permanent identity-level events with world consequences |
 | Deliberate time-skip = unanimous connected vote (M-34) | Time-skip is an event-queue fast-forward, not a special code path |
 | Deterministic/data-oriented/event-driven simulation is E-03 **WORKING HYPOTHESIS** | Determinism is assumed *useful, unproven* — S5 must test it |
 
 ## 2. Executive summary
 
-**Recommended research direction [HYPOTHESIS]: a tiered hybrid simulation.** A single **event-driven spine** owns the world clock and all time advancement (the RCT trick: sleeping or far-away things cost nothing until something happens). **Data-oriented batch systems** own continuous near-field simulation (movement, combat-adjacent state, crowds) where cache-friendly throughput is the efficiency summit. **Cognitive facades** — rich per-NPC behavior objects for authored/story NPCs — sit *on top of* the data layer as readers/writers, never as the storage substrate. All durable state lives in a **canonical persistent store** (the multiplayer study's model); every active representation (calendar, components, facade) is a **rebuildable projection** of that store. The two hazards this architecture must prove safe are **LOD transitions** (no visible pop, no lost history, no implausible behavior — §4) and **shared-clock narrative gating** (frontier time cannot fire authored-city irreversible events — §6).
+**Recommended research direction [HYPOTHESIS]: a tiered hybrid simulation.** A single **event-driven spine** owns the world clock and all time advancement (the RCT trick: sleeping or far-away things cost nothing until something happens). **Data-oriented batch systems** own continuous near-field simulation (movement, combat-adjacent state, crowds) where cache-friendly throughput is the efficiency summit. **Cognitive facades** — rich per-NPC behavior objects for authored/story NPCs — sit *on top of* the data layer as readers/writers, never as the storage substrate. All durable state lives in a **canonical persistent store** (the multiplayer study's model); every active representation (calendar, components, facade) is a **rebuildable projection** of that store. The host's **live authoritative state** additionally contains pending/unconfirmed deltas and provisional encounter state (§3); LOD transitions capture durable deltas locally and never wait on remote commits. The two hazards this architecture must prove safe are **LOD transitions** (no visible pop, no lost history, no implausible behavior — §4) and **shared-clock narrative gating** (frontier time cannot fire authored-city irreversible events — §6).
 
 ## 3. Simulation model comparison (Q1) — and how the models coexist
 
@@ -89,9 +89,12 @@ Ratified anchors this study must respect (never modify):
 | `Region.activate()` / `Region.deactivate()` | LOD transitions per §4 contracts |
 | `NpcStore.get(id)` / `.commit_durable(deltas)` | Read canonical record; durable deltas ride the existing commit pipeline (never bypassed) |
 | `SystemTick.run(region, lod, budget)` | Batch system execution with per-tick time budget; budget overruns are *measured*, never silently dropped |
-| `GateKeeper.evaluate(event)` | Returns fire / hold for irreversible authored-city events based on session scope |
+| `GateKeeper.evaluate(event)` | Returns fire / hold per the four-lane classification (§6), based on session scope |
+| `GateKeeper.revalidate(held_event)` | On gate opening: re-check preconditions, trigger context, and classification before presentation — never blind-fire |
 
-**[PROJECT EVIDENCE]:** the godot prototype demonstrated both halves of this direction in miniature — MultiMesh batching (1,265 prop instances in ~a dozen draw calls) shows data-oriented throughput working in this project's context, and deterministic seeded generation (seed 1337, count-asserting tests) shows reproducible simulation working (PROTOTYPE-INVENTORY §4). Neither proves the tiered architecture; both are supporting evidence.
+**Live authoritative state composition [HYPOTHESIS]:** the host's live authoritative state is the canonical persistent store's **committed data** (last acknowledged revisions, T3) **plus pending/unconfirmed durable deltas** (locally captured, idempotently keyed, awaiting canonical acknowledgment — T1/T2) **plus provisional encounter-transaction state** (the M-30 lane) **plus temporary simulation state** (never restored across terminated sessions). All active representations are projections of this live state. **Safe activation/deactivation without synchronous remote commits:** at deactivation, every durable delta is *captured into the commit pipeline* — a local, idempotent append — and only then is the representation discarded; canonical acknowledgment proceeds asynchronously and **never blocks an LOD transition**. **Pending changes survive LOD deactivation in the active authoritative session:** captured deltas live in the pipeline's local record, not in the discarded representation, and are re-read at reactivation — deactivation never loses a still-unacknowledged change while the session lives. They remain **authoritative-live but not canonical**: pending deltas may shape subsequent simulation, yet they are never misrepresented as T3-confirmed progress (M-29/M-35); if the host is lost, unacknowledged pending work may be lost with it — the durability tier the ratified model already assigns to it. **Reactivation applies each pending change exactly once:** every delta carries an idempotency key, and re-encountering a key already reflected in the live state is a no-op (the applied-key ledger discipline consumed from MULTIPLAYER-ARCHITECTURE-RESEARCH §3). Consequences are never lost *silently*: capture is local and synchronous; confirmation is remote and asynchronous.
+
+**[PROJECT EVIDENCE — scope corrected 2026-10-18]:** the godot prototype offers supporting evidence at the *rendering-submission and world-generation* level only. MultiMesh batching coalesced 1,265 prop instances into batched draw submissions — the actual draw-call count was **not measured** (PROTOTYPE-INVENTORY §3 lists draw calls as needing proof). Deterministic seeded **world generation** (seed 1337) with count-asserting tests demonstrates reproducible *generation*, not deterministic **NPC simulation** (E-03 remains unproven) and not data-oriented agent throughput. Neither demonstrates the tiered architecture; both are supporting evidence within their measured scope.
 
 ## 4. Simulation level-of-detail and the transition model (Q2, Deliverable 4)
 
@@ -105,19 +108,19 @@ Four levels (the lead's taxonomy, formalized):
 | **Dormant** | Canonical record + `next_event` timestamp; nothing scheduled sooner | Long-unvisited regions; interiors never entered | ≈ storage only |
 
 **Activation (toward full) — the transition contract [HYPOTHESIS]:**
-1. **Durable base:** load the canonical record (last committed state).
-2. **Catch-up:** fast-forward to *now* by **deterministic replay** of the entity's event/schedule history from the last committed point. This is where determinism pays: replay reproduces what continuous simulation would have produced.
-3. **Bounded catch-up [ASSUMPTION]:** if the dormancy window exceeds a replay budget, fall back to **plausibility synthesis** — derive a coherent present state from schedule + travel times + variability seeds ("where *would* Mara be at 14:37?"), and mark the entity's micro-history as synthesized.
+1. **Durable base:** load the **live authoritative record** — last committed state **plus captured-but-unacknowledged pending deltas** (§3), plus any active encounter-transaction state if the region is within one. Pending deltas re-apply exactly once via their idempotency keys.
+2. **Catch-up:** fast-forward to *now* by **deterministic replay of the entity's represented history** — recorded events, schedule commitments, and committed deltas from the last committed point. Replay reproduces only what was **actually represented**; it does not invent the micro-events of dormant or simplified spans. This is where determinism pays: the recorded event history replays exactly.
+3. **Bounded catch-up [ASSUMPTION]:** if the dormancy window exceeds a replay budget, fall back to **plausibility synthesis** — derive a coherent present state from schedule + travel times + variability seeds ("where *would* Mara be at 14:37?"), and mark the entity's micro-history as synthesized. **Synthesized spans are labeled and never claimed as exact historical record** — exactness is claimed only where a complete recorded event history exists (see §6's determinism scope).
 4. **Stitch:** place full-detail state consistent with the coarse trajectory that any simplified-level observer saw (no visible pop); hand off to facades/batches.
 
-**Deactivation (toward dormant):** flush all **durable deltas** through the commit pipeline (I1 below — nothing consequential is lost), stamp `next_event`, discard the representation (it is rebuildable by construction).
+**Deactivation (toward dormant):** **capture** all durable deltas into the commit pipeline (I1 below — local idempotent append; canonical acknowledgment is asynchronous and never blocks the transition), stamp `next_event`, discard the representation — it is rebuildable by construction, **and its pending deltas survive in the pipeline's local record for the next activation** (§3).
 
 **The three named risks and their mitigations:**
 
 | Risk | Mitigation |
 |---|---|
 | Visible inconsistencies (pop, teleporting NPCs) | Stitch step (4); simplified-level trajectories are *constraints* the activated state must satisfy; hysteresis bands prevent LOD thrashing at boundaries |
-| Lost history | Only reconstructible state is discarded; everything durable went through the commit pipeline before deactivation (auditable invariant I1) |
+| Lost history | Only reconstructible state is discarded; everything durable was captured into the commit pipeline before deactivation (auditable invariant I1; acknowledgment is asynchronous) |
 | Implausible behavior (NPC frozen in last week's task) | Catch-up replay or plausibility synthesis *always* advances the entity to the current clock; an activation that cannot produce a coherent present state fails closed to a fallback anchor (home/last known location) rather than presenting stale state |
 
 **Transition correctness is the load-bearing claim of this whole study** — S6 (§10) exists to fuzz it.
@@ -131,7 +134,7 @@ Four levels (the lead's taxonomy, formalized):
 | **Identity** | Stable NPC ID (never reused — permanent deaths, M-13/G-08); name; appearance seed; home; faction memberships | **Always** |
 | **Schedule** | Recurring + one-off commitments (work, sleep, travel, leisure) with variability seeds | **Always** (it is authored/durable content + committed one-offs) |
 | **Relationships** | Typed, weighted edges to NPCs/factions/players + their history | **Always** (world consequences) |
-| **Episodic memory** | Witnessed events, player interactions, crimes seen — the inputs to NPC-specific memories (SPEC §4) and the **single shared campaign reputation** (M-08) | **Always** (this is the "NPCs remember you" surface) |
+| **Episodic memory** | Witnessed events, player interactions, crimes seen — the inputs to NPC-specific memories and behavior (SPEC §4). **Retention depth is [OPEN]** (§11.3). Not every personal memory must alter the shared reputation: only events classified as **reputation-relevant** feed the single shared campaign reputation (M-08); which classes qualify is game policy **[OPEN]**. NPC-local memories shape dialogue/behavior without creating a second reputation score | **Always** (this is the "NPCs remember you" surface) |
 | **Personal state** | Health/injury, possessions, economy position | **Durable when consequential** (injuries, ownership); routine vitals reconstructible |
 | **Location** | Last **committed** location | Committed location persists; micro-movement is reconstructible |
 | **Routine state** | Current task, hunger, mood, micro-position | **Reconstructible** — derived from schedule + clock on activation |
@@ -147,7 +150,7 @@ Four levels (the lead's taxonomy, formalized):
 | A quiet week | Dormant/event | Calendar advances; she wakes only for scheduled commitments (≈ tens of events/week [ASSUMPTION]) | One-offs committed; routine state derived on demand |
 | Player enters her district | Full | Activation: catch-up replay to now; she's hauling crates on the pier | Nothing new yet |
 | Player steals from her employer **in her view** | Full | Encounter: witnessing → episodic memory entry, relationship delta to the player, contribution to **shared campaign reputation** (M-08), faction consequence flag | All four committed as durable deltas (world consequences) |
-| Players leave | Full → dormant | Facade discarded; deltas flushed; `next_event` = end of shift | The memory and reputation changes *must* survive (I1) |
+| Players leave | Full → dormant | Facade discarded; deltas captured into the pipeline (pending until acknowledged); `next_event` = end of shift | The memory and reputation changes *must* survive (I1 — pending-live through deactivation, never lost) |
 | Next visit, days later | Activation | Catch-up: her schedule adapted (avoidance behavior from the memory), tells dockside rumors referencing the theft | New one-off schedule entries committed |
 | A rival kills her (emergent, M-13) | Full | Death: identity tombstoned — **permanent**; schedule cancelled; relationships produce grief/consequences in others; quests adapt per DESIGN-BIBLE §6 succession patterns | Tombstone + all consequence records committed; she is never reused (I6) |
 
@@ -157,11 +160,18 @@ Four levels (the lead's taxonomy, formalized):
 
 **Players in different regions:** each region's LOD follows *its* observers; the clock is shared, so a frontier player's 20:00 is the city's 20:00. Cross-region consistency is anchored by the shared clock + canonical store, not by region-local time.
 
-**Clock advance during frontier-only activity (the ratified boundary, M-07/M-29):** while only frontier sessions are active, the authored city runs in **event/simplified mode** whose outputs are limited to *routine, reversible* city state (schedules ticking, weather, ambient economy drift within bands **[OPEN — see §11]**). **Irreversible authored-city narrative milestones are gated events**: the Narrative Gate Keeper holds them (they do not fire, expire, or silently expire) until a full-roster authored-city session (or a governance action) opens the gate. When players re-enter the city, **held events present themselves** — the world delivers what was pending rather than having silently resolved it. This is the mechanism that makes "frontier time must not independently trigger major authored-city narrative events" enforceable rather than aspirational. [HYPOTHESIS]
+**Clock advance during frontier-only activity (the ratified boundary, M-07/M-29):** while only frontier sessions are active, the authored city runs in **event/simplified mode**. The Gate Keeper classifies city-side activity into four distinct lanes **[HYPOTHESIS]**:
+
+1. **Story milestone gates** — irreversible authored narrative milestones. **Held** (they do not fire, expire, or silently resolve) until a full-roster authored-city session (or a governance action) opens the gate.
+2. **Formal voting requirements** — major branching decisions resolved by ranked-choice vote with all registered members participating (M-33). A governance lane, not a simulation gate: the simulation presents the decision point; the ballot resolves it.
+3. **Ordinary reversible routines** — schedules ticking, weather, ambient economy drift within bands **[OPEN — see §11]**. These run freely during frontier-only epochs.
+4. **Emergent irreversible NPC/world consequences** — permanent NPC deaths, relationship ruptures, property consequences arising from ordinary emergent play (M-13). Within a legitimate session they commit immediately through the durable pipeline and are **not** vote-gated; authored-city-side irreversible consequences of this kind are held with the story milestones during frontier-only epochs rather than silently firing.
+
+**Held events are revalidated before execution, never blindly fired on city re-entry:** when the gate opens, each held event's preconditions, trigger context, and classification are re-checked against the current world state (and governance where applicable) before it presents itself — the world delivers what was pending, after confirming it is still coherent to deliver. This is the mechanism that makes "frontier time must not independently trigger major authored-city narrative events" enforceable rather than aspirational. [HYPOTHESIS]
 
 **Deliberate time-skip (M-34, unanimous connected):** a skip is a **fast-forward of the event queue** — cost proportional to scheduled events, not elapsed time (the event-driven spine's core payoff). The same narrative gates apply: gated authored-city events hold through skips; frontier and routine events process. Catch-up on the next activation uses the same replay machinery as §4. [HYPOTHESIS]
 
-**Determinism (E-03, unproven):** same seed + same inputs (player actions) ⇒ same world evolution. This is what makes catch-up replay *equal* to having simulated, and what would ease testing/replication. S5 tests it; the cross-platform floating-point caveat is flagged in §7.
+**Determinism (E-03, unproven):** same seed + same inputs (player actions) ⇒ same evolution of **represented** state. This makes catch-up replay faithful for the recorded event/schedule history and would ease testing/replication; it does **not** make plausibility-synthesized micro-history exact — synthesized spans are labeled, never claimed as historical equivalence (§4). S5 tests it; the cross-platform floating-point caveat is flagged in §7.
 
 ## 7. Scheduling, parallelism, and determinism (Q5)
 
@@ -194,14 +204,14 @@ They must remain **decoupled**: a teammate's distant region is simulation-full *
 
 **Invariants (all [HYPOTHESIS] until S-experiments prove them enforceable):**
 
-- **I1 — No lost consequences:** every durable delta reaches the commit pipeline *before* its representation is discarded at deactivation.
+- **I1 — No lost consequences:** every durable delta is **captured into the commit pipeline** (local idempotent append) *before* its representation is discarded at deactivation; captured pending deltas **survive discard and are re-read on reactivation within the active authoritative session, applied exactly once** (idempotency keys make reapplication a no-op); canonical acknowledgment is asynchronous and never blocks an LOD transition; unacknowledged deltas remain pending, never falsely confirmed as T3.
 - **I2 — Dormant cost is storage-shaped:** a dormant NPC costs no per-tick CPU; its next cost is its next event.
 - **I3 — No time travel:** activation always yields a state coherent with the shared clock, the schedule, and committed history — never a stale pose.
 - **I4 — One clock:** the campaign clock is single, monotonic, and owned by the spine.
 - **I5 — Narrative gates hold:** irreversible authored-city events fire only under their gates (M-07/M-29), including during skips and frontier-only epochs.
 - **I6 — Death is permanent:** a tombstoned identity is never reused, and its consequences propagate to relationships/quests/factions.
 - **I7 — Determinism where claimed:** same seed + inputs ⇒ same state hash, per platform (E-03; FP caveat §7).
-- **I8 — Reputation is singular:** every NPC memory/reputation event feeds exactly one shared campaign reputation (M-08) — no hidden second scores.
+- **I8 — Reputation is singular:** reputation-*relevant* events feed exactly one shared campaign reputation (M-08) — no hidden second scores. NPC-specific memories may persist and shape behavior/dialogue without altering the shared reputation; which memory classes are reputation-relevant is game policy **[OPEN]**.
 
 **Edge cases (research list, not exhaustive):**
 
@@ -213,7 +223,7 @@ They must remain **decoupled**: a teammate's distant region is simulation-full *
 | Schedule references a dead NPC (workplace, relationship) | Implausible behavior | DESIGN-BIBLE §6 succession/substitution patterns — simulation consumes them |
 | Player waits outside a dormant interior | Interior must not "pop" on entry | Interiors activate before the door opens (prefetch by proximity + intent) |
 | Event backlog during combat | Near-field starvation | Reserved near-field budgets (§7); backlog is *deferred* far-field work |
-| Catch-up replay meets player-diverged history | Replay only valid until the last player interaction | Exact replay up to last committed interaction; plausibility synthesis after |
+| Catch-up replay meets player-diverged history | Replay only valid until the last player interaction | Exact replay up to the last recorded interaction (committed or captured-pending); plausibility synthesis after |
 | Cross-platform float divergence | Replay/state-hash mismatch between Windows and Linux | [TO-VERIFY] per §7; possibly per-platform determinism or fixed-point shared paths |
 
 ## 10. Proposed experiments (Q7, Deliverable 6) — headless, prioritized, NOT implemented
@@ -224,11 +234,11 @@ All are deterministic, stdlib-style harnesses in the pattern of `experiments/e5-
 |---|---|---|---|
 | **S1** | **LOD scaling core** | N ∈ {1k, 5k, 20k} NPCs distributed across the four levels; batch systems + event spine; measure CPU/tick, memory/NPC per level, events/sec | Dormant per-NPC per-tick cost ≈ 0; simplified ≪ full (measured ratio reported, not asserted) |
 | **S2** | **Event-queue stress** | Schedule-density sweeps; burst injection; per-tick budgets | Backlog bounded; no near-field starvation; no dropped consequences |
-| **S3** | **Reactivation latency** | Dormancy-duration sweep; exact-replay vs plausibility-synthesis crossover | Activation latency under labeled budget; synthesized states pass I3 plausibility checks |
-| **S4** | **Time-skip cost + gating** | Advance 24 h / 7 d at event LOD with gated authored-city events | Cost ∝ events, not elapsed time; **zero gated events fired** (I5); held events present correctly on re-entry |
-| **S5** | **Determinism/replay** | Same seed + scripted inputs across repeated runs | Identical state hashes; per-platform FP behavior characterized |
-| **S6** | **Transition fuzzer** | Randomized activate/deactivate/skip interleavings | I1–I3, I6 hold in 100% of runs; violations reproduced deterministically |
-| **S7** (later, with multiplayer line) | **Multi-region co-op profile** | 2–4 simulated player regions; interest scoping | Host-side cost sublinear in distant-player count; residency axes stay decoupled |
+| **S3** | **Reactivation latency** | Dormancy-duration sweep; exact-replay vs plausibility-synthesis crossover | Activation latency under labeled budget; synthesized states pass I3 plausibility checks; exactness claimed only for spans with a complete recorded event history |
+| **S4** | **Time-skip cost + gating** | Advance 24 h / 7 d at event LOD with gated authored-city events | Cost ∝ events, not elapsed time; **zero gated events fired** (I5); held events **revalidate then present** correctly on re-entry (never blind-fire) |
+| **S5** | **Determinism/replay** | Same seed + scripted inputs across repeated runs | Identical state hashes for **represented** state; per-platform FP behavior characterized |
+| **S6** | **Transition fuzzer** | Randomized activate/deactivate/skip interleavings | I1–I3, I6 hold in 100% of runs (I1 in capture semantics — no transition blocks on remote acknowledgment; pending deltas survive deactivate→reactivate cycles and re-apply exactly once); violations reproduced deterministically |
+| **S7** (later, with multiplayer line) | **Multi-region co-op profile** | 2–4 simulated player regions; interest scoping | Host-side scaling across separated active regions is **measured and predictable** (characterized curve, no unbounded surprises); sublinearity is *evaluated*, not imposed as a requirement; residency axes stay decoupled |
 
 Priority order: S1 → S6 → S4 → S3 → S2 → S5 → S7 (throughput first because it tests the summit claim; the fuzzer second because transitions are the load-bearing correctness claim). **None is implemented or authorized by this study.**
 
@@ -236,7 +246,7 @@ Priority order: S1 → S6 → S4 → S3 → S2 → S5 → S7 (throughput first b
 
 1. **Plausibility vs exactness policy:** how exact must long-dormant activation be (pure plausibility is cheaper; exact replay is verifiable)? Affects feel and S3 budgets.
 2. **Far-field fidelity from flight:** how *believable* must distant city life be at horizon scale — per-NPC events, coarse statistics, or visual-only life? Fidelity ambition vs cost; feeds §8.
-3. **NPC memory depth:** how much episodic history persists per NPC (storage/complexity vs "the world remembers you" richness)?
+3. **NPC memory depth:** how much episodic history persists per NPC (storage/complexity vs "the world remembers you" richness), and which memory classes are reputation-relevant versus NPC-local only?
 4. **City routine drift during frontier-only time:** schedules only, or bounded economy/faction drift too (within the M-07 boundary)?
 5. **Time-skip presentation:** instant fast-forward vs visible accelerated processing (UX, not mechanism).
 6. **Determinism strictness:** required for replay/debug/networking (E-03), or best-effort with per-platform scoping (FP caveat)?
@@ -254,4 +264,4 @@ Class-level only: no claim is made about any specific title's implementation; ev
 
 ---
 
-*Research-only study, 2026-10-17 (v0.1). Nothing here is ratified, implemented, or selected; all proposals are unapproved hypotheses for three-way review. The study defers to DESIGN-BIBLE (gameplay), MULTIPLAYER-SPEC (policy), MULTIPLAYER-ARCHITECTURE-RESEARCH (persistence/authority), and DECISIONS (registry). The next gate is the lead's review of this proposal, then — on explicit authorization — the S-experiments.*
+*Research-only study, 2026-10-17 (v0.1); corrected 2026-10-18 (v0.2) per the lead's reconciliation directives after ChatGPT's independent full-archive review. Nothing here is ratified, implemented, or selected; all proposals are unapproved hypotheses for three-way review. The study defers to DESIGN-BIBLE (gameplay), MULTIPLAYER-SPEC (policy), MULTIPLAYER-ARCHITECTURE-RESEARCH (persistence/authority), and DECISIONS (registry). The next gate is the lead's review of this proposal, then — on explicit authorization — the S-experiments.*
