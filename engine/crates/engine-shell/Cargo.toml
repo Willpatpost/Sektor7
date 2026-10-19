@@ -1,0 +1,26 @@
+[package]
+name = "engine-shell"
+version.workspace = true
+edition.workspace = true
+description = "Sektor7 original engine — Stage 1 SDL3 application shell: windowing, input intents, application lifecycle"
+
+[dependencies]
+# Native-library strategy (Stage 1 decision, lead-authorized 2026-10-19):
+# vendored SDL 3.4.18 from sdl3-src, built from source with CMake and
+# linked statically via the wrapper's build-from-source-static feature —
+# identical native version on the dev pod, CI runners, and the lead's
+# Windows rig; no system SDL packages, no DLL redistribution. SDL3 is
+# zlib-licensed, so static linking is unproblematic.
+sdl3 = { version = "0.20", default-features = false, features = ["build-from-source-static"] }
+
+[target.'cfg(unix)'.dependencies]
+# Unix environments without X11/Wayland development libraries (the dev pod,
+# CI runners) otherwise fail SDL's CMake configure with "could not find X11
+# or Wayland development libraries". Console-build mode permits building
+# with the dummy video driver (any available backends are still
+# autodetected). Windows builds are unaffected by this target-scoped
+# dependency.
+sdl3-sys = { version = "0.7.2", default-features = false, features = ["sdl-unix-console-build"] }
+
+[lints]
+workspace = true

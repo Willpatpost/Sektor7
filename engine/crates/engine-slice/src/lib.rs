@@ -4,4 +4,5 @@
 //! the same code path without spawning a process.
 
 pub mod session;
+pub mod window_demo;
 pub mod world;
