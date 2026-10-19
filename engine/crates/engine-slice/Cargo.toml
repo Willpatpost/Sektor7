@@ -1,0 +1,11 @@
+[package]
+name = "engine-slice"
+version.workspace = true
+edition.workspace = true
+description = "Sektor7 original engine — Stage 0 interactive slice application"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,47 @@
+name: engine-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine-ci.yml"
+  pull_request:
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine-ci.yml"
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Tests
+        run: cargo test --workspace
+      - name: Fingerprint self-test double run
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --fingerprint-selftest)
+          b=$(cargo run -q -p engine-slice -- --fingerprint-selftest)
+          if [ "$a" != "$b" ]; then
+            echo "fingerprint self-test mismatch between runs"
+            exit 1
+          fi
+          echo "$a"

@@ -2,5 +2,6 @@ node_modules/
 dist/
 artifact/
 godot/.godot/
+engine/target/
 *.pyc
 .DS_Store
