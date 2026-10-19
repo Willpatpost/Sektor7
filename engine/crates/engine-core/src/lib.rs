@@ -10,10 +10,14 @@
 //! * **Safe watermark** — [`Spine::processed_through`] is distinct from
 //!   [`Spine::max_executed_due`] and never claims completeness while earlier
 //!   required events remain queued, executing, or blocked by unresolved
-//!   causal dependencies. It is computed live and may retreat when late
-//!   events are scheduled.
-//! * **Cross-class causal dependencies** — in-class execution order is
-//!   `(due, seq)`; across classes, ordering exists only through explicit
+//!   causal dependencies; it returns `None` when nothing is provably
+//!   complete (including a pending event at tick 0). It is computed live,
+//!   may retreat when late events are scheduled, and is a progress measure
+//!   — not irreversible finality.
+//! * **Causal dependencies and ordering** — the spine's queue priority is
+//!   globally `(due, seq)`; execution follows it except under causal
+//!   blocking or late arrival (both recorded in the ledger — see
+//!   [`EventClass`]). Across classes, ordering exists only through explicit
 //!   `depends_on` links. Dependency ids must reference already-scheduled or
 //!   already-executed events (unknown ids are rejected at schedule time),
 //!   which makes dependency cycles structurally impossible.

@@ -53,29 +53,35 @@ impl World for DemoWorld {
         // - payload divisible by 7: follow-up chained on the currently
         //   executing event (valid: the spine records execution before the
         //   handler)
-        if event.payload.is_multiple_of(3) {
-            ctx.follow_up(
-                1 + event.payload % 4,
-                event.class,
-                event.payload + 1,
-                Vec::new(),
-            );
+        // Payload arithmetic is deliberately checked (independent audit
+        // 2026-10-19, item 3): a follow-up whose payload would exceed
+        // u64::MAX is not spawned — the chain terminates instead of
+        // panicking or wrapping. (Saturating would loop forever: u64::MAX
+        // is divisible by both 3 and 5.)
+        if event.payload.is_multiple_of(3)
+            && let Some(next) = event.payload.checked_add(1)
+        {
+            ctx.follow_up(1 + event.payload % 4, event.class, next, Vec::new());
         }
-        if event.payload.is_multiple_of(5) {
+        if event.payload.is_multiple_of(5)
+            && let Some(next) = event.payload.checked_add(2)
+        {
             ctx.schedule_at(
                 ctx.executed_tick().saturating_add(7),
                 EventClass::new(1),
-                event.payload + 2,
+                next,
                 Vec::new(),
             );
         }
-        if event.payload.is_multiple_of(7) {
-            ctx.follow_up(2, EventClass::new(2), event.payload + 3, vec![event.id]);
+        if event.payload.is_multiple_of(7)
+            && let Some(next) = event.payload.checked_add(3)
+        {
+            ctx.follow_up(2, EventClass::new(2), next, vec![event.id]);
         }
     }
 
     fn fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/demo-world/1");
+        fp.write_str("engine-slice/demo-world/2");
         fp.write_usize(self.log.len());
         for (seq, tick) in &self.log {
             fp.write_u64(*seq);

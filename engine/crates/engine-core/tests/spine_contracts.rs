@@ -20,7 +20,7 @@ impl World for CountingWorld {
     }
 
     fn fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-core-test/counting-world/1");
+        fp.write_str("engine-core-test/counting-world/2");
         fp.write_usize(self.counts.len());
         for (payload, count) in &self.counts {
             fp.write_u64(*payload);
@@ -313,4 +313,77 @@ fn every_scheduled_event_eventually_executes() {
         stats.blocked_transitions > 0,
         "the chain must exercise blocking"
     );
+}
+
+#[test]
+fn watermark_is_none_while_a_pending_event_sits_at_tick_zero() {
+    // Regression (independent audit 2026-10-19, item 1): a pending event at
+    // tick 0 leaves no non-negative tick whose completeness is provable, so
+    // the safe watermark must be None. The previous saturating subtraction
+    // wrongly returned Some(Tick(0)).
+    let mut spine = spine(4);
+    spine.schedule(at(0, 1)).unwrap();
+    spine.run_ticks(1); // the tick-0 event executes at clock 1
+    assert_eq!(spine.max_executed_due(), Some(Tick(0)));
+    assert_eq!(spine.processed_through(), Some(Tick(0)));
+
+    spine.schedule(at(0, 2)).unwrap(); // late arrival, pending at tick 0
+    assert_eq!(
+        spine.processed_through(),
+        None,
+        "no non-negative tick is provably complete while a tick-0 event is pending"
+    );
+
+    spine.run_to_completion(10);
+    assert_eq!(spine.processed_through(), Some(Tick(0)));
+}
+
+#[test]
+fn audit_counterexample_blocking_reorders_in_class_execution() {
+    // Documents the clarified in-class contract (independent audit
+    // 2026-10-19, item 2): (due, seq) is a queue-priority guarantee. A
+    // causality-blocked event can execute after a later same-class sibling.
+    let mut spine = spine(8);
+    let prerequisite = spine.schedule(at(10, 1)).unwrap();
+    let blocked = spine
+        .schedule(at(5, 2).with_dependencies(vec![prerequisite]))
+        .unwrap();
+    let sibling = spine.schedule(at(6, 3)).unwrap();
+
+    spine.run_to_completion(50);
+
+    let ledger = spine.ledger();
+    let position = |id: EventId| ledger.iter().position(|r| r.id == id).unwrap();
+    assert!(
+        position(sibling) < position(blocked),
+        "the due-6 sibling executes before the blocked due-5 event: \
+         (due, seq) dequeue priority does not survive causal blocking"
+    );
+    let blocked_record = ledger[position(blocked)];
+    assert!(blocked_record.late);
+    assert_eq!(blocked_record.executed_tick, Tick(10));
+}
+
+#[test]
+fn audit_counterexample_late_arrival_reorders_in_class_execution() {
+    // Documents the clarified in-class contract (independent audit
+    // 2026-10-19, item 2): a late arrival executes after earlier-due
+    // same-class events that already ran — by construction, not by fault.
+    let mut spine = spine(8);
+    let on_time = spine.schedule(at(5, 1)).unwrap();
+    spine.run_ticks(5); // executes on time at tick 5
+
+    let late_arrival = spine.schedule(at(3, 2)).unwrap(); // due 3, scheduled late
+    spine.run_ticks(1); // clock 6: executes late
+
+    let ledger = spine.ledger();
+    let position = |id: EventId| ledger.iter().position(|r| r.id == id).unwrap();
+    assert!(
+        position(on_time) < position(late_arrival),
+        "the earlier-due (3) late arrival executes after the due-5 event"
+    );
+    let late_record = ledger[position(late_arrival)];
+    assert!(late_record.late);
+    assert_eq!(late_record.intended_due, Tick(3));
+    assert_eq!(late_record.executed_tick, Tick(6));
 }

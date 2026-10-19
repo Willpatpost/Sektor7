@@ -7,6 +7,12 @@ use std::fmt;
 /// The spine's tick loop is the only component that advances campaign time;
 /// wall-clock/OS time never enters simulation logic
 /// (`docs/TECH-ARCHITECTURE.md` §3.2).
+///
+/// Tick arithmetic saturates by design (independent audit 2026-10-19, item
+/// 5): due computation and clock advancement use `saturating_add`, so an
+/// overflowing schedule cannot panic. The u64 tick space (about 584 years
+/// at nanosecond granularity) makes saturation unreachable in practice,
+/// and it would manifest as a frozen clock rather than silent wraparound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Tick(pub u64);
 

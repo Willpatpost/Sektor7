@@ -57,7 +57,7 @@ impl World for ScriptedWorld {
     }
 
     fn fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-core-test/scripted-world/1");
+        fp.write_str("engine-core-test/scripted-world/2");
         fp.write_usize(self.counters.len());
         for (payload, count) in &self.counters {
             fp.write_u64(*payload);

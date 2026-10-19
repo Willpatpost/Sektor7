@@ -60,11 +60,14 @@ impl Fingerprinter {
         }
     }
 
-    /// Writes a NUL-terminated string so `("ab", "c")` and `("a", "bc")`
-    /// fingerprint differently.
+    /// Writes a length-prefixed string (independent audit 2026-10-19, item
+    /// 4): the byte length as `u64`, then the bytes. Length-prefixing makes
+    /// the encoding unambiguous — NUL-terminated strings could not
+    /// distinguish `"a\0b"` from the pair `("a", "b")`, and embedded NULs
+    /// are now safe.
     pub fn write_str(&mut self, text: &str) {
+        self.write_u64(text.len() as u64);
         self.write_bytes(text.as_bytes());
-        self.write_u8(0);
     }
 
     pub fn write_tick(&mut self, tick: crate::Tick) {
@@ -97,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn write_str_terminator_separates_splits() {
+    fn write_str_length_prefix_separates_splits() {
         let mut x = Fingerprinter::new();
         x.write_str("ab");
         x.write_str("c");
@@ -107,6 +110,34 @@ mod tests {
         y.write_str("bc");
 
         assert_ne!(x.finish(), y.finish());
+    }
+
+    #[test]
+    fn embedded_nul_strings_do_not_collide() {
+        let mut whole = Fingerprinter::new();
+        whole.write_str("a\0b");
+
+        let mut split = Fingerprinter::new();
+        split.write_str("a");
+        split.write_str("b");
+        assert_ne!(
+            whole.finish(),
+            split.finish(),
+            "an embedded NUL must not alias a string split"
+        );
+
+        let mut other_split = Fingerprinter::new();
+        other_split.write_str("a");
+        other_split.write_str("\0b");
+        assert_ne!(
+            whole.finish(),
+            other_split.finish(),
+            "different splits of the same concatenated bytes must differ"
+        );
+
+        let mut repeat = Fingerprinter::new();
+        repeat.write_str("a\0b");
+        assert_eq!(whole.finish(), repeat.finish());
     }
 
     #[test]

@@ -143,3 +143,26 @@ fn selftest_is_deterministic() {
     assert_eq!(first.0.len(), 16);
     assert_eq!(first.1.len(), 16);
 }
+
+#[test]
+fn max_payload_terminates_without_panic_or_wrap() {
+    // Regression (independent audit 2026-10-19, item 3): a u64::MAX payload
+    // must execute without panicking or wrapping — and spawn no follow-ups,
+    // so the demo chain terminates instead of looping.
+    let mut session = Session::new();
+    let out = run(&mut session, "at 2 18446744073709551615");
+    assert!(out.contains("scheduled"), "{out}");
+
+    run(&mut session, "tick 10");
+    let status = run(&mut session, "status");
+    assert!(status.contains("executed=1"), "{status}");
+    assert!(status.contains("pending=0"), "{status}");
+    assert!(status.contains("blocked_now=0"), "{status}");
+
+    let counters = run(&mut session, "counters");
+    assert!(
+        counters.contains("payload 18446744073709551615: 1 executions"),
+        "{counters}"
+    );
+    assert!(counters.contains("total: 1"), "{counters}");
+}

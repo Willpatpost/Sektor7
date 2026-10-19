@@ -1,6 +1,6 @@
-//! The event spine: canonical campaign clock, scheduling with in-class
-//! `(due, seq)` ordering, cross-class causal dependencies, per-tick budget,
-//! the execution ledger, and the safe processed-through watermark.
+//! The event spine: canonical campaign clock, scheduling with global
+//! `(due, seq)` queue priority, cross-class causal dependencies, per-tick
+//! budget, the execution ledger, and the safe processed-through watermark.
 //!
 //! Stage 0 scope (`docs/TECH-ARCHITECTURE.md` §6): single queue, no near/far
 //! lanes, no regions, no persistence — only the contract semantics the
@@ -124,9 +124,10 @@ pub struct Stats {
     pub budget_exhausted_ticks: u64,
 }
 
-/// Queue entry, ordered by `(due, seq)`: in-class FIFO, and a global
-/// `(due, seq)` order that incidentally interleaves classes without
-/// promising anything across them.
+/// Queue entry, ordered by `(due, seq)` — the spine's dequeue order.
+/// Execution order can deviate from dequeue order when an event is
+/// causality-blocked past its siblings or arrives late (see
+/// [`EventClass`](crate::EventClass)); the ledger records actual execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     due: Tick,
@@ -272,18 +273,29 @@ impl<W: World> Spine<W> {
     /// 2. no pending event — queued, executing, or blocked by unresolved
     ///    causal dependencies — has an intended due `<= T`.
     ///
+    /// Returns `None` when no such `T` exists: nothing has executed yet, or
+    /// a pending event sits at tick 0 (independent audit 2026-10-19, item 1
+    /// — the largest safe `T` would have to be negative, so no
+    /// non-negative tick is provably complete).
+    ///
     /// Computed live from queue state, so it may **retreat** when late
-    /// events are scheduled; consumers must re-read, never cache. Stage 0
-    /// executes synchronously, so the "executing" state is observable only
-    /// between ticks — where this query is meaningful.
+    /// events are scheduled; consumers must re-read, never cache. This is a
+    /// **live progress measure, not irreversible finality** — it makes no
+    /// permanence claim; durable finality belongs to the Commit Pipeline's
+    /// confirmed lane, a separate subsystem. Stage 0 executes
+    /// synchronously, so the "executing" state is observable only between
+    /// ticks — where this query is meaningful.
     pub fn processed_through(&self) -> Option<Tick> {
         let max_exec = self.max_executed_due()?;
         match self.min_pending_due() {
-            Some(min_pending) => Some(Tick(
-                max_exec
-                    .as_u64()
-                    .min(min_pending.as_u64().saturating_sub(1)),
-            )),
+            Some(min_pending) => {
+                let due = min_pending.as_u64();
+                if due == 0 {
+                    None
+                } else {
+                    Some(Tick(max_exec.as_u64().min(due - 1)))
+                }
+            }
             None => Some(max_exec),
         }
     }
@@ -392,10 +404,15 @@ impl<W: World> Spine<W> {
     }
 
     /// Runs until no pending work remains (queue and blocked set both
-    /// empty) or `max_ticks` elapse; returns the ticks consumed. Dependency
-    /// chains are finite and acyclic by construction and every pending due
-    /// is eventually reached by the advancing clock, so a quiet spine is
-    /// reached for sufficiently large `max_ticks`.
+    /// empty) or `max_ticks` elapse; returns the ticks consumed.
+    ///
+    /// Termination is guaranteed only for **finite** event graphs: within a
+    /// fixed scheduled set, dependency chains are acyclic by construction
+    /// and the advancing clock eventually reaches every pending due. A
+    /// `World` whose handlers unconditionally spawn follow-ups can keep the
+    /// spine busy indefinitely — `max_ticks` is the bound that protects
+    /// against that, and remaining work stays observable through
+    /// `pending_count`/`blocked_count` rather than being assumed absent.
     pub fn run_to_completion(&mut self, max_ticks: u64) -> u64 {
         let mut used = 0;
         while used < max_ticks && self.has_any_work() {
@@ -412,7 +429,9 @@ impl<W: World> Spine<W> {
     /// and the world — see [`Self::state_fingerprint`].
     pub fn engine_fingerprint(&self) -> u64 {
         let mut fp = Fingerprinter::new();
-        fp.write_str("engine-core/spine/1");
+        // Schema v2: length-prefixed strings in Fingerprinter::write_str
+        // (independent audit 2026-10-19, item 4).
+        fp.write_str("engine-core/spine/2");
         fp.write_tick(self.clock);
         fp.write_u64(self.next_seq);
         fp.write_u32(self.budget);
@@ -464,7 +483,7 @@ impl<W: World> Spine<W> {
     /// state, in the E-07…E-10 double-run tradition.
     pub fn state_fingerprint(&self) -> u64 {
         let mut fp = Fingerprinter::new();
-        fp.write_str("engine-core/state/1");
+        fp.write_str("engine-core/state/2");
         fp.write_u64(self.engine_fingerprint());
         self.world.fingerprint(&mut fp);
         fp.finish()

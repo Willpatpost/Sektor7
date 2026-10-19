@@ -6,11 +6,17 @@ use crate::clock::Tick;
 
 /// Opaque event classification tag (game-defined).
 ///
-/// Execution order is guaranteed only **within** a class — `(due, seq)`,
-/// monotone and deterministic. Across classes no ordering is guaranteed;
-/// causal ordering across classes requires explicit
-/// [`EventSpec::depends_on`] links (`docs/TECH-ARCHITECTURE.md` §3.2,
-/// review correction 2).
+/// The spine's **queue priority** is globally `(due, seq)`, so events of one
+/// class are dequeued in `(due, seq)` order. **Execution order** follows
+/// dequeue order except in two recorded cases (independent audit
+/// 2026-10-19, item 2): a causality-blocked event waits for its
+/// dependencies and can execute after later same-class siblings, and a
+/// late arrival — scheduled after its intended due — executes after
+/// earlier-due events that already ran. Both deviations are first-class
+/// ledger data (`executed_tick`, `late`), never silent. Across classes no
+/// ordering is guaranteed at all; causal ordering (across or within
+/// classes) requires explicit [`EventSpec::depends_on`] links
+/// (`docs/TECH-ARCHITECTURE.md` §3.2, review correction 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventClass(pub u16);
 
