@@ -1,0 +1,560 @@
+{
+  "checks": [
+    {
+      "detail": "lambda=30 < budget=50, 2000 ticks: max backlog 0, final backlog 0, mean lateness 0.00, drops 0",
+      "name": "Q7 stable queue under sustainable load",
+      "pass": true
+    },
+    {
+      "detail": "lambda=50 == budget: jitter transients (max backlog 202) fully drained (final 0), drops 0",
+      "name": "Q6b at-capacity transients drain completely",
+      "pass": true
+    },
+    {
+      "detail": "lambda=75 (actual 74.6) for 1000 ticks: backlog grew ~24.4/tick vs predicted 24.6/tick; recovery at lambda=25 drained to 0 in 0 extra ticks; drops 0",
+      "name": "Q6 predictable growth + full recovery",
+      "pass": true
+    },
+    {
+      "detail": "lambda=150 (actual 150.7): growth ~100.4/tick vs predicted 100.7; max backlog 60395; drops 0; per-tick cost by depth: {'0': 48.835, '1-100': 116.577, '101-1k': 93.1, '1k+': 85.291}",
+      "name": "Q6b measurable growth under 3x overload",
+      "pass": true
+    },
+    {
+      "detail": "far bursts K=50/250/1000 over sustainable base: all drained (K=1000 needed 0 extra ticks); max NEAR lateness during the K=1000 burst window: 0 tick(s); drops 0",
+      "name": "Q4 no near-field starvation under far bursts",
+      "pass": true
+    },
+    {
+      "detail": "near burst of 60 vs reserve 20: near backlog peaked at 41 over 2 overloaded ticks, then drained; explicitly reported (never dropped); drops 0",
+      "name": "Q5 explicit near-field overload reporting",
+      "pass": true
+    },
+    {
+      "detail": "overload with 27062 dynamically generated follow-ups: every event executed exactly once (drops 0, dups False); per-class (due,seq) order monotone: True; cause-before-effect violations: 0",
+      "name": "Q1/Q2/Q3 exactly-once, in-class order, causality",
+      "pass": true
+    },
+    {
+      "detail": "far write due at tick 101 executed at tick 140 (39 ticks late) behind a 2000-event jam; all 4 reads before execution were flagged stale-and-pre-write; all 15 after saw the updated value unflagged; 223/439 reads stale overall; drops 0",
+      "name": "Q8 overdue events never look silently current",
+      "pass": true
+    },
+    {
+      "detail": "1,000 NPCs / 7 days = 27218 events, 2.70/tick avg (~19x headroom at B=50), but schedule windows cluster starts to 80/tick (standard lunch/work2) and ~200/tick (fixed-time shift schedules): B=50 formed bounded transient backlogs (max 302) that fully drained; B=250 (above the fixed-time spike) never formed a backlog (max 0); near-field max lateness at B=50: 2; drops 0",
+      "name": "Q7b NPC baseline: synchrony clusters, not the average rate, set the spine load",
+      "pass": true
+    },
+    {
+      "detail": "mixed overload (lambda=75, 30% near): near max lateness R=10: 581, R=25: 2 (reserve is a research-candidate policy knob, not a selection)",
+      "name": "Q4b larger reserve lowers near-field latency",
+      "pass": true
+    },
+    {
+      "detail": "sorted-list/pointer oracle reproduces the heap spine's execution log, read log, and final state exactly on causal/overdue/near-burst scenarios",
+      "name": "Q9 independent oracle agreement",
+      "pass": true
+    }
+  ],
+  "determinism": {
+    "fingerprint": "f7fce3ee1d7835d1",
+    "note": "sha256 of canonical logical results (execution logs, reads, state, series tails) across two full in-process suite runs; timings excluded and NOT bit-identical",
+    "pass": true
+  },
+  "failures": [],
+  "meta": {
+    "authorization": "lead, 2026-10-18/19 \u2014 S2-lite event queue stress, budgeting, and backlog correctness",
+    "machine": {
+      "cpu_count": 96,
+      "cpu_model": "Intel(R) Xeon(R) Platinum 8268 CPU @ 2.90GHz",
+      "implementation": "CPython",
+      "machine": "x86_64",
+      "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+      "python": "3.12.3"
+    },
+    "run_date": "2026-10-19",
+    "seed": 66007
+  },
+  "scenario_summaries": [
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 94.93,
+      "executed_total": 60063,
+      "far_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "max_backlog": 0,
+      "max_near_backlog": 0,
+      "name": "sustainable_l30",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 11974,
+      "scheduled_total": 60063,
+      "stale_reads": 8198,
+      "throughput_events_per_ms": 632.7,
+      "ticks_run": 2000,
+      "us_per_tick": 47.467
+    },
+    {
+      "drain_ticks": 4,
+      "drops": 0,
+      "elapsed_ms": 76.27,
+      "executed_total": 49898,
+      "far_lateness": {
+        "max": 5,
+        "mean": 1.357,
+        "p95": 4
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 5,
+        "mean": 1.086,
+        "p95": 4
+      },
+      "max_backlog": 202,
+      "max_near_backlog": 0,
+      "name": "at_capacity_l50",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 9994,
+      "scheduled_total": 49898,
+      "stale_reads": 9642,
+      "throughput_events_per_ms": 654.3,
+      "ticks_run": 1004,
+      "us_per_tick": 75.963
+    },
+    {
+      "backlog_growth_per_tick": 24.41,
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 191.96,
+      "executed_total": 112188,
+      "far_lateness": {
+        "max": 548,
+        "mean": 271.153,
+        "p95": 525
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 548,
+        "mean": 216.398,
+        "p95": 520
+      },
+      "max_backlog": 24583,
+      "max_near_backlog": 14,
+      "name": "overload_1.5x_then_recovery",
+      "near_lateness": {
+        "max": 1,
+        "mean": 0.014,
+        "p95": 0
+      },
+      "near_overload_ticks": 101,
+      "reads_total": 22431,
+      "scheduled_total": 112188,
+      "stale_reads": 21460,
+      "throughput_events_per_ms": 584.4,
+      "ticks_run": 2500,
+      "us_per_tick": 76.783
+    },
+    {
+      "backlog_growth_per_tick": 100.41,
+      "drain_ticks": 1208,
+      "drops": 0,
+      "elapsed_ms": 155.11,
+      "executed_total": 90395,
+      "far_lateness": {
+        "max": 1208,
+        "mean": 716.657,
+        "p95": 1166
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 1208,
+        "mean": 603.941,
+        "p95": 1155
+      },
+      "max_backlog": 60395,
+      "max_near_backlog": 6087,
+      "name": "overload_3x",
+      "near_lateness": {
+        "max": 305,
+        "mean": 153.326,
+        "p95": 289
+      },
+      "near_overload_ticks": 904,
+      "reads_total": 18111,
+      "scheduled_total": 90395,
+      "stale_reads": 18110,
+      "throughput_events_per_ms": 582.8,
+      "tick_cost_us_by_backlog": {
+        "0": 48.835,
+        "1-100": 116.577,
+        "101-1k": 93.1,
+        "1k+": 85.291
+      },
+      "ticks_run": 1808,
+      "us_per_tick": 85.791
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 70.17,
+      "executed_total": 44901,
+      "far_lateness": {
+        "max": 1,
+        "mean": 0.001,
+        "p95": 0
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 1,
+        "mean": 0.001,
+        "p95": 0
+      },
+      "max_backlog": 27,
+      "max_near_backlog": 0,
+      "name": "far_burst_K50",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 8954,
+      "scheduled_total": 44901,
+      "stale_reads": 6107,
+      "throughput_events_per_ms": 639.9,
+      "ticks_run": 1500,
+      "us_per_tick": 46.779
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 68.84,
+      "executed_total": 45104,
+      "far_lateness": {
+        "max": 6,
+        "mean": 0.043,
+        "p95": 0
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 6,
+        "mean": 0.035,
+        "p95": 0
+      },
+      "max_backlog": 232,
+      "max_near_backlog": 0,
+      "name": "far_burst_K250",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 9005,
+      "scheduled_total": 45104,
+      "stale_reads": 6062,
+      "throughput_events_per_ms": 655.2,
+      "ticks_run": 1500,
+      "us_per_tick": 45.892
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 69.79,
+      "executed_total": 45603,
+      "far_lateness": {
+        "max": 23,
+        "mean": 0.694,
+        "p95": 5
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 23,
+        "mean": 0.559,
+        "p95": 0
+      },
+      "max_backlog": 979,
+      "max_near_backlog": 0,
+      "name": "far_burst_K1000",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 8925,
+      "scheduled_total": 45603,
+      "stale_reads": 6240,
+      "throughput_events_per_ms": 653.4,
+      "ticks_run": 1500,
+      "us_per_tick": 46.529
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 52.21,
+      "executed_total": 36068,
+      "far_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 2,
+        "mean": 0.002,
+        "p95": 0
+      },
+      "max_backlog": 41,
+      "max_near_backlog": 41,
+      "name": "near_burst_3x_reserve",
+      "near_lateness": {
+        "max": 2,
+        "mean": 0.009,
+        "p95": 0
+      },
+      "near_overload_ticks": 2,
+      "reads_total": 7330,
+      "scheduled_total": 36068,
+      "stale_reads": 5084,
+      "throughput_events_per_ms": 690.8,
+      "ticks_run": 1200,
+      "us_per_tick": 43.508
+    },
+    {
+      "drain_ticks": 1041,
+      "drops": 0,
+      "elapsed_ms": 209.79,
+      "executed_total": 102026,
+      "far_lateness": {
+        "max": 798,
+        "mean": 513.195,
+        "p95": 776
+      },
+      "final_backlog": 0,
+      "followups_generated": 27062,
+      "lateness": {
+        "max": 798,
+        "mean": 412.055,
+        "p95": 771
+      },
+      "max_backlog": 39726,
+      "max_near_backlog": 332,
+      "name": "causal_chains_overload",
+      "near_lateness": {
+        "max": 17,
+        "mean": 7.735,
+        "p95": 15
+      },
+      "near_overload_ticks": 1017,
+      "reads_total": 28368,
+      "scheduled_total": 102026,
+      "stale_reads": 28360,
+      "throughput_events_per_ms": 486.3,
+      "ticks_run": 2041,
+      "us_per_tick": 102.786
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 5.23,
+      "executed_total": 4001,
+      "far_lateness": {
+        "max": 40,
+        "mean": 10.423,
+        "p95": 36
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 40,
+        "mean": 9.777,
+        "p95": 36
+      },
+      "max_backlog": 1950,
+      "max_near_backlog": 0,
+      "name": "overdue_reads_vs_clock",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 439,
+      "scheduled_total": 4001,
+      "stale_reads": 223,
+      "throughput_events_per_ms": 764.9,
+      "ticks_run": 300,
+      "us_per_tick": 17.436
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 61.77,
+      "executed_total": 27218,
+      "far_lateness": {
+        "max": 7,
+        "mean": 1.756,
+        "p95": 6
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 7,
+        "mean": 1.361,
+        "p95": 6
+      },
+      "max_backlog": 302,
+      "max_near_backlog": 34,
+      "name": "npc_schedule_baseline_B50",
+      "near_lateness": {
+        "max": 2,
+        "mean": 0.156,
+        "p95": 1
+      },
+      "near_overload_ticks": 112,
+      "reads_total": 0,
+      "scheduled_total": 27218,
+      "stale_reads": 0,
+      "throughput_events_per_ms": 440.6,
+      "ticks_run": 10280,
+      "us_per_tick": 6.009
+    },
+    {
+      "drain_ticks": 0,
+      "drops": 0,
+      "elapsed_ms": 62.08,
+      "executed_total": 27218,
+      "far_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "max_backlog": 0,
+      "max_near_backlog": 0,
+      "name": "npc_schedule_baseline_B250",
+      "near_lateness": {
+        "max": 0,
+        "mean": 0.0,
+        "p95": 0
+      },
+      "near_overload_ticks": 0,
+      "reads_total": 0,
+      "scheduled_total": 27218,
+      "stale_reads": 0,
+      "throughput_events_per_ms": 438.4,
+      "ticks_run": 10280,
+      "us_per_tick": 6.039
+    },
+    {
+      "drain_ticks": 401,
+      "drops": 0,
+      "elapsed_ms": 94.54,
+      "executed_total": 60016,
+      "far_lateness": {
+        "max": 254,
+        "mean": 127.382,
+        "p95": 241
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 581,
+        "mean": 200.442,
+        "p95": 527
+      },
+      "max_backlog": 20016,
+      "max_near_backlog": 9888,
+      "name": "reservation_R10",
+      "near_lateness": {
+        "max": 581,
+        "mean": 372.507,
+        "p95": 566
+      },
+      "near_overload_ticks": 1200,
+      "near_reserve": 10,
+      "reads_total": 11873,
+      "scheduled_total": 60016,
+      "stale_reads": 11871,
+      "throughput_events_per_ms": 634.8,
+      "ticks_run": 1201,
+      "us_per_tick": 78.716
+    },
+    {
+      "drain_ticks": 395,
+      "drops": 0,
+      "elapsed_ms": 99.8,
+      "executed_total": 59701,
+      "far_lateness": {
+        "max": 395,
+        "mean": 283.985,
+        "p95": 392
+      },
+      "final_backlog": 0,
+      "followups_generated": 0,
+      "lateness": {
+        "max": 395,
+        "mean": 198.103,
+        "p95": 392
+      },
+      "max_backlog": 19701,
+      "max_near_backlog": 26,
+      "name": "reservation_R25",
+      "near_lateness": {
+        "max": 2,
+        "mean": 0.115,
+        "p95": 1
+      },
+      "near_overload_ticks": 341,
+      "near_reserve": 25,
+      "reads_total": 11800,
+      "scheduled_total": 59701,
+      "stale_reads": 11797,
+      "throughput_events_per_ms": 598.2,
+      "ticks_run": 1195,
+      "us_per_tick": 83.519
+    }
+  ],
+  "workload_assumptions": {
+    "budget_per_tick": 50,
+    "near_reserve": 20,
+    "note": "an always-bounded backlog under arbitrary sustained overload is NOT claimed \u2014 impossible for a finite processor when arrival exceeds capacity; growth is measured and predictable instead",
+    "npc_baseline": "base schedule machinery, 1,000 NPCs, 7 days",
+    "policy_note": "reservation/sharing policy is a research candidate ([HYPOTHESIS]), not an approved production policy; throttling and coalescing are NOT implemented \u2014 only measured deferral",
+    "synthetic_streams": "seeded Poisson per-tick counts; arrival rate and near-fraction swept independently of NPC population"
+  }
+}
