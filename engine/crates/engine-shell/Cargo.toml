@@ -5,6 +5,11 @@ edition.workspace = true
 description = "Sektor7 original engine — Stage 1 SDL3 application shell: windowing, input intents, application lifecycle"
 
 [dependencies]
+# Diagnostics reuse (Stage 1 corrective pass, finding 4): the shell records
+# focus transitions through engine-core's Diagnostics subsystem (L0,
+# consumed by all — TECH-ARCHITECTURE §2.12) instead of a second logger.
+# engine-core stays platform-independent (no SDL).
+engine-core = { path = "../engine-core" }
 # Native-library strategy (Stage 1 decision, lead-authorized 2026-10-19):
 # vendored SDL 3.4.18 from sdl3-src, built from source with CMake and
 # linked statically via the wrapper's build-from-source-static feature —

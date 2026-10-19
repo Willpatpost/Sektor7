@@ -1,0 +1,14 @@
+# Corrective-pass finding 2 (LNK4098): SDL's CMake Debug configuration
+# selects MSVC's debug CRT (/MDd — MSVCRTD) while Rust links the release
+# dynamic CRT, producing defaultlib conflicts (LNK4098) and mixed-CRT
+# linkage on Windows MSVC targets. The toolchain file referenced below
+# forces the release dynamic CRT (/MD) for the vendored SDL build in every
+# configuration — the underlying mismatch is corrected, not suppressed.
+#
+# The variable is target-suffixed (the underscore form of
+# x86_64-pc-windows-msvc, matching how cmake-rs looks it up), so
+# non-Windows builds never read it, and `relative = true` resolves the
+# path against this workspace root on every machine. Run cargo from
+# engine/ so this config file is discovered.
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "build/msvc-sdl3-crt.cmake", relative = true }

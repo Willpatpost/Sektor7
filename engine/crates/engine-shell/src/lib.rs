@@ -31,6 +31,13 @@
 //! it does not verify physical hardware input. GUI evidence requires a
 //! graphical session and is documented separately (engine-slice
 //! `--window` mode; manual instructions in the repository README).
+//!
+//! Corrective-pass notes (Stage 1 review): driver selection uses SDL3's
+//! safe hint interface (`SDL_HINT_VIDEO_DRIVER` / `SDL_HINT_AUDIO_DRIVER`,
+//! renamed from the SDL2-era concatenated names) — Stage 1 contains
+//! **zero project-owned unsafe code** — and focus loss/regain are recorded
+//! through engine-core's Diagnostics subsystem (shared L0 logger, no
+//! second diagnostics implementation).
 
 pub mod app;
 pub mod input;
@@ -41,6 +48,10 @@ pub use app::{
 };
 pub use input::{InputSnapshot, InputState};
 pub use platform::{DriverPreference, Platform};
+
+/// Re-exported so applications configure the shell's diagnostics (focus
+/// loss/regain records) through the shared engine-core subsystem.
+pub use engine_core::diag::{Diagnostics, Level};
 
 /// Re-exported input-identification types so applications bind keys and
 /// buttons through the shell's curated surface rather than the SDL binding

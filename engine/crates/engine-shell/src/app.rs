@@ -4,8 +4,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+use engine_core::diag::{Diagnostics, Level};
 use sdl3::EventPump;
-use sdl3::event::Event;
+use sdl3::event::{Event, WindowEvent};
 use sdl3::mouse::MouseUtil;
 use sdl3::video::{Window, WindowBuildError};
 
@@ -102,6 +103,7 @@ pub struct ShellApp {
     pump: EventPump,
     mouse: MouseUtil,
     input: InputState,
+    diag: Diagnostics,
     frame_target: Duration,
 }
 
@@ -124,6 +126,7 @@ impl ShellApp {
             pump,
             mouse,
             input: InputState::new(),
+            diag: Diagnostics::new(Level::Off),
             frame_target,
         })
     }
@@ -154,6 +157,17 @@ impl ShellApp {
         self.mouse.relative_mouse_mode(&self.window)
     }
 
+    /// Raises the shell diagnostics level. Focus loss/regain records are
+    /// logged at Info.
+    pub fn set_diag_level(&mut self, level: Level) {
+        self.diag.set_min_level(level);
+    }
+
+    /// The shell's diagnostics records (shared engine-core subsystem).
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diag
+    }
+
     /// Pushes an event onto SDL's queue. Used by tests and tooling — this is
     /// event dispatch, not physical device input.
     pub fn push_event(&mut self, event: Event) -> Result<(), String> {
@@ -162,9 +176,23 @@ impl ShellApp {
     }
 
     /// Pumps pending OS events through the input state machine and returns
-    /// this frame's intent snapshot.
+    /// this frame's intent snapshot. Focus transitions are recorded in the
+    /// shell's diagnostics at Info (Stage 1 corrective pass, review
+    /// finding 4) — core input behavior is unchanged.
     pub fn frame(&mut self) -> InputSnapshot {
         for event in self.pump.poll_iter() {
+            if let Event::Window { win_event, .. } = &event {
+                match win_event {
+                    WindowEvent::FocusLost => self.diag.log(
+                        Level::Info,
+                        "keyboard focus lost — held keys and pending look deltas cleared",
+                    ),
+                    WindowEvent::FocusGained => {
+                        self.diag.log(Level::Info, "keyboard focus regained");
+                    }
+                    _ => {}
+                }
+            }
             self.input.process(&event);
         }
         self.input.poll()
@@ -190,10 +218,13 @@ impl ShellApp {
             next_frame_at += self.frame_target;
             let snapshot = self.frame();
             control = on_frame(self, &snapshot);
-            if control == LoopControl::Quit {
-                quit_reason = QuitReason::Callback;
-            } else if self.input.quit_requested() {
+            if self.input.quit_requested() {
+                // A window close or SDL quit request is the observable
+                // cause even when the callback also quits on seeing it
+                // (Stage 1 corrective pass, review finding 3).
                 quit_reason = QuitReason::Requested;
+            } else if control == LoopControl::Quit {
+                quit_reason = QuitReason::Callback;
             }
             let frame_end = Instant::now();
             if next_frame_at > frame_end {

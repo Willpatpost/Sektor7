@@ -300,3 +300,47 @@ fn paced_loop_stops_on_close_request() {
     assert_eq!(summary.quit_reason, QuitReason::Requested);
     assert_eq!(summary.frames, 1, "the close is honored by the first frame");
 }
+
+#[test]
+fn close_request_is_reported_as_requested_when_callback_quits() {
+    // Stage 1 corrective pass, review finding 3: when the frame callback
+    // quits upon observing a close request, the reported cause must be
+    // QuitReason::Requested, not Callback.
+    let _guard = lock();
+    let mut app = common::dummy_app("quit-reason");
+    app.push_event(window_event(WindowEvent::CloseRequested))
+        .expect("push close");
+    let summary = app.run(|_, snap| {
+        if snap.quit_requested {
+            engine_shell::LoopControl::Quit
+        } else {
+            engine_shell::LoopControl::Continue
+        }
+    });
+    assert_eq!(summary.quit_reason, QuitReason::Requested);
+}
+
+#[test]
+fn focus_transitions_are_recorded_in_diagnostics() {
+    // Stage 1 corrective pass, review finding 4: focus loss/regain are
+    // recorded through the shell's diagnostics; core input behavior is
+    // unchanged. SDL itself may enqueue window events (e.g. an initial
+    // focus-gain) when a window is created, so the queue is drained
+    // BEFORE diagnostics are enabled — only the synthetic transitions
+    // below are then recorded.
+    let _guard = lock();
+    let mut app = common::dummy_app("focus-diag");
+    app.frame(); // drain SDL-generated window events
+    app.set_diag_level(engine_shell::Level::Info);
+    app.push_event(window_event(WindowEvent::FocusLost))
+        .expect("push focus lost");
+    app.push_event(window_event(WindowEvent::FocusGained))
+        .expect("push focus gained");
+    let snap = app.frame();
+    assert!(snap.focus_lost);
+    assert!(snap.focus_gained);
+    let records = app.diagnostics().records();
+    assert_eq!(records.len(), 2);
+    assert!(records[0].message.contains("focus lost"));
+    assert!(records[1].message.contains("focus regained"));
+}

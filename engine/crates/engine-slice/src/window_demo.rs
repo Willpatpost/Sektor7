@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use engine_shell::{
-    DriverPreference, Keycode, LoopControl, MouseButton, RunSummary, ShellApp, ShellConfig,
+    DriverPreference, Keycode, Level, LoopControl, MouseButton, RunSummary, ShellApp, ShellConfig,
     resident_set_kib,
 };
 
@@ -30,6 +30,7 @@ pub fn run_window_demo(dummy: bool, frame_limit: Option<u64>) -> Result<(), Stri
         driver,
     };
     let mut app = ShellApp::new(config)?;
+    app.set_diag_level(Level::Info);
     let version = engine_shell::linked_sdl_version();
     if dummy {
         println!(
@@ -60,6 +61,12 @@ pub fn run_window_demo(dummy: bool, frame_limit: Option<u64>) -> Result<(), Stri
         }
         if let Some((w, h)) = snap.resized {
             println!("window resized: {w}x{h}");
+        }
+        if snap.focus_lost {
+            println!("diagnostics: keyboard focus lost — held input cleared");
+        }
+        if snap.focus_gained {
+            println!("diagnostics: keyboard focus regained");
         }
         if frames.is_multiple_of(60) {
             println!(
