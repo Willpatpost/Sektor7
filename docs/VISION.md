@@ -1,6 +1,6 @@
 # PROJECT VISION — Working Title: SEKTOR 7
 
-> **Status:** Consolidated vision foundation v0.9 · 2026-10-19. This edition integrates the four supplied Markdown files, decisions from the subsequent design conversation, and GLM 5.3's reported Stage 0 audit. The reported repository v0.6 and original `PROTOTYPE-INVENTORY.md` were not supplied for direct comparison; the inventory was reconciled in-repo on 2026-10-17 (PROTOTYPE-INVENTORY §7). The 2026-10-18 revision corrects the §10 recovery summary to the ratified live-suspension/encounter-boundary distinction and refreshes the §4.2 open-question list. v0.9 (2026-10-19) registers `TECH-ARCHITECTURE.md` — the unapproved engine-consolidation proposal — in the §11 documentation map; no vision content is changed. No implementation authorized.
+> **Status:** Consolidated vision foundation v0.10 · 2026-10-19. This edition integrates the four supplied Markdown files, decisions from the subsequent design conversation, and GLM 5.3's reported Stage 0 audit. The reported repository v0.6 and original `PROTOTYPE-INVENTORY.md` were not supplied for direct comparison; the inventory was reconciled in-repo on 2026-10-17 (PROTOTYPE-INVENTORY §7). The 2026-10-18 revision corrects the §10 recovery summary to the ratified live-suspension/encounter-boundary distinction and refreshes the §4.2 open-question list. v0.9 (2026-10-19) registered `TECH-ARCHITECTURE.md` in the §11 documentation map. v0.10 (2026-10-19) updates the §11 map to the three-way-review outcome — engine foundation ratified (DECISIONS T-01–T-08), Stage 0 workspace complete, later stages gated — with no vision content changed. Stage 0 was explicitly lead-authorized; no further implementation is authorized without approval.
 >
 > **Authority / ownership:** The human project lead sets the vision and ratifies decisions. This document owns the product goals, creative/engineering philosophy, and high-level constraints. [`DESIGN-BIBLE.md`](DESIGN-BIBLE.md) owns first-game mechanics; [`MULTIPLAYER-SPEC.md`](MULTIPLAYER-SPEC.md) owns multiplayer gameplay policy; [`CUSTOM-ENGINE-RESEARCH.md`](CUSTOM-ENGINE-RESEARCH.md) owns research methodology; [`DECISIONS.md`](DECISIONS.md) is the decision registry; [`README.md`](README.md) maps the folder.
 >
@@ -214,7 +214,7 @@ A new technology is valuable when it measurably improves our goals; novelty alon
 
 ## 11. Process and living documentation map
 
-We remain in research and design alignment. GLM’s reported Godot prototype audit is reference evidence, not the selected engine. No new implementation of the original engine or game has been authorized. Research plans and small experiments require explicit lead approval before substantive coding.
+We remain in a gated, review-driven process: the engine's initial technical foundation was ratified 2026-10-19 (Rust + Cargo, Vulkan, SDL3 — DECISIONS T-01–T-06) and the Stage 0 workspace is complete (T-08), but every further engine stage requires explicit lead approval before implementation. GLM’s reported Godot prototype audit is reference evidence, not the selected engine. Stage 0 (workspace only) is the sole authorized implementation to date (T-08); no further engine or game implementation is authorized without the lead's approval. Research plans and small experiments require explicit lead approval before substantive coding.
 
 | File | Owns | Status |
 |---|---|---|
@@ -228,7 +228,7 @@ We remain in research and design alignment. GLM’s reported Godot prototype aud
 | [`MULTIPLAYER-ARCHITECTURE-RESEARCH.md`](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) | Research study: co-op authority, persistence, synchronization — unapproved proposal | Exists (research) |
 | [`E5-CANONICAL-MEDIUM-FEASIBILITY.md`](E5-CANONICAL-MEDIUM-FEASIBILITY.md) | E5 feasibility research annex — provider matrix, deployment alternatives, cost models | Exists (research) |
 | [`SIMULATION-ARCHITECTURE-RESEARCH.md`](SIMULATION-ARCHITECTURE-RESEARCH.md) | Research study: living-world simulation architecture — models, LOD, persistent NPCs, chronology, scheduling, experiments | Exists (research) |
-| [`TECH-ARCHITECTURE.md`](TECH-ARCHITECTURE.md) | Engine technical architecture proposal — subsystems, boundaries, state ownership, technology decision map, vertical-slice plan | Exists (proposal — unapproved) |
+| [`TECH-ARCHITECTURE.md`](TECH-ARCHITECTURE.md) | Engine technical architecture — subsystems, boundaries, state ownership, time contract, technology decision map, vertical-slice plan and stage gates | Exists (provisional blueprint — foundation ratified 2026-10-19; stages gated) |
 
 **Possible future documents only when needed:** `WORLD-DESIGN.md`, `PERFORMANCE-BENCHMARKS.md`, `ENGINE-ROADMAP.md`, `TECHNOLOGY-RESEARCH.md`, `ASSETS.md`, `PRODUCTION-PLAN.md`. The anticipated technical `SAVE-ARCHITECTURE.md` territory (serialization, snapshots, distribution, crash consistency) is covered by `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` while that study is under review; any later split must not override player-facing save policy in `MULTIPLAYER-SPEC.md`.
 

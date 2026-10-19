@@ -1,6 +1,6 @@
 # Project Documentation — Working Title SEKTOR 7
 
-> **Status:** Folder index and documentation governance v0.3 · 2026-10-19 · registers `TECH-ARCHITECTURE.md` (unapproved engine-consolidation proposal).
+> **Status:** Folder index and documentation governance v0.4 · 2026-10-19 · registers `TECH-ARCHITECTURE.md` (provisional engine blueprint — foundation ratified 2026-10-19, DECISIONS T-01–T-08; Stage 0 workspace complete, later stages gated).
 >
 > **Authority and scope:** The human project lead makes final commitments. This folder records the vision, game mechanics, shared-campaign rules, original-engine research framework and prior prototype evidence. **This document set does not authorize implementing or modifying the game/engine.**
 >
@@ -17,7 +17,7 @@
 7. [MULTIPLAYER-ARCHITECTURE-RESEARCH.md](MULTIPLAYER-ARCHITECTURE-RESEARCH.md) — **unapproved research:** co-op authority, persistence, synchronization; architecture-E direction, durability tiers, E1–E5 experiments.
 8. [E5-CANONICAL-MEDIUM-FEASIBILITY.md](E5-CANONICAL-MEDIUM-FEASIBILITY.md) — **unapproved E5 research annex:** canonical-medium feasibility, provider matrix, deployment alternatives, cost models, local harness results.
 9. [SIMULATION-ARCHITECTURE-RESEARCH.md](SIMULATION-ARCHITECTURE-RESEARCH.md) — **unapproved research:** living-world simulation architecture, LOD transitions, persistent NPCs, chronology, S-experiments.
-10. [TECH-ARCHITECTURE.md](TECH-ARCHITECTURE.md) — **unapproved consolidation proposal:** engine subsystems and boundaries, state ownership and the time contract, technology decision map (shortlists, no selections), and the Slice-0 vertical-slice plan.
+10. [TECH-ARCHITECTURE.md](TECH-ARCHITECTURE.md) — **provisional engine blueprint** (foundation ratified 2026-10-19): engine subsystems and boundaries, state ownership and the time contract with the six review corrections, technology decision map (Rust + Cargo / Vulkan / SDL3 decided; remainder deferred), and the Slice-0 vertical-slice plan (Stage 0 complete; Stages 1–6 gated).
 
 ## Ownership rules
 
@@ -31,7 +31,7 @@
 | `MULTIPLAYER-ARCHITECTURE-RESEARCH.md` | Unapproved research: authority/persistence/synchronization architectures and experiments | MULTIPLAYER-SPEC policy, DECISIONS registry, lead approval |
 | `E5-CANONICAL-MEDIUM-FEASIBILITY.md` | Unapproved E5 research annex: medium feasibility, deployment alternatives, cost models | MULTIPLAYER-ARCHITECTURE-RESEARCH, DECISIONS registry, lead approval |
 | `SIMULATION-ARCHITECTURE-RESEARCH.md` | Unapproved research: living-world simulation architecture and experiments | DESIGN-BIBLE gameplay rules, MULTIPLAYER-SPEC policy, MULTIPLAYER-ARCHITECTURE-RESEARCH state taxonomy, DECISIONS registry, lead approval |
-| `TECH-ARCHITECTURE.md` | Unapproved proposal: engine subsystems, boundaries, contracts; technology decision map; vertical-slice plan | VISION summits, research-study hypotheses, game-policy owners, DECISIONS registry, lead approval |
+| `TECH-ARCHITECTURE.md` | Provisional blueprint: engine subsystems, boundaries, contracts; ratified foundation + technology decision map; vertical-slice plan and stage gates | VISION summits, research-study hypotheses, game-policy owners, DECISIONS registry, lead approval |
 | `PROTOTYPE-INVENTORY.md` | Reported existing-experiment evidence and source limitations | Technical validation and new tests |
 | `README.md` | Folder map, maintenance rules | All substantive owners above |
 
@@ -52,7 +52,7 @@ Examples and speculative implementation mechanisms must carry the correct tag. W
 
 ## Current hard boundaries
 
-- **Original reusable engine selected as project direction**; exact engine technology remains open.
+- **Original reusable engine selected as project direction.** Initial technical foundation ratified 2026-10-19 (DECISIONS T-01–T-06): Rust + Cargo, direct Vulkan as the single initial rendering backend, SDL3 for windowing/input, `ash` as the Vulkan-binding investigation candidate, minimal GLSL→SPIR-V starting path. The six-layer architecture is a provisional implementation blueprint (T-07); the Stage 0 workspace (`engine/`) is complete (T-08) and all further stages are gated.
 - **First game:** large open-world futuristic RPG with authored city and separate procedural frontier; both first- and third-person; highly systemic combat; classless and ultimately broad-mastery progression; major consequences and selected NPC mortality.
 - **Launch multiplayer:** functional for 1–4 players, with separate solo saves and world-bound co-op characters, **no developer-funded dedicated servers**; player-hosted listen-server currently preferred. All registered members required for authored story; subsets may play frontier.
 - **Persistence and recovery (multiplayer):** automatic progress-based persistence with shared-canonical-storage acknowledgment (no manual save slots or arbitrary-state reloads); encounter-failure transactional rollback; planned host handoff required; unexpected-disconnect suspension (15 min authored / ~10 min frontier grace); fail-closed authority.
