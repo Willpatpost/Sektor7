@@ -51,6 +51,11 @@ pub struct InputSnapshot {
     pub focus_gained: bool,
     /// Focus lost in this snapshot (held keys were cleared).
     pub focus_lost: bool,
+    /// Window minimized in this snapshot (held keys were cleared). Stage 2:
+    /// the render loop suspends presentation while minimized.
+    pub minimized: bool,
+    /// Window restored from minimization in this snapshot.
+    pub restored: bool,
     /// A quit was requested (window close or SDL quit); sticky once set.
     pub quit_requested: bool,
 }
@@ -71,6 +76,8 @@ pub struct InputState {
     resized: Option<(u32, u32)>,
     focus_gained: bool,
     focus_lost: bool,
+    minimized: bool,
+    restored: bool,
     quit_requested: bool,
 }
 
@@ -94,6 +101,8 @@ impl InputState {
             resized: None,
             focus_gained: false,
             focus_lost: false,
+            minimized: false,
+            restored: false,
             quit_requested: false,
         }
     }
@@ -165,6 +174,14 @@ impl InputState {
                 self.keys_held.clear();
                 self.look_delta = (0.0, 0.0);
             }
+            WindowEvent::Minimized => {
+                self.minimized = true;
+                // A minimized window receives no input; apply the same
+                // anti-stuck-key discipline as focus loss (Stage 2).
+                self.keys_held.clear();
+                self.look_delta = (0.0, 0.0);
+            }
+            WindowEvent::Restored => self.restored = true,
             _ => {}
         }
     }
@@ -187,6 +204,8 @@ impl InputState {
             resized: self.resized,
             focus_gained: self.focus_gained,
             focus_lost: self.focus_lost,
+            minimized: self.minimized,
+            restored: self.restored,
             quit_requested: self.quit_requested,
         };
         self.look_delta = (0.0, 0.0);
@@ -194,6 +213,8 @@ impl InputState {
         self.resized = None;
         self.focus_gained = false;
         self.focus_lost = false;
+        self.minimized = false;
+        self.restored = false;
         snapshot
     }
 }

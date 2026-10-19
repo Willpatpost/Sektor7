@@ -1,9 +1,8 @@
-//! Interactive slice binary: the Stage 0 stdin CLI for `engine-core`, plus
-//! the Stage 1 SDL3 shell modes (`--window`, `--window --dummy`,
-//! `--soak <secs>`).
-//!
-//! Rendering is Stage 2 and is absent by authorization; the window modes
-//! are CPU-driven only.
+//! Interactive slice binary: the Stage 0 stdin CLI for `engine-core`, the
+//! Stage 1 SDL3 shell modes (`--window`, `--window --dummy`,
+//! `--soak <secs>`), and the Stage 2 Vulkan render demo (`--render`, with
+//! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
+//! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`).
 
 use std::io::{self, Write};
 
@@ -19,6 +18,65 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|arg| arg == "--render") {
+        let mut options = engine_slice::render_demo::RenderOptions::default();
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--present" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(mode) = engine_renderer::PresentModePreference::parse(value)
+                    {
+                        options.present = mode;
+                        index += 1;
+                    }
+                }
+                "--fps" => {
+                    if let Some(value) = args.get(index + 1) {
+                        if value == "uncapped" {
+                            options.fps = 0;
+                            index += 1;
+                        } else if let Ok(fps) = value.parse::<u32>() {
+                            options.fps = fps.clamp(1, 1000);
+                            index += 1;
+                        }
+                    }
+                }
+                "--frames" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(frames) = value.parse::<u64>()
+                    {
+                        options.frames = Some(frames.clamp(1, 1_000_000));
+                        index += 1;
+                    }
+                }
+                "--no-overlay" => options.overlay = false,
+                "--validation" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(preference) =
+                            engine_renderer::ValidationPreference::parse(value)
+                    {
+                        options.validation = preference;
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if let Err(message) = engine_slice::render_demo::run_render_demo(options) {
+            eprintln!("error: {message}");
+            if message.contains("Vulkan loader") {
+                eprintln!(
+                    "(no Vulkan runtime installed? headless smoke uses \
+                     SDL_VIDEODRIVER=offscreen plus a software ICD)"
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.iter().any(|arg| arg == "--window") {
         let dummy = args.iter().any(|arg| arg == "--dummy");
@@ -53,6 +111,7 @@ fn main() {
 
     println!(
         "Sektor7 original engine — interactive slice (stdin CLI; \
+         --render for the Stage 2 Vulkan demo; \
          --window / --window --dummy for the Stage 1 shell; \
          --soak <secs> for the loop soak; --fingerprint-selftest for determinism)"
     );

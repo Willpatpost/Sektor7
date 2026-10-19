@@ -45,3 +45,10 @@ jobs:
             exit 1
           fi
           echo "$a"
+      - name: Vulkan offscreen render smoke (Linux only — software rasterizer, correctness evidence, NOT performance evidence)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0

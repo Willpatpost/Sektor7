@@ -141,6 +141,11 @@ impl ShellApp {
         self.window.size()
     }
 
+    /// The underlying SDL3 window — Stage 2 renderer surface creation.
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
     pub fn is_held(&self, key: sdl3::keyboard::Keycode) -> bool {
         self.input.is_held(key)
     }

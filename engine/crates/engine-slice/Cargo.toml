@@ -6,6 +6,7 @@ description = "Sektor7 original engine — Stage 0 interactive slice application
 
 [dependencies]
 engine-core = { path = "../engine-core" }
+engine-renderer = { path = "../engine-renderer" }
 engine-shell = { path = "../engine-shell" }
 
 [lints]

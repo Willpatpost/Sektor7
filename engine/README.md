@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-48 tests (33 Stage 0 + 15 Stage 1). The 60-second soak is a measurement, ignored by default:
+61 tests (33 Stage 0 + 15 Stage 1 + 13 Stage 2: 9 renderer, 4 camera math). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
@@ -59,16 +59,29 @@ The first build compiles vendored SDL 3.4.18 (a few minutes). A 1280×720 window
 
 **Linux (desktop with X11/Wayland dev packages):** the same commands; desktop backends are autodetected. Without them, `--window --dummy` is the headless smoke only.
 
+## Stage 2 render demo (Vulkan; hardware evidence needs a graphical session)
+
+**Windows reference rig (RTX 5070 Ti):** after the Stage 1 setup above:
+
+```sh
+cargo run -p engine-slice -- --render
+cargo run -p engine-slice -- --render --present mailbox
+cargo run -p engine-slice -- --render --present immediate --fps uncapped
+cargo run -p engine-slice -- --render --fps 240
+```
+
+Verify: **depth ordering** (the three overlapping depth-demo cubes intersect correctly from every angle); **resize** (swapchain recreation, no hangs or artifacts); **minimize/restore** (frames skip while minimized; rendering resumes); **close** (Esc or the close button) exits cleanly with the run summary — presented frames, CPU P50/P95/P99, GPU timestamp percentiles, present mode, swapchain recreations, validation counts; **relaunch** repeatedly; **O** toggles the overlay; the build output shows **no LNK4098**. `--validation on` forces validation layers (absent layers are an environment limitation, reported honestly); `--no-overlay` disables the readout. The exit summary carries the instrument caveat: readings of this simple scene are **not first-game performance claims** — the 240+ FPS target is a long-term objective (DECISIONS T-11), and present-mode/uncapped runs exist to measure presentation behavior on real hardware. Pod/CI lavapipe runs are correctness evidence only.
+
 ## Tested environments
 
 | Environment | Method | Result |
 |---|---|---|
-| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 46/46 tests, fmt/clippy clean, headless smoke + 60 s soak |
+| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 61/61 tests, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
 | Real-window GUI | manual, lead's rig | instructions above; evidence pending the lead's run |
 
 ## What is deliberately absent
 
-Renderer (Vulkan/`ash`) — Stage 2; physics, ECS, scripting, audio, cooked asset formats, networking, editor, threading/job framework, subsystem registries, render graph — each deferred with a stated trigger (`docs/TECH-ARCHITECTURE.md` §5/§8). No SDL GPU/render APIs are used.
+Physics, ECS, scripting, audio, cooked asset formats, networking, editor, threading/job framework, subsystem registries, render graph, material framework, scene graph — each deferred with a stated trigger (`docs/TECH-ARCHITECTURE.md` §5/§8). No SDL GPU/render APIs are used; Vulkan is reached only through ash (T-12).
 
-Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-10).
+Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-13).

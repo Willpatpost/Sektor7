@@ -1,0 +1,32 @@
+[package]
+name = "engine-renderer"
+version.workspace = true
+edition.workspace = true
+description = "Sektor7 original engine — Stage 2 Vulkan presentation and first render"
+
+[dependencies]
+# Vulkan binding (T-03 investigation concluded: ash 0.38, the de-facto
+# standard raw Vulkan binding, actively maintained, pairs with sdl3-sys's
+# ash integration). Direct Vulkan remains the single backend (T-02).
+ash = "0.38.0"
+# Surface creation and instance-extension discovery stay on the SDL
+# boundary the wrapper already provides; the wrapper's `ash` feature makes
+# its VkInstance/VkSurfaceKHR types alias ash's handles directly.
+sdl3 = { version = "0.20", default-features = false, features = ["build-from-source-static", "ash"] }
+# Validation-layer messages, swapchain events, and renderer diagnostics
+# flow through the shared engine-core logger (L0, TECH-ARCHITECTURE §2.12).
+engine-core = { path = "../engine-core" }
+# Debug-overlay font: public-domain 8x8 bitmap data, no code (Stage 2
+# authorization item 4 — minimal overlay, no UI framework).
+font8x8 = "0.3.1"
+# Zero-copy vertex/matrix byte casts (Pod casts of #[repr(C)] scene and
+# overlay vertices and the push-constant matrix).
+bytemuck = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+# Minimal GLSL-to-SPIR-V path (T-05): pure-Rust compilation at build time —
+# no external shader tools on any platform (dev pod, CI runners, the lead's
+# rig). The permanent shader-toolchain decision remains deferred.
+# Pinned to 29.0.4: naga 30.0.1's glsl-in frontend does not compile against its
+# own ir module (apply_default_interpolation missing) — observed 2026-10-19.
+naga = { version = "=29.0.4", features = ["glsl-in", "spv-out"] }
