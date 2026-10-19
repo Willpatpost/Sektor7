@@ -1,4 +1,4 @@
-//! The event spine: canonical campaign clock, scheduling with global
+//! The event spine: canonical campaign clock, scheduling with deterministic
 //! `(due, seq)` queue priority, cross-class causal dependencies, per-tick
 //! budget, the execution ledger, and the safe processed-through watermark.
 //!
@@ -124,10 +124,13 @@ pub struct Stats {
     pub budget_exhausted_ticks: u64,
 }
 
-/// Queue entry, ordered by `(due, seq)` — the spine's dequeue order.
-/// Execution order can deviate from dequeue order when an event is
-/// causality-blocked past its siblings or arrives late (see
-/// [`EventClass`](crate::EventClass)); the ledger records actual execution.
+/// Queue entry, ordered by `(due, seq)`. Each dequeue selects the minimum
+/// key among currently queued, due events; a causality-blocked event leaves
+/// the queue and reenters with its original priority once its dependencies
+/// are satisfied, and late arrivals can introduce earlier-due events after
+/// later ones have executed — so neither dequeue nor execution order is
+/// globally monotonic (see [`EventClass`](crate::EventClass)); the ledger
+/// records actual execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     due: Tick,

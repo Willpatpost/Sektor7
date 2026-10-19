@@ -6,17 +6,21 @@ use crate::clock::Tick;
 
 /// Opaque event classification tag (game-defined).
 ///
-/// The spine's **queue priority** is globally `(due, seq)`, so events of one
-/// class are dequeued in `(due, seq)` order. **Execution order** follows
-/// dequeue order except in two recorded cases (independent audit
-/// 2026-10-19, item 2): a causality-blocked event waits for its
-/// dependencies and can execute after later same-class siblings, and a
-/// late arrival — scheduled after its intended due — executes after
-/// earlier-due events that already ran. Both deviations are first-class
-/// ledger data (`executed_tick`, `late`), never silent. Across classes no
-/// ordering is guaranteed at all; causal ordering (across or within
-/// classes) requires explicit [`EventSpec::depends_on`] links
-/// (`docs/TECH-ARCHITECTURE.md` §3.2, review correction 2).
+/// Within a class, `(due, seq)` defines **deterministic queue priority**:
+/// each dequeue selects the minimum key among currently queued, due events.
+/// This is not a guarantee of globally monotonic dequeue or execution order
+/// (`docs/TECH-ARCHITECTURE.md` §3.2, clarified 2026-10-19 per the lead).
+/// Causality-blocked events leave the active queue until their dependencies
+/// are satisfied and may subsequently reenter with their original priority;
+/// late arrivals may introduce earlier-due events after later-due events
+/// have already executed. Execution order is represented by the ordered
+/// execution ledger (`intended_due`, `executed_tick`, `late`), which
+/// exposes timing and ordering deviations but does not necessarily identify
+/// their causes. Explicit [`EventSpec::depends_on`] relationships enforce
+/// required causal precedence, including across event classes; consumers
+/// must never infer causal guarantees solely from chronological queue
+/// priority. Cross-class execution order remains unspecified except where
+/// explicit dependencies impose constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventClass(pub u16);
 

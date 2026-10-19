@@ -14,13 +14,15 @@
 //!   complete (including a pending event at tick 0). It is computed live,
 //!   may retreat when late events are scheduled, and is a progress measure
 //!   — not irreversible finality.
-//! * **Causal dependencies and ordering** — the spine's queue priority is
-//!   globally `(due, seq)`; execution follows it except under causal
-//!   blocking or late arrival (both recorded in the ledger — see
-//!   [`EventClass`]). Across classes, ordering exists only through explicit
-//!   `depends_on` links. Dependency ids must reference already-scheduled or
-//!   already-executed events (unknown ids are rejected at schedule time),
-//!   which makes dependency cycles structurally impossible.
+//! * **Causal dependencies and ordering** — within a class, `(due, seq)`
+//!   defines deterministic queue priority (minimum key among currently
+//!   queued, due events) — not a globally monotonic dequeue or execution
+//!   guarantee; the ledger records deviations without identifying their
+//!   causes (see [`EventClass`]). Across classes, ordering exists only
+//!   through explicit `depends_on` links. Dependency ids must reference
+//!   already-scheduled or already-executed events (unknown ids are rejected
+//!   at schedule time), which makes dependency cycles structurally
+//!   impossible.
 //! * **Event vs execution timestamps** — [`Schedule::AtLogicalTime`] fixes
 //!   the due tick at schedule time; [`Schedule::ExecutionRelative`] anchors
 //!   a follow-up to the tick at which its scheduling event actually
