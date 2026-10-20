@@ -73,6 +73,14 @@ impl ValidationPreference {
 pub struct RenderConfig {
     pub present_mode: PresentModePreference,
     pub validation: ValidationPreference,
+    /// Verification scenario (`--replace-pipelines`): force every
+    /// swapchain recreation to replace the pipeline state, exercising
+    /// the surface-format-change lifecycle — including the dynamic
+    /// region-scene buffer carry-over (Stage 4 final-review finding A)
+    /// — without a real format change, which resizing alone cannot
+    /// produce (the CI resize smoke keeps the surface format). Never
+    /// set by normal operation.
+    pub replace_pipelines: bool,
 }
 
 /// Frames simultaneously in flight (sync objects per slot). Fixed at 2 for

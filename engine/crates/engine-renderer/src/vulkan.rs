@@ -1745,6 +1745,7 @@ pub(crate) fn render_frame(
     frames: &mut FrameState,
     window_size: (u32, u32),
     present_preference: PresentModePreference,
+    replace_pipelines: bool,
     view_proj: &[[f32; 4]; 4],
     region_vertices: &[SceneVertex],
     overlay_vertices: &[OverlayVertex],
@@ -1791,6 +1792,7 @@ pub(crate) fn render_frame(
             frames,
             window_size,
             present_preference,
+            replace_pipelines,
         )?;
         outcome.recreated = true;
     }
@@ -1805,6 +1807,7 @@ pub(crate) fn render_frame(
             frames,
             window_size,
             present_preference,
+            replace_pipelines,
         )?;
         outcome.recreated = true;
     }
@@ -1841,6 +1844,7 @@ pub(crate) fn render_frame(
             frames,
             window_size,
             present_preference,
+            replace_pipelines,
         )?;
         outcome.recreated = true;
         acquire_result = unsafe {
@@ -2085,6 +2089,7 @@ pub(crate) fn render_frame(
                 frames,
                 window_size,
                 present_preference,
+                replace_pipelines,
             )?;
             outcome.recreated = true;
         }
@@ -2145,16 +2150,38 @@ fn recreate_swapchain(
     frames: &mut FrameState,
     window_size: (u32, u32),
     present_preference: PresentModePreference,
+    replace_pipelines: bool,
 ) -> Result<(), RendererError> {
     unsafe { ctx.device.device_wait_idle() }
         .map_err(|error| RendererError::vk(error, "device_wait_idle"))?;
     let depth_format = swapchain.depth_format;
     let (new_format, new_color_space) = pick_surface_format(ctx)?;
     // Build the replacement pipelines first when the format changed
-    // (finding F); on failure the old state is untouched and the
-    // partial replacement cleans itself up (finding G).
-    let replacement_pipes = if new_format != swapchain.format {
-        Some(PipelineState::new(ctx, new_format, depth_format)?)
+    // (finding F) — or when the verification flag forces the
+    // replacement path (`--replace-pipelines`, exercising the
+    // format-change lifecycle without a real format change; the CI
+    // resize smoke cannot otherwise reach it because resizing keeps
+    // the surface format). On failure the old state is untouched and
+    // the partial replacement cleans itself up (finding G).
+    let replacement_pipes = if replace_pipelines || new_format != swapchain.format {
+        let mut replacement = PipelineState::new(ctx, new_format, depth_format)?;
+        // Stage 4 final-review finding A: a replacement pipeline must
+        // be fully prepared for dynamic region drawing BEFORE it
+        // becomes active. If the outgoing state owns a lazily
+        // allocated region-scene buffer, the replacement allocates its
+        // own before installation — a failure destroys the replacement
+        // and leaves the old state valid (the finding-G discipline),
+        // so no half-installed pipeline state and, afterward, no null
+        // mapped-buffer writes or null region-VBO draws. The default
+        // `--render` path never has a region buffer, so it never pays
+        // this allocation.
+        if pipes.region_vbo != vk::Buffer::null()
+            && let Err(error) = replacement.ensure_region_capacity(ctx)
+        {
+            replacement.destroy(ctx);
+            return Err(error);
+        }
+        Some(replacement)
     } else {
         None
     };

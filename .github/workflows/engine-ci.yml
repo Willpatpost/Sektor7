@@ -95,3 +95,8 @@ jobs:
           # silently skipped).
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize
+          # Stage 4 final-review finding A: force pipeline replacement on
+          # recreation with region buffers initialized — the
+          # surface-format-change lifecycle (region-scene buffer
+          # carry-over) that same-format resizing cannot reach.
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize --replace-pipelines

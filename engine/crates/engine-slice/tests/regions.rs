@@ -1210,9 +1210,15 @@ fn per_lod_work_scales_across_levels() {
          event(2) {event} · event(7) {event_7} · dormant(3-6) {dormant}"
     );
     println!(
-        "tick time (per-tick, region director active): p50 {:.3} ms · p95 {:.3} ms",
+        "spine tick time (per-tick): p50 {:.3} ms · p95 {:.3} ms",
         driver.tick_ms_percentile(0.50),
         driver.tick_ms_percentile(0.95)
+    );
+    println!(
+        "region director boundary (per-tick, presence sampling + transitions): \
+         p50 {:.3} ms · p95 {:.3} ms",
+        driver.director_ms_percentile(0.50),
+        driver.director_ms_percentile(0.95)
     );
     println!(
         "obligations: queued {} · blocked {} · held {}",

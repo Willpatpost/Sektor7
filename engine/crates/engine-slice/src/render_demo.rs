@@ -45,6 +45,14 @@ pub struct RenderOptions {
     /// proxies for Full/Simplified regions. `false` (the default) keeps
     /// the Stage 3 baseline path untouched.
     pub regions: bool,
+    /// Verification scenario (Stage 4 final-review finding A): force
+    /// every swapchain recreation to replace the pipeline state,
+    /// exercising the surface-format-change lifecycle — including the
+    /// dynamic region-scene buffer carry-over — without a real format
+    /// change (resizing keeps the surface format, so the plain resize
+    /// scenario cannot reach the replacement path). Pairs with
+    /// `--simulate-resize` for the regression smoke.
+    pub replace_pipelines: bool,
 }
 
 impl Default for RenderOptions {
@@ -59,6 +67,7 @@ impl Default for RenderOptions {
             sim_budget: None,
             sim_near_reserve: None,
             regions: false,
+            replace_pipelines: false,
         }
     }
 }
@@ -128,6 +137,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     let render_config = RenderConfig {
         present_mode: options.present,
         validation: options.validation,
+        replace_pipelines: options.replace_pipelines,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
@@ -485,11 +495,22 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         totals.far_backlogged_ticks
     );
     println!(
-        "sim tick time: p50 {:.3} ms · p95 {:.3} ms (per-tick, {} samples)",
+        "sim tick time (spine execution): p50 {:.3} ms · p95 {:.3} ms (per-tick, {} samples)",
         sim.tick_ms_percentile(0.50),
         sim.tick_ms_percentile(0.95),
         sim.tick_sample_count()
     );
+    if sim.director().is_some() {
+        // Stage 4 final-review finding B: the tick-boundary work is
+        // reported under its own label — never presented as spine
+        // execution time or vice versa.
+        println!(
+            "region director time (presence sampling + transitions): p50 {:.3} ms · p95 {:.3} ms (per-tick, {} samples)",
+            sim.director_ms_percentile(0.50),
+            sim.director_ms_percentile(0.95),
+            sim.tick_sample_count()
+        );
+    }
     println!(
         "watermark max_executed_due {} · processed_through {}",
         spine

@@ -126,6 +126,15 @@ pub struct SimDriver {
     /// batches (corrective finding D). Observational only, never
     /// fingerprinted.
     tick_ms_history: Vec<f64>,
+    /// Bounded history of per-tick tick-boundary durations in
+    /// milliseconds — the scripted-presence sampling plus
+    /// RegionDirector application (transition processing) that precedes
+    /// spine execution, timed SEPARATELY so spine-only timing is never
+    /// presented as RegionDirector overhead (Stage 4 final-review
+    /// finding B). One entry per logical tick (0.0 when no director
+    /// exists — the true empty-boundary cost). Observational only,
+    /// never fingerprinted.
+    director_ms_history: Vec<f64>,
     /// Stage 4 region director — absent in the Stage 3 baseline
     /// configuration, so every historical fingerprint is preserved
     /// mechanically when no director exists.
@@ -161,6 +170,7 @@ impl SimDriver {
             total_advanced_ns: 0,
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
+            director_ms_history: Vec::new(),
             director: None,
             presence: Vec::new(),
             presence_scenario: None,
@@ -197,6 +207,7 @@ impl SimDriver {
             total_advanced_ns: 0,
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
+            director_ms_history: Vec::new(),
             director: Some(director),
             presence: initial_presence.to_vec(),
             presence_scenario: None,
@@ -306,6 +317,11 @@ impl SimDriver {
         // Per-tick instrumentation (corrective finding D): each history
         // entry is one logical tick, so the percentiles represent real
         // tick costs including catch-up batches — not batch averages.
+        // Stage 4 final-review finding B: the tick-boundary work
+        // (scripted-presence sampling + RegionDirector application) is
+        // timed separately from spine execution and reported under its
+        // own label — spine tick timing is never presented as
+        // RegionDirector overhead.
         for _ in 0..ticks {
             // Batch 2 corrective finding B: scripted presence is a
             // function of the LOGICAL tick — each completed tick
@@ -314,6 +330,7 @@ impl SimDriver {
             // history across cadences. Camera presence (set per frame
             // by the graphical loop) is a live external input and stays
             // frame-sampled by design.
+            let boundary_start = std::time::Instant::now();
             if let (Some(scenario), Some(centers)) = (
                 &self.presence_scenario,
                 self.director
@@ -330,6 +347,7 @@ impl SimDriver {
             if let Some(director) = self.director.as_mut() {
                 director.apply(&mut self.spine, &self.presence);
             }
+            let director_ms = boundary_start.elapsed().as_secs_f64() * 1000.0;
             let start = std::time::Instant::now();
             self.spine.run_tick();
             let tick_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -338,10 +356,20 @@ impl SimDriver {
             if len > 600 {
                 self.tick_ms_history.drain(0..len - 600);
             }
+            self.director_ms_history.push(director_ms);
+            let len = self.director_ms_history.len();
+            if len > 600 {
+                self.director_ms_history.drain(0..len - 600);
+            }
         }
     }
 
-    /// Observational per-tick duration percentiles (milliseconds).
+    /// Observational per-tick SPINE EXECUTION duration percentiles
+    /// (milliseconds) — the timed `run_tick` call only. The
+    /// tick-boundary work (scripted-presence sampling +
+    /// RegionDirector application) is reported separately by
+    /// [`Self::director_ms_percentile`]; neither is ever presented as
+    /// the other (Stage 4 final-review finding B).
     pub fn tick_ms_percentile(&self, quantile: f64) -> f64 {
         if self.tick_ms_history.is_empty() {
             return 0.0;
@@ -356,5 +384,23 @@ impl SimDriver {
 
     pub fn tick_sample_count(&self) -> usize {
         self.tick_ms_history.len()
+    }
+
+    /// Observational per-tick TICK-BOUNDARY duration percentiles
+    /// (milliseconds): scripted-presence sampling plus RegionDirector
+    /// application (transition processing) — the work that precedes
+    /// spine execution. 0.0 throughout when no director exists.
+    /// Reported under its own label, never as spine execution time
+    /// (Stage 4 final-review finding B).
+    pub fn director_ms_percentile(&self, quantile: f64) -> f64 {
+        if self.director_ms_history.is_empty() {
+            return 0.0;
+        }
+        let mut sorted = self.director_ms_history.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let index = ((quantile * sorted.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        sorted[index]
     }
 }

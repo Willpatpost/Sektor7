@@ -214,6 +214,7 @@ impl Renderer {
             &mut self.frames,
             window_size,
             self.config.present_mode,
+            self.config.replace_pipelines,
             view_proj,
             region_scene,
             &overlay,
