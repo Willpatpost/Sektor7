@@ -127,7 +127,14 @@ jobs:
           uname -m
           rustc -vV
           [ "$(uname -m)" = "arm64" ] || { echo "runner is not arm64"; exit 1; }
-          rustc -vV | grep -q "host: aarch64-apple-darwin" || { echo "Rust host is not aarch64-apple-darwin"; exit 1; }
+          # Not `rustc -vV | grep -q "..."`: BSD grep -q exits on the first
+          # match while rustc's line-buffered stdout still has lines to
+          # write, so rustc takes SIGPIPE and `pipefail` fails the pipeline
+          # even though the host matched (observed in run 39510072079).
+          # Capturing the line and comparing it exactly avoids piping a
+          # live producer and rejects partial matches.
+          rustc_host=$(rustc -vV | grep "^host:")
+          [ "$rustc_host" = "host: aarch64-apple-darwin" ] || { echo "Rust host is not aarch64-apple-darwin (got: $rustc_host)"; exit 1; }
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
