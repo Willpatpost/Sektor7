@@ -1,6 +1,6 @@
 # Sektor7 macOS ARM64 Port — Mac 0 Feasibility Audit and Implementation Plan
 
-> **Status:** PROPOSAL under staged execution — experimental platform-portability research on the isolated `macos-port` branch (base `2e71770`, created from `stage4-review`; `stage4-review` and `main` untouched). Not authorized for merge. **Mac 0 PASS** — independent review of `559b2c2`, 2026-10-20. **Mac 1 GO** — same review; scope is CPU portability + macOS CI only (no Vulkan implementation work), with two qualifications folded in below: §6.3 (Vulkan loader consistency is an empirical Mac 2 verification, not an assumption) and §7 (exact ARM64 fingerprint equality is an acceptance condition, not a design proof). Mac 2/3 remain gated on independent review after Mac 1 delivery.
+> **Status:** PROPOSAL under staged execution — experimental platform-portability research on the isolated `macos-port` branch (base `2e71770`, created from `stage4-review`; `stage4-review` and `main` untouched). Not authorized for merge. **Mac 0 PASS** — independent review of `559b2c2`, 2026-10-20. **Mac 1 GO** — same review; scope is CPU portability + macOS CI only (no Vulkan implementation work), with two qualifications folded in below: §6.3 (Vulkan loader consistency is an empirical Mac 2 verification, not an assumption) and §7 (exact ARM64 fingerprint equality is an acceptance condition, not a design proof). **Mac 1 delivered 2026-10-20** — CI run 39512109794 green on all three jobs with exact historical fingerprints on `aarch64-apple-darwin` (record §13); the review's HOLD conditions are satisfied and the record awaits independent review. Mac 2 is not authorized.
 >
 > **Scope guardrails (from the port authorization):** retain Rust, SDL3, ash, Vulkan and the existing rendering architecture; no separate native Metal renderer; no gameplay systems, persistence, networking or ECS; portability-enumeration instance extensions/flags only when supported and required; enable `VK_KHR_portability_subset` on devices that advertise it; verify ash/SDL3 loader consistency; treat validation-layer and device-discovery failures transparently; preserve renderer safety and all Stage 4 contracts. Independent of the pending Stage 4 Windows hardware acceptance; Stage 5 remains unauthorized.
 >
@@ -208,4 +208,37 @@ No risk identified in: dependencies (§4), determinism (§7), or renderer archit
 - Fingerprint/determinism: `engine/crates/engine-core/src/fingerprint.rs`; `engine-core/src/clock.rs`; grep over `engine/` — transcendentals only in `engine-slice/src/math.rs` (render camera).
 - CI gates and pinned values: `.github/workflows/engine-ci.yml`; acceptance-plan structure to mirror: `engine/README.md`.
 
-*Mac 0 stops here for review. No engine source was changed; the `macos-port` branch carries only this document.*
+## 13. Mac 1 record (2026-10-20) — CPU portability delivered; CI green on macOS ARM64
+
+**Scope delivered (per the Mac 1 GO):** `macos-port` push trigger; additive `macos-15` ARM64 job mirroring the CPU gates with an explicit architecture gate and pinned Stage 0/3/4 fingerprints; the two Mac 0 review qualifications folded into §6.3/§7; herestring `grep -Fq` forms per the review follow-up. **No engine source, test, manifest, or lockfile changes**; the ubuntu/windows matrix job is byte-identical to the reviewed workflow in every run below.
+
+**Commits (`macos-port`, base `2e71770`):**
+- `473df26` — Mac 1 implementation (job + trigger + doc qualifications).
+- `8b9a5dd` — corrective 1: architecture-gate shell fix (BSD `grep -q` early-exit + `pipefail` SIGPIPE self-terminated a correctly-matching host; runner `arm64` and host `aarch64-apple-darwin` were both confirmed in that run's log).
+- `13ee359` — corrective 2: herestring grep forms throughout the macOS job + SDL Apple video-thread handling (one test per process for the three SDL-touching engine-shell suites).
+- This commit — Mac 1 record.
+
+**CI evidence (workflow `engine-ci`):**
+- **`39512109794` (commit `13ee359`) — all three jobs green** (`ubuntu-latest`, `windows-latest`, `macos-15 ARM64`; macOS job 3 min 22 s): https://github.com/Willpatpost/Sektor7/actions/runs/39512109794
+- Honest failure trail: `39510072079` (`473df26` — macOS gate shell bug; ubuntu/windows green) and `39510757458` (`8b9a5dd` — SDL Apple video-thread assertion; ubuntu/windows green; fmt/clippy/build already green on macOS with 79 tests green before the abort).
+
+**Runner architecture (gated, not assumed):** `uname -m` = `arm64`; `rustc -vV` host = `aarch64-apple-darwin` (rustc 1.99.1, 58cf8f9c3 2026-10-13); pinned toolchain installed from `rust-toolchain.toml`.
+
+**macOS ARM64 results (run 39512109794):**
+- **Format check, Clippy (`-D warnings`), workspace build: green.** The vendored SDL 3.4.18 CMake static build compiled cleanly with no macOS-specific flags; the 7 GB M1 runner needed no parallelism reduction.
+- **Tests: 148 passed + 1 ignored — identical to ubuntu/windows.** 133 passed via the multi-threaded SDL-free run (`cargo test --workspace --exclude engine-shell`); 15 passed via one-test-per-process for the SDL-touching suites (`input_dispatch` 13, `lifecycle` 2); the 60 s soak measurement stays ignored by design (its per-process invocation reports `0 passed; 1 ignored`). SDL3's Apple-only video-thread assertion (§8.6) is satisfied by construction in the per-process runs.
+- **Stage 0 (double-run identical):** `engine=6504123a47cab66f`, `state=937bd3b6f56f07e0` — exact historical values.
+- **Stage 3, 300 ticks (double-run identical):** `executed 45717`, `engine-lanes=5591d3eb05643e78`, `state-lanes=9d90cb3bbd45b032` — exact historical values.
+- **Stage 4 presence (double-run identical per scenario):** `stage4=da1b2d1a7e5cd49e` (stationary), `stage4=1df391ad488848bf` (walk), `stage4=495ab27b37549e93` (tour) — exact historical values. **The review's acceptance condition B is met empirically: ARM64 output is byte-identical to the pinned cross-platform values.**
+
+**macOS-specific corrections required:** two, both CI-workflow-level and outside engine source — (1) the `grep -q`/`pipefail` gate bug; (2) the SDL-on-Apple video-thread invariant vs the multi-threaded libtest harness (one test per process for the SDL suites; ubuntu/windows keep the default harness — the assertion is Apple-only in the vendored SDL source). Zero engine, test, dependency, or gate changes.
+
+**Remaining blockers for Mac 2 (Mac 2 is not authorized):**
+1. Independent review of this Mac 1 record (Mac 1 was on HOLD until the review gates passed; the green run above satisfies the stated gates).
+2. Vulkan loader resolved-path verification on the M1 rig (§6.3 — empirical; SDL may resolve `vulkan.framework/vulkan` before `libvulkan.1.dylib`).
+3. The §6.1/§6.2 engine changes (portability enumeration + `VK_KHR_portability_subset`) — not yet made; no Vulkan work was done in Mac 1.
+4. MoltenVK/SDK environment on the lead's M1 MacBook Air (R2); CI MoltenVK smoke feasibility (R1/R3) remains staged and non-gating.
+
+A green CPU-portability run is **not** graphical Vulkan/MoltenVK acceptance (§8.5).
+
+*Mac 1 stops here for independent review. No engine source was changed at any point in Mac 1; the `macos-port` branch carries the audit document, the CI additions, and this record.*
