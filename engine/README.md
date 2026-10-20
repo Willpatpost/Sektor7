@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-65 tests (33 Stage 0 + 15 Stage 1 + 17 Stage 2: 13 renderer, 4 camera math). The 60-second soak is a measurement, ignored by default:
+85 tests (33 Stage 0 + 15 Stage 1 + 21 Stage 2 + 16 Stage 3: 9 spine lanes, 7 simulation determinism). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
@@ -74,6 +74,29 @@ Verify: **depth ordering** (the three overlapping depth-demo cubes intersect cor
 
 **Windows note — "An Application Control policy has blocked this file" (os error 4551):** Smart App Control blocks locally built unsigned executables. Confirm with `Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy -Name VerifiedAndReputablePolicyState` (1/2 = evaluation/enforcement) and the block events in the `Microsoft-Windows-CodeIntegrity/Operational` log (3076/3077, naming policy `VerifiedAndReputableDesktop`); the fix is Settings → Privacy & security → Windows Security → App & browser control → Smart App Control settings → **Off** (permanent for the install — the standard choice for a dev machine, which compiles unsigned binaries by definition). Headless recreation verification: `cargo run -p engine-slice -- --render --frames 20 --fps 0 --simulate-resize` (the run summary reports swapchain recreations).
 
+## Stage 3 headless simulation (`--sim`)
+
+Deterministic, no GPU or window required — every run prints only logical state, so repeated runs with identical arguments print identical output:
+
+```powershell
+cargo run -p engine-slice -- --sim --ticks 300 --cadence 60
+cargo run -p engine-slice -- --sim --ticks 300 --cadence 240
+cargo run -p engine-slice -- --sim --ticks 300 --cadence irregular
+cargo run -p engine-slice -- --sim --ticks 300 --seed 4242
+cargo run -p engine-slice -- --sim --ticks 300 --budget 140 --near-reserve 70
+cargo run -p engine-slice -- --sim --ticks 300 --budget 30 --near-reserve 10
+```
+
+Expected observations: identical output for repeated identical commands (double-run discipline); `cadence` variants and `irregular` (which includes a 500 ms stall) all reach the same campaign tick with the same fingerprints — render cadence does not change logical results; the 140/70 run shows the near-field reservation working (near backlogged ticks 0 while far backlogs ~293 of 300); the budget-30 run shows honest overload (every tick budget-exhausted, ~9k late executions, progress slowed ~5× — chained schedules self-throttle, so lateness and exhausted ticks, not queue growth, are the overload signal). The graphical demo runs the same simulation beside rendering:
+
+```powershell
+cargo run -p engine-slice -- --render
+cargo run -p engine-slice -- --render --fps 240
+cargo run -p engine-slice -- --render --sim-budget 30
+```
+
+The overlay and the exit summary carry the simulation lines (campaign tick and rate, outstanding catch-up work, events/sec, pending/blocked near/far, lateness, budget exhaustion, the `max_executed_due` / `processed_through` watermark pair, and the lane-domain fingerprints at close). The 10 Hz simulation rate is a default for this demonstration workload, configurable via `--rate` — not an engine-wide rate for future systems.
+
 ## Tested environments
 
 | Environment | Method | Result |
@@ -86,4 +109,4 @@ Verify: **depth ordering** (the three overlapping depth-demo cubes intersect cor
 
 Physics, ECS, scripting, audio, cooked asset formats, networking, editor, threading/job framework, subsystem registries, render graph, material framework, scene graph — each deferred with a stated trigger (`docs/TECH-ARCHITECTURE.md` §5/§8). No SDL GPU/render APIs are used; Vulkan is reached only through ash (T-12).
 
-Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-13).
+Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-14).

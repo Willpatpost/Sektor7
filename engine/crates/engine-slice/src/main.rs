@@ -1,9 +1,11 @@
 //! Interactive slice binary: the Stage 0 stdin CLI for `engine-core`, the
 //! Stage 1 SDL3 shell modes (`--window`, `--window --dummy`,
-//! `--soak <secs>`), and the Stage 2 Vulkan render demo (`--render`, with
+//! `--soak <secs>`), the Stage 2 Vulkan render demo (`--render`, with
 //! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
 //! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`,
-//! `--simulate-resize`).
+//! `--simulate-resize`, `--sim-budget <n>`), and the Stage 3 headless
+//! simulation (`--sim`, with `--seed`, `--ticks`, `--budget`,
+//! `--near-reserve`, `--rate`, `--cadence <hz>|irregular`).
 
 use std::io::{self, Write};
 
@@ -19,6 +21,79 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|arg| arg == "--sim") {
+        // Stage 3 headless simulation (deterministic; no GPU, no window).
+        let mut npc_config = engine_slice::npc::NpcConfig::default();
+        let mut sim_config = engine_slice::sim::SimConfig::default();
+        let mut ticks: u64 = 600;
+        let mut cadence_hz: u32 = 60;
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--seed" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(seed) = value.parse::<u64>()
+                    {
+                        npc_config.seed = seed;
+                        index += 1;
+                    }
+                }
+                "--ticks" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(count) = value.parse::<u64>()
+                    {
+                        ticks = count.clamp(1, 1_000_000);
+                        index += 1;
+                    }
+                }
+                "--budget" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(budget) = value.parse::<u32>()
+                    {
+                        sim_config.budget = budget.clamp(1, 100_000);
+                        index += 1;
+                    }
+                }
+                "--near-reserve" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(reserve) = value.parse::<u32>()
+                    {
+                        sim_config.near_reserve = reserve;
+                        index += 1;
+                    }
+                }
+                "--rate" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(rate) = value.parse::<u32>()
+                    {
+                        sim_config.tick_rate_hz = rate.clamp(1, 1000);
+                        index += 1;
+                    }
+                }
+                "--cadence" => {
+                    if let Some(value) = args.get(index + 1) {
+                        if value == "irregular" {
+                            cadence_hz = 0;
+                            index += 1;
+                        } else if let Ok(hz) = value.parse::<u32>() {
+                            cadence_hz = hz.clamp(1, 1000);
+                            index += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if let Err(message) =
+            engine_slice::sim_demo::run_sim_demo(npc_config, sim_config, ticks, cadence_hz)
+        {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.iter().any(|arg| arg == "--render") {
         let mut options = engine_slice::render_demo::RenderOptions::default();
@@ -54,6 +129,14 @@ fn main() {
                 }
                 "--no-overlay" => options.overlay = false,
                 "--simulate-resize" => options.resize_test = true,
+                "--sim-budget" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(budget) = value.parse::<u32>()
+                    {
+                        options.sim_budget = Some(budget.clamp(1, 100_000));
+                        index += 1;
+                    }
+                }
                 "--validation" => {
                     if let Some(value) = args.get(index + 1)
                         && let Some(preference) =

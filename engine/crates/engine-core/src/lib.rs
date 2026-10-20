@@ -30,9 +30,10 @@
 //!   ledger data.
 //!
 //! Deliberately absent (anti-abstraction ledger, §8): regions, LOD levels,
-//! near/far lanes, persistence, gating, networking, rendering, threading,
-//! and any subsystem not exercised by this crate's own tests or the
-//! `engine-slice` application.
+//! persistence, gating, networking, rendering, threading, and any
+//! subsystem not exercised by this crate's own tests or the `engine-slice`
+//! application. (Near/far lanes arrived with Stage 3 — §2.4's three-phase
+//! budget policy — while regions and LOD levels remain gated.)
 //!
 //! Determinism rules: fingerprints use FNV-1a (stable across platforms and
 //! compiler versions — `std`'s hashers are not); fingerprinted state never
@@ -47,6 +48,8 @@ pub mod spine;
 
 pub use clock::Tick;
 pub use diag::{Diagnostics, Level, Record};
-pub use event::{Event, EventClass, EventId, EventSpec, ExecutionRecord, Schedule, ScheduleKind};
+pub use event::{
+    Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
+};
 pub use fingerprint::Fingerprinter;
-pub use spine::{ExecCtx, ScheduleError, Spine, Stats, World};
+pub use spine::{ExecCtx, LaneReport, LaneTotals, ScheduleError, Spine, Stats, World};

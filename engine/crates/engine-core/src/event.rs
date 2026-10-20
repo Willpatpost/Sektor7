@@ -4,6 +4,22 @@ use std::fmt;
 
 use crate::clock::Tick;
 
+/// Near/far execution lane (Stage 3, `docs/TECH-ARCHITECTURE.md` §2.4).
+///
+/// The near lane's reservation is a **guaranteed allocation, not a
+/// ceiling**: per tick, near-field events execute up to the reserved
+/// capacity first, far-field events up to the nonreserved capacity, and
+/// any remaining budget is redistributed **near-first**. Near work
+/// backlogs only when the total budget is exhausted with near work
+/// remaining — never merely because it exceeded its reserve while unused
+/// budget remains (reviewer clarification 2026-10-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Field {
+    #[default]
+    Near,
+    Far,
+}
+
 /// Opaque event classification tag (game-defined).
 ///
 /// Within a class, `(due, seq)` defines **deterministic queue priority**:
@@ -108,6 +124,10 @@ pub struct EventSpec {
     /// Opaque payload token; meaning is game-side — the engine never
     /// inspects it.
     pub payload: u64,
+    /// Near/far execution lane (Stage 3 budget policy). Defaults to
+    /// Near, preserving the Stage 0 single-lane behavior for existing
+    /// constructors.
+    pub field: Field,
     /// Cross-class causal prerequisites. Every id must have executed before
     /// this event runs. Ids must reference already-scheduled or
     /// already-executed events — the spine rejects unknown ids at schedule
@@ -121,12 +141,19 @@ impl EventSpec {
             class,
             schedule,
             payload,
+            field: Field::default(),
             depends_on: Vec::new(),
         }
     }
 
     pub fn with_dependencies(mut self, depends_on: Vec<EventId>) -> Self {
         self.depends_on = depends_on;
+        self
+    }
+
+    /// Sets the execution lane (near/far budget policy, Stage 3).
+    pub fn in_field(mut self, field: Field) -> Self {
+        self.field = field;
         self
     }
 }
@@ -138,6 +165,7 @@ pub struct Event {
     pub class: EventClass,
     pub schedule: Schedule,
     pub payload: u64,
+    pub field: Field,
     pub depends_on: Vec<EventId>,
 }
 
@@ -147,6 +175,8 @@ pub struct Event {
 pub struct ExecutionRecord {
     pub id: EventId,
     pub class: EventClass,
+    /// Execution lane at execution time (Stage 3).
+    pub field: Field,
     pub intended_due: Tick,
     pub executed_tick: Tick,
     pub schedule_kind: ScheduleKind,

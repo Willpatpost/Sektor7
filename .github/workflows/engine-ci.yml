@@ -45,6 +45,16 @@ jobs:
             exit 1
           fi
           echo "$a"
+      - name: Stage 3 headless simulation smoke (deterministic, no GPU required)
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --sim --ticks 300 --cadence 60)
+          b=$(cargo run -q -p engine-slice -- --sim --ticks 300 --cadence 60)
+          if [ "$a" != "$b" ]; then
+            echo "headless simulation diverged between runs"
+            exit 1
+          fi
+          echo "$a"
       - name: Vulkan offscreen render smoke (Linux only — software rasterizer, correctness evidence, NOT performance evidence)
         if: runner.os == 'Linux'
         shell: bash

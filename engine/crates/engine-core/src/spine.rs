@@ -1,11 +1,20 @@
 //! The event spine: canonical campaign clock, scheduling with deterministic
 //! `(due, seq)` queue priority, cross-class causal dependencies, per-tick
-//! budget, the execution ledger, and the safe processed-through watermark.
+//! budget with the near/far lane policy, the execution ledger, and the safe
+//! processed-through watermark.
 //!
-//! Stage 0 scope (`docs/TECH-ARCHITECTURE.md` §6): single queue, no near/far
-//! lanes, no regions, no persistence — only the contract semantics the
-//! 2026-10-19 review ratified. Lanes and regions attach above this core when
-//! their stages arrive; nothing here assumes them.
+//! Stage 3 (`docs/TECH-ARCHITECTURE.md` §2.4, §6): near and far lanes with
+//! the three-phase budget policy — the near reservation is a **guaranteed
+//! allocation, not a ceiling**: (1) near-field events execute up to the
+//! reservation, (2) far-field events up to the nonreserved capacity, and
+//! (3) remaining budget redistributes near-first (reviewer clarification
+//! 2026-10-20). The legacy constructors keep `near_reserve == budget`,
+//! reproducing the Stage 0 single-lane behavior exactly; the Stage 0
+//! fingerprint domain ("engine-core/spine/2") is untouched and stays
+//! byte-identical, while the new lane-aware domain ("spine-lanes/1")
+//! represents the lane classification and reservation as authoritative
+//! state. Regions, LOD levels, and persistence still attach above this
+//! core in their stages.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -13,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use crate::clock::Tick;
 use crate::diag::{Diagnostics, Level};
 use crate::event::{
-    Event, EventClass, EventId, EventSpec, ExecutionRecord, Schedule, ScheduleKind,
+    Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 use crate::fingerprint::Fingerprinter;
 
@@ -36,6 +45,11 @@ pub trait World {
 pub struct ExecCtx<'a> {
     executed_tick: Tick,
     executed: &'a BTreeSet<u64>,
+    /// Lane of the currently executing event: handler follow-ups inherit
+    /// their cause's lane (Stage 3 decision — chained work stays in its
+    /// lane; an explicit override API is deferred until a use case
+    /// exists).
+    field: Field,
     follow_ups: Vec<EventSpec>,
 }
 
@@ -67,6 +81,7 @@ impl<'a> ExecCtx<'a> {
                 delay,
             },
             payload,
+            field: self.field,
             depends_on,
         });
     }
@@ -85,6 +100,7 @@ impl<'a> ExecCtx<'a> {
             class,
             schedule: Schedule::AtLogicalTime { due: tick },
             payload,
+            field: self.field,
             depends_on,
         });
     }
@@ -122,6 +138,33 @@ pub struct Stats {
     /// Ticks that ended with the budget fully consumed and due work
     /// remaining in the queue.
     pub budget_exhausted_ticks: u64,
+}
+
+/// Observational per-tick near/far lane report (Stage 3). Not part of the
+/// Stage 0 fingerprint schema and not authoritative state — the ledger
+/// and queues already represent executions deterministically; this is
+/// instrumentation for diagnostics and the overlay, like `Diagnostics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaneReport {
+    pub near_executed: u32,
+    pub far_executed: u32,
+    pub near_reserve: u32,
+    pub budget: u32,
+    /// Due near work remained when the total budget was exhausted.
+    pub near_backlogged: bool,
+    /// Due far work remained when the total budget was exhausted.
+    pub far_backlogged: bool,
+}
+
+/// Cumulative lane execution totals (observational, Stage 3): derivable
+/// from the ledger, kept separately so diagnostics never touch
+/// fingerprinted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaneTotals {
+    pub near_executed: u64,
+    pub far_executed: u64,
+    pub near_backlogged_ticks: u64,
+    pub far_backlogged_ticks: u64,
 }
 
 /// Queue entry, ordered by `(due, seq)`. Each dequeue selects the minimum
@@ -165,7 +208,8 @@ impl PartialOrd for Pending {
 pub struct Spine<W: World> {
     clock: Tick,
     next_seq: u64,
-    queue: BinaryHeap<Reverse<Pending>>,
+    near_queue: BinaryHeap<Reverse<Pending>>,
+    far_queue: BinaryHeap<Reverse<Pending>>,
     /// Due events waiting on unmet dependencies, keyed by seq.
     blocked: BTreeMap<u64, Event>,
     /// dependency seq -> dependent seqs currently registered on it.
@@ -177,8 +221,13 @@ pub struct Spine<W: World> {
     ledger: Vec<ExecutionRecord>,
     world: W,
     budget: u32,
+    /// Guaranteed near-lane capacity per tick — never a ceiling; leftover
+    /// budget redistributes near-first (§2.4 three-phase policy).
+    near_reserve: u32,
     stats: Stats,
     diag: Diagnostics,
+    last_report: LaneReport,
+    lane_totals: LaneTotals,
 }
 
 impl<W: World> Spine<W> {
@@ -187,19 +236,46 @@ impl<W: World> Spine<W> {
     }
 
     pub fn with_diagnostics(world: W, budget: u32, diag: Diagnostics) -> Self {
+        Self::with_reservation_and_diagnostics(world, budget, budget, diag)
+    }
+
+    /// Stage 3 near/far lanes: `near_reserve` is the guaranteed near-lane
+    /// capacity per tick, clamped to the total budget. The legacy
+    /// constructors keep `near_reserve == budget`, which reproduces the
+    /// Stage 0 single-lane behavior exactly.
+    pub fn with_reservation(world: W, budget: u32, near_reserve: u32) -> Self {
+        Self::with_reservation_and_diagnostics(
+            world,
+            budget,
+            near_reserve,
+            Diagnostics::new(Level::Off),
+        )
+    }
+
+    pub fn with_reservation_and_diagnostics(
+        world: W,
+        budget: u32,
+        near_reserve: u32,
+        diag: Diagnostics,
+    ) -> Self {
+        let budget = budget.max(1);
         Spine {
             clock: Tick::ZERO,
             next_seq: 0,
-            queue: BinaryHeap::new(),
+            near_queue: BinaryHeap::new(),
+            far_queue: BinaryHeap::new(),
             blocked: BTreeMap::new(),
             waiting_on: BTreeMap::new(),
             known: BTreeSet::new(),
             executed: BTreeSet::new(),
             ledger: Vec::new(),
             world,
-            budget: budget.max(1),
+            budget,
+            near_reserve: near_reserve.min(budget),
             stats: Stats::default(),
             diag,
+            last_report: LaneReport::default(),
+            lane_totals: LaneTotals::default(),
         }
     }
 
@@ -211,6 +287,31 @@ impl<W: World> Spine<W> {
 
     pub fn budget(&self) -> u32 {
         self.budget
+    }
+
+    /// Guaranteed near-lane capacity per tick (Stage 3).
+    pub fn near_reserve(&self) -> u32 {
+        self.near_reserve
+    }
+
+    /// Events waiting in the near lane (due or not yet due).
+    pub fn near_pending_count(&self) -> usize {
+        self.near_queue.len()
+    }
+
+    /// Events waiting in the far lane (due or not yet due).
+    pub fn far_pending_count(&self) -> usize {
+        self.far_queue.len()
+    }
+
+    /// Observational per-tick lane report (Stage 3 diagnostics).
+    pub fn lane_report(&self) -> LaneReport {
+        self.last_report
+    }
+
+    /// Cumulative lane execution totals (observational, Stage 3).
+    pub fn lane_totals(&self) -> LaneTotals {
+        self.lane_totals
     }
 
     pub fn world(&self) -> &W {
@@ -237,9 +338,9 @@ impl<W: World> Spine<W> {
         &self.ledger
     }
 
-    /// Events waiting in the queue (due or not yet due).
+    /// Events waiting in either lane (due or not yet due).
     pub fn pending_count(&self) -> usize {
-        self.queue.len()
+        self.near_queue.len() + self.far_queue.len()
     }
 
     /// Due events parked on unmet dependencies.
@@ -259,7 +360,13 @@ impl<W: World> Spine<W> {
 
     /// Smallest intended due among pending events (queued or blocked).
     pub fn min_pending_due(&self) -> Option<Tick> {
-        let mut min = self.queue.peek().map(|item| item.0.due);
+        let mut min = self
+            .near_queue
+            .peek()
+            .map(|item| item.0.due)
+            .into_iter()
+            .chain(self.far_queue.peek().map(|item| item.0.due))
+            .min();
         for event in self.blocked.values() {
             let due = event.schedule.due();
             min = Some(min.map_or(due, |m| m.min(due)));
@@ -322,6 +429,7 @@ impl<W: World> Spine<W> {
         let event = Event {
             id,
             class: spec.class,
+            field: spec.field,
             schedule: spec.schedule,
             payload: spec.payload,
             depends_on: spec.depends_on,
@@ -347,55 +455,65 @@ impl<W: World> Spine<W> {
             ),
         );
         self.known.insert(seq);
-        self.queue.push(Reverse(Pending::new(event)));
+        match event.field {
+            Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
+            Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
+        }
         self.stats.scheduled += 1;
         Ok(id)
     }
 
     // -------------------------------------------------------------- ticking
 
-    /// Advances one tick and processes due events up to the per-tick budget.
-    /// The budget is a *mechanism*; the budget *value* is game policy (P5).
+    /// Advances one tick and processes due events under the per-tick
+    /// budget. The budget is a *mechanism*; the budget *value* is game
+    /// policy (P5).
+    ///
+    /// §2.4 three-phase policy (reviewer clarification 2026-10-20): the
+    /// near reservation is a **guaranteed allocation, not a ceiling** —
+    /// (1) near-field events execute up to the reservation, (2) far-field
+    /// events up to the nonreserved capacity, and (3) remaining budget
+    /// redistributes near-first. With the legacy constructors
+    /// (`near_reserve == budget`, all events Near by default) the three
+    /// phases collapse to the Stage 0 single-queue behavior exactly.
     pub fn run_tick(&mut self) -> Tick {
         self.clock = self.clock.saturating_add(1);
-        let mut remaining = self.budget;
-        while remaining > 0 {
-            let Some(top) = self.queue.peek() else { break };
-            if top.0.due > self.clock {
-                break;
-            }
-            let Reverse(pending) = self.queue.pop().expect("queue head was just peeked");
-            let event = pending.event;
-            let unmet = self.unmet_dependencies(&event);
-            if unmet.is_empty() {
-                self.execute_now(event);
-                remaining -= 1;
-            } else {
-                // Due, but causality-blocked: parked, not dropped. Blocked
-                // transitions consume no execution budget (no work was
-                // done), and the parked event keeps capping the safe
-                // watermark until its dependencies resolve.
-                self.stats.blocked_transitions += 1;
-                self.diag.log(
-                    Level::Trace,
-                    format!(
-                        "blocked {} at {} ({} unmet dependencies)",
-                        event.id,
-                        self.clock,
-                        unmet.len()
-                    ),
-                );
-                self.register_waiters(event.id.seq, &unmet);
-                self.blocked.insert(event.id.seq, event);
-            }
-        }
-        if remaining == 0 && self.has_due_work() {
+        let near_guaranteed = self.drain_due(Field::Near, self.near_reserve);
+        let far_guaranteed = self.drain_due(Field::Far, self.budget - self.near_reserve);
+        let near_extra =
+            self.drain_due(Field::Near, self.budget - near_guaranteed - far_guaranteed);
+        let far_extra = self.drain_due(
+            Field::Far,
+            self.budget - near_guaranteed - far_guaranteed - near_extra,
+        );
+        let near_executed = near_guaranteed + near_extra;
+        let far_executed = far_guaranteed + far_extra;
+        let executed = near_executed + far_executed;
+        let near_backlogged = self.lane_has_due_work(Field::Near);
+        let far_backlogged = self.lane_has_due_work(Field::Far);
+        if executed >= self.budget && (near_backlogged || far_backlogged) {
             self.stats.budget_exhausted_ticks += 1;
             self.diag.log(
                 Level::Info,
                 format!("budget exhausted at {} with due work remaining", self.clock),
             );
         }
+        self.lane_totals.near_executed += u64::from(near_executed);
+        self.lane_totals.far_executed += u64::from(far_executed);
+        if near_backlogged {
+            self.lane_totals.near_backlogged_ticks += 1;
+        }
+        if far_backlogged {
+            self.lane_totals.far_backlogged_ticks += 1;
+        }
+        self.last_report = LaneReport {
+            near_executed,
+            far_executed,
+            near_reserve: self.near_reserve,
+            budget: self.budget,
+            near_backlogged,
+            far_backlogged,
+        };
         self.clock
     }
 
@@ -447,7 +565,14 @@ impl<W: World> Spine<W> {
         fp.write_u64(self.stats.budget_exhausted_ticks);
 
         // Heap iteration order is unspecified — sort canonically first.
-        let mut queued: Vec<&Pending> = self.queue.iter().map(|item| &item.0).collect();
+        // The two lanes merge into one (due, seq)-sorted view so the
+        // Stage 0 schema hashes identical bytes for single-lane states.
+        let mut queued: Vec<&Pending> = self
+            .near_queue
+            .iter()
+            .chain(self.far_queue.iter())
+            .map(|item| &item.0)
+            .collect();
         queued.sort_by_key(|pending| (pending.due, pending.seq));
         fp.write_usize(queued.len());
         for pending in queued {
@@ -500,7 +625,157 @@ impl<W: World> Spine<W> {
         format!("{:016x}", self.state_fingerprint())
     }
 
+    /// Stage 3 lane-aware engine fingerprint (domain
+    /// "engine-core/spine-lanes/1"): the authoritative engine state
+    /// **including** the near/far lane classification and the reservation.
+    /// The Stage 0 domain ("engine-core/spine/2") is deliberately
+    /// untouched so its historical fingerprints stay byte-identical;
+    /// this domain meaningfully represents the new authoritative state —
+    /// different lane configurations or classifications produce
+    /// different fingerprints (reviewer clarification 2026-10-20). Like
+    /// every fingerprint here, it derives only from logical state:
+    /// wall-clock time, rendering cadence, and unordered iteration never
+    /// reach it.
+    pub fn lane_fingerprint(&self) -> u64 {
+        let mut fp = Fingerprinter::new();
+        fp.write_str("engine-core/spine-lanes/1");
+        fp.write_tick(self.clock);
+        fp.write_u64(self.next_seq);
+        fp.write_u32(self.budget);
+        fp.write_u32(self.near_reserve);
+        fp.write_u64(self.stats.scheduled);
+        fp.write_u64(self.stats.executed);
+        fp.write_u64(self.stats.late_arrivals);
+        fp.write_u64(self.stats.late_executions);
+        fp.write_u64(self.stats.blocked_transitions);
+        fp.write_u64(self.stats.invalid_dropped);
+        fp.write_u64(self.stats.budget_exhausted_ticks);
+
+        // Each lane sorts canonically by (due, seq); the section itself
+        // encodes the lane, so the classification is authoritative here.
+        for (queue, field) in [
+            (&self.near_queue, Field::Near),
+            (&self.far_queue, Field::Far),
+        ] {
+            let mut lane: Vec<&Pending> = queue.iter().map(|item| &item.0).collect();
+            lane.sort_by_key(|pending| (pending.due, pending.seq));
+            fp.write_usize(lane.len());
+            for pending in lane {
+                fp.write_u64(pending.seq);
+                fp.write_u8(field_byte(field));
+                fp.write_u32(u32::from(pending.event.class.0));
+                fp.write_u64(pending.event.payload);
+                fingerprint_schedule(&mut fp, &pending.event.schedule);
+                fingerprint_deps(&mut fp, &pending.event);
+            }
+        }
+
+        fp.write_usize(self.blocked.len());
+        for (seq, event) in &self.blocked {
+            fp.write_u64(*seq);
+            fp.write_u8(field_byte(event.field));
+            fp.write_u32(u32::from(event.class.0));
+            fp.write_u64(event.payload);
+            fingerprint_schedule(&mut fp, &event.schedule);
+            fingerprint_deps(&mut fp, event);
+        }
+
+        fp.write_usize(self.ledger.len());
+        for record in &self.ledger {
+            fp.write_u64(record.id.seq);
+            fp.write_u8(field_byte(record.field));
+            fp.write_u32(u32::from(record.class.0));
+            fp.write_tick(record.intended_due);
+            fp.write_tick(record.executed_tick);
+            fp.write_u8(match record.schedule_kind {
+                ScheduleKind::AtLogicalTime => 0,
+                ScheduleKind::ExecutionRelative => 1,
+            });
+            fp.write_u8(u8::from(record.late));
+        }
+        fp.finish()
+    }
+
+    /// Stage 3 lane-aware state fingerprint (domain
+    /// "engine-core/state-lanes/1"): the lane fingerprint plus world
+    /// state.
+    pub fn lane_state_fingerprint(&self) -> u64 {
+        let mut fp = Fingerprinter::new();
+        fp.write_str("engine-core/state-lanes/1");
+        fp.write_u64(self.lane_fingerprint());
+        self.world.fingerprint(&mut fp);
+        fp.finish()
+    }
+
+    pub fn lane_fingerprint_hex(&self) -> String {
+        format!("{:016x}", self.lane_fingerprint())
+    }
+
+    pub fn lane_state_fingerprint_hex(&self) -> String {
+        format!("{:016x}", self.lane_state_fingerprint())
+    }
+
     // ------------------------------------------------------------ internals
+
+    /// Drains due events from one lane, executing up to `cap`.
+    /// Causality-blocked events park without consuming budget (no work
+    /// was done) and keep their original `(due, seq)` priority on
+    /// reentry.
+    fn drain_due(&mut self, field: Field, cap: u32) -> u32 {
+        let mut executed = 0;
+        while executed < cap {
+            let head = match field {
+                Field::Near => self.near_queue.peek(),
+                Field::Far => self.far_queue.peek(),
+            };
+            let Some(top) = head else { break };
+            if top.0.due > self.clock {
+                break;
+            }
+            let Reverse(pending) = match field {
+                Field::Near => self.near_queue.pop(),
+                Field::Far => self.far_queue.pop(),
+            }
+            .expect("queue head was just peeked");
+            let event = pending.event;
+            let unmet = self.unmet_dependencies(&event);
+            if unmet.is_empty() {
+                self.execute_now(event);
+                executed += 1;
+            } else {
+                // Due, but causality-blocked: parked, not dropped. Blocked
+                // transitions consume no execution budget (no work was
+                // done), and the parked event keeps capping the safe
+                // watermark until its dependencies resolve.
+                self.stats.blocked_transitions += 1;
+                self.diag.log(
+                    Level::Trace,
+                    format!(
+                        "blocked {} at {} ({} unmet dependencies)",
+                        event.id,
+                        self.clock,
+                        unmet.len()
+                    ),
+                );
+                self.register_waiters(event.id.seq, &unmet);
+                self.blocked.insert(event.id.seq, event);
+            }
+        }
+        executed
+    }
+
+    fn lane_has_due_work(&self, field: Field) -> bool {
+        match field {
+            Field::Near => self
+                .near_queue
+                .peek()
+                .is_some_and(|item| item.0.due <= self.clock),
+            Field::Far => self
+                .far_queue
+                .peek()
+                .is_some_and(|item| item.0.due <= self.clock),
+        }
+    }
 
     fn execute_now(&mut self, event: Event) {
         let id = event.id;
@@ -509,6 +784,7 @@ impl<W: World> Spine<W> {
         let record = ExecutionRecord {
             id: event.id,
             class: event.class,
+            field: event.field,
             intended_due: due,
             executed_tick,
             schedule_kind: event.schedule.kind(),
@@ -538,6 +814,7 @@ impl<W: World> Spine<W> {
             let mut ctx = ExecCtx {
                 executed_tick,
                 executed,
+                field: event.field,
                 follow_ups: Vec::new(),
             };
             self.world.execute(&event, &mut ctx);
@@ -598,17 +875,21 @@ impl<W: World> Spine<W> {
         let due = event.schedule.due();
         self.diag
             .log(Level::Trace, format!("unblocked {} (due {due})", event.id));
-        self.queue.push(Reverse(Pending::new(event)));
-    }
-
-    fn has_due_work(&self) -> bool {
-        self.queue
-            .peek()
-            .is_some_and(|item| item.0.due <= self.clock)
+        match event.field {
+            Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
+            Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
+        }
     }
 
     fn has_any_work(&self) -> bool {
-        !self.queue.is_empty() || !self.blocked.is_empty()
+        !self.near_queue.is_empty() || !self.far_queue.is_empty() || !self.blocked.is_empty()
+    }
+}
+
+fn field_byte(field: Field) -> u8 {
+    match field {
+        Field::Near => 0,
+        Field::Far => 1,
     }
 }
 

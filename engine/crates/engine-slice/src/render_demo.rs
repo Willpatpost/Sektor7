@@ -9,6 +9,8 @@ use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationP
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
 use crate::math;
+use crate::npc::NpcConfig;
+use crate::sim::{SimConfig, SimDriver};
 
 /// Demo options; CLI parsing lives in the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,9 @@ pub struct RenderOptions {
     /// recreation path headlessly — the app owns window state, so this is
     /// exactly how a real resize reaches the renderer.
     pub resize_test: bool,
+    /// Stage 3: artificially constrained event budget for the integrated
+    /// simulation (verification — measurable backlog, never silent loss).
+    pub sim_budget: Option<u32>,
 }
 
 impl Default for RenderOptions {
@@ -37,6 +42,7 @@ impl Default for RenderOptions {
             overlay: true,
             validation: ValidationPreference::Auto,
             resize_test: false,
+            sim_budget: None,
         }
     }
 }
@@ -101,6 +107,16 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
     renderer.set_overlay_enabled(options.overlay);
 
+    // Stage 3: the campaign simulation runs beside rendering — render
+    // cadence stays independent of the fixed simulation cadence (the
+    // renderer imposes no ceiling; the sim accrues its own ticks from
+    // elapsed real time, which never enters logical state).
+    let mut sim_config = SimConfig::default();
+    if let Some(budget) = options.sim_budget {
+        sim_config.budget = budget;
+    }
+    let mut sim = SimDriver::new(NpcConfig::default(), sim_config);
+
     {
         let stats = renderer.stats();
         println!("Sektor7 Stage 2 — Vulkan first render");
@@ -163,6 +179,11 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
 
         camera.update(&snapshot, &app, dt as f32);
 
+        // Fixed-step simulation advance: elapsed monotonic time accrues
+        // due ticks (bounded per-frame catch-up; outstanding obligations
+        // are retained and reported, never silently discarded).
+        sim.advance(Duration::from_secs_f64(dt));
+
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
             16.0 / 9.0
@@ -177,7 +198,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
             format!(
-                "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
+                "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\nsim tick {} @ {} Hz · out {} · ev/s {:.0}\nnear/far {}/{} · pend {} · blk {} · late {} · bud-exh {}\nwm {} / {}\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
                 math::percentile(&cpu_work_ms, 0.95),
                 stats.gpu_ms_p95(),
@@ -192,6 +213,24 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
                 stats.validation_active,
                 stats.validation_errors,
                 stats.validation_warnings,
+                sim.spine().clock(),
+                sim.config().tick_rate_hz,
+                sim.outstanding_ticks(),
+                sim.spine().stats().executed as f64 / elapsed,
+                sim.spine().near_pending_count(),
+                sim.spine().far_pending_count(),
+                sim.spine().pending_count(),
+                sim.spine().blocked_count(),
+                sim.spine().stats().late_executions,
+                sim.spine().stats().budget_exhausted_ticks,
+                sim.spine()
+                    .processed_through()
+                    .map(|tick| tick.as_u64().to_string())
+                    .unwrap_or_else(|| "none".into()),
+                sim.spine()
+                    .max_executed_due()
+                    .map(|tick| tick.as_u64().to_string())
+                    .unwrap_or_else(|| "none".into()),
                 camera.position[0],
                 camera.position[1],
                 camera.position[2],
@@ -280,6 +319,55 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         stats.swapchain_recreations,
         stats.validation_errors,
         stats.validation_warnings
+    );
+    println!("--- simulation summary ---");
+    let spine = sim.spine();
+    let sim_stats = spine.stats();
+    let totals = spine.lane_totals();
+    println!(
+        "campaign tick {} · executed {} · late arrivals {} · late executions {}",
+        spine.clock(),
+        sim_stats.executed,
+        sim_stats.late_arrivals,
+        sim_stats.late_executions
+    );
+    println!(
+        "backlog pending {} (near {} / far {}) · blocked {} · budget-exhausted ticks {}",
+        spine.pending_count(),
+        spine.near_pending_count(),
+        spine.far_pending_count(),
+        spine.blocked_count(),
+        sim_stats.budget_exhausted_ticks
+    );
+    println!(
+        "lanes near {} (backlogged ticks {}) · far {} (backlogged ticks {})",
+        totals.near_executed,
+        totals.near_backlogged_ticks,
+        totals.far_executed,
+        totals.far_backlogged_ticks
+    );
+    println!(
+        "sim tick time: p50 {:.3} ms · p95 {:.3} ms ({} samples)",
+        sim.tick_ms_percentile(0.50),
+        sim.tick_ms_percentile(0.95),
+        sim.tick_sample_count()
+    );
+    println!(
+        "watermark max_executed_due {} · processed_through {}",
+        spine
+            .max_executed_due()
+            .map(|tick| tick.as_u64().to_string())
+            .unwrap_or_else(|| "none".into()),
+        spine
+            .processed_through()
+            .map(|tick| tick.as_u64().to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "npc activity steps {} · fingerprints engine-lanes {} · state-lanes {}",
+        spine.world().total_steps(),
+        spine.lane_fingerprint_hex(),
+        spine.lane_state_fingerprint_hex()
     );
     for message in &stats.recent_validation {
         println!("  validation: {message}");
