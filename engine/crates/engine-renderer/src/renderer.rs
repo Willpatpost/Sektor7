@@ -2,6 +2,8 @@
 //! [`crate::vulkan`]; this module owns the four Vulkan states, exposes the
 //! safe surface, and collects instrumentation.
 
+use ash::vk;
+
 use sdl3::video::Window as SdlWindow;
 
 use crate::config::{RenderConfig, present_mode_str};
@@ -124,6 +126,7 @@ impl Renderer {
             color_space,
             pipes.render_pass,
             depth_format,
+            vk::SwapchainKHR::null(),
         ) {
             Ok(swapchain) => swapchain,
             Err(error) => {

@@ -2,7 +2,8 @@
 //! Stage 1 SDL3 shell modes (`--window`, `--window --dummy`,
 //! `--soak <secs>`), and the Stage 2 Vulkan render demo (`--render`, with
 //! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
-//! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`).
+//! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`,
+//! `--simulate-resize`).
 
 use std::io::{self, Write};
 
@@ -52,6 +53,7 @@ fn main() {
                     }
                 }
                 "--no-overlay" => options.overlay = false,
+                "--simulate-resize" => options.resize_test = true,
                 "--validation" => {
                     if let Some(value) = args.get(index + 1)
                         && let Some(preference) =

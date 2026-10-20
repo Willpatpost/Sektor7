@@ -530,6 +530,16 @@ impl SwapchainState {
     /// `depth_format` is chosen once by the owning renderer and shared
     /// with the pipeline state, so the render pass and the depth
     /// attachments cannot drift apart (corrective finding F).
+    /// `old_swapchain` is set during recreation: creating the replacement
+    /// while the current swapchain still owns the native window is the
+    /// documented `VkSwapchainCreateInfoKHR::oldSwapchain` flow — without
+    /// it, native-window platforms (Win32) fail with
+    /// ERROR_NATIVE_WINDOW_IN_USE_KHR, found on the lead's rig when
+    /// maximizing (corrective follow-up, 2026-10-20). Null for a fresh
+    /// renderer.
+    // Swapchain creation inputs plus the recreation linkage; bundling
+    // would hide which object pairs with which lifetime.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &VulkanContext,
         window_size: (u32, u32),
@@ -538,6 +548,7 @@ impl SwapchainState {
         color_space: vk::ColorSpaceKHR,
         render_pass: vk::RenderPass,
         depth_format: vk::Format,
+        old_swapchain: vk::SwapchainKHR,
     ) -> Result<SwapchainState, RendererError> {
         // Partial-initialization cleanup (corrective finding G): build
         // into a state whose handles start dead; on failure `destroy`
@@ -563,6 +574,7 @@ impl SwapchainState {
             format,
             color_space,
             render_pass,
+            old_swapchain,
         ) {
             state.destroy(ctx);
             return Err(error);
@@ -570,6 +582,9 @@ impl SwapchainState {
         Ok(state)
     }
 
+    // Same rationale as `new`: the creation inputs plus the recreation
+    // linkage, spread for lifetime clarity.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &mut self,
         ctx: &VulkanContext,
@@ -578,6 +593,7 @@ impl SwapchainState {
         format: vk::Format,
         color_space: vk::ColorSpaceKHR,
         render_pass: vk::RenderPass,
+        old_swapchain: vk::SwapchainKHR,
     ) -> Result<(), RendererError> {
         let surface = ctx.surface;
         let capabilities = unsafe {
@@ -615,6 +631,7 @@ impl SwapchainState {
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(self.present_mode)
+            .old_swapchain(old_swapchain)
             .clipped(true);
         self.swapchain = unsafe { ctx.swapchain_ext.create_swapchain(&create_info, None) }
             .map_err(|error| RendererError::vk(error, "create_swapchain"))?;
@@ -1985,6 +2002,10 @@ fn recreate_swapchain(
         new_color_space,
         render_pass_for_new,
         depth_format,
+        // The current swapchain still owns the native window while the
+        // replacement is created; passing it as `old_swapchain` retires
+        // it on success (destroyed below) and leaves it valid on failure.
+        swapchain.swapchain,
     ) {
         Ok(mut new_state) => {
             // Re-sync the per-image tables before installing the new

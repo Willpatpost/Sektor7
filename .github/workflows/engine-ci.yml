@@ -53,6 +53,7 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0
           # Corrective-pass verification: run with the Khronos validation
-          # layer actually enabled — the demo exits nonzero when the layer
-          # is active and reports errors (Stage 2 re-review evidence).
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0 --validation on
+          # layer actually enabled and exercise the swapchain-recreation
+          # path (--simulate-resize) — the demo exits nonzero when the
+          # layer is active and reports errors.
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0 --validation on --simulate-resize

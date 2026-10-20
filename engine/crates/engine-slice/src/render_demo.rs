@@ -21,6 +21,11 @@ pub struct RenderOptions {
     pub frames: Option<u64>,
     pub overlay: bool,
     pub validation: ValidationPreference,
+    /// Verification scenario (corrective follow-up): frame 11 reports a
+    /// different window size for one frame, forcing the swapchain
+    /// recreation path headlessly — the app owns window state, so this is
+    /// exactly how a real resize reaches the renderer.
+    pub resize_test: bool,
 }
 
 impl Default for RenderOptions {
@@ -31,6 +36,7 @@ impl Default for RenderOptions {
             frames: None,
             overlay: true,
             validation: ValidationPreference::Auto,
+            resize_test: false,
         }
     }
 }
@@ -194,8 +200,14 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             )
         });
 
+        let window_size = if options.resize_test && presented == 10 {
+            let (width, height) = app.window_size();
+            (width + 128, height + 72)
+        } else {
+            app.window_size()
+        };
         let frame_result = renderer
-            .render_frame(&view_proj, overlay_text.as_deref(), app.window_size())
+            .render_frame(&view_proj, overlay_text.as_deref(), window_size)
             .map_err(|error| format!("{error}"))?;
 
         if frame_result.presented {
