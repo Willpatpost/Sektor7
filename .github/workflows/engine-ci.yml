@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, stage4-review]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
@@ -45,6 +45,9 @@ jobs:
             exit 1
           fi
           echo "$a"
+          # Stage 0 historical baseline compatibility: the pinned values.
+          echo "$a" | grep -q "engine=6504123a47cab66f" || { echo "Stage 0 engine fingerprint changed"; exit 1; }
+          echo "$a" | grep -q "state=937bd3b6f56f07e0" || { echo "Stage 0 state fingerprint changed"; exit 1; }
       - name: Stage 3 headless simulation smoke (deterministic, no GPU required)
         shell: bash
         run: |
@@ -55,6 +58,22 @@ jobs:
             exit 1
           fi
           echo "$a"
+          # Stage 3 historical baseline compatibility: the pinned values.
+          echo "$a" | grep -q "executed 45717" || { echo "Stage 3 baseline execution count changed"; exit 1; }
+          echo "$a" | grep -q "engine-lanes=5591d3eb05643e78" || { echo "Stage 3 lane fingerprint changed"; exit 1; }
+          echo "$a" | grep -q "state-lanes=9d90cb3bbd45b032" || { echo "Stage 3 state-lanes fingerprint changed"; exit 1; }
+      - name: Stage 4 presence scenario determinism (double run per scenario)
+        shell: bash
+        run: |
+          for scenario in stationary walk tour; do
+            a=$(cargo run -q -p engine-slice -- --sim --presence $scenario)
+            b=$(cargo run -q -p engine-slice -- --sim --presence $scenario)
+            if [ "$a" != "$b" ]; then
+              echo "presence scenario $scenario diverged between runs"
+              exit 1
+            fi
+            echo "$scenario: $(echo "$a" | grep -o 'stage4=[0-9a-f]*')"
+          done
       - name: Vulkan offscreen render smoke (Linux only — software rasterizer, correctness evidence, NOT performance evidence)
         if: runner.os == 'Linux'
         shell: bash
@@ -67,3 +86,12 @@ jobs:
           # path (--simulate-resize) — the demo exits nonzero when the
           # layer is active and reports errors.
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0 --validation on --simulate-resize
+          # Stage 4: the regional render path (camera-as-presence, dynamic
+          # region-scene buffers) under the ACTIVE validation layer, plus
+          # the swapchain-recreation path with region geometry live — zero
+          # application-generated validation errors required. Windows
+          # runners expose no Vulkan loader; that platform's validation
+          # coverage stays in these Linux gates (reported honestly, not
+          # silently skipped).
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize

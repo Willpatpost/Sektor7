@@ -1166,3 +1166,122 @@ fn activation_without_a_recovery_checkpoint_fails_closed() {
     }
     assert!(conservation(&driver));
 }
+
+#[test]
+fn per_lod_work_scales_across_levels() {
+    // Stage 4 final-verification efficiency evidence: one stable
+    // presence position producing all four LOD levels simultaneously —
+    // region 0 Full (≈21 units), region 1 Simplified (≈59), regions 2+7
+    // EventDriven, regions 3–6 Dormant. Lower levels do meaningfully
+    // less work at the same logical tick count; dormant regions do
+    // none. Printed (via --nocapture) for the delivery report:
+    // per-class execution counts, tick-time percentiles, obligation
+    // counts, and the total against the all-active Legacy baseline.
+    let mut driver = region_driver_with(
+        SimConfig::default(),
+        PresenceScenario::Stationary {
+            position: (95.0, 20.0),
+        },
+    );
+    driver.run_headless(300);
+    let spine = driver.spine();
+    let levels = driver.director().expect("director").levels();
+    assert_eq!(levels[0], LodLevel::Full, "region 0 at ≈21 units");
+    assert_eq!(levels[1], LodLevel::Simplified, "region 1 at ≈59 units");
+    assert_eq!(levels[2], LodLevel::EventDriven, "region 2 at ≈124 units");
+    assert_eq!(levels[7], LodLevel::EventDriven, "region 7 at ≈97 units");
+    for region in [3, 4, 5, 6] {
+        assert_eq!(levels[region], LodLevel::Dormant);
+    }
+    let executed_in = |class: u16| {
+        spine
+            .ledger()
+            .iter()
+            .filter(|record| record.class.0 == class)
+            .count()
+    };
+    let full = executed_in(0);
+    let simplified = executed_in(1);
+    let event = executed_in(2);
+    let event_7 = executed_in(7);
+    let dormant: usize = (3..=6).map(executed_in).sum();
+    println!(
+        "per-LOD over 300 ticks: full {full} · simplified {simplified} · \
+         event(2) {event} · event(7) {event_7} · dormant(3-6) {dormant}"
+    );
+    println!(
+        "tick time (per-tick, region director active): p50 {:.3} ms · p95 {:.3} ms",
+        driver.tick_ms_percentile(0.50),
+        driver.tick_ms_percentile(0.95)
+    );
+    println!(
+        "obligations: queued {} · blocked {} · held {}",
+        spine.pending_count(),
+        spine.blocked_count(),
+        spine.held_count()
+    );
+    assert!(
+        full > 4_000,
+        "Full executes at the natural cadence ({full})"
+    );
+    assert!(
+        simplified * 3 < full,
+        "Simplified executes meaningfully less ({simplified} vs {full})"
+    );
+    assert!(
+        event * 2 < simplified,
+        "EventDriven executes meaningfully less ({event} vs {simplified})"
+    );
+    assert_eq!(
+        dormant, 0,
+        "dormant regions execute nothing — zero ordinary work"
+    );
+    // The measurable dormancy reduction against the all-active Legacy
+    // baseline (45,717 executions over the same 300 ticks) — fewer
+    // executions is the measured fact here; total CPU-time reduction is
+    // reported separately, not inferred from this count alone.
+    let total = spine.stats().executed;
+    println!("total executions {total} (all-active Legacy baseline: 45,717)");
+    assert!(
+        total < 20_000,
+        "proximity-driven LOD measurably reduces total work ({total})"
+    );
+    assert!(conservation(&driver));
+}
+
+#[test]
+fn activation_latency_stays_under_the_delivery_budget() {
+    // Stage 4 acceptance requirement: a 125-NPC region activation stays
+    // under 50 ms. The authoritative measurement is the Windows rig
+    // (the README Stage 4 acceptance commands); this pins the budget on
+    // every platform the suite runs on, using the full tour's
+    // activation-latency distribution (observational percentiles from
+    // the director).
+    let mut driver = region_driver(PresenceScenario::Tour {
+        ticks_per_region: 75,
+    });
+    driver.run_headless(600);
+    let director = driver.director().expect("director");
+    let diagnostics = director.diagnostics();
+    assert!(
+        diagnostics.activations >= 4,
+        "the tour performed real activations ({})",
+        diagnostics.activations
+    );
+    let p50 = director.activation_latency_percentile(0.50);
+    let p95 = director.activation_latency_percentile(0.95);
+    let worst = director.activation_latency_percentile(1.0);
+    println!(
+        "activation latency over {} activations: p50 {p50:.3} ms · \
+         p95 {p95:.3} ms · worst {worst:.3} ms",
+        diagnostics.activations
+    );
+    assert!(
+        p95 < 50.0,
+        "125-NPC region activation p95 stays under the 50 ms budget ({p95:.3} ms)"
+    );
+    assert!(
+        worst < 50.0,
+        "125-NPC region activation worst stays under the 50 ms budget ({worst:.3} ms)"
+    );
+}

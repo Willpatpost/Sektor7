@@ -387,3 +387,58 @@ fn audit_counterexample_late_arrival_reorders_in_class_execution() {
     assert_eq!(late_record.intended_due, Tick(3));
     assert_eq!(late_record.executed_tick, Tick(6));
 }
+
+#[test]
+fn max_executed_due_is_incremental_exact_and_query_bounded() {
+    // Stage 4 final-verification finding: the graphical overlay queries
+    // `max_executed_due()` — and `processed_through()`, which opens with
+    // it — every frame, so a ledger scan would scale per-frame cost with
+    // the total execution history. The O(1) incremental index must be
+    // value-identical to the canonical scan, and the query cost must not
+    // grow with the ledger (measured against a near-empty control — the
+    // Batch-1 watermark-benchmark pattern).
+    // The near-empty control for the relative timing bound — built
+    // before the `spine` name is shadowed by the main spine below.
+    let mut control = spine(1);
+    control.run_tick();
+    let mut spine = spine(150_000);
+    for payload in 0..150_000u64 {
+        spine
+            .schedule(at(1 + payload % 4, payload))
+            .expect("dependency-free burst");
+    }
+    spine.run_ticks(8);
+    assert_eq!(
+        spine.stats().executed,
+        150_000,
+        "the burst drained completely — real executions past any query guard"
+    );
+    // Value-identical to the canonical scan over the public ledger.
+    let scan = spine
+        .ledger()
+        .iter()
+        .map(|record| record.intended_due)
+        .max();
+    assert_eq!(spine.max_executed_due(), scan);
+    assert_eq!(spine.max_executed_due(), Some(Tick(4)));
+    // No pending work: the watermark is exactly the max executed due.
+    assert_eq!(spine.processed_through(), spine.max_executed_due());
+    // Query cost does not scale with the ledger: the same query loop on
+    // the 150k-record spine stays within a small multiple of a
+    // near-empty control (a scan would be hundreds of times slower).
+    let query_loop = |spine: &Spine<CountingWorld>| {
+        let start = std::time::Instant::now();
+        for _ in 0..6_000 {
+            let _ = spine.max_executed_due();
+            let _ = spine.processed_through();
+        }
+        start.elapsed()
+    };
+    let control_ms = query_loop(&control).as_secs_f64() * 1000.0;
+    let measured_ms = query_loop(&spine).as_secs_f64() * 1000.0;
+    assert!(
+        measured_ms <= control_ms * 20.0 + 250.0,
+        "per-frame watermark queries do not scale with the execution history \
+         (measured {measured_ms:.2} ms vs control {control_ms:.2} ms over 6000 queries)"
+    );
+}

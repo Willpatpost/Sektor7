@@ -969,11 +969,30 @@ impl PipelineState {
         self.overlay_mapped = overlay_mapped;
 
         // Dynamic region-scene buffer (Stage 4 graphical integration):
-        // the same persistently mapped, disjoint per-slot pattern as the
-        // overlay, carrying `SceneVertex` geometry (region area plates +
-        // NPC render proxies) drawn through the scene pipeline without
-        // an index buffer. The total vertex budget stays
-        // `region_scene_capacity_vertices()`.
+        // NOT created here — it is allocated lazily on first use
+        // (`ensure_region_capacity`) so the default renderer path
+        // (no dynamic region geometry) pays no allocation, mapping, or
+        // memory cost (Stage 4 final-verification finding). The pattern
+        // itself is the overlay's: persistently mapped, disjoint
+        // per-slot regions, fenced-slot writes.
+        Ok(())
+    }
+
+    /// Allocates the dynamic region-scene buffer on first use (the
+    /// overlay's mapped-buffer pattern): persistently mapped host
+    /// visible memory with one disjoint region per frame slot, sized by
+    /// `region_scene_capacity_vertices()` divided by
+    /// `FRAMES_IN_FLIGHT`. Called from `render_frame` OUTSIDE command
+    /// recording whenever a frame carries region geometry; a no-op once
+    /// allocated. Partial-state safe: `destroy` handles the null
+    /// handles this leaves on the default path.
+    pub(crate) fn ensure_region_capacity(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<(), RendererError> {
+        if self.region_vbo != vk::Buffer::null() {
+            return Ok(());
+        }
         self.region_capacity = crate::scene::region_scene_capacity_vertices() / FRAMES_IN_FLIGHT;
         self.region_slot_bytes = self.region_capacity as vk::DeviceSize
             * std::mem::size_of::<SceneVertex>() as vk::DeviceSize;
@@ -1751,6 +1770,14 @@ pub(crate) fn render_frame(
     if !surface_available_now(ctx)? {
         outcome.deferred = true;
         return Ok(outcome);
+    }
+
+    // Lazy region-scene buffer (Stage 4 final-verification finding):
+    // allocated on first use only, outside command recording — the
+    // default renderer path (no dynamic region geometry) pays no
+    // allocation, mapping, or memory cost.
+    if !region_vertices.is_empty() {
+        pipes.ensure_region_capacity(ctx)?;
     }
 
     // A previous present reported suboptimal — recreate before drawing

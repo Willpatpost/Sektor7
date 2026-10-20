@@ -299,6 +299,15 @@ pub struct Spine<W: World> {
     /// Every seq already executed.
     executed: BTreeSet<u64>,
     ledger: Vec<ExecutionRecord>,
+    /// Incrementally maintained maximum intended-due among executed
+    /// events — updated at the single ledger-append site, so
+    /// `max_executed_due()` is O(1) instead of a scan over the
+    /// ever-growing execution history (the graphical overlay queries it
+    /// and `processed_through()` every frame — Stage 4
+    /// final-verification finding). Derived state, value-identical to
+    /// the ledger scan; the ledger stays canonical and neither is
+    /// fingerprinted (the `held_index` precedent).
+    max_executed_index: Option<Tick>,
     world: W,
     budget: u32,
     /// Guaranteed near-lane capacity per tick — never a ceiling; leftover
@@ -362,6 +371,7 @@ impl<W: World> Spine<W> {
             known: BTreeSet::new(),
             executed: BTreeSet::new(),
             ledger: Vec::new(),
+            max_executed_index: None,
             world,
             budget,
             near_reserve: near_reserve.min(budget),
@@ -478,8 +488,13 @@ impl<W: World> Spine<W> {
 
     /// Maximum intended-due tick among executed events — a raw progress
     /// measure, **not** a completeness claim (review correction 1).
+    /// O(1): read from the incrementally maintained index updated at the
+    /// ledger-append site (Stage 4 final-verification finding — the
+    /// graphical overlay queries this and `processed_through()` every
+    /// frame, and a ledger scan would scale per-frame cost with the
+    /// total execution history).
     pub fn max_executed_due(&self) -> Option<Tick> {
-        self.ledger.iter().map(|r| r.intended_due).max()
+        self.max_executed_index
     }
 
     /// Smallest intended due among pending events — queued, blocked, or
@@ -1217,6 +1232,13 @@ impl<W: World> Spine<W> {
         // Record execution *before* the handler runs, so follow-ups may
         // declare dependencies on the event currently executing.
         self.ledger.push(record);
+        // The derived max-intended-due index (O(1) per execution — the
+        // overlay queries it every frame; a ledger scan would scale
+        // per-frame cost with total execution history).
+        self.max_executed_index = Some(match self.max_executed_index {
+            Some(max) if max >= due => max,
+            _ => due,
+        });
         self.executed.insert(event.id.seq);
         self.stats.executed += 1;
         if executed_tick > due {

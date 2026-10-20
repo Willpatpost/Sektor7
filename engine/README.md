@@ -99,16 +99,49 @@ cargo run -p engine-slice -- --render --sim-budget 30 --sim-near-reserve 25
 
 The overlay and the exit summary carry the simulation lines (campaign tick and rate, outstanding catch-up work, events/sec, pending/blocked near/far, lateness, budget exhaustion, the `max_executed_due` / `processed_through` watermark pair, and the lane-domain fingerprints at close); the exit summary additionally reports the **effective configuration** (budget, near reservation with provenance, catch-up bound), the **no-discard time accounting** (`ticks due = campaign + outstanding` over the total advanced simulation time), and **per-tick** time percentiles (one sample per logical tick, catch-up batches included). Elapsed simulation time is never silently discarded: rendering stalls and minimized periods accrue in full — the campaign clock keeps advancing while the application runs, with no pause policy — and only camera movement is capped against post-stall view jumps. The 10 Hz simulation rate is a default for this demonstration workload, configurable via `--rate` — not an engine-wide rate for future systems.
 
+## Stage 4 regions & LOD (`--presence`, `--render --regions`)
+
+Deterministic headless scripted presence drives the RegionDirector — presence is a function of the **logical tick** (frame cadence cannot change transition history), and every scenario prints only logical state, so repeated runs are identical:
+
+```powershell
+cargo run -p engine-slice -- --sim --presence stationary
+cargo run -p engine-slice -- --sim --presence walk
+cargo run -p engine-slice -- --sim --presence tour
+```
+
+Expected observations: the `--- regions ---` report — per-region LOD levels, activation/deactivation counts, reconstruction activities and captured/reapplied consequences, queued/blocked/held with the conservation identity, and the `stage4`/`held` fingerprints. `stationary` (at region 0's center) demotes five regions to Dormant — 625 held obligations, zero executions for them, their NPC steps frozen; `tour` cycles all eight regions through deactivate/reactivate with conservation true throughout. Double-run identical output is the determinism gate; the test suite additionally proves cross-cadence equivalence (headless vs 60 Hz vs 240 Hz vs an irregular stall pattern reach identical `stage4-state` fingerprints — fewer executions at lower LOD is the measured work reduction; total CPU-time claims are reported separately, never inferred from execution counts alone).
+
+The graphical mode makes the **camera the live presence source** (frame-sampled external input — genuinely cadence-dependent, with no cross-cadence equivalence claim for camera input, unlike the scripted path):
+
+```powershell
+cargo run -p engine-slice -- --render --regions
+```
+
+Eight area plates colored by LOD (F green · S blue · E amber · D near-black) mark the region ring; NPC render proxies (small boxes) appear for Full/Simplified regions only and drop on demotion; the camera starts on region 0's plate. The overlay adds region lines (levels, transitions, invalid, reconstruction, activation latency p50/p95); the exit summary prints the full region report including worst-case activation latency and the stage4/held fingerprints. Rendering stays strictly downstream of authoritative simulation state: proxies are derived read-only from the represented world each frame, and the dynamic geometry rides a fenced per-frame-slot persistently mapped buffer — the overlay's validated pattern — drawn through the existing scene pipeline (no new pipeline, layout, or graphics system; the buffer allocates lazily, so the default `--render` path pays nothing).
+
+### Stage 4 Windows acceptance (RTX 5070 Ti / Ryzen 7 9800X3D)
+
+CI's lavapipe regional smokes are **correctness evidence only**; the acceptance below establishes real-GPU behavior and the activation-latency budget. Run from `engine/`; use `--release` wherever latency matters.
+
+1. **Normal graphics regression** — `cargo run -p engine-slice -- --render`: the full Stage 2 checklist still holds (depth ordering, resize, minimize/restore, close/relaunch, `O` overlay, no LNK4098). The default path is untouched by the region system.
+2. **Regional graphics + the four LODs** — `cargo run --release -p engine-slice -- --render --regions`: walk (WASD, `Shift` to sprint) from region 0's plate toward region 1's (world +X then +Z, ~75–106 units per hop). Watch plates go green → blue → amber → dark as you leave, and the destination's proxies appear as you approach (velocity lookahead activates it early). A full lap visits all eight plates; every plate should pass through all four states. The overlay's `regions F S E D …` line tracks levels live.
+3. **Validation enabled** — `cargo run --release -p engine-slice -- --render --regions --validation on`: zero validation errors/warnings for the whole run, including through region transitions (the exit summary prints the counts; nonzero errors fail the run by design).
+4. **Rapid movement + repeated transitions** — sprint back and forth across a boundary: hysteresis prevents oscillation (no per-tick transition thrash); activation/deactivation counters grow only on real crossings; `invalid` stays 0. Re-enter a dormant region repeatedly to exercise activation under backlog.
+5. **Minimize/restore + resize** — minimize ~5 s mid-tour: the campaign clock keeps advancing (no pause policy — the sim-time line stays accounted); rendering resumes on restore. Drag-resize: swapchain recreation, `recreations N > 0`, no hangs or artifacts. Headless recreation variant: `cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --simulate-resize`.
+6. **Presentation modes + pacing** — repeat 2 with `--present mailbox`, `--present immediate --fps uncapped`, and `--fps 240`: the overlay FPS and cpu/gpu percentiles respond as in Stage 2; the simulation lines stay coherent (conservation, watermark) — note the camera is live input, so logical fingerprints legitimately differ across frame rates (documented; the scripted path is the deterministic one).
+7. **Conservation + invalid counters** — every run's exit summary must print `conservation true` and `invalid 0`; anything else is a reportable anomaly.
+8. **Activation latency under realistic backlog** — `cargo run --release -p engine-slice -- --render --regions --sim-budget 30`: walk to a dormant region; its reactivation faces real backlog (125 overdue obligations against a 30/tick budget). The exit summary's `activation latency p50/p95/worst` must stay **< 50 ms** — the Stage 4 acceptance budget for a 125-NPC region. That latency is CPU simulation work inside the tick boundary (commit consequences → reconstruct → resume), distinct from GPU render time (the gpu percentiles), presentation blocking (present mode), and frame pacing (the paced-interval percentiles) — four separate measurements, all in the summaries.
+
 ## Tested environments
 
 | Environment | Method | Result |
 |---|---|---|
-| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 90 passed + 1 ignored soak, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke incl. a validation-enabled run (correctness only) |
+| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 148 passed + 1 ignored soak, fmt/clippy clean, headless smoke + presence-scenario double runs + per-LOD/activation-latency measurement tests + lavapipe offscreen render smokes incl. `--render --regions` (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
-| Real-window GUI | manual, lead's rig | instructions above; evidence pending the lead's run |
+| Real-window GUI | manual, lead's rig | instructions above (Stage 2 checklist + the Stage 4 acceptance plan); evidence pending the lead's run |
 
 ## What is deliberately absent
 
 Physics, ECS, scripting, audio, cooked asset formats, networking, editor, threading/job framework, subsystem registries, render graph, material framework, scene graph — each deferred with a stated trigger (`docs/TECH-ARCHITECTURE.md` §5/§8). No SDL GPU/render APIs are used; Vulkan is reached only through ash (T-12).
 
-Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-14).
+Owners: `docs/TECH-ARCHITECTURE.md` (§6 stage records), `docs/DECISIONS.md` (T-01–T-15).
