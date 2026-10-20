@@ -1684,14 +1684,16 @@ pub(crate) fn render_frame(
         outcome.recreated = true;
     }
 
-    // Wait for this slot's previous submission.
+    // Wait for this slot's previous submission. The fence is reset only
+    // AFTER the per-image guard below: under present backpressure the
+    // driver can hand a slot the image that slot last rendered, and
+    // resetting first would leave that guard waiting on a fence only
+    // THIS frame's submission will signal — the 240-pacing-against-FIFO
+    // wedge (rig finding, 2026-10-20: "wait image fence timed out").
     unsafe {
         ctx.device
             .wait_for_fences(&[frames.in_flight[slot]], true, WAIT_TIMEOUT_NS)
             .map_err(|error| RendererError::vk(error, "wait_for_fences (slot fence timed out — a submission never completed; presenting faster than the present mode drains?)"))?;
-        ctx.device
-            .reset_fences(&[frames.in_flight[slot]])
-            .map_err(|error| RendererError::vk(error, "reset_fences"))?;
     }
 
     // Acquire; OUT_OF_DATE recreates and retries once. If the retry also
@@ -1765,6 +1767,14 @@ pub(crate) fn render_frame(
             }
         }
         *image_fence = frames.in_flight[slot];
+    }
+
+    // Safe to reset only now: the image guard above is the last wait
+    // that can reference this slot's previous signal.
+    unsafe {
+        ctx.device
+            .reset_fences(&[frames.in_flight[slot]])
+            .map_err(|error| RendererError::vk(error, "reset_fences"))?;
     }
 
     // Timestamps from this slot's previous use are resolved now (the
