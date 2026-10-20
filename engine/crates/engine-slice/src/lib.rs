@@ -6,6 +6,7 @@
 pub mod frame_timing;
 pub mod math;
 pub mod npc;
+pub mod region;
 pub mod render_demo;
 pub mod session;
 pub mod sim;

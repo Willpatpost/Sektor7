@@ -6,10 +6,12 @@
 //! `--simulate-resize`, `--sim-budget <n>`, `--sim-near-reserve <n>`),
 //! and the Stage 3 headless simulation (`--sim`, with `--seed`,
 //! `--ticks`, `--budget`, `--near-reserve`, `--rate`, `--cadence
-//! <hz>|irregular`).
+//! <hz>|irregular`, and the Stage 4 region scenarios `--presence
+//! stationary|walk|tour`).
 
 use std::io::{self, Write};
 
+use engine_slice::region::PresenceScenario;
 use engine_slice::session::{Outcome, Session, run_selftest};
 use engine_slice::window_demo;
 
@@ -29,6 +31,7 @@ fn main() {
         let mut sim_config = engine_slice::sim::SimConfig::default();
         let mut ticks: u64 = 600;
         let mut cadence_hz: u32 = 60;
+        let mut presence: Option<PresenceScenario> = None;
         let mut index = 1;
         while index < args.len() {
             match args[index].as_str() {
@@ -83,13 +86,42 @@ fn main() {
                         }
                     }
                 }
+                "--presence" => {
+                    // Stage 4 region scenarios (deterministic scripted
+                    // presence over the default region ring layout).
+                    if let Some(value) = args.get(index + 1) {
+                        match value.as_str() {
+                            "stationary" => {
+                                presence = Some(PresenceScenario::Stationary {
+                                    position: (100.0, 0.0),
+                                });
+                                index += 1;
+                            }
+                            "walk" => {
+                                presence = Some(PresenceScenario::Walk {
+                                    from: (100.0, 0.0),
+                                    to: (-100.0, 0.0),
+                                    ticks: 300,
+                                });
+                                index += 1;
+                            }
+                            "tour" => {
+                                presence = Some(PresenceScenario::Tour {
+                                    ticks_per_region: 75,
+                                });
+                                index += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
             index += 1;
         }
-        if let Err(message) =
-            engine_slice::sim_demo::run_sim_demo(npc_config, sim_config, ticks, cadence_hz)
-        {
+        if let Err(message) = engine_slice::sim_demo::run_sim_demo(
+            npc_config, sim_config, ticks, cadence_hz, presence,
+        ) {
             eprintln!("error: {message}");
             std::process::exit(1);
         }

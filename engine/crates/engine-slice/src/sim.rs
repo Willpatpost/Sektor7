@@ -6,9 +6,10 @@
 
 use std::time::Duration;
 
-use engine_core::{Spine, Tick};
+use engine_core::{PresenceSample, Spine, Tick};
 
 use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+use crate::region::{RegionConfig, RegionDirector};
 
 /// Default simulation tick rate for the Stage 3 NPC scheduling
 /// demonstration: 10 Hz. This is a *demo default, not an engine-wide
@@ -125,6 +126,14 @@ pub struct SimDriver {
     /// batches (corrective finding D). Observational only, never
     /// fingerprinted.
     tick_ms_history: Vec<f64>,
+    /// Stage 4 region director — absent in the Stage 3 baseline
+    /// configuration, so every historical fingerprint is preserved
+    /// mechanically when no director exists.
+    director: Option<RegionDirector>,
+    /// The presence the next tick boundary consumes — explicit
+    /// simulation input (the graphical loop feeds the camera; headless
+    /// scenarios feed scripted samples); never wall-clock.
+    presence: Vec<PresenceSample>,
 }
 
 impl SimDriver {
@@ -144,7 +153,96 @@ impl SimDriver {
             total_advanced_ns: 0,
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
+            director: None,
+            presence: Vec::new(),
         }
+    }
+
+    /// Stage 4: constructs the driver with a RegionDirector. Forces the
+    /// region-LOD handler path, installs the schedules, and only then
+    /// applies the initial presence — so distant regions demote (their
+    /// obligations suspend straight into the held set with
+    /// checkpointed references) before any tick runs.
+    pub fn with_regions(
+        mut npc_config: NpcConfig,
+        config: SimConfig,
+        region_config: RegionConfig,
+        initial_presence: &[PresenceSample],
+    ) -> Result<Self, String> {
+        npc_config.region_lods_enabled = true;
+        let mut spine = Spine::with_reservation(
+            NpcWorld::new(npc_config.clone()),
+            config.budget,
+            config.effective_near_reserve(),
+        );
+        install_initial_schedules(&mut spine, &npc_config);
+        let mut director = RegionDirector::new(region_config)
+            .map_err(|error| format!("region config: {error:?}"))?;
+        director.apply(&mut spine, initial_presence);
+        let rate = config.tick_rate_hz.max(1);
+        Ok(SimDriver {
+            spine,
+            config,
+            period_ns: u128::from(1_000_000_000u64) / u128::from(rate),
+            accumulator_ns: 0,
+            total_advanced_ns: 0,
+            headless_ticks: 0,
+            tick_ms_history: Vec::new(),
+            director: Some(director),
+            presence: initial_presence.to_vec(),
+        })
+    }
+
+    /// The region director, when running with regions (Stage 4).
+    pub fn director(&self) -> Option<&RegionDirector> {
+        self.director.as_ref()
+    }
+
+    pub fn director_mut(&mut self) -> Option<&mut RegionDirector> {
+        self.director.as_mut()
+    }
+
+    /// Sets the presence the next tick boundary consumes. Explicit
+    /// simulation input — never wall-clock.
+    pub fn set_presence(&mut self, presence: Vec<PresenceSample>) {
+        self.presence = presence;
+    }
+
+    /// Schedules a new obligation under the director's policy (Stage 4
+    /// reviewer priority B): dormant regions take the held path
+    /// directly, so new work targeting them can never execute
+    /// unnoticed. Without a director this is a plain schedule.
+    pub fn schedule(
+        &mut self,
+        spec: engine_core::EventSpec,
+    ) -> Result<engine_core::EventId, engine_core::ScheduleError> {
+        match self.director.as_mut() {
+            Some(director) => director.schedule(&mut self.spine, spec),
+            None => self.spine.schedule(spec),
+        }
+    }
+
+    /// Runs `ticks` headless ticks with scripted presence per tick — a
+    /// deterministic input function of the tick index. Requires a
+    /// director (the region configuration).
+    pub fn run_headless_with_presence<F>(
+        &mut self,
+        ticks: u64,
+        presence_at: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(u64) -> Vec<PresenceSample>,
+    {
+        if self.director.is_none() {
+            return Err("run_headless_with_presence requires a region driver".to_string());
+        }
+        for _ in 0..ticks {
+            let tick = self.spine.clock().as_u64();
+            self.presence = presence_at(tick);
+            self.run_ticks(1);
+        }
+        self.headless_ticks += ticks;
+        Ok(())
     }
 
     pub fn spine(&self) -> &Spine<NpcWorld> {
@@ -206,6 +304,14 @@ impl SimDriver {
         // entry is one logical tick, so the percentiles represent real
         // tick costs including catch-up batches — not batch averages.
         for _ in 0..ticks {
+            // Stage 4 tick-boundary transitions: the director reshapes
+            // the queues from the current presence BEFORE the tick.
+            // Absent a director this path is identical to the previous
+            // behavior — no director, no per-tick work, so every
+            // baseline is preserved mechanically.
+            if let Some(director) = self.director.as_mut() {
+                director.apply(&mut self.spine, &self.presence);
+            }
             let start = std::time::Instant::now();
             self.spine.run_tick();
             let tick_ms = start.elapsed().as_secs_f64() * 1000.0;

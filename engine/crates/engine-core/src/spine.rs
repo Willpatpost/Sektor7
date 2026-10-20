@@ -105,6 +105,34 @@ impl<'a> ExecCtx<'a> {
         });
     }
 
+    /// Schedules an execution-relative follow-up in an **explicit lane**
+    /// — the Stage 3 "deferred until a use case exists" override, whose
+    /// use case is Stage 4's dynamic near/far classification: the
+    /// workload classifies each *new* follow-up under the region's
+    /// current policy, while live obligations keep their creation-time
+    /// lane (reclassified only through the explicit transition
+    /// operation, [`Spine::reclassify_matching`]). Identity,
+    /// dependencies, and accounting are identical to [`Self::follow_up`].
+    pub fn follow_up_in_field(
+        &mut self,
+        field: Field,
+        delay: u64,
+        class: EventClass,
+        payload: u64,
+        depends_on: Vec<EventId>,
+    ) {
+        self.follow_ups.push(EventSpec {
+            class,
+            schedule: Schedule::ExecutionRelative {
+                origin: self.executed_tick,
+                delay,
+            },
+            payload,
+            field,
+            depends_on,
+        });
+    }
+
     fn drain(&mut self) -> Vec<EventSpec> {
         std::mem::take(&mut self.follow_ups)
     }
@@ -167,15 +195,21 @@ pub struct LaneTotals {
     pub far_backlogged_ticks: u64,
 }
 
-/// Observational suspension counters (Stage 4 diagnostics — like
-/// `LaneTotals`, never fingerprinted; the held set itself is the
-/// authoritative suspended state).
+/// Observational suspension and reclassification counters (Stage 4
+/// diagnostics — like `LaneTotals`, never fingerprinted; the held set
+/// itself is the authoritative suspended state).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SuspensionStats {
     /// Total obligations moved into the held set.
     pub suspended_total: u64,
     /// Total obligations returned from the held set.
     pub resumed_total: u64,
+    /// Total obligations created directly in the held state
+    /// ([`Spine::schedule_held`] — new work targeting dormant regions).
+    pub scheduled_held_total: u64,
+    /// Total queued/blocked obligations moved between lanes
+    /// ([`Spine::reclassify_matching`]).
+    pub reclassified_total: u64,
 }
 
 /// Where an obligation currently lives (Stage 4 suspension).
@@ -561,6 +595,52 @@ impl<W: World> Spine<W> {
         Ok(id)
     }
 
+    /// Schedules an obligation directly into the held (suspended) state
+    /// — for new work targeting dormant regions (Stage 4 Batch 2
+    /// priority B): it cannot execute while held, so nothing resumes
+    /// ordinary processing unnoticed; it resumes with full identity
+    /// when its region reactivates, and it is accounted at creation
+    /// (both `scheduled` and the held set count it — the conservation
+    /// identity holds unchanged). Dependency validation and late-
+    /// arrival accounting are identical to [`Self::schedule`].
+    pub fn schedule_held(&mut self, spec: EventSpec) -> Result<EventId, ScheduleError> {
+        if let Some(unknown) = spec
+            .depends_on
+            .iter()
+            .find(|id| !self.known.contains(&id.seq))
+        {
+            return Err(ScheduleError::UnknownDependency(*unknown));
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let id = EventId { seq };
+        let event = Event {
+            id,
+            class: spec.class,
+            field: spec.field,
+            schedule: spec.schedule,
+            payload: spec.payload,
+            depends_on: spec.depends_on,
+        };
+        let pending = Pending::new(event);
+        if pending.due < self.clock {
+            self.stats.late_arrivals += 1;
+            self.diag.log(
+                Level::Warn,
+                format!(
+                    "late arrival {id}: due {} behind clock {} — completeness claims above {} are invalidated",
+                    pending.due, self.clock, pending.due
+                ),
+            );
+        }
+        self.known.insert(seq);
+        self.held_index.insert((pending.due, pending.seq));
+        self.held.insert(pending.seq, pending);
+        self.stats.scheduled += 1;
+        self.suspension.scheduled_held_total += 1;
+        Ok(id)
+    }
+
     // ---------------------------------------------------------- suspension
 
     /// Suspends matching pending (queued or blocked) obligations into
@@ -693,6 +773,84 @@ impl<W: World> Spine<W> {
             queue.push(item);
         }
         suspended
+    }
+
+    /// Moves matching queued and blocked obligations to the target lane,
+    /// **preserving full identity** — `(due, seq)`, schedule, payload,
+    /// and dependencies (Stage 4 Batch 2 priority C: dynamic near/far
+    /// classification, so a newly player-proximate region is protected
+    /// by the near reservation immediately instead of starving behind
+    /// far-lane overload for the remainder of a long event-driven
+    /// cadence). The execution ledger records the lane at execution
+    /// time, as always. Conservation is untouched — obligations stay
+    /// queued/blocked; only their lane changes. Matching events already
+    /// in the target lane are left as they are (not counted). Held
+    /// obligations are **not** reclassified here: `resume` restores
+    /// their original lane, and the caller reclassifies after
+    /// resumption if the region's policy changed.
+    pub fn reclassify_matching(
+        &mut self,
+        mut matches: impl FnMut(&ObligationView) -> bool,
+        field: Field,
+    ) -> u32 {
+        let mut moved: Vec<Pending> = Vec::new();
+        Self::reclassify_queue(
+            &mut self.near_queue,
+            &mut matches,
+            field,
+            Field::Near,
+            &mut moved,
+        );
+        Self::reclassify_queue(
+            &mut self.far_queue,
+            &mut matches,
+            field,
+            Field::Far,
+            &mut moved,
+        );
+        let mut reclassified = moved.len() as u32;
+        for mut pending in moved {
+            pending.event.field = field;
+            match field {
+                Field::Near => self.near_queue.push(Reverse(pending)),
+                Field::Far => self.far_queue.push(Reverse(pending)),
+            }
+        }
+        for event in self.blocked.values_mut() {
+            if event.field != field && matches(&event_view(event, ObligationLocation::Blocked)) {
+                event.field = field;
+                reclassified += 1;
+            }
+        }
+        self.suspension.reclassified_total += u64::from(reclassified);
+        reclassified
+    }
+
+    /// Drains one lane, collecting matching obligations into `moved`
+    /// (the caller re-lanes and re-pushes them) and re-pushing the rest.
+    /// Same rebuild-invisibility argument as [`Self::suspend_from_queue`]:
+    /// observable order derives from the canonical `(due, seq)` keys.
+    fn reclassify_queue(
+        queue: &mut BinaryHeap<Reverse<Pending>>,
+        matches: &mut impl FnMut(&ObligationView) -> bool,
+        target: Field,
+        source: Field,
+        moved: &mut Vec<Pending>,
+    ) {
+        if target == source {
+            return;
+        }
+        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
+        while let Some(Reverse(pending)) = queue.pop() {
+            if matches(&pending.view(ObligationLocation::Queued)) {
+                moved.push(pending);
+            } else {
+                retained.push(Reverse(pending));
+            }
+        }
+        for item in retained {
+            queue.push(item);
+        }
     }
 
     // -------------------------------------------------------------- ticking

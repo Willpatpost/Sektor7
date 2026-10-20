@@ -513,3 +513,233 @@ fn run_to_completion_does_not_advance_time_on_held_blocked_graphs() {
     assert!(b_record.late);
     assert!(conservation(&spine));
 }
+
+#[test]
+fn schedule_held_targets_dormant_regions_without_execution() {
+    // Batch 2 priority B: new obligations targeting dormant regions are
+    // created directly in the held state — they cannot execute
+    // unnoticed, are accounted at creation, validate dependencies like
+    // schedule(), and resume with full identity (original due, lateness
+    // honestly recorded when the hold made them overdue).
+    let mut spine = Spine::with_reservation(RecordingWorld::new(), 100, 50);
+    let dep = spine.schedule(at(Field::Near, 1, 1)).expect("dep");
+    spine.run_ticks(1);
+    let id = spine
+        .schedule_held(at(Field::Far, 5, 2).with_dependencies(vec![dep]))
+        .expect("held schedule validates dependencies");
+    assert_eq!(spine.held_count(), 1);
+    assert_eq!(spine.pending_count(), 0, "never queued");
+    assert_eq!(spine.suspension_stats().scheduled_held_total, 1);
+    assert_eq!(spine.stats().scheduled, 2, "accounted at creation");
+    assert!(conservation(&spine));
+    // Unknown dependencies are rejected exactly as with schedule().
+    let unknown = EventId { seq: 999 };
+    assert!(
+        spine
+            .schedule_held(at(Field::Far, 5, 3).with_dependencies(vec![unknown]))
+            .is_err()
+    );
+    // It cannot execute while held, however far time advances.
+    spine.run_ticks(100);
+    assert_eq!(spine.stats().executed, 1, "the held obligation never runs");
+    assert!(spine.has_unfinished_work());
+    // Resume: full identity, original due, lateness from the hold.
+    assert_eq!(spine.resume_matching(|view| view.id.seq == id.seq), 1);
+    spine.run_to_completion(10);
+    let record = spine
+        .ledger()
+        .iter()
+        .find(|record| record.id.seq == id.seq)
+        .expect("executed after resumption");
+    assert_eq!(record.intended_due, Tick(5));
+    assert!(
+        record.late,
+        "overdue through the dormant hold — lateness recorded"
+    );
+    assert!(conservation(&spine));
+    assert!(!spine.has_unfinished_work());
+}
+
+#[test]
+fn reclassify_protects_promoted_regions_under_far_overload() {
+    // Batch 2 priority C: dynamic near/far classification under actual
+    // far-lane overload. A region reclassified to near on promotion
+    // executes immediately inside the reservation — zero
+    // priority-transition latency — while the same region without
+    // reclassification starves behind the far backlog for a measured
+    // multi-tick window.
+    let mut spine = Spine::with_reservation(RecordingWorld::new(), 100, 30);
+    // Far-lane bulk: 300 due events (far drains ~100/tick here: 70
+    // guaranteed + near's unused leftover), so a durable backlog forms.
+    for payload in 0..300u64 {
+        spine
+            .schedule(at(Field::Far, 1, 1000 + payload))
+            .expect("schedule");
+    }
+    // The promoted region (class 7): classified Far before promotion,
+    // scheduled after the bulk so its (due, seq) keys order last.
+    let mut promoted = Vec::new();
+    for payload in 0..10u64 {
+        promoted.push(
+            spine
+                .schedule(
+                    EventSpec::new(
+                        EventClass::new(7),
+                        Schedule::AtLogicalTime { due: Tick(1) },
+                        payload,
+                    )
+                    .in_field(Field::Far),
+                )
+                .expect("schedule"),
+        );
+    }
+    // Promotion: the region's obligations move to the near lane with
+    // identity intact — (due, seq), schedule, payload, dependencies.
+    assert_eq!(
+        spine.reclassify_matching(|view| view.class == EventClass::new(7), Field::Near),
+        10
+    );
+    assert_eq!(spine.near_pending_count(), 10);
+    assert_eq!(spine.far_pending_count(), 300);
+    assert_eq!(spine.suspension_stats().reclassified_total, 10);
+    assert!(conservation(&spine));
+    // Tick 1: the promoted region executes fully inside the reservation
+    // while the far bulk still backlogs.
+    spine.run_ticks(1);
+    let promoted_executed = spine
+        .ledger()
+        .iter()
+        .filter(|record| promoted.iter().any(|id| id.seq == record.id.seq))
+        .count();
+    assert_eq!(
+        promoted_executed, 10,
+        "the promoted region executes fully on the first tick — zero latency"
+    );
+    for record in spine
+        .ledger()
+        .iter()
+        .filter(|record| promoted.iter().any(|id| id.seq == record.id.seq))
+    {
+        assert_eq!(
+            record.field,
+            Field::Near,
+            "ledger records the lane at execution"
+        );
+        assert_eq!(record.intended_due, Tick(1), "identity preserved");
+    }
+    assert_eq!(spine.far_pending_count(), 210, "far bulk still backlogged");
+    // Control: the same setup WITHOUT reclassification starves the
+    // promoted events behind the bulk for a measured multi-tick window.
+    let mut control = Spine::with_reservation(RecordingWorld::new(), 100, 30);
+    for payload in 0..300u64 {
+        control
+            .schedule(at(Field::Far, 1, 1000 + payload))
+            .expect("schedule");
+    }
+    let mut control_ids = Vec::new();
+    for payload in 0..10u64 {
+        control_ids.push(
+            control
+                .schedule(
+                    EventSpec::new(
+                        EventClass::new(7),
+                        Schedule::AtLogicalTime { due: Tick(1) },
+                        payload,
+                    )
+                    .in_field(Field::Far),
+                )
+                .expect("schedule"),
+        );
+    }
+    control.run_ticks(1);
+    let starved = control
+        .ledger()
+        .iter()
+        .filter(|record| control_ids.iter().any(|id| id.seq == record.id.seq))
+        .count();
+    assert_eq!(
+        starved, 0,
+        "without reclassification the region starves on tick 1"
+    );
+    let mut control_ticks = 0;
+    while control_ticks < 50 {
+        control.run_ticks(1);
+        control_ticks += 1;
+        let done = control
+            .ledger()
+            .iter()
+            .filter(|record| control_ids.iter().any(|id| id.seq == record.id.seq))
+            .count();
+        if done == 10 {
+            break;
+        }
+    }
+    assert!(
+        control_ticks >= 3,
+        "the control starvation window is real and multi-tick (measured {control_ticks})"
+    );
+}
+
+#[test]
+fn follow_up_in_field_classifies_new_obligations() {
+    // The Stage 3 "deferred until a use case exists" explicit-field
+    // follow-up (Batch 2 priority C): a new follow-up classifies under
+    // the region's CURRENT policy while its cause keeps its own lane;
+    // the ledger records each execution's actual lane.
+    struct LaneWorld {
+        follow_up_field: Field,
+        executed: Vec<u64>,
+    }
+    impl World for LaneWorld {
+        fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+            self.executed.push(event.payload);
+            ctx.follow_up_in_field(
+                self.follow_up_field,
+                1,
+                event.class,
+                event.payload + 1,
+                Vec::new(),
+            );
+        }
+        fn fingerprint(&self, fp: &mut Fingerprinter) {
+            fp.write_str("engine-core-suspension-test/lane-world/1");
+            fp.write_usize(self.executed.len());
+            for payload in &self.executed {
+                fp.write_u64(*payload);
+            }
+        }
+    }
+    let mut spine = Spine::with_reservation(
+        LaneWorld {
+            follow_up_field: Field::Far,
+            executed: Vec::new(),
+        },
+        100,
+        50,
+    );
+    // Cause in Near; its follow-up classifies Far per current policy.
+    spine.schedule(at(Field::Near, 1, 1)).expect("schedule");
+    spine.run_ticks(1);
+    assert_eq!(spine.near_pending_count(), 0, "the cause executed");
+    assert_eq!(
+        spine.far_pending_count(),
+        1,
+        "the follow-up lands in the explicit lane"
+    );
+    spine.run_ticks(1);
+    assert_eq!(spine.stats().executed, 2);
+    let lanes: Vec<Field> = spine.ledger().iter().map(|record| record.field).collect();
+    assert_eq!(
+        lanes,
+        vec![Field::Near, Field::Far],
+        "the ledger records each execution's actual lane"
+    );
+    let stats = spine.stats();
+    assert_eq!(
+        stats.scheduled,
+        stats.executed
+            + spine.pending_count() as u64
+            + spine.blocked_count() as u64
+            + spine.held_count() as u64
+    );
+}

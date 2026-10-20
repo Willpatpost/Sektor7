@@ -323,3 +323,53 @@ fn overflowed_projection_degenerates_to_stationary() {
         "an overflowing projection never fabricates proximity"
     );
 }
+
+#[test]
+fn segment_distance_is_nan_free_under_huge_coordinates() {
+    // Batch 2 priority E: finite-but-huge coordinates must not produce
+    // NaN through squared-length/dot overflow. The naive formulation
+    // computes inf/inf = NaN on the crossing case below; the robust
+    // scaled projection keeps the crossing exact, resolves overflowing
+    // distances to infinitely-far (which orders correctly), and never
+    // returns NaN.
+    let controller = controller();
+    let center = (0.0, 0.0);
+    // A colossal crossing: the segment spans ±1e200 through the center.
+    // Naive: length_sq and dot both overflow to inf → t = NaN. Robust:
+    // exact zero distance → Full.
+    let huge_crossing = [sample_moving(-1e200, 0.0, 1e200, 0.0)];
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &huge_crossing),
+        LodLevel::Full,
+        "huge-coordinate crossings stay exact — never NaN-poisoned"
+    );
+    // A colossal near miss: the segment passes at height 1e200 — the
+    // distance square overflows to inf, the honest far result.
+    let huge_near_miss = [sample_moving(-1e200, 1e200, 1e200, 0.0)];
+    let distance = controller
+        .effective_distance(center, &huge_near_miss)
+        .expect("a distance exists");
+    assert!(!distance.is_nan(), "never NaN");
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &huge_near_miss),
+        LodLevel::Dormant,
+        "overflowing distances resolve to deterministically far"
+    );
+    // The pathological projection: a microscopic segment with a
+    // colossally distant center — scaled terms overflow and must
+    // resolve to infinitely far, never NaN.
+    let microscopic = [sample_moving(1e-300, 0.0, 1e-300, 0.0)];
+    let far_center = (1e308, 0.0);
+    let distance = controller
+        .effective_distance(far_center, &microscopic)
+        .expect("a distance exists");
+    assert!(
+        !distance.is_nan(),
+        "never NaN, even for overflowing projection terms"
+    );
+    assert_eq!(
+        controller.next_lod(LodLevel::Simplified, far_center, &microscopic),
+        LodLevel::Dormant,
+        "deterministically far — demoted all the way, never NaN-frozen"
+    );
+}

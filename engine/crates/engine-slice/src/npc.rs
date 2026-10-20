@@ -11,16 +11,44 @@
 //! streaming, or LOD in Stage 3.
 
 use engine_core::{
-    Event, EventClass, EventSpec, ExecCtx, Field, Fingerprinter, Schedule, Spine, Tick, World,
+    Event, EventClass, EventSpec, ExecCtx, Field, Fingerprinter, LodLevel, Schedule, Spine, Tick,
+    World,
 };
 
 /// Eight logical region identifiers (Stage 3 metadata for later stages).
 pub const REGION_COUNT: usize = 8;
 
-/// The Stage 3 workload: 1,000 stable NPC identities.
+/// The Stage 4 workload: 1,000 stable NPC identities.
 pub const NPC_COUNT: usize = 1000;
 
-/// Workload configuration — all policy, all configurable (Stage 3 §2).
+/// Real-execution milestone period: every MILESTONE_PERIOD-th actual
+/// activity is an irreversible consequence. Milestones arise ONLY from
+/// real event execution — never from reconstruction (reviewer priority
+/// A: reconstructed progression cannot fabricate irreversible
+/// consequences).
+pub const MILESTONE_PERIOD: u64 = 16;
+
+/// Side length of the per-NPC region-local position grid (bounds and
+/// travel-reachability invariants; derived render proxies).
+pub const REGION_GRID: u8 = 16;
+
+/// How the workload handler chains activities (Stage 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionMode {
+    /// Stage 3 behavior, character-for-character: period + jitter
+    /// delays, lane-inheriting follow-ups, payload activity + 1. The
+    /// frozen `npc-world/1` baselines depend on this path staying
+    /// untouched.
+    Legacy,
+    /// Stage 4 region-LOD behavior: per-region cadence factors, explicit
+    /// -lane follow-ups under the region's current near/far
+    /// classification, routine-cursor payload re-basing, position
+    /// advances, and real-execution milestones.
+    Lod,
+}
+
+/// Workload configuration — all policy, all configurable (Stage 3 §2,
+/// Stage 4 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpcConfig {
     /// Deterministic workload seed. Identity assignment is stable by id;
@@ -33,6 +61,17 @@ pub struct NpcConfig {
     /// period, with seeded jitter that also desynchronizes schedule
     /// synchrony clusters (E-10: budgets are sized to cluster peaks).
     pub activity_period: u64,
+    /// Stage 4 demo policy: the cadence multiplier at Simplified LOD
+    /// (coarser, less frequent updates — meaningfully less work).
+    pub simplify_factor: u64,
+    /// Stage 4 demo policy: the cadence multiplier at EventDriven LOD —
+    /// the commitment window between long-cadence wake-ups (records and
+    /// scheduled commitments only).
+    pub commitment_window: u64,
+    /// Stage 4: enable the region-LOD handler path. `false` (the
+    /// default) keeps the Stage 3 Legacy path, so every historical
+    /// fingerprint stays byte-identical.
+    pub region_lods_enabled: bool,
 }
 
 impl Default for NpcConfig {
@@ -46,6 +85,34 @@ impl Default for NpcConfig {
             seed: 1337,
             near_regions,
             activity_period: 6,
+            simplify_factor: 4,
+            commitment_window: 12,
+            region_lods_enabled: false,
+        }
+    }
+}
+
+impl NpcConfig {
+    /// Cadence multiplier at a LOD level (demo policy, configurable):
+    /// Full = every period, Simplified = period × simplify factor,
+    /// EventDriven = period × commitment window. Dormant never executes
+    /// (its obligations are suspended), so the value is defensive.
+    pub fn cadence_factor(&self, lod: LodLevel) -> u64 {
+        match lod {
+            LodLevel::Full => 1,
+            LodLevel::Simplified => self.simplify_factor.max(1),
+            LodLevel::EventDriven | LodLevel::Dormant => self.commitment_window.max(1),
+        }
+    }
+
+    /// Near/far classification for a region at a LOD level (Stage 4
+    /// demo policy, application-side by contract): player-proximate
+    /// levels classify Near — the reservation protects them — while
+    /// far-field levels classify Far.
+    pub fn lod_field(&self, lod: LodLevel) -> Field {
+        match lod {
+            LodLevel::Full | LodLevel::Simplified => Field::Near,
+            LodLevel::EventDriven | LodLevel::Dormant => Field::Far,
         }
     }
 }
@@ -79,15 +146,49 @@ fn mix64(mut x: u64) -> u64 {
 /// state; diagnostics derive from them read-only.
 pub struct NpcWorld {
     config: NpcConfig,
-    /// Executed activity count per NPC, indexed by stable identity.
+    /// Executed activity count per NPC, indexed by stable identity —
+    /// ACTUAL executions only (reviewer priority A): reconstruction
+    /// never increments this counter.
     steps: Vec<u64>,
+    /// Stage 4 routine progression cursor per NPC: the index of the next
+    /// activity the routine would perform — advanced by real execution
+    /// AND by labeled reconstruction. Separate from `steps` by contract;
+    /// equivalently `cursor == steps` whenever no reconstruction has
+    /// occurred, which is what keeps the Legacy chain coherent.
+    routine_cursor: Vec<u64>,
+    /// Per-NPC position on the region-local grid (x, y in 0..REGION_GRID)
+    /// — bounds- and travel-reachability-checked state, and the source
+    /// for derived render proxies.
+    positions: Vec<(u8, u8)>,
+    /// Real-execution milestones per NPC: every MILESTONE_PERIOD-th
+    /// actual activity. Irreversible consequences — never fabricated by
+    /// reconstruction.
+    milestones: Vec<u64>,
+    /// The director's current LOD per region — the handler's cadence and
+    /// classification view. The director (region state) owns the
+    /// authoritative levels; this copy is what execution actually
+    /// consumed, and is fingerprinted with the routine state.
+    region_lods: [LodLevel; REGION_COUNT],
 }
 
 impl NpcWorld {
     pub fn new(config: NpcConfig) -> Self {
+        let positions = (0..NPC_COUNT)
+            .map(|npc| {
+                let hash = mix64(config.seed ^ ((npc as u64) << 32) ^ 0xB0B0_0000_0000_0000);
+                (
+                    (hash % u64::from(REGION_GRID)) as u8,
+                    ((hash >> 32) % u64::from(REGION_GRID)) as u8,
+                )
+            })
+            .collect();
         NpcWorld {
             config,
             steps: vec![0; NPC_COUNT],
+            routine_cursor: vec![0; NPC_COUNT],
+            positions,
+            milestones: vec![0; NPC_COUNT],
+            region_lods: [LodLevel::Full; REGION_COUNT],
         }
     }
 
@@ -105,6 +206,32 @@ impl NpcWorld {
         &self.steps
     }
 
+    /// Per-NPC routine progression cursors (read-only view).
+    pub fn routine_cursor(&self) -> &[u64] {
+        &self.routine_cursor
+    }
+
+    /// Per-NPC grid positions (read-only view).
+    pub fn positions(&self) -> &[(u8, u8)] {
+        &self.positions
+    }
+
+    /// Per-NPC real-execution milestones (read-only view).
+    pub fn milestones(&self) -> &[u64] {
+        &self.milestones
+    }
+
+    /// The handler's current LOD view per region.
+    pub fn region_lods(&self) -> [LodLevel; REGION_COUNT] {
+        self.region_lods
+    }
+
+    /// Sets one region's LOD (the director's tick-boundary update —
+    /// never mid-tick).
+    pub fn set_region_lod(&mut self, region: usize, lod: LodLevel) {
+        self.region_lods[region] = lod;
+    }
+
     /// The lane for a region under the configured classification.
     pub fn region_field(&self, region: usize) -> Field {
         if self.config.near_regions[region] {
@@ -113,33 +240,183 @@ impl NpcWorld {
             Field::Far
         }
     }
+
+    /// Exact step-by-step replay of a dormant span (reviewer priority
+    /// A/C): recomputes the seeded jitter chain activity by activity
+    /// from the held obligation's due to `now`, advancing the routine
+    /// cursor and position walk exactly as live execution would have.
+    /// Cost is proportional to the reconstructed activity count (E-09's
+    /// replay). NEVER touches `steps`, milestones, or the execution
+    /// ledger — reconstruction is labeled state, not history. Returns
+    /// the reconstructed activity count.
+    pub fn replay_routine_span(
+        &mut self,
+        npc: usize,
+        from_due: Tick,
+        now: Tick,
+        cadence: u64,
+    ) -> u64 {
+        let period = self.config.activity_period * cadence.max(1);
+        let activity = self.routine_cursor[npc];
+        let mut time = from_due.as_u64();
+        let mut count = 0u64;
+        loop {
+            let jitter = mix64(self.config.seed ^ ((npc as u64) << 32) ^ (activity + count)) % 2;
+            let delay = period + jitter;
+            if time.saturating_add(delay) > now.as_u64() {
+                break;
+            }
+            time += delay;
+            count += 1;
+        }
+        self.apply_routine_advance(npc, count);
+        count
+    }
+
+    /// Closed-form synthesis of a dormant span (reviewer priority A):
+    /// the approximate activity count from elapsed time over the mean
+    /// cadence, with a bounded-drift position displacement (at most one
+    /// cell per activity — travel-reachable by construction). O(1).
+    /// NEVER touches `steps`, milestones, or the ledger; the caller
+    /// labels the span as synthesized. Returns the synthesized count.
+    pub fn synthesize_routine_span(
+        &mut self,
+        npc: usize,
+        from_due: Tick,
+        now: Tick,
+        cadence: u64,
+    ) -> u64 {
+        let period = (self.config.activity_period * cadence.max(1)).max(1);
+        let elapsed = now.as_u64().saturating_sub(from_due.as_u64());
+        let missed = elapsed / period;
+        let cursor = self.routine_cursor[npc];
+        // Average-drift displacement: half the activities' worth of cells
+        // in a seeded direction — bounded by `missed`, so reachability
+        // holds by construction.
+        let direction = mix64(self.config.seed ^ ((npc as u64) << 32) ^ cursor ^ 0x5151) % 4;
+        let travel = (missed / 2) as i16;
+        let (x, y) = self.positions[npc];
+        let (dx, dy) = match direction {
+            0 => (travel, 0),
+            1 => (-travel, 0),
+            2 => (0, travel),
+            _ => (0, -travel),
+        };
+        let nx = (i16::from(x) + dx).clamp(0, i16::from(REGION_GRID) - 1) as u8;
+        let ny = (i16::from(y) + dy).clamp(0, i16::from(REGION_GRID) - 1) as u8;
+        self.positions[npc] = (nx, ny);
+        self.routine_cursor[npc] += missed;
+        missed
+    }
+
+    /// Advances the routine cursor and position walk by `count`
+    /// activities (the per-step replay rule: one seeded cell per
+    /// activity, clamped to the region grid — the bounds invariant).
+    fn apply_routine_advance(&mut self, npc: usize, count: u64) {
+        for _ in 0..count {
+            self.routine_cursor[npc] += 1;
+            self.advance_position(npc);
+        }
+    }
+
+    /// One seeded position step on the region-local grid, clamped to
+    /// bounds (the travel-reachability unit: at most one cell per
+    /// activity).
+    fn advance_position(&mut self, npc: usize) {
+        let cursor = self.routine_cursor[npc];
+        let direction = mix64(self.config.seed ^ ((npc as u64) << 32) ^ cursor ^ 0x5050) % 4;
+        let (x, y) = self.positions[npc];
+        let (nx, ny) = match direction {
+            0 => (i16::from(x) + 1, i16::from(y)),
+            1 => (i16::from(x) - 1, i16::from(y)),
+            2 => (i16::from(x), i16::from(y) + 1),
+            _ => (i16::from(x), i16::from(y) - 1),
+        };
+        let nx = nx.clamp(0, i16::from(REGION_GRID) - 1) as u8;
+        let ny = ny.clamp(0, i16::from(REGION_GRID) - 1) as u8;
+        self.positions[npc] = (nx, ny);
+    }
+
+    /// Stage 4 authoritative workload state beyond the frozen Stage 3
+    /// domain: routine cursor, grid positions, milestones, and the
+    /// region-LOD view execution actually consumed. New domain
+    /// "engine-slice/npc-spatial/1" — hashed only by the Stage 4
+    /// combined fingerprint; the Stage 3 domains never see it.
+    pub fn spatial_fingerprint(&self, fp: &mut Fingerprinter) {
+        fp.write_str("engine-slice/npc-spatial/1");
+        fp.write_u64(self.config.seed);
+        fp.write_usize(self.routine_cursor.len());
+        for cursor in &self.routine_cursor {
+            fp.write_u64(*cursor);
+        }
+        for position in &self.positions {
+            fp.write_u8(position.0);
+            fp.write_u8(position.1);
+        }
+        for milestone in &self.milestones {
+            fp.write_u64(*milestone);
+        }
+        for lod in &self.region_lods {
+            fp.write_u8(match lod {
+                LodLevel::Full => 0,
+                LodLevel::Simplified => 1,
+                LodLevel::EventDriven => 2,
+                LodLevel::Dormant => 3,
+            });
+        }
+    }
 }
 
 /// Installs the initial schedule for every NPC identity: one event per
 /// NPC, due within the first two activity periods (seeded spread), in
 /// the region's lane. The chain then self-sustains through follow-ups.
 pub fn install_initial_schedules(spine: &mut Spine<NpcWorld>, config: &NpcConfig) {
+    // Stage 4: in Lod mode the install classifies and spreads under the
+    // region-LOD view the director set before installation (the world
+    // defaults to Full everywhere when no director has run — the same
+    // all-active start Stage 3 used).
+    let lods = spine.world().region_lods();
     for npc in 0..NPC_COUNT {
         let region = npc % REGION_COUNT;
-        let field = if config.near_regions[region] {
-            Field::Near
-        } else {
-            Field::Far
-        };
-        let spread = (config.activity_period * 2).max(1);
-        let offset = mix64(config.seed ^ ((npc as u64) << 32)) % spread;
-        spine
-            .schedule(
-                EventSpec::new(
-                    EventClass::new(region as u16),
-                    Schedule::AtLogicalTime {
-                        due: Tick(1 + offset),
-                    },
-                    payload(npc, 0),
+        if config.region_lods_enabled {
+            let lod = lods[region];
+            let field = config.lod_field(lod);
+            let spread = (config.activity_period * 2 * config.cadence_factor(lod)).max(1);
+            let offset = mix64(config.seed ^ ((npc as u64) << 32)) % spread;
+            spine
+                .schedule(
+                    EventSpec::new(
+                        EventClass::new(region as u16),
+                        Schedule::AtLogicalTime {
+                            due: Tick(1 + offset),
+                        },
+                        payload(npc, 0),
+                    )
+                    .in_field(field),
                 )
-                .in_field(field),
-            )
-            .expect("initial NPC schedule is dependency-free");
+                .expect("initial NPC schedule is dependency-free");
+        } else {
+            // Stage 3 Legacy path — untouched (frozen baselines).
+            let field = if config.near_regions[region] {
+                Field::Near
+            } else {
+                Field::Far
+            };
+            let spread = (config.activity_period * 2).max(1);
+            let offset = mix64(config.seed ^ ((npc as u64) << 32)) % spread;
+            spine
+                .schedule(
+                    EventSpec::new(
+                        EventClass::new(region as u16),
+                        Schedule::AtLogicalTime {
+                            due: Tick(1 + offset),
+                        },
+                        payload(npc, 0),
+                    )
+                    .in_field(field),
+                )
+                .expect("initial NPC schedule is dependency-free");
+        }
     }
 }
 
@@ -153,17 +430,55 @@ impl World for NpcWorld {
             return;
         }
         let activity = payload_activity(event.payload);
+        if !self.config.region_lods_enabled {
+            // Stage 3 Legacy path, character-for-character — the frozen
+            // npc-world/1 baselines hash this exact behavior.
+            self.steps[npc] += 1;
+            // Chain the next activity: execution-relative (anchored to actual
+            // execution), same region class, same lane (follow-ups inherit
+            // the executing event's field). Jitter derives from logical data
+            // only — seed, identity, activity — never wall-clock time.
+            let jitter = mix64(self.config.seed ^ ((npc as u64) << 32) ^ activity) % 2;
+            let delay = self.config.activity_period + jitter;
+            ctx.follow_up(delay, event.class, payload(npc, activity + 1), Vec::new());
+            return;
+        }
+        // Stage 4 region-LOD path (reviewer priority A): `steps` counts
+        // actual executions only; the routine cursor — advanced here AND
+        // by labeled reconstruction — re-bases the chained payload, so a
+        // reconstructed span never double-counts and a resumed
+        // obligation performs the next activity after the reconstructed
+        // state. Milestones — irreversible consequences — arise only
+        // from this real-execution counter.
         self.steps[npc] += 1;
-        // Chain the next activity: execution-relative (anchored to actual
-        // execution), same region class, same lane (follow-ups inherit
-        // the executing event's field). Jitter derives from logical data
-        // only — seed, identity, activity — never wall-clock time.
+        if self.steps[npc].is_multiple_of(MILESTONE_PERIOD) {
+            self.milestones[npc] += 1;
+        }
+        self.routine_cursor[npc] += 1;
+        self.advance_position(npc);
+        let region = npc % REGION_COUNT;
+        let lod = self.region_lods[region];
+        let cadence = self.config.cadence_factor(lod);
+        // Jitter derives from logical data only — seed, identity,
+        // activity — never wall-clock time.
         let jitter = mix64(self.config.seed ^ ((npc as u64) << 32) ^ activity) % 2;
-        let delay = self.config.activity_period + jitter;
-        ctx.follow_up(delay, event.class, payload(npc, activity + 1), Vec::new());
+        let delay = self.config.activity_period * cadence + jitter;
+        let field = self.config.lod_field(lod);
+        ctx.follow_up_in_field(
+            field,
+            delay,
+            event.class,
+            payload(npc, self.routine_cursor[npc]),
+            Vec::new(),
+        );
     }
 
     fn fingerprint(&self, fp: &mut Fingerprinter) {
+        // FROZEN Stage 3 domain "engine-slice/npc-world/1": the new
+        // Stage 4 state (routine cursor, positions, milestones, region
+        // LODs) never enters here — it lives in
+        // [`Self::spatial_fingerprint`] under a new versioned domain, so
+        // every historical fingerprint stays byte-identical.
         fp.write_str("engine-slice/npc-world/1");
         fp.write_u64(self.config.seed);
         fp.write_u64(self.config.activity_period);

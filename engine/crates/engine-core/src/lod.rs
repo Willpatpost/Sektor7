@@ -304,15 +304,36 @@ fn dist_sq(a: (f64, f64), b: (f64, f64)) -> f64 {
 /// `[start, end]`, endpoints included (Batch 1 review item A): a
 /// projected path passing near — or through — a region counts even when
 /// both endpoints are distant. Zero-length segments (stationary
-/// presence) fall back to the point distance. IEEE-754 arithmetic only,
-/// deterministic; the caller has already filtered non-finite inputs.
+/// presence) fall back to the point distance.
+///
+/// Numerically robust projection (Batch 2 priority E): the direction is
+/// scaled by its largest component before any division, so finite but
+/// huge coordinates cannot yield `inf/inf` = NaN. The scaled
+/// denominator is finite by construction (each scaled component is ≤ 1
+/// in magnitude); a non-finite scaled projection means the center is
+/// colossally far relative to the segment — deterministically
+/// infinitely distant, never NaN. The residual differences are bounded
+/// between the finite endpoint offsets, so only the final squaring can
+/// overflow — to `inf`, which orders correctly (farther than
+/// everything) instead of poisoning comparisons.
 fn segment_dist_sq(start: (f64, f64), end: (f64, f64), center: (f64, f64)) -> f64 {
     let dx = end.0 - start.0;
     let dy = end.1 - start.1;
-    let length_sq = dx * dx + dy * dy;
-    if length_sq == 0.0 {
+    if dx == 0.0 && dy == 0.0 {
         return dist_sq(start, center);
     }
-    let t = (((center.0 - start.0) * dx + (center.1 - start.1) * dy) / length_sq).clamp(0.0, 1.0);
-    dist_sq((start.0 + t * dx, start.1 + t * dy), center)
+    let scale = dx.abs().max(dy.abs());
+    let ux = dx / scale;
+    let uy = dy / scale;
+    let denominator = ux * ux + uy * uy;
+    let wx = center.0 - start.0;
+    let wy = center.1 - start.1;
+    let projection = (wx / scale) * ux + (wy / scale) * uy;
+    if !projection.is_finite() {
+        return f64::INFINITY;
+    }
+    let t = (projection / denominator).clamp(0.0, 1.0);
+    let ex = wx - t * dx;
+    let ey = wy - t * dy;
+    ex * ex + ey * ey
 }
