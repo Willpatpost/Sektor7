@@ -214,19 +214,31 @@ impl VulkanContext {
         let sdl_extensions = window
             .vulkan_instance_extensions()
             .map_err(|error| RendererError::Surface(format!("{error}")))?;
-        let mut extension_cstrings: Vec<CString> = sdl_extensions
-            .iter()
-            .map(|name| CString::new(name.as_str()).unwrap_or_default())
-            .collect();
-        let mut layer_cstrings: Vec<CString> = Vec::new();
 
         let want_validation = match config.validation {
             crate::config::ValidationPreference::Off => false,
             crate::config::ValidationPreference::On => true,
             crate::config::ValidationPreference::Auto => cfg!(debug_assertions),
         };
+
+        // Mac 2, change A: the loader's advertised instance extensions
+        // decide portability enumeration. Enumeration failure is an
+        // environment limitation, not an application error — an empty
+        // advertised set preserves the pre-Mac-2 behavior exactly.
+        let loader_advertised: Vec<String> =
+            unsafe { entry.enumerate_instance_extension_properties(None) }
+                .unwrap_or_default()
+                .iter()
+                .map(|property| {
+                    unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+        let mut plan =
+            InstanceExtensionPlan::select(&sdl_extensions, &loader_advertised, want_validation);
+        let mut layer_cstrings: Vec<CString> = Vec::new();
         if want_validation {
-            extension_cstrings.push(CString::from(ext::debug_utils::NAME));
             layer_cstrings.push(CString::new(VALIDATION_LAYER_NAME).unwrap());
         }
 
@@ -243,8 +255,11 @@ impl VulkanContext {
         if want_validation {
             // Try with validation; failure here is an environment
             // limitation (no layer installed), not an application error.
-            let extension_names: Vec<*const core::ffi::c_char> =
-                extension_cstrings.iter().map(|c| c.as_ptr()).collect();
+            // The fallback drops ONLY the validation extension/layer —
+            // portability enumeration and its flag survive (Mac 2
+            // authorization §4), so a missing layer can never hide
+            // MoltenVK devices.
+            let (_extension_cstrings, extension_names) = extension_name_pointers(&plan.extensions);
             let layer_names: Vec<*const core::ffi::c_char> =
                 layer_cstrings.iter().map(|c| c.as_ptr()).collect();
             let mut debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -261,6 +276,7 @@ impl VulkanContext {
                 .pfn_user_callback(Some(validation_callback));
             let create_info = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
+                .flags(plan.create_flags())
                 .enabled_extension_names(&extension_names)
                 .enabled_layer_names(&layer_names)
                 .push_next(&mut debug_info);
@@ -270,7 +286,7 @@ impl VulkanContext {
                     validation_active = true;
                 }
                 Err(_) => {
-                    extension_cstrings.pop();
+                    plan = plan.without_validation();
                     layer_cstrings.clear();
                 }
             }
@@ -278,10 +294,14 @@ impl VulkanContext {
         let instance = match instance {
             Some(created) => created,
             None => {
-                let extension_names: Vec<*const core::ffi::c_char> =
-                    extension_cstrings.iter().map(|c| c.as_ptr()).collect();
+                // The fallback differs from the attempt above only in
+                // validation — portability enumeration and its flag are
+                // the same decision in both attempts.
+                let (_extension_cstrings, extension_names) =
+                    extension_name_pointers(&plan.extensions);
                 let create_info = vk::InstanceCreateInfo::default()
                     .application_info(&app_info)
+                    .flags(plan.create_flags())
                     .enabled_extension_names(&extension_names);
                 unsafe { entry.create_instance(&create_info, None) }
                     .map_err(|error| RendererError::Vulkan(format!("create_instance: {error}")))?
@@ -326,7 +346,7 @@ impl VulkanContext {
             vk::DebugUtilsMessengerEXT::null()
         };
 
-        let Some((physical_device, graphics_family)) =
+        let Some((physical_device, graphics_family, portability_subset)) =
             pick_physical_device(&instance, &surface_ext, surface)
         else {
             unsafe {
@@ -376,14 +396,22 @@ impl VulkanContext {
         }
         .unwrap_or_default();
 
-        let swapchain_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
+        // Mac 2, change B: swapchain always; portability subset when the
+        // chosen device advertises it (required when advertised —
+        // VUID-VkDeviceCreateInfo-pProperties-04451; MoltenVK device
+        // creation fails without it). Inert on devices that don't.
+        let device_extension_names: Vec<*const core::ffi::c_char> =
+            select_device_extensions(portability_subset)
+                .iter()
+                .map(|name| name.as_ptr())
+                .collect();
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(graphics_family)
             .queue_priorities(&[1.0]);
         let queue_infos = [queue_info];
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
-            .enabled_extension_names(&swapchain_extension_names);
+            .enabled_extension_names(&device_extension_names);
         let device_creation =
             unsafe { instance.create_device(physical_device, &device_create, None) };
         let device = match device_creation {
@@ -440,13 +468,143 @@ impl VulkanContext {
     }
 }
 
+/// Instance-creation extension plan (Mac 2, change A): a pure selection
+/// policy over SDL's driver-required extensions and the loader's
+/// advertised instance extensions. `VK_KHR_portability_enumeration` is
+/// enabled when the loader advertises it — without the extension and
+/// the matching instance flag, a conformant loader hides portability
+/// devices such as MoltenVK, which today surfaces as the designed
+/// transparent `RendererError::NoDevice`. The validation-only
+/// `VK_EXT_debug_utils` extension is appended last and removed **by
+/// name** on fallback — the Mac 0-era `pop()` relied on debug-utils
+/// being last, an ordering invariant the portability insertion would
+/// silently break (Mac 2 authorization §4 hazard).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstanceExtensionPlan {
+    /// Enabled extensions in creation order: SDL-required first, then
+    /// portability enumeration (when enabled), then debug-utils last.
+    extensions: Vec<String>,
+    /// `VK_KHR_portability_enumeration` is enabled — the instance must
+    /// set `ENUMERATE_PORTABILITY_KHR`.
+    portability_enumeration: bool,
+    /// The validation debug-utils extension is included (an instance
+    /// created from this plan can report validation active).
+    validation: bool,
+}
+
+impl InstanceExtensionPlan {
+    /// SDL-required extensions keep their order and content; the
+    /// loader's portability enumeration is appended when advertised and
+    /// not already required; the validation extension is appended only
+    /// when validation is wanted. No duplicates.
+    fn select(
+        sdl_required: &[String],
+        loader_advertised: &[String],
+        want_validation: bool,
+    ) -> InstanceExtensionPlan {
+        let portability = khr::portability_enumeration::NAME
+            .to_string_lossy()
+            .into_owned();
+        let advertised = loader_advertised.contains(&portability);
+        let already_required = sdl_required.contains(&portability);
+        let mut extensions = sdl_required.to_vec();
+        if advertised && !already_required {
+            extensions.push(portability);
+        }
+        if want_validation {
+            extensions.push(ext::debug_utils::NAME.to_string_lossy().into_owned());
+        }
+        InstanceExtensionPlan {
+            extensions,
+            portability_enumeration: advertised || already_required,
+            validation: want_validation,
+        }
+    }
+
+    /// Validation fallback: remove the debug-utils extension by name,
+    /// leaving the SDL-required and portability extensions — and hence
+    /// the instance flag — untouched.
+    fn without_validation(&self) -> InstanceExtensionPlan {
+        let debug_utils = ext::debug_utils::NAME.to_string_lossy().into_owned();
+        InstanceExtensionPlan {
+            extensions: self
+                .extensions
+                .iter()
+                .filter(|name| name.as_str() != debug_utils)
+                .cloned()
+                .collect(),
+            portability_enumeration: self.portability_enumeration,
+            validation: false,
+        }
+    }
+
+    /// Instance flags derived from the same plan that produced the
+    /// extension list — flag and extension cannot diverge in either
+    /// creation attempt.
+    fn create_flags(&self) -> vk::InstanceCreateFlags {
+        if self.portability_enumeration {
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+        } else {
+            vk::InstanceCreateFlags::empty()
+        }
+    }
+}
+
+/// Owned CString copies of an extension list plus raw pointers into
+/// them; the CStrings live as long as the pointers' use (both drop
+/// together at the end of each creation attempt).
+fn extension_name_pointers(extensions: &[String]) -> (Vec<CString>, Vec<*const core::ffi::c_char>) {
+    let owned: Vec<CString> = extensions
+        .iter()
+        .map(|name| CString::new(name.as_str()).unwrap_or_default())
+        .collect();
+    let pointers = owned.iter().map(|c| c.as_ptr()).collect();
+    (owned, pointers)
+}
+
+/// Device-extension capability scan (Mac 2, change B): which
+/// policy-relevant extensions a candidate device advertises.
+/// `VK_KHR_swapchain` stays mandatory for candidacy;
+/// `VK_KHR_portability_subset` only parameterizes device creation — the
+/// spec requires enabling it when advertised
+/// (`VUID-VkDeviceCreateInfo-pProperties-04451`), which is why MoltenVK
+/// device creation fails without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceExtensionCapabilities {
+    swapchain: bool,
+    portability_subset: bool,
+}
+
+fn device_extension_capabilities(advertised: &[String]) -> DeviceExtensionCapabilities {
+    let has = |name: &CStr| advertised.contains(&name.to_string_lossy().into_owned());
+    DeviceExtensionCapabilities {
+        swapchain: has(khr::swapchain::NAME),
+        portability_subset: has(khr::portability_subset::NAME),
+    }
+}
+
+/// Device-extension selection for the chosen device (Mac 2, change B):
+/// swapchain always; portability subset only when advertised. The
+/// single source for device creation — no second selection path.
+fn select_device_extensions(portability_subset: bool) -> Vec<&'static CStr> {
+    let mut extensions = vec![khr::swapchain::NAME];
+    if portability_subset {
+        extensions.push(khr::portability_subset::NAME);
+    }
+    extensions
+}
+
+/// Candidate selection; the result carries the chosen device's
+/// portability-subset capability alongside the queue family (Mac 2,
+/// change B) — an extension of the existing tuple, not a divergent
+/// selection path.
 fn pick_physical_device(
     instance: &Instance,
     surface_ext: &khr::surface::Instance,
     surface: vk::SurfaceKHR,
-) -> Option<(vk::PhysicalDevice, u32)> {
+) -> Option<(vk::PhysicalDevice, u32, bool)> {
     let devices = unsafe { instance.enumerate_physical_devices() }.ok()?;
-    let mut best: Option<(u64, vk::PhysicalDevice, u32)> = None;
+    let mut best: Option<(u64, vk::PhysicalDevice, u32, bool)> = None;
     for device in devices {
         let properties = unsafe { instance.get_physical_device_properties(device) };
         let score = match properties.device_type {
@@ -470,12 +628,20 @@ fn pick_physical_device(
         let Some(family) = chosen_family else {
             continue;
         };
-        let extensions =
-            unsafe { instance.enumerate_device_extension_properties(device) }.unwrap_or_default();
-        let has_swapchain = extensions
-            .iter()
-            .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == khr::swapchain::NAME);
-        if !has_swapchain {
+        let advertised: Vec<String> =
+            unsafe { instance.enumerate_device_extension_properties(device) }
+                .unwrap_or_default()
+                .iter()
+                .map(|property| {
+                    unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+        // Mac 2, change B: swapchain stays mandatory; portability subset
+        // is recorded for device creation, not for candidacy.
+        let capabilities = device_extension_capabilities(&advertised);
+        if !capabilities.swapchain {
             continue;
         }
         let formats = unsafe { surface_ext.get_physical_device_surface_formats(device, surface) }
@@ -483,11 +649,11 @@ fn pick_physical_device(
         if formats.is_empty() {
             continue;
         }
-        if best.is_none_or(|(best_score, _, _)| score > best_score) {
-            best = Some((score, device, family));
+        if best.is_none_or(|(best_score, _, _, _)| score > best_score) {
+            best = Some((score, device, family, capabilities.portability_subset));
         }
     }
-    best.map(|(_, device, family)| (device, family))
+    best.map(|(_, device, family, portability_subset)| (device, family, portability_subset))
 }
 
 /// Swapchain + attachments + framebuffers. Recreated on resize,
@@ -2389,5 +2555,151 @@ mod policy_tests {
             &capabilities([u32::MAX, u32::MAX], [1, 1], [3840, 2160]),
         );
         assert_eq!((driven.width, driven.height), (1280, 720));
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn portability_enumeration_enabled_with_flag_when_advertised() {
+        let plan = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_metal_surface"]),
+            &strings(&[
+                "VK_KHR_surface",
+                "VK_KHR_portability_enumeration",
+                "VK_EXT_debug_utils",
+            ]),
+            false,
+        );
+        assert!(plan.portability_enumeration);
+        assert_eq!(
+            plan.create_flags(),
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+        );
+        assert_eq!(
+            plan.extensions,
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_metal_surface",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+    }
+
+    #[test]
+    fn portability_enumeration_absent_keeps_existing_behavior() {
+        let plan = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_headless_surface"]),
+            &strings(&["VK_KHR_surface", "VK_EXT_debug_utils"]),
+            false,
+        );
+        assert!(!plan.portability_enumeration);
+        assert_eq!(plan.create_flags(), vk::InstanceCreateFlags::empty());
+        assert_eq!(
+            plan.extensions,
+            strings(&["VK_KHR_surface", "VK_EXT_headless_surface"])
+        );
+    }
+
+    #[test]
+    fn sdl_required_extensions_preserved_without_duplicates() {
+        // SDL's list keeps its order and content; portability enumeration
+        // is appended exactly once even when the loader also advertises
+        // it, and never appended on top of an SDL-required entry.
+        let plan = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_metal_surface"]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            false,
+        );
+        assert_eq!(
+            plan.extensions,
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_metal_surface",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+        // Defensive: if SDL itself required the extension, it is not
+        // duplicated — but the flag decision still holds.
+        let already = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_KHR_portability_enumeration"]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            false,
+        );
+        assert_eq!(
+            already.extensions,
+            strings(&["VK_KHR_surface", "VK_KHR_portability_enumeration"])
+        );
+        assert!(already.portability_enumeration);
+    }
+
+    #[test]
+    fn validation_fallback_keeps_portability_and_drops_only_debug_utils() {
+        // Mac 2 authorization §4 hazard: the fallback must remove the
+        // validation-only extension by name — never the portability
+        // extension that precedes it — and the flag decision survives.
+        let with = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_metal_surface"]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            true,
+        );
+        assert!(with.validation);
+        let without = with.without_validation();
+        assert!(!without.validation);
+        assert!(without.portability_enumeration);
+        assert_eq!(without.create_flags(), with.create_flags());
+        assert_eq!(
+            without.extensions,
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_metal_surface",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+    }
+
+    #[test]
+    fn validation_disabled_adds_no_debug_utils_extension() {
+        let plan = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface"]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            false,
+        );
+        assert!(!plan.validation);
+        assert!(!plan.extensions.contains(&"VK_EXT_debug_utils".to_string()));
+        // Fallback on a plan that never had validation is a no-op.
+        assert_eq!(plan.without_validation(), plan);
+    }
+
+    #[test]
+    fn device_portability_subset_enabled_only_when_advertised() {
+        assert_eq!(
+            select_device_extensions(true),
+            vec![khr::swapchain::NAME, khr::portability_subset::NAME]
+        );
+        assert_eq!(select_device_extensions(false), vec![khr::swapchain::NAME]);
+    }
+
+    #[test]
+    fn device_capability_scan_keeps_swapchain_mandatory() {
+        // Swapchain absence disqualifies a device (candidacy enforces
+        // the scan's verdict); portability subset alone neither
+        // qualifies nor disqualifies — it only parameterizes creation.
+        let neither = device_extension_capabilities(&strings(&["VK_KHR_maintenance1"]));
+        assert!(!neither.swapchain);
+        assert!(!neither.portability_subset);
+
+        let both = device_extension_capabilities(&strings(&[
+            "VK_KHR_swapchain",
+            "VK_KHR_portability_subset",
+            "VK_KHR_something_else",
+        ]));
+        assert!(both.swapchain);
+        assert!(both.portability_subset);
+
+        let subset_only = device_extension_capabilities(&strings(&["VK_KHR_portability_subset"]));
+        assert!(!subset_only.swapchain);
+        assert!(subset_only.portability_subset);
     }
 }

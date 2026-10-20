@@ -1,0 +1,48 @@
+name: macos-molvk-research
+
+# Mac 2 §8 optional evidence-gathering — NOT a gate, NOT part of
+# engine-ci. Read-only probes of whether the GitHub-hosted macOS ARM64
+# runner offers a viable Vulkan SDK / MoltenVK installation path (the
+# Mac 0 audit's open risks R1–R3: preinstalled components, Homebrew
+# availability, LunarG SDK reachability, VM GPU/Metal visibility). No
+# SDK install and no render smoke run here; every step prints its
+# findings either way and the job's conclusion carries no gating
+# meaning. Manually dispatched only.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: macos-15 MoltenVK environment probe (research, non-gating)
+    runs-on: macos-15
+    steps:
+      - name: Runner inventory
+        run: |
+          uname -m
+          sw_vers
+          echo "VULKAN_SDK=${VULKAN_SDK:-<unset>}"
+          ls -l /usr/local/lib/libvulkan* 2>/dev/null || echo "no /usr/local/lib/libvulkan*"
+          ls -l /opt/homebrew/lib/libvulkan* 2>/dev/null || echo "no /opt/homebrew/lib/libvulkan*"
+          ls /usr/local/share/vulkan 2>/dev/null || echo "no /usr/local/share/vulkan"
+          command -v vulkaninfo >/dev/null && echo "vulkaninfo present" || echo "no vulkaninfo"
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Metal" || echo "no GPU/Metal info from system_profiler"
+      - name: Homebrew availability
+        run: |
+          brew --version | head -1
+          for formula in molten-vk vulkan-loader spirv-tools; do
+            if brew info --formula "$formula" >/dev/null 2>&1; then
+              echo "brew formula $formula: EXISTS"
+              brew info --formula "$formula" | head -4
+            else
+              echo "brew formula $formula: absent"
+            fi
+          done
+      - name: LunarG SDK URL reachability (HEAD only, no download)
+        run: |
+          for url in \
+            "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.tar.gz" \
+            "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.dmg"; do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 30 "$url" || echo curl-error)
+            echo "$url -> HTTP $code"
+          done
