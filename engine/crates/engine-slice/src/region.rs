@@ -185,16 +185,31 @@ pub fn consequence_key(region: usize, episode: u64, npc: usize) -> u64 {
 }
 
 /// One NPC's checkpoint entry — a REFERENCE to the spine-held
-/// obligation carrying its chain (the spine owns the obligation; this
+/// obligation carrying its chain (the spine owns the obligation with
+/// its original EventId, due, schedule, dependencies, and lane; this
 /// duplicates no authoritative state), plus the reconstructible state
-/// captured at suspension for reconstruction: the routine cursor and
-/// grid position (corrective finding A — the world's copies are
-/// discarded at deactivation; reactivation restores from here).
+/// captured at suspension for reconstruction (corrective findings A
+/// and D — the world's copies are discarded at deactivation;
+/// reactivation restores from here): the CURRENT represented routine
+/// cursor and grid position, and the represented-through boundary —
+/// the coherent anchor a later reconstruction counts FROM, so an
+/// already-represented interval is never reconstructed again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionEntry {
     pub npc: usize,
     pub event: EventId,
-    pub due: Tick,
+    /// The represented-through boundary (corrective finding D): the
+    /// logical time through which this NPC's routine progression is
+    /// represented — the obligation's own due while the chain is
+    /// coherent (its payload cursor matches the world cursor, so the
+    /// next activity is genuinely pending at that due), otherwise the
+    /// reconstruction boundary tracked by the world. Reconstruction
+    /// counts only activities strictly after this anchor; the pending
+    /// obligation's own activity is performed by real execution.
+    pub represented_through: Tick,
+    /// The represented routine cursor captured from the WORLD at
+    /// deactivation — never reinitialized from a stale pending payload
+    /// (corrective finding D).
     pub cursor: u64,
     /// The grid position captured at deactivation (reconstructible
     /// state held by the checkpoint).
@@ -460,15 +475,15 @@ impl RegionDirector {
         }
     }
 
-    /// Capture-before-discard deactivation (corrective finding A):
-    /// hold the region's obligations (identity-preserving), write the
-    /// checkpoint from the held view (references plus the captured
-    /// reconstructible cursor/position — routine-typed chains only),
-    /// capture every uncommitted consequential signal into the
-    /// in-memory ledger, and only then DISCARD the region's
-    /// reconstructible routine representation and signal scratch. The
-    /// dormant region costs the spine nothing per tick — its
-    /// obligations are held, its handler never runs.
+    /// Capture-before-discard deactivation (corrective findings A and
+    /// D): hold the region's obligations (identity-preserving), write
+    /// the checkpoint from the held view (references plus the captured
+    /// represented cursor/position and represented-through boundary —
+    /// routine-typed chains only), capture every uncommitted
+    /// consequential signal into the in-memory ledger, and only then
+    /// DISCARD the region's reconstructible routine representation and
+    /// signal scratch. The dormant region costs the spine nothing per
+    /// tick — its obligations are held, its handler never runs.
     fn deactivate(
         &mut self,
         spine: &mut Spine<NpcWorld>,
@@ -494,13 +509,30 @@ impl RegionDirector {
         {
             let world = spine.world();
             for (event, due, payload) in &held {
-                if let Some((npc, cursor)) = routine_payload_parts(*payload) {
+                if let Some((npc, payload_cursor)) = routine_payload_parts(*payload) {
                     let pending = world.pending_signals()[npc];
+                    // Corrective finding D: capture the CURRENT
+                    // represented state from the world — never a stale
+                    // pending payload. The coherent anchor is the
+                    // obligation's own due while the chain is coherent
+                    // (payload cursor == world cursor: the state was
+                    // last advanced by real execution, which re-bases
+                    // the chain); once reconstruction advanced the
+                    // state past the obligation's knowledge, the
+                    // world's tracked represented-through boundary is
+                    // the anchor, and a later reconstruction counts
+                    // only the unrepresented interval.
+                    let world_cursor = world.routine_cursor()[npc];
+                    let represented_through = if payload_cursor == world_cursor {
+                        *due
+                    } else {
+                        world.represented_through()[npc]
+                    };
                     entries.push(RegionEntry {
                         npc,
                         event: *event,
-                        due: *due,
-                        cursor,
+                        represented_through,
+                        cursor: world_cursor,
                         position: world.positions()[npc],
                         has_signal: pending > 0,
                     });
@@ -615,13 +647,15 @@ impl RegionDirector {
         // estimate over the pre-dormancy cadence.
         let cadence = spine.world().config().cadence_factor(checkpoint.from_level);
         let period = spine.world().config().activity_period * cadence.max(1);
-        // The work estimate spans from the earliest suspended due —
-        // obligations already overdue at deactivation carry more
-        // reconstruction work than the dormancy window alone.
+        // The work estimate spans from the earliest represented-through
+        // boundary — the UNREPRESENTED interval is what reconstruction
+        // must cover (corrective finding D: anchors already advanced
+        // past the historical dues by prior reconstruction estimate
+        // only the remaining work, never the full dormant span again).
         let base = checkpoint
             .entries
             .iter()
-            .map(|entry| entry.due.as_u64())
+            .map(|entry| entry.represented_through.as_u64())
             .min()
             .unwrap_or_else(|| now.as_u64());
         let elapsed = now.as_u64().saturating_sub(base);
@@ -631,23 +665,38 @@ impl RegionDirector {
         } else {
             ReconstructionMethod::Replay
         };
-        // Phase 2 — reconstruction: restore each chain's captured
-        // cursor/position from the checkpoint (the world's copies were
-        // DISCARDED at deactivation), then advance the dormant span —
-        // labeled routine-state reconstruction only; never steps,
-        // milestones, credits, or the execution ledger.
+        // Phase 2 — reconstruction (corrective finding D): restore each
+        // chain's captured cursor/position AND represented-through
+        // boundary from the checkpoint (the world's copies were
+        // DISCARDED at deactivation), then reconstruct ONLY the
+        // previously unrepresented interval — counting strictly after
+        // the boundary, so a span already represented at an earlier
+        // activation is never reconstructed again. Labeled
+        // routine-state reconstruction only; never steps, milestones,
+        // credits, or the execution ledger.
         let mut reconstructed = 0u64;
         {
             let world = spine.world_mut();
             for entry in &checkpoint.entries {
-                world.restore_routine(entry.npc, entry.cursor, entry.position);
+                world.restore_routine(
+                    entry.npc,
+                    entry.cursor,
+                    entry.position,
+                    entry.represented_through,
+                );
                 let count = match method {
-                    ReconstructionMethod::Replay => {
-                        world.replay_routine_span(entry.npc, entry.due, now, cadence)
-                    }
-                    ReconstructionMethod::Synthesis => {
-                        world.synthesize_routine_span(entry.npc, entry.due, now, cadence)
-                    }
+                    ReconstructionMethod::Replay => world.replay_routine_span(
+                        entry.npc,
+                        entry.represented_through,
+                        now,
+                        cadence,
+                    ),
+                    ReconstructionMethod::Synthesis => world.synthesize_routine_span(
+                        entry.npc,
+                        entry.represented_through,
+                        now,
+                        cadence,
+                    ),
                 };
                 reconstructed += count;
             }
@@ -682,15 +731,15 @@ impl RegionDirector {
     }
 
     /// Stage 4 authoritative region-state fingerprint (domain
-    /// "engine-slice/region-state/2" — version 2 per the Batch 2
-    /// corrective: checkpoint entries now carry the captured
-    /// reconstructible position and the consequence claim, and the
-    /// ledger keys are per-NPC): per-region level, episode, checkpoint
-    /// references, reconstruction labels and counts, plus the capture
-    /// ledger. Observational diagnostics and latency history are
-    /// excluded.
+    /// "engine-slice/region-state/3" — version 3 per the Batch 2
+    /// corrective finding D: checkpoint entries carry the
+    /// represented-through boundary instead of the raw obligation due,
+    /// and the cursor is the world-captured represented state): per-
+    /// region level, episode, checkpoint references, reconstruction
+    /// labels and counts, plus the capture ledger. Observational
+    /// diagnostics and latency history are excluded.
     pub fn region_fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/region-state/2");
+        fp.write_str("engine-slice/region-state/3");
         for state in &self.states {
             fp.write_u8(lod_byte(state.level));
             fp.write_u64(state.episode);
@@ -702,7 +751,7 @@ impl RegionDirector {
                 for entry in &checkpoint.entries {
                     fp.write_usize(entry.npc);
                     fp.write_u64(entry.event.seq);
-                    fp.write_tick(entry.due);
+                    fp.write_tick(entry.represented_through);
                     fp.write_u64(entry.cursor);
                     fp.write_u8(entry.position.0);
                     fp.write_u8(entry.position.1);

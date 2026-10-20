@@ -1,13 +1,16 @@
 //! Stage 4 Batch 2 region contracts (authorization §9 A–H subset,
-//! reviewer priorities A–C, Batch 2 corrective findings A–C):
+//! reviewer priorities A–C, Batch 2 corrective findings A–D):
 //! presence-driven LOD across all levels, true dormancy (zero ordinary
 //! work), identity and conservation through transition cycles, genuine
 //! capture-before-discard with exactly-once consequence application,
-//! coherent activation failure, reconstruction labels + adaptive
-//! selection, per-tick scripted presence with cross-cadence
-//! equivalence, watermark safety during dormancy, immediate near-lane
-//! protection on reactivation, and determinism across double runs.
+//! coherent activation failure, represented-through-boundary
+//! reconstruction under rapid transitions (finding D), reconstruction
+//! labels + adaptive selection, per-tick scripted presence with
+//! cross-cadence equivalence, watermark safety during dormancy,
+//! immediate near-lane protection on reactivation, and determinism
+//! across double runs.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use engine_core::{EventClass, EventSpec, Field, LodLevel, Schedule, Tick};
@@ -22,20 +25,19 @@ use engine_slice::region::{
 use engine_slice::sim::{SimConfig, SimDriver};
 use engine_slice::sim_demo::irregular_frame;
 
-fn region_driver(presence: PresenceScenario) -> SimDriver {
+fn region_driver_with(config: SimConfig, presence: PresenceScenario) -> SimDriver {
     let region_config = RegionConfig::default();
     let initial = [presence.sample_at(0, &region_config.centers)];
-    let mut driver = SimDriver::with_regions(
-        NpcConfig::default(),
-        SimConfig::default(),
-        region_config,
-        &initial,
-    )
-    .expect("valid region config");
+    let mut driver = SimDriver::with_regions(NpcConfig::default(), config, region_config, &initial)
+        .expect("valid region config");
     // Corrective finding B: scripted presence is per-tick — the driver
     // samples the scenario at each logical tick inside the tick loop.
     driver.set_presence_scenario(presence);
     driver
+}
+
+fn region_driver(presence: PresenceScenario) -> SimDriver {
+    region_driver_with(SimConfig::default(), presence)
 }
 
 /// The stable NPC identities belonging to one region (region = id mod 8).
@@ -856,4 +858,175 @@ fn post_checkpoint_dormant_obligations_resume_without_routine_confusion() {
         "routine-chain invariant after the foreign event executed"
     );
     assert!(conservation(&driver));
+}
+
+#[test]
+fn rapid_transitions_reconstruct_only_the_unrepresented_interval() {
+    // Batch 2 corrective finding D: after an activation reconstructs a
+    // dormant span, the world's represented state is AHEAD of the
+    // still-held obligations' payloads — only real execution re-bases
+    // a chain. When the region deactivates again before those
+    // obligations execute (budget 30 < the 125 routine obligations, so
+    // most stay pending), the checkpoint must capture the CURRENT
+    // represented state and its represented-through boundary, and the
+    // next activation must reconstruct ONLY the previously
+    // unrepresented interval:
+    //   - the first activation's representation is neither lost
+    //     (cursor monotonicity) nor reconstructed a second time (the
+    //     reconstructed-activity count is bounded by the short window);
+    //   - positions stay consistent with the represented progression
+    //     (at most one cell per activity);
+    //   - the original outstanding obligations retain their identities
+    //     and dues;
+    //   - spine obligation conservation and consequential-state
+    //     conservation hold.
+    // The near-zero-elapsed double transition (one dormant tick)
+    // contributes at most one legitimately-due activity per NPC —
+    // never a re-representation of the dormant span. Both
+    // reconstruction methods exercise the first activation.
+    for (first_dormancy, expected_method) in [
+        (200u64, ReconstructionMethod::Synthesis),
+        (12u64, ReconstructionMethod::Replay),
+    ] {
+        let config = SimConfig {
+            budget: 30,
+            near_reserve: Some(10),
+            ..SimConfig::default()
+        };
+        let at = |position: (f64, f64)| PresenceScenario::Stationary { position };
+        let mut driver = region_driver_with(config, at((-100.0, 0.0)));
+        driver.run_headless(150); // region 4 Full — chains advance
+        // Dormant span 1: long enough that reactivation must
+        // reconstruct (synthesis for 200 ticks, replay for 12).
+        driver.set_presence_scenario(at((100.0, 0.0)));
+        driver.run_headless(first_dormancy);
+        // Snapshot the original outstanding obligations (identity,
+        // due, npc) while held.
+        let original: Vec<(engine_core::EventId, Tick, usize)> = driver
+            .spine()
+            .held_view()
+            .iter()
+            .filter(|view| view.class.0 == 4)
+            .filter_map(|view| {
+                routine_payload_parts(view.payload).map(|(npc, _)| (view.id, view.due, npc))
+            })
+            .collect();
+        assert_eq!(original.len(), 125, "the region's routine chains are held");
+        // Reactivation: reconstruction advances the represented state
+        // past most payloads; the budget-starved tick leaves most
+        // resumed obligations pending (at most ~30 of 125 execute).
+        driver.set_presence_scenario(at((-100.0, 0.0)));
+        driver.run_headless(1);
+        assert_eq!(
+            driver.director().expect("director").states()[4].last_method,
+            Some(expected_method),
+            "the first dormancy exercises {expected_method:?}"
+        );
+        // Snapshot the represented state after the first activation's
+        // execution tick.
+        let (cursor_before, position_before): (Vec<u64>, Vec<(u8, u8)>) = {
+            let world = driver.spine().world();
+            (
+                region_npcs(4)
+                    .map(|npc| world.routine_cursor()[npc])
+                    .collect(),
+                region_npcs(4).map(|npc| world.positions()[npc]).collect(),
+            )
+        };
+        // Deactivate again — one boundary later, before the remaining
+        // obligations execute.
+        driver.set_presence_scenario(at((100.0, 0.0)));
+        driver.run_headless(1);
+        // The never-executed originals are held again — with their
+        // ORIGINAL identities and dues.
+        {
+            let spine = driver.spine();
+            let held_pairs: HashSet<(u64, u64)> = spine
+                .held_view()
+                .iter()
+                .filter(|view| view.class.0 == 4)
+                .map(|view| (view.id.seq, view.due.as_u64()))
+                .collect();
+            let mut survivors = 0;
+            for (id, due, _) in &original {
+                if !spine.is_executed(*id) {
+                    survivors += 1;
+                    assert!(
+                        held_pairs.contains(&(id.seq, due.as_u64())),
+                        "never-executed obligation {} retains identity and due",
+                        id.seq
+                    );
+                }
+            }
+            assert!(
+                survivors >= 60,
+                "the budget-starved window leaves most obligations pending ({survivors})"
+            );
+        }
+        // Reactivate after a near-zero interval (one dormant tick):
+        // only the unrepresented interval is reconstructed.
+        driver.set_presence_scenario(at((-100.0, 0.0)));
+        driver.run_headless(1);
+        {
+            let director = driver.director().expect("director");
+            let state = &director.states()[4];
+            assert!(
+                state.reconstructed_activities <= NPC_COUNT as u64,
+                "at most one window activity per NPC is reconstructed ({})",
+                state.reconstructed_activities
+            );
+            assert_eq!(
+                state.last_method,
+                Some(ReconstructionMethod::Replay),
+                "the unrepresented interval is small — the estimate sees only it"
+            );
+        }
+        // Per-NPC progression bounds: at most one reconstructed window
+        // activity plus at most one real execution across the two
+        // activation ticks — monotone, and positions move consistently
+        // with the represented progression.
+        {
+            let spine = driver.spine();
+            let world = spine.world();
+            for (index, npc) in region_npcs(4).enumerate() {
+                let cursor_delta = world.routine_cursor()[npc] - cursor_before[index];
+                assert!(
+                    cursor_delta <= 2,
+                    "npc {npc}: at most one window activity + one execution ({cursor_delta})"
+                );
+                let (dx, dy) = (
+                    i16::from(world.positions()[npc].0) - i16::from(position_before[index].0),
+                    i16::from(world.positions()[npc].1) - i16::from(position_before[index].1),
+                );
+                assert!(
+                    u64::from(dx.unsigned_abs() + dy.unsigned_abs()) <= cursor_delta,
+                    "npc {npc}: position moves consistently with represented progression"
+                );
+                assert!(
+                    world.positions()[npc].0 < REGION_GRID
+                        && world.positions()[npc].1 < REGION_GRID,
+                    "npc {npc} stays in bounds"
+                );
+            }
+        }
+        // Conservation: obligations and consequential state.
+        assert!(conservation(&driver));
+        {
+            let spine = driver.spine();
+            let world = spine.world();
+            let milestones: u64 = world.milestones().iter().sum();
+            let credits: u64 = world.credits().iter().sum();
+            let pending: u64 = world.pending_signals().iter().sum();
+            let captured = driver
+                .director()
+                .expect("director")
+                .ledger()
+                .pending_total();
+            assert_eq!(
+                milestones,
+                credits + pending + captured,
+                "consequence conservation through the rapid transitions"
+            );
+        }
+    }
 }

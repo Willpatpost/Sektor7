@@ -172,6 +172,10 @@ pub const ROUTINE_CURSOR_DISCARDED: u64 = u64::MAX;
 /// Sentinel for a dormant NPC's discarded grid position.
 pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
 
+/// Sentinel for a dormant NPC's discarded represented-through boundary
+/// (Batch 2 corrective finding D).
+pub const REPRESENTED_THROUGH_DISCARDED: Tick = Tick(u64::MAX);
+
 /// splitmix64 finalizer — a fully specified, stable mixer (no `std`
 /// hasher nondeterminism reaches fingerprinted state).
 fn mix64(mut x: u64) -> u64 {
@@ -199,6 +203,19 @@ pub struct NpcWorld {
     /// — bounds- and travel-reachability-checked state, and the source
     /// for derived render proxies.
     positions: Vec<(u8, u8)>,
+    /// Per-NPC represented-through boundary (Batch 2 corrective finding
+    /// D): the logical time through which this NPC's routine progression
+    /// is represented — the coherent anchor a later reconstruction
+    /// counts FROM, so an already-represented interval is never
+    /// reconstructed again. Updated by span reconstruction (replay's
+    /// exact stopping point — the last represented activity's time;
+    /// synthesis's closed-form boundary). Whenever the pending
+    /// obligation's payload cursor equals the world cursor (the state
+    /// was last advanced by real execution, which re-bases the chain),
+    /// the obligation's own due is the boundary and this value is not
+    /// consulted; deactivation picks whichever anchor matches the
+    /// captured state.
+    represented_through: Vec<Tick>,
     /// Real-execution milestones per NPC: every MILESTONE_PERIOD-th
     /// actual activity. Irreversible consequences — never fabricated by
     /// reconstruction.
@@ -240,6 +257,7 @@ impl NpcWorld {
             steps: vec![0; NPC_COUNT],
             routine_cursor: vec![0; NPC_COUNT],
             positions,
+            represented_through: vec![Tick(0); NPC_COUNT],
             milestones: vec![0; NPC_COUNT],
             pending_signals: vec![0; NPC_COUNT],
             credits: vec![0; NPC_COUNT],
@@ -269,6 +287,12 @@ impl NpcWorld {
     /// Per-NPC grid positions (read-only view).
     pub fn positions(&self) -> &[(u8, u8)] {
         &self.positions
+    }
+
+    /// Per-NPC represented-through boundaries (read-only view) — the
+    /// coherent reconstruction anchors captured into checkpoints.
+    pub fn represented_through(&self) -> &[Tick] {
+        &self.represented_through
     }
 
     /// Per-NPC real-execution milestones (read-only view).
@@ -309,29 +333,39 @@ impl NpcWorld {
     }
 
     /// Discards a dormant region's reconstructible routine
-    /// representation (Batch 2 corrective finding A): the routine
-    /// cursor and grid position become sentinels — the representation
-    /// is GONE, not merely flagged — and the uncommitted signal scratch
-    /// is cleared AFTER the director captured its consequences into the
-    /// ledger. Steps, milestones, and credits — authoritative
-    /// consequential state — are retained untouched.
+    /// representation (Batch 2 corrective findings A and D): the
+    /// routine cursor, grid position, and represented-through boundary
+    /// become sentinels — the representation is GONE, not merely
+    /// flagged — and the uncommitted signal scratch is cleared AFTER
+    /// the director captured its consequences into the ledger. Steps,
+    /// milestones, and credits — authoritative consequential state —
+    /// are retained untouched.
     pub fn discard_region_routine(&mut self, region: usize) {
         for npc in 0..NPC_COUNT {
             if npc % REGION_COUNT == region {
                 self.routine_cursor[npc] = ROUTINE_CURSOR_DISCARDED;
                 self.positions[npc] = POSITION_DISCARDED;
+                self.represented_through[npc] = REPRESENTED_THROUGH_DISCARDED;
                 self.pending_signals[npc] = 0;
             }
         }
     }
 
-    /// Restores one NPC's routine cursor and grid position from the
-    /// region checkpoint (the reconstructible state captured at
-    /// deactivation) — the seed the span reconstruction advances from
-    /// at reactivation.
-    pub fn restore_routine(&mut self, npc: usize, cursor: u64, position: (u8, u8)) {
+    /// Restores one NPC's routine cursor, grid position, and
+    /// represented-through boundary from the region checkpoint (the
+    /// reconstructible state captured at deactivation) — the seed the
+    /// span reconstruction advances from at reactivation, counting only
+    /// the previously unrepresented interval (corrective finding D).
+    pub fn restore_routine(
+        &mut self,
+        npc: usize,
+        cursor: u64,
+        position: (u8, u8),
+        represented_through: Tick,
+    ) {
         self.routine_cursor[npc] = cursor;
         self.positions[npc] = position;
+        self.represented_through[npc] = represented_through;
     }
 
     /// Commits one captured signal delta — the reactivation-side
@@ -343,13 +377,18 @@ impl NpcWorld {
     }
 
     /// Exact step-by-step replay of a dormant span (reviewer priority
-    /// A/C): recomputes the seeded jitter chain activity by activity
-    /// from the held obligation's due to `now`, advancing the routine
+    /// A/C, Batch 2 corrective finding D): recomputes the seeded jitter
+    /// chain activity by activity AFTER `from_due` (the coherent
+    /// anchor — the pending obligation's own activity is performed by
+    /// real execution, never reconstructed), advancing the routine
     /// cursor and position walk exactly as live execution would have.
-    /// Cost is proportional to the reconstructed activity count (E-09's
-    /// replay). NEVER touches `steps`, milestones, or the execution
-    /// ledger — reconstruction is labeled state, not history. Returns
-    /// the reconstructed activity count.
+    /// Cost is proportional to the reconstructed activity count
+    /// (E-09's replay). NEVER touches `steps`, milestones, credits, or
+    /// the execution ledger — reconstruction is labeled state, not
+    /// history. Records the loop's exact stopping time as the
+    /// represented-through boundary, so a later reconstruction resumes
+    /// from there and this span is never re-represented. Returns the
+    /// reconstructed activity count.
     pub fn replay_routine_span(
         &mut self,
         npc: usize,
@@ -370,16 +409,24 @@ impl NpcWorld {
             time += delay;
             count += 1;
         }
+        // The boundary is the last represented activity's time (the
+        // loop's stopping point); a zero-count replay leaves the anchor
+        // at `from_due`, unchanged.
+        self.represented_through[npc] = Tick(time);
         self.apply_routine_advance(npc, count);
         count
     }
 
-    /// Closed-form synthesis of a dormant span (reviewer priority A):
-    /// the approximate activity count from elapsed time over the mean
-    /// cadence, with a bounded-drift position displacement (at most one
-    /// cell per activity — travel-reachable by construction). O(1).
-    /// NEVER touches `steps`, milestones, or the ledger; the caller
-    /// labels the span as synthesized. Returns the synthesized count.
+    /// Closed-form synthesis of a dormant span (reviewer priority A,
+    /// Batch 2 corrective finding D): the approximate activity count
+    /// from elapsed time over the mean cadence, with a bounded-drift
+    /// position displacement (at most one cell per activity —
+    /// travel-reachable by construction). O(1). NEVER touches `steps`,
+    /// milestones, credits, or the ledger; the caller labels the span
+    /// as synthesized. Records the closed-form represented-through
+    /// boundary (`from_due + missed × period`), so a later
+    /// reconstruction resumes from there and this span is never
+    /// re-represented. Returns the synthesized count.
     pub fn synthesize_routine_span(
         &mut self,
         npc: usize,
@@ -407,6 +454,7 @@ impl NpcWorld {
         let ny = (i16::from(y) + dy).clamp(0, i16::from(REGION_GRID) - 1) as u8;
         self.positions[npc] = (nx, ny);
         self.routine_cursor[npc] += missed;
+        self.represented_through[npc] = Tick(from_due.as_u64() + missed * period);
         missed
     }
 
@@ -440,14 +488,15 @@ impl NpcWorld {
 
     /// Stage 4 authoritative workload state beyond the frozen Stage 3
     /// domain: routine cursor (with discard sentinels while dormant),
-    /// grid positions, milestones, the region-LOD view execution
-    /// actually consumed, and the consequential signal state —
-    /// uncommitted scratch plus committed credits (Batch 2 corrective
-    /// finding A). Domain version 2: the corrective added the signal
-    /// state; version 1 never reached main. Hashed only by the Stage 4
-    /// combined fingerprint; the Stage 3 domains never see it.
+    /// grid positions, the represented-through boundaries, milestones,
+    /// the region-LOD view execution actually consumed, and the
+    /// consequential signal state — uncommitted scratch plus committed
+    /// credits. Domain version 3 (Batch 2 corrective finding D): adds
+    /// the represented-through boundaries; versions 1–2 never reached
+    /// main. Hashed only by the Stage 4 combined fingerprint; the
+    /// Stage 3 domains never see it.
     pub fn spatial_fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/npc-spatial/2");
+        fp.write_str("engine-slice/npc-spatial/3");
         fp.write_u64(self.config.seed);
         fp.write_usize(self.routine_cursor.len());
         for cursor in &self.routine_cursor {
@@ -456,6 +505,9 @@ impl NpcWorld {
         for position in &self.positions {
             fp.write_u8(position.0);
             fp.write_u8(position.1);
+        }
+        for boundary in &self.represented_through {
+            fp.write_tick(*boundary);
         }
         for milestone in &self.milestones {
             fp.write_u64(*milestone);

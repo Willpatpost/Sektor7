@@ -61,6 +61,14 @@ fn legacy_mode_reproduces_the_accepted_stage3_baseline() {
         spine.world().credits().iter().all(|credit| *credit == 0),
         "Legacy mode never commits credits"
     );
+    assert!(
+        spine
+            .world()
+            .represented_through()
+            .iter()
+            .all(|boundary| *boundary == Tick(0)),
+        "Legacy mode never advances a represented-through boundary"
+    );
 }
 
 #[test]
