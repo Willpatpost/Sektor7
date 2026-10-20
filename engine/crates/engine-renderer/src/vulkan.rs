@@ -1243,7 +1243,11 @@ fn create_device_local_buffer_with_data(
     let result = (|| -> Result<(), RendererError> {
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(usage)
+            // The staging copy's destination must allow transfers
+            // (VUID-vkCmdCopyBuffer-dstBuffer-00120 — surfaced by the
+            // CI validation-enabled smoke, invisible to the layer-less
+            // pod kit).
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         buffer = unsafe { ctx.device.create_buffer(&buffer_info, None) }
             .map_err(|error| RendererError::vk(error, "create_buffer"))?;
