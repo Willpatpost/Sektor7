@@ -766,9 +766,15 @@ fn clamp_extent(
     capabilities: &vk::SurfaceCapabilitiesKHR,
 ) -> vk::Extent2D {
     let current = capabilities.current_extent;
-    let clamp = |value: u32, min: u32, max: u32| {
-        value.clamp(min.max(1), if max == 0 { u32::MAX } else { max })
-    };
+    // Zero-sized inputs are deliberately NOT forced to 1: a zero extent
+    // means the drawable is temporarily unavailable, which render_frame
+    // defers before any swapchain is created — the 1×1 fabrication was
+    // the Win32 minimize/transition defect (VUID
+    // VkSwapchainCreateInfoKHR-pNext-07781, found on the rig 2026-10-20).
+    // max == 0 reads as unbounded, per the swapchain extension's
+    // convention for extent limits.
+    let clamp =
+        |value: u32, min: u32, max: u32| value.clamp(min, if max == 0 { u32::MAX } else { max });
     let (width, height) = if current.width == u32::MAX && current.height == u32::MAX {
         window_size
     } else {
@@ -786,6 +792,26 @@ fn clamp_extent(
             capabilities.max_image_extent.height,
         ),
     }
+}
+
+/// True when the surface's drawable is temporarily unavailable — a
+/// zero-sized current extent (Win32 reports (0,0) for minimized and
+/// mid-transition surfaces; with min/max also 0 there is provably no
+/// valid extent). Pure policy over the capabilities.
+pub(crate) fn surface_extent_unavailable(capabilities: &vk::SurfaceCapabilitiesKHR) -> bool {
+    capabilities.current_extent.width == 0 || capabilities.current_extent.height == 0
+}
+
+/// Live availability probe used once per frame before any recreation
+/// trigger: a deferred frame creates nothing, destroys nothing, and
+/// errors on nothing.
+fn surface_available_now(ctx: &VulkanContext) -> Result<bool, RendererError> {
+    let capabilities = unsafe {
+        ctx.surface_ext
+            .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)
+    }
+    .map_err(|error| RendererError::vk(error, "surface capabilities"))?;
+    Ok(!surface_extent_unavailable(&capabilities))
 }
 
 /// Depth format for the graphics device; chosen **once per renderer** and
@@ -1627,6 +1653,9 @@ pub(crate) struct FrameOutcome {
     pub presented: bool,
     pub recreated: bool,
     pub suboptimal: bool,
+    /// The drawable was temporarily unavailable (zero-sized surface
+    /// capabilities) — nothing was created, destroyed, or presented.
+    pub deferred: bool,
     pub gpu_render_ms: Option<f64>,
 }
 
@@ -1652,6 +1681,20 @@ pub(crate) fn render_frame(
 
     // Minimized windows report a zero extent — present nothing.
     if window_size.0 == 0 || window_size.1 == 0 {
+        return Ok(outcome);
+    }
+
+    // A minimized or transitioning surface can report zero-sized
+    // capabilities while the application-side window size stays stale
+    // and nonzero (Win32: currentExtent and min/max all 0) — the
+    // drawable is temporarily unavailable. Defer the whole frame BEFORE
+    // any recreation trigger: no swapchain is created, destroyed, or
+    // retried and no error is raised; rendering resumes when the
+    // surface reports a valid extent again (correction of the 1×1
+    // fabrication defect, VUID-VkSwapchainCreateInfoKHR-pNext-07781,
+    // found on the rig 2026-10-20).
+    if !surface_available_now(ctx)? {
+        outcome.deferred = true;
         return Ok(outcome);
     }
 
@@ -2150,5 +2193,78 @@ mod policy_tests {
                 }
             }
         }
+    }
+
+    fn capabilities(current: [u32; 2], min: [u32; 2], max: [u32; 2]) -> vk::SurfaceCapabilitiesKHR {
+        vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: current[0],
+                height: current[1],
+            },
+            min_image_extent: vk::Extent2D {
+                width: min[0],
+                height: min[1],
+            },
+            max_image_extent: vk::Extent2D {
+                width: max[0],
+                height: max[1],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zero_sized_surface_capabilities_defer_rendering() {
+        // The Win32 minimize/transition signal: current, min, and max
+        // all report (0,0) — no valid extent exists.
+        assert!(surface_extent_unavailable(&capabilities(
+            [0, 0],
+            [0, 0],
+            [0, 0]
+        )));
+        assert!(surface_extent_unavailable(&capabilities(
+            [0, 720],
+            [0, 0],
+            [0, 0]
+        )));
+    }
+
+    #[test]
+    fn valid_and_unspecified_surfaces_remain_renderable() {
+        assert!(!surface_extent_unavailable(&capabilities(
+            [1280, 720],
+            [1, 1],
+            [2560, 1440]
+        )));
+        // Unspecified extent (headless/software surfaces) stays
+        // renderable — the application drives the size.
+        assert!(!surface_extent_unavailable(&capabilities(
+            [u32::MAX, u32::MAX],
+            [1, 1],
+            [2560, 1440]
+        )));
+    }
+
+    #[test]
+    fn extent_selection_never_fabricates_nonzero_from_zero() {
+        // The rig defect: clamping must not invent a 1×1 swapchain from
+        // zero-sized capabilities. The frame path defers before any
+        // swapchain ever sees this result.
+        let extent = clamp_extent((1280, 720), &capabilities([0, 0], [0, 0], [0, 0]));
+        assert_eq!((extent.width, extent.height), (0, 0));
+    }
+
+    #[test]
+    fn extent_selection_respects_pinned_and_unspecified_surfaces() {
+        let pinned = clamp_extent(
+            (1280, 720),
+            &capabilities([1920, 1080], [1, 1], [3840, 2160]),
+        );
+        assert_eq!((pinned.width, pinned.height), (1920, 1080));
+        let driven = clamp_extent(
+            (1280, 720),
+            &capabilities([u32::MAX, u32::MAX], [1, 1], [3840, 2160]),
+        );
+        assert_eq!((driven.width, driven.height), (1280, 720));
     }
 }

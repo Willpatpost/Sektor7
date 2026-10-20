@@ -19,6 +19,10 @@ pub struct FrameResult {
     pub presented: bool,
     pub recreated: bool,
     pub suboptimal: bool,
+    /// The drawable was temporarily unavailable (zero-sized surface
+    /// capabilities — minimized or mid-transition): nothing happened;
+    /// poll and try again next frame.
+    pub deferred: bool,
     pub gpu_render_ms: Option<f64>,
 }
 
@@ -239,6 +243,7 @@ impl Renderer {
             presented: outcome.presented,
             recreated: outcome.recreated,
             suboptimal: outcome.suboptimal,
+            deferred: outcome.deferred,
             gpu_render_ms: outcome.gpu_render_ms,
         })
     }

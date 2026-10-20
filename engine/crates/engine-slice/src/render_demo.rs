@@ -210,6 +210,14 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             .render_frame(&view_proj, overlay_text.as_deref(), window_size)
             .map_err(|error| format!("{error}"))?;
 
+        if frame_result.deferred {
+            // The drawable is temporarily unavailable (minimized or
+            // mid-transition): poll quietly, present nothing, count
+            // nothing, and retry next frame without a recreation storm.
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
         if frame_result.presented {
             presented += 1;
             // CPU work duration: poll → camera → overlay build → render
