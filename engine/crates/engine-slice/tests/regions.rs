@@ -1030,3 +1030,139 @@ fn rapid_transitions_reconstruct_only_the_unrepresented_interval() {
         }
     }
 }
+
+#[test]
+fn malformed_routine_events_cannot_corrupt_a_foreign_region() {
+    // Batch 3 defensive check 1: a routine-TAGGED event whose NPC
+    // identity belongs to a different region than its event class is
+    // ignored by the workload and never joins the class-region's
+    // checkpoint — it cannot advance another region's NPC state or
+    // corrupt its reconstruction data. The spine still counts the
+    // execution in its ledger.
+    let at = |position: (f64, f64)| PresenceScenario::Stationary { position };
+    let mut driver = region_driver(at((-100.0, 0.0)));
+    driver.run_headless(150); // region 4 Full — chains advance
+    // Activate region 2 (its center) and let its chains run.
+    driver.set_presence_scenario(at((0.0, 100.0)));
+    driver.run_headless(50);
+    // A routine-tagged event for npc 5 (home region 5) scheduled with
+    // CLASS 2 while region 2 is active — the malformed combination.
+    let malformed = driver
+        .schedule(
+            EventSpec::new(
+                EventClass::new(2),
+                Schedule::AtLogicalTime { due: Tick(205) },
+                engine_slice::npc::routine_payload(5, 999),
+            )
+            .in_field(Field::Near),
+        )
+        .expect("director schedule validates");
+    // The due is still in the future: the malformed event stays queued
+    // while the region deactivates two ticks later.
+    driver.run_headless(2);
+    driver.set_presence_scenario(at((-100.0, 0.0)));
+    driver.run_headless(30); // region 2 dormant — the malformed event is held
+    {
+        let director = driver.director().expect("director");
+        let checkpoint = director.states()[2]
+            .checkpoint
+            .as_ref()
+            .expect("region 2 dormant");
+        assert_eq!(
+            checkpoint.entries.len(),
+            125,
+            "only the region's own chains join the checkpoint"
+        );
+        assert!(
+            checkpoint
+                .entries
+                .iter()
+                .all(|entry| entry.npc % REGION_COUNT == 2),
+            "no foreign-region NPC in region 2's checkpoint"
+        );
+        assert!(
+            !checkpoint.entries.iter().any(|entry| entry.npc == 5),
+            "the malformed event's NPC never joins the checkpoint"
+        );
+    }
+    // Reactivate region 2: the malformed event resumes and executes
+    // (the spine counts it), but the workload ignores it — npc 5's
+    // state is untouched (its own region is dormant at this presence,
+    // so any change could only come from the malformed event).
+    let steps_before = driver.spine().world().steps()[5];
+    driver.set_presence_scenario(at((0.0, 100.0)));
+    driver.run_headless(50);
+    let spine = driver.spine();
+    assert!(
+        spine.is_executed(malformed),
+        "the malformed event executed (spine-ledger accounted)"
+    );
+    assert_eq!(
+        spine.world().steps()[5],
+        steps_before,
+        "the malformed routine-tagged event never advanced npc 5's state"
+    );
+    assert!(conservation(&driver));
+}
+
+#[test]
+fn activation_without_a_recovery_checkpoint_fails_closed() {
+    // Batch 3 defensive check 2: a dormant region whose recovery
+    // checkpoint is missing cannot have its suspended state
+    // reconstructed — activation fails CLOSED: the region stays
+    // dormant, its obligations stay held, and the anomaly is reported
+    // on every promotion attempt. Never a silent promotion of
+    // unreconstructible state.
+    let mut driver = region_driver(PresenceScenario::Stationary {
+        position: (-100.0, 0.0),
+    });
+    driver.run_headless(150);
+    driver.set_presence_scenario(PresenceScenario::Stationary {
+        position: (100.0, 0.0),
+    });
+    driver.run_headless(100); // region 4 dormant with a checkpoint
+    let held_region_4 = driver
+        .spine()
+        .held_view()
+        .iter()
+        .filter(|view| view.class.0 == 4)
+        .count();
+    let invalid_before = driver
+        .director()
+        .expect("director")
+        .diagnostics()
+        .invalid_transitions;
+    // Corrupt the recovery state (test-only seam): without a
+    // checkpoint the suspended state cannot be reconstructed.
+    driver
+        .director_mut()
+        .expect("director")
+        .debug_clear_checkpoint(4);
+    driver.set_presence_scenario(PresenceScenario::Stationary {
+        position: (-100.0, 0.0),
+    });
+    driver.run_headless(10); // a promotion attempt every tick boundary
+    {
+        let spine = driver.spine();
+        let director = driver.director().expect("director");
+        assert_eq!(
+            director.levels()[4],
+            LodLevel::Dormant,
+            "the region is never promoted without a recovery checkpoint"
+        );
+        assert_eq!(
+            spine
+                .held_view()
+                .iter()
+                .filter(|view| view.class.0 == 4)
+                .count(),
+            held_region_4,
+            "the region's obligations stay held"
+        );
+        assert!(
+            director.diagnostics().invalid_transitions > invalid_before,
+            "the anomaly is reported on every promotion attempt"
+        );
+    }
+    assert!(conservation(&driver));
+}

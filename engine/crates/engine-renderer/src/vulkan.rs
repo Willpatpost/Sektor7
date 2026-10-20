@@ -875,6 +875,15 @@ pub(crate) struct PipelineState {
     /// Byte size of one frame slot's overlay region.
     pub overlay_slot_bytes: vk::DeviceSize,
     overlay_mapped: *mut core::ffi::c_void,
+    pub region_vbo: vk::Buffer,
+    pub region_vbo_memory: vk::DeviceMemory,
+    /// Per-slot vertex capacity of the dynamic region-scene buffer
+    /// (Stage 4 graphical integration — the same disjoint per-slot
+    /// pattern as the overlay).
+    pub region_capacity: u32,
+    /// Byte size of one frame slot's region-scene region.
+    pub region_slot_bytes: vk::DeviceSize,
+    region_mapped: *mut core::ffi::c_void,
 }
 
 impl PipelineState {
@@ -904,6 +913,11 @@ impl PipelineState {
             overlay_capacity: 0,
             overlay_slot_bytes: 0,
             overlay_mapped: core::ptr::null_mut(),
+            region_vbo: vk::Buffer::null(),
+            region_vbo_memory: vk::DeviceMemory::null(),
+            region_capacity: 0,
+            region_slot_bytes: 0,
+            region_mapped: core::ptr::null_mut(),
         };
         if let Err(error) = state.build(ctx, color_format, depth_format) {
             state.destroy(ctx);
@@ -953,6 +967,22 @@ impl PipelineState {
         self.overlay_vbo = overlay_vbo;
         self.overlay_vbo_memory = overlay_vbo_memory;
         self.overlay_mapped = overlay_mapped;
+
+        // Dynamic region-scene buffer (Stage 4 graphical integration):
+        // the same persistently mapped, disjoint per-slot pattern as the
+        // overlay, carrying `SceneVertex` geometry (region area plates +
+        // NPC render proxies) drawn through the scene pipeline without
+        // an index buffer. The total vertex budget stays
+        // `region_scene_capacity_vertices()`.
+        self.region_capacity = crate::scene::region_scene_capacity_vertices() / FRAMES_IN_FLIGHT;
+        self.region_slot_bytes = self.region_capacity as vk::DeviceSize
+            * std::mem::size_of::<SceneVertex>() as vk::DeviceSize;
+        let region_size = self.region_slot_bytes * FRAMES_IN_FLIGHT as vk::DeviceSize;
+        let (region_vbo, region_vbo_memory, region_mapped) =
+            create_mapped_buffer(ctx, vk::BufferUsageFlags::VERTEX_BUFFER, region_size)?;
+        self.region_vbo = region_vbo;
+        self.region_vbo_memory = region_vbo_memory;
+        self.region_mapped = region_mapped;
         Ok(())
     }
 
@@ -1236,6 +1266,24 @@ impl PipelineState {
         }
     }
 
+    /// Writes one frame slot's dynamic region-scene vertices into that
+    /// slot's disjoint region of the persistently mapped buffer — the
+    /// same fenced-slot discipline as [`Self::write_overlay`]: called
+    /// during command recording, after this slot's fence wait, so
+    /// in-flight submissions never read a region being rewritten.
+    /// Truncates to the slot's capacity.
+    pub(crate) fn write_region_scene(&mut self, slot: usize, vertices: &[SceneVertex]) {
+        let slot_bytes = self.region_slot_bytes as usize;
+        let byte_len = std::mem::size_of_val(vertices).min(slot_bytes);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr() as *const u8,
+                (self.region_mapped as *mut u8).add(slot * slot_bytes),
+                byte_len,
+            );
+        }
+    }
+
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
         unsafe {
             if !self.overlay_mapped.is_null() {
@@ -1244,6 +1292,12 @@ impl PipelineState {
             }
             ctx.device.destroy_buffer(self.overlay_vbo, None);
             ctx.device.free_memory(self.overlay_vbo_memory, None);
+            if !self.region_mapped.is_null() {
+                ctx.device.unmap_memory(self.region_vbo_memory);
+                self.region_mapped = core::ptr::null_mut();
+            }
+            ctx.device.destroy_buffer(self.region_vbo, None);
+            ctx.device.free_memory(self.region_vbo_memory, None);
             ctx.device.destroy_buffer(self.scene_ibo, None);
             ctx.device.free_memory(self.scene_ibo_memory, None);
             ctx.device.destroy_buffer(self.scene_vbo, None);
@@ -1673,6 +1727,7 @@ pub(crate) fn render_frame(
     window_size: (u32, u32),
     present_preference: PresentModePreference,
     view_proj: &[[f32; 4]; 4],
+    region_vertices: &[SceneVertex],
     overlay_vertices: &[OverlayVertex],
     overlay_enabled: bool,
 ) -> Result<FrameOutcome, RendererError> {
@@ -1914,6 +1969,20 @@ pub(crate) fn render_frame(
             .cmd_bind_index_buffer(command, pipes.scene_ibo, 0, vk::IndexType::UINT32);
         ctx.device
             .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+
+        // Dynamic region scene (Stage 4 graphical integration): drawn
+        // through the already-bound scene pipeline (same vertex layout
+        // and view-projection push constants) from the per-slot
+        // persistently mapped buffer — the overlay's fenced-slot
+        // dynamic-update pattern applied to scene geometry.
+        if !region_vertices.is_empty() {
+            pipes.write_region_scene(slot, region_vertices);
+            let vertex_count = (region_vertices.len() as u32).min(pipes.region_capacity);
+            let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
+            ctx.device
+                .cmd_bind_vertex_buffers(command, 0, &[pipes.region_vbo], &[region_offset]);
+            ctx.device.cmd_draw(command, vertex_count, 1, 0, 0);
+        }
 
         if overlay_enabled && !overlay_vertices.is_empty() {
             pipes.write_overlay(slot, overlay_vertices);

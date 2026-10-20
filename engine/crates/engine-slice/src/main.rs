@@ -3,7 +3,8 @@
 //! `--soak <secs>`), the Stage 2 Vulkan render demo (`--render`, with
 //! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
 //! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`,
-//! `--simulate-resize`, `--sim-budget <n>`, `--sim-near-reserve <n>`),
+//! `--simulate-resize`, `--sim-budget <n>`, `--sim-near-reserve <n>`,
+//! and the Stage 4 region visualization `--regions`),
 //! and the Stage 3 headless simulation (`--sim`, with `--seed`,
 //! `--ticks`, `--budget`, `--near-reserve`, `--rate`, `--cadence
 //! <hz>|irregular`, and the Stage 4 region scenarios `--presence
@@ -162,6 +163,7 @@ fn main() {
                 }
                 "--no-overlay" => options.overlay = false,
                 "--simulate-resize" => options.resize_test = true,
+                "--regions" => options.regions = true,
                 "--sim-budget" => {
                     if let Some(value) = args.get(index + 1)
                         && let Ok(budget) = value.parse::<u32>()

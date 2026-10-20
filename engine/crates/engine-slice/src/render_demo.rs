@@ -11,6 +11,8 @@ use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConf
 use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::npc::NpcConfig;
+use crate::region::{RegionConfig, stage4_state_fingerprint_hex};
+use crate::region_render::{build_region_scene, camera_presence, levels_compact};
 use crate::sim::{SimConfig, SimDriver};
 
 /// Demo options; CLI parsing lives in the binary.
@@ -36,6 +38,13 @@ pub struct RenderOptions {
     /// simulation. `None` keeps the documented default, which scales
     /// proportionally when the budget is reduced (corrective finding C).
     pub sim_near_reserve: Option<u32>,
+    /// Stage 4 graphical integration: run the campaign simulation under
+    /// the RegionDirector with the CAMERA as the live presence source
+    /// (frame-sampled external input), and draw the derived region
+    /// visualization — eight LOD-colored area plates plus NPC render
+    /// proxies for Full/Simplified regions. `false` (the default) keeps
+    /// the Stage 3 baseline path untouched.
+    pub regions: bool,
 }
 
 impl Default for RenderOptions {
@@ -49,6 +58,7 @@ impl Default for RenderOptions {
             resize_test: false,
             sim_budget: None,
             sim_near_reserve: None,
+            regions: false,
         }
     }
 }
@@ -72,7 +82,11 @@ impl Default for Camera {
 }
 
 impl Camera {
-    fn update(&mut self, snapshot: &InputSnapshot, app: &ShellApp, dt: f32) {
+    /// Applies one frame of look/roll/move input and returns the world
+    /// displacement actually applied — the Stage 4 graphical
+    /// integration feeds it (over the camera dt) to the region
+    /// director as the live presence velocity.
+    fn update(&mut self, snapshot: &InputSnapshot, app: &ShellApp, dt: f32) -> [f32; 3] {
         let look = 0.0025;
         self.yaw += snapshot.look_delta.0 * look;
         self.pitch = (self.pitch - snapshot.look_delta.1 * look).clamp(-1.54, 1.54);
@@ -85,12 +99,18 @@ impl Camera {
         };
         let forward = math::camera_forward(self.yaw, self.pitch, self.roll);
         let right = math::camera_right(self.yaw, self.pitch, self.roll);
+        let mut displacement = [0.0f32; 3];
         for axis in 0..3 {
-            self.position[axis] += forward[axis] * f32::from(snapshot.move_forward) * speed * dt
+            let delta = forward[axis] * f32::from(snapshot.move_forward) * speed * dt
                 + right[axis] * f32::from(snapshot.move_strafe) * speed * dt;
+            self.position[axis] += delta;
+            displacement[axis] = delta;
         }
         let vertical = i8::from(app.is_held(Keycode::R)) - i8::from(app.is_held(Keycode::F));
-        self.position[1] += vertical as f32 * speed * dt;
+        let vertical_delta = vertical as f32 * speed * dt;
+        self.position[1] += vertical_delta;
+        displacement[1] += vertical_delta;
+        displacement
     }
 }
 
@@ -122,7 +142,24 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         sim_config.budget = budget;
     }
     sim_config.near_reserve = options.sim_near_reserve;
-    let mut sim = SimDriver::new(NpcConfig::default(), sim_config);
+    // Stage 4 graphical integration: with `--regions` the campaign runs
+    // under the RegionDirector and the CAMERA is the live presence
+    // source (frame-sampled external input — no cross-cadence
+    // equivalence claim, unlike the scripted per-tick path). The camera
+    // starts near region 0's center so the region visualization is
+    // immediately meaningful.
+    let region_start = [100.0f32, 2.0, 9.0];
+    let mut sim = if options.regions {
+        let initial = [camera_presence(region_start, [0.0; 3], 0.0)];
+        SimDriver::with_regions(
+            NpcConfig::default(),
+            sim_config,
+            RegionConfig::default(),
+            &initial,
+        )?
+    } else {
+        SimDriver::new(NpcConfig::default(), sim_config)
+    };
 
     {
         let stats = renderer.stats();
@@ -144,9 +181,22 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             "  controls: WASD move · mouse look · Q/E roll · R/F up/down · \
              Shift fast · O overlay · Esc/close quit"
         );
+        if options.regions {
+            println!(
+                "  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies \
+                 for Full/Simplified only · camera = live presence source"
+            );
+        }
     }
 
-    let mut camera = Camera::default();
+    let mut camera = if options.regions {
+        Camera {
+            position: region_start,
+            ..Camera::default()
+        }
+    } else {
+        Camera::default()
+    };
     let mut cpu_work_ms: Vec<f64> = Vec::new();
     let mut frame_intervals_ms: Vec<f64> = Vec::new();
     let mut presented: u64 = 0;
@@ -196,17 +246,39 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             continue;
         }
 
-        camera.update(
-            &snapshot,
-            &app,
-            split.camera_dt.unwrap_or_default().as_secs_f32(),
-        );
+        let camera_dt = split.camera_dt.unwrap_or_default().as_secs_f32();
+        let camera_displacement = camera.update(&snapshot, &app, camera_dt);
+
+        // Stage 4: the camera is the live presence source —
+        // frame-sampled (each tick boundary in this frame's batch
+        // consumes the same live sample; a genuinely cadence-dependent
+        // external input, documented as such on the scripted path).
+        if options.regions {
+            sim.set_presence(vec![camera_presence(
+                camera.position,
+                camera_displacement,
+                camera_dt,
+            )]);
+        }
 
         // Fixed-step simulation advance: the full raw elapsed interval
         // accrues due ticks (bounded per-frame catch-up; outstanding
         // obligations are retained and reported, never silently
         // discarded).
         sim.advance(split.sim_advance);
+
+        // Derived, non-authoritative region visualization: built AFTER
+        // the simulation advance, read-only over the world — rendering
+        // stays strictly downstream of authoritative state. Rebuilt
+        // per frame (the region levels and represented positions move
+        // with the simulation); the CPU cost is part of the measured
+        // frame work, and the GPU update is one per-slot copy.
+        let region_scene = if options.regions {
+            let director = sim.director().expect("region driver");
+            build_region_scene(&director.levels(), sim.spine().world(), director.config())
+        } else {
+            Vec::new()
+        };
 
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
@@ -215,13 +287,17 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             width as f32 / height as f32
         };
         let view = math::camera_view(camera.position, camera.yaw, camera.pitch, camera.roll);
-        let projection = math::perspective(std::f32::consts::FRAC_PI_3, aspect, 0.1, 200.0);
+        // The region ring (centers at radius 75–100, far side ~200 units
+        // from any ring position) needs a deeper far plane than the
+        // Stage 2 cube field.
+        let far = if options.regions { 400.0 } else { 200.0 };
+        let projection = math::perspective(std::f32::consts::FRAC_PI_3, aspect, 0.1, far);
         let view_proj = math::mul(&projection, &view);
 
         let overlay_text = renderer.overlay_enabled().then(|| {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
-            format!(
+            let mut text = format!(
                 "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\nsim tick {} @ {} Hz · out {} · ev/s {:.0}\nnear/far {}/{} · pend {} · blk {} · late {} · bud-exh {}\nwm {} / {}\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
                 math::percentile(&cpu_work_ms, 0.95),
@@ -260,7 +336,26 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
                 camera.position[2],
                 camera.yaw,
                 camera.pitch,
-            )
+            );
+            // Stage 4: regional state and activation-cost diagnostics
+            // (observational, never authoritative).
+            if options.regions {
+                let director = sim.director().expect("region driver");
+                let diagnostics = director.diagnostics();
+                text.push_str(&format!(
+                    "\nregions {}\nact {} · deact {} · invalid {} · recon {}\ncaptured {} · reapplied {} · act-lat p50 {:.2} / p95 {:.2} ms",
+                    levels_compact(&director.levels()),
+                    diagnostics.activations,
+                    diagnostics.deactivations,
+                    diagnostics.invalid_transitions,
+                    diagnostics.reconstructed_activities,
+                    diagnostics.captured_deltas,
+                    diagnostics.reapplied_deltas,
+                    director.activation_latency_percentile(0.50),
+                    director.activation_latency_percentile(0.95),
+                ));
+            }
+            text
         });
 
         let window_size = if options.resize_test && presented == 10 {
@@ -270,7 +365,12 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             app.window_size()
         };
         let frame_result = renderer
-            .render_frame(&view_proj, overlay_text.as_deref(), window_size)
+            .render_frame(
+                &view_proj,
+                &region_scene,
+                overlay_text.as_deref(),
+                window_size,
+            )
             .map_err(|error| format!("{error}"))?;
 
         if frame_result.deferred {
@@ -407,6 +507,45 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         spine.lane_fingerprint_hex(),
         spine.lane_state_fingerprint_hex()
     );
+    if let Some(director) = sim.director() {
+        let diagnostics = director.diagnostics();
+        println!("--- regions ---");
+        println!("  levels: {}", levels_compact(&director.levels()));
+        println!(
+            "  transitions: activations {} · deactivations {} · invalid {}",
+            diagnostics.activations, diagnostics.deactivations, diagnostics.invalid_transitions
+        );
+        println!(
+            "  reconstruction: activities {} · replay {} / synthesis {} · captured {} · reapplied {}",
+            diagnostics.reconstructed_activities,
+            diagnostics.replay_activations,
+            diagnostics.synthesis_activations,
+            diagnostics.captured_deltas,
+            diagnostics.reapplied_deltas
+        );
+        println!(
+            "  activation latency (observational): p50 {:.2} ms · p95 {:.2} ms · worst {:.2} ms",
+            director.activation_latency_percentile(0.50),
+            director.activation_latency_percentile(0.95),
+            director.activation_latency_percentile(1.0)
+        );
+        println!(
+            "  obligations: queued {} · blocked {} · held {} · conservation {}",
+            spine.pending_count(),
+            spine.blocked_count(),
+            spine.held_count(),
+            sim_stats.scheduled
+                == sim_stats.executed
+                    + spine.pending_count() as u64
+                    + spine.blocked_count() as u64
+                    + spine.held_count() as u64
+        );
+        println!(
+            "  fingerprints: stage4 {} · held {}",
+            stage4_state_fingerprint_hex(spine, director),
+            spine.held_fingerprint_hex()
+        );
+    }
     for message in &stats.recent_validation {
         println!("  validation: {message}");
     }

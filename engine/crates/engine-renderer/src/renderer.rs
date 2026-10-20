@@ -8,6 +8,7 @@ use sdl3::video::Window as SdlWindow;
 
 use crate::config::{RenderConfig, present_mode_str};
 use crate::overlay::build_overlay_vertices;
+use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, pick_depth_format, pick_surface_format,
@@ -184,11 +185,17 @@ impl Renderer {
     /// Renders one frame. `window_size` is the current window size in
     /// pixels — the application owns window state (the Stage 1 shell), and
     /// the renderer never queries SDL after construction. A minimized
-    /// window (zero extent) presents nothing. `overlay_text` renders the
-    /// debug overlay when overlays are enabled.
+    /// window (zero extent) presents nothing. `region_scene` is dynamic
+    /// per-frame geometry (Stage 4 graphical integration: region area
+    /// plates + NPC render proxies) drawn through the scene pipeline from
+    /// a per-frame-slot persistently mapped buffer — the overlay's
+    /// dynamic-update pattern; an empty slice draws nothing (the Stage
+    /// 2/3 default path). `overlay_text` renders the debug overlay when
+    /// overlays are enabled.
     pub fn render_frame(
         &mut self,
         view_proj: &[[f32; 4]; 4],
+        region_scene: &[SceneVertex],
         overlay_text: Option<&str>,
         window_size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
@@ -208,6 +215,7 @@ impl Renderer {
             window_size,
             self.config.present_mode,
             view_proj,
+            region_scene,
             &overlay,
             self.overlay_enabled,
         )?;

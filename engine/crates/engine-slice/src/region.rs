@@ -383,6 +383,17 @@ impl RegionDirector {
         self.fail_next_apply_region = Some(region);
     }
 
+    /// Test-only state corruption (Batch 3 defensive check 2): clears
+    /// the named region's recovery checkpoint, so its next activation
+    /// hits the fail-closed path — no checkpoint means the suspended
+    /// state cannot be reconstructed, and the region must stay
+    /// dormant. Unreachable through normal transitions (deactivate
+    /// always writes a checkpoint); engine code never calls this.
+    #[doc(hidden)]
+    pub fn debug_clear_checkpoint(&mut self, region: usize) {
+        self.states[region].checkpoint = None;
+    }
+
     pub fn config(&self) -> &RegionConfig {
         &self.config
     }
@@ -510,6 +521,14 @@ impl RegionDirector {
             let world = spine.world();
             for (event, due, payload) in &held {
                 if let Some((npc, payload_cursor)) = routine_payload_parts(*payload) {
+                    // Class↔region consistency (Batch 3 defensive
+                    // check): a malformed routine-tagged payload whose
+                    // NPC belongs to another region never joins THIS
+                    // region's checkpoint — it cannot corrupt another
+                    // region's reconstruction data.
+                    if npc % REGION_COUNT != region {
+                        continue;
+                    }
                     let pending = world.pending_signals()[npc];
                     // Corrective finding D: capture the CURRENT
                     // represented state from the world — never a stale
@@ -587,11 +606,14 @@ impl RegionDirector {
         // Phase 0 — validation, no state mutations (the fault-injection
         // flag is test-only state).
         let Some(checkpoint) = self.states[region].checkpoint.clone() else {
-            // Dormant with nothing held (never deactivated in this
-            // session) — a level change only, reported.
+            // No recovery checkpoint: the region's suspended state
+            // cannot be reconstructed — fail CLOSED (Batch 3 defensive
+            // check 2). The region stays dormant with its held
+            // obligations untouched and the anomaly reported — never a
+            // silent promotion of unreconstructible state. (Unreachable
+            // through normal transitions: deactivate always writes a
+            // checkpoint.)
             self.diagnostics.invalid_transitions += 1;
-            spine.world_mut().set_region_lod(region, to);
-            self.states[region].level = to;
             return;
         };
         if self.fail_next_apply_region == Some(region) {

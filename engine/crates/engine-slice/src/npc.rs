@@ -612,6 +612,16 @@ impl World for NpcWorld {
         let Some((npc, cursor)) = routine_payload_parts(event.payload) else {
             return;
         };
+        // Class↔region consistency (Batch 3 defensive check): this
+        // workload's application policy maps an event's class to the
+        // NPC's home region (npc mod 8). A malformed routine-tagged
+        // event whose identity belongs to a different region is
+        // ignored by the workload — it can never advance another
+        // region's NPC state (the spine still counts the execution in
+        // its ledger).
+        if npc % REGION_COUNT != usize::from(event.class.0) {
+            return;
+        }
         // `steps` counts actual executions only; the routine cursor —
         // advanced here AND by labeled reconstruction — re-bases the
         // chained payload, so a reconstructed span never double-counts

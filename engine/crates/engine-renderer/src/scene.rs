@@ -3,6 +3,8 @@
 //! application data, not an engine mechanism — the renderer only knows
 //! the vertex format.
 
+use crate::config::FRAMES_IN_FLIGHT;
+
 /// Scene vertex: position + color (24 bytes, matches `scene.vert`).
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -213,6 +215,103 @@ fn push_cube(
         shade(0.65),
     );
     debug_assert_eq!(vertices.len() as u32 - base_index, 24);
+}
+
+/// Appends an axis-aligned box as NON-INDEXED triangle vertices (36 per
+/// box — six per face, two triangles each). The Stage 4 graphical
+/// integration (region areas + NPC render proxies) draws dynamic
+/// per-frame geometry through the scene pipeline without an index
+/// buffer, mirroring the overlay's per-slot dynamic path. Same face
+/// order, winding, and shading convention as [`push_cube`].
+pub fn push_box(
+    vertices: &mut Vec<SceneVertex>,
+    base: [f32; 3],
+    footprint: f32,
+    height: f32,
+    color: [f32; 3],
+) {
+    let [x, y, z] = base;
+    let h = footprint / 2.0;
+    let top = y + height;
+    let shade = |mult: f32| [color[0] * mult, color[1] * mult, color[2] * mult];
+    let face = |vertices: &mut Vec<SceneVertex>, quad: [[f32; 3]; 4], color: [f32; 3]| {
+        // The indexed convention flattened: (a, b, c) and (a, c, d).
+        for pos in [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]] {
+            vertices.push(SceneVertex { pos, col: color });
+        }
+    };
+    // Top (CCW from above) and bottom.
+    face(
+        vertices,
+        [
+            [x - h, top, z + h],
+            [x - h, top, z - h],
+            [x + h, top, z - h],
+            [x + h, top, z + h],
+        ],
+        shade(1.0),
+    );
+    face(
+        vertices,
+        [
+            [x - h, y, z - h],
+            [x - h, y, z + h],
+            [x + h, y, z + h],
+            [x + h, y, z - h],
+        ],
+        shade(0.45),
+    );
+    // Sides.
+    face(
+        vertices,
+        [
+            [x - h, y, z - h],
+            [x - h, top, z - h],
+            [x + h, top, z - h],
+            [x + h, y, z - h],
+        ],
+        shade(0.80),
+    );
+    face(
+        vertices,
+        [
+            [x + h, y, z + h],
+            [x + h, top, z + h],
+            [x - h, top, z + h],
+            [x - h, y, z + h],
+        ],
+        shade(0.80),
+    );
+    face(
+        vertices,
+        [
+            [x - h, y, z + h],
+            [x - h, top, z + h],
+            [x - h, top, z - h],
+            [x - h, y, z - h],
+        ],
+        shade(0.65),
+    );
+    face(
+        vertices,
+        [
+            [x + h, y, z - h],
+            [x + h, top, z - h],
+            [x + h, top, z + h],
+            [x + h, y, z + h],
+        ],
+        shade(0.65),
+    );
+}
+
+/// Dynamic region-scene vertex budget (Stage 4 graphical integration):
+/// the worst-case single frame is all eight regions Full — eight area
+/// plates plus 1000 NPC proxy boxes, 36 non-indexed vertices each —
+/// plus margin. The disjoint per-slot pattern divides this total by
+/// `FRAMES_IN_FLIGHT`, so the total carries that factor; one frame's
+/// output must fit one slot.
+pub fn region_scene_capacity_vertices() -> u32 {
+    ((8 + 1000) * 36 + 512) * FRAMES_IN_FLIGHT
 }
 
 #[cfg(test)]
