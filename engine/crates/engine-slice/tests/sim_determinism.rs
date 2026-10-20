@@ -1,9 +1,11 @@
 //! Stage 3 deterministic verification (authorization §5): double-run
 //! fingerprints, render-cadence independence at equivalent campaign
 //! ticks, the 200-event synchrony cluster, backlog-under-constrained-
-//! budget without silent loss, and near-field starvation-freedom under
-//! far-field pressure. Workload-level policy tests — the lane mechanism
-//! contracts live in `engine-core/tests/lanes.rs`.
+//! budget without silent loss, near-field starvation-freedom under
+//! far-field pressure, and catch-up-bound overflow retention (corrective
+//! finding B). Workload-level policy tests — the lane mechanism
+//! contracts live in `engine-core/tests/lanes.rs`; the application
+//! timing integration lives in `tests/frame_timing.rs`.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -67,19 +69,60 @@ fn render_cadence_does_not_change_logical_results() {
         at_60, at_240,
         "render rate must not change logical results per completed tick"
     );
-    // Irregular cadence with a stall: short frames, one 500 ms stall per
-    // dozen frames (five due ticks at once — inside the catch-up bound),
-    // then faster frames.
-    let irregular = advance_to(300, config, |index| match index % 12 {
-        0..=4 => Duration::from_secs_f64(1.0 / 60.0),
-        5 => Duration::from_millis(500),
-        6..=10 => Duration::from_secs_f64(1.0 / 240.0),
-        _ => Duration::from_secs_f64(1.0 / 120.0),
-    });
+    // Irregular cadence — the demo's actual pattern (shared with
+    // `--sim --cadence irregular`): short frames, one 2 s stall per
+    // dozen frames (twenty due ticks at once — EXCEEDING the eight-tick
+    // catch-up bound, so the retained obligation drains across the
+    // following frames; corrective finding B), then faster frames.
+    let irregular = advance_to(300, config, engine_slice::sim_demo::irregular_frame);
     assert_eq!(
         irregular, at_60,
         "stalls and irregular frames must not change logical results"
     );
+}
+
+#[test]
+fn catch_up_bound_retains_reports_and_eventually_executes_overflow() {
+    // Corrective finding B: a stall producing more due ticks than the
+    // eight-tick catch-up bound must execute exactly the bound, retain
+    // the remainder as reported outstanding obligation, and drain it
+    // later — every due tick eventually executes, nothing is lost.
+    let config = SimConfig::default();
+    assert_eq!(config.max_catchup_per_frame, 8);
+    let mut driver = SimDriver::new(NpcConfig::default(), config);
+    // 5 s at 10 Hz = 50 due ticks in one frame.
+    let step = driver.advance(Duration::from_secs(5));
+    assert_eq!(step.executed_ticks, 8, "the bound caps per-frame execution");
+    assert_eq!(
+        step.outstanding_ticks, 42,
+        "the remainder is retained and reported"
+    );
+    // Zero-time advances keep draining the retained obligation,
+    // bounded per advance, until nothing is owed.
+    let mut executed_ticks = u64::from(step.executed_ticks);
+    let mut drains = 0;
+    while driver.outstanding_ticks() > 0 {
+        let step = driver.advance(Duration::ZERO);
+        assert!(step.executed_ticks <= 8, "the bound holds while draining");
+        executed_ticks += u64::from(step.executed_ticks);
+        drains += 1;
+        assert!(drains < 100, "the drain must terminate");
+    }
+    assert_eq!(
+        executed_ticks, 50,
+        "every due tick eventually executes — no loss"
+    );
+    assert_eq!(driver.spine().clock().as_u64(), 50);
+    assert_eq!(
+        driver.spine().clock().as_u64() + u64::from(driver.outstanding_ticks()),
+        driver.ticks_due_total(),
+        "the accounting invariant holds end-to-end"
+    );
+    let spine = driver.spine();
+    let stats = spine.stats();
+    assert_eq!(stats.invalid_dropped, 0, "nothing is silently dropped");
+    let accounted = stats.executed + spine.pending_count() as u64 + spine.blocked_count() as u64;
+    assert_eq!(accounted, stats.scheduled, "conservation: nothing vanishes");
 }
 
 #[test]
@@ -119,7 +162,7 @@ fn artificially_low_budget_produces_measurable_backlog_never_silent_loss() {
     // signals must be measurable, and no event may vanish.
     let config = SimConfig {
         budget: 30,
-        near_reserve: 10,
+        near_reserve: Some(10),
         ..SimConfig::default()
     };
     let mut driver = SimDriver::new(NpcConfig::default(), config);
@@ -164,7 +207,7 @@ fn near_field_starvation_free_under_far_field_pressure() {
     // share.
     let config = SimConfig {
         budget: 140,
-        near_reserve: 70,
+        near_reserve: Some(70),
         ..SimConfig::default()
     };
     let mut driver = SimDriver::new(NpcConfig::default(), config);

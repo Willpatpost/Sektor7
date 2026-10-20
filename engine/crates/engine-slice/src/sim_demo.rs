@@ -13,8 +13,9 @@ use crate::sim::{SimConfig, SimDriver};
 /// Runs the simulation to `target_ticks` campaign ticks under a synthetic
 /// frame cadence, then prints the logical-state report. The cadence
 /// exercises the same elapsed-time accrual the graphical loop performs;
-/// `cadence_hz` of 0 selects an irregular pattern including a stall, to
-/// exercise bounded catch-up headlessly.
+/// `cadence_hz` of 0 selects an irregular pattern including a stall that
+/// exceeds the per-frame catch-up bound, exercising retained-obligation
+/// drain headlessly.
 pub fn run_sim_demo(
     npc_config: NpcConfig,
     sim_config: SimConfig,
@@ -57,7 +58,7 @@ pub fn run_sim_demo(
         "  config: {} Hz tick rate · budget {} · near reserve {} · seed {} · cadence {}",
         rate,
         spine.budget(),
-        spine.near_reserve(),
+        sim_config.near_reserve_description(),
         npc_config.seed,
         if cadence_hz == 0 {
             "irregular".to_string()
@@ -111,12 +112,15 @@ pub fn run_sim_demo(
 }
 
 /// Irregular synthetic cadence: a repeating pattern of short frames, a
-/// 500 ms stall (five due ticks at once — bounded catch-up), and more
-/// short frames. Computed constants only, so runs stay identical.
-fn irregular_frame(index: u64) -> Duration {
+/// 2 s stall (twenty due ticks at 10 Hz — EXCEEDING the eight-tick
+/// per-frame catch-up bound, so the retained obligation drains across
+/// subsequent frames; corrective finding B), and more short frames.
+/// Computed constants only, so runs stay identical. Public so the
+/// determinism tests exercise the demo's actual cadence.
+pub fn irregular_frame(index: u64) -> Duration {
     match index % 12 {
         0..=4 => Duration::from_secs_f64(1.0 / 60.0),
-        5 => Duration::from_millis(500),
+        5 => Duration::from_millis(2000),
         6..=10 => Duration::from_secs_f64(1.0 / 240.0),
         _ => Duration::from_secs_f64(1.0 / 120.0),
     }

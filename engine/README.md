@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-85 tests (33 Stage 0 + 15 Stage 1 + 21 Stage 2 + 16 Stage 3: 9 spine lanes, 7 simulation determinism). The 60-second soak is a measurement, ignored by default:
+90 tests (33 Stage 0 + 15 Stage 1 + 21 Stage 2 + 21 Stage 3: 9 spine lanes, 8 simulation determinism, 4 frame timing). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
@@ -84,24 +84,26 @@ cargo run -p engine-slice -- --sim --ticks 300 --cadence 240
 cargo run -p engine-slice -- --sim --ticks 300 --cadence irregular
 cargo run -p engine-slice -- --sim --ticks 300 --seed 4242
 cargo run -p engine-slice -- --sim --ticks 300 --budget 140 --near-reserve 70
+cargo run -p engine-slice -- --sim --ticks 300 --budget 30
 cargo run -p engine-slice -- --sim --ticks 300 --budget 30 --near-reserve 10
 ```
 
-Expected observations: identical output for repeated identical commands (double-run discipline); `cadence` variants and `irregular` (which includes a 500 ms stall) all reach the same campaign tick with the same fingerprints — render cadence does not change logical results; the 140/70 run shows the near-field reservation working (near backlogged ticks 0 while far backlogs ~293 of 300); the budget-30 run shows honest overload (every tick budget-exhausted, ~9k late executions, progress slowed ~5× — chained schedules self-throttle, so lateness and exhausted ticks, not queue growth, are the overload signal). The graphical demo runs the same simulation beside rendering:
+Expected observations: identical output for repeated identical commands (double-run discipline); `cadence` variants and `irregular` (which includes a 2 s stall — twenty due ticks, exceeding the 8-tick per-frame catch-up bound, so the retained obligation drains across the following frames) all reach the same campaign tick with the same fingerprints — render cadence does not change logical results; the 140/70 run shows the near-field reservation working (near backlogged ticks 0 while far backlogs ~293 of 300); the budget-30 runs show honest overload (every tick budget-exhausted, ~9k late executions, progress slowed ~5× — chained schedules self-throttle, so lateness and exhausted ticks, not queue growth, are the overload signal). The near reservation with a reduced budget: the **default** scales proportionally to preserve the documented near share (60/200 → 9 of 30, keeping both lanes under pressure instead of degenerating into a near-only split), while an **explicit** `--near-reserve` is honored as given, clamped to the budget — the config line in the report prints the effective reservation and its provenance either way. The graphical demo runs the same simulation beside rendering:
 
 ```powershell
 cargo run -p engine-slice -- --render
 cargo run -p engine-slice -- --render --fps 240
 cargo run -p engine-slice -- --render --sim-budget 30
+cargo run -p engine-slice -- --render --sim-budget 30 --sim-near-reserve 25
 ```
 
-The overlay and the exit summary carry the simulation lines (campaign tick and rate, outstanding catch-up work, events/sec, pending/blocked near/far, lateness, budget exhaustion, the `max_executed_due` / `processed_through` watermark pair, and the lane-domain fingerprints at close). The 10 Hz simulation rate is a default for this demonstration workload, configurable via `--rate` — not an engine-wide rate for future systems.
+The overlay and the exit summary carry the simulation lines (campaign tick and rate, outstanding catch-up work, events/sec, pending/blocked near/far, lateness, budget exhaustion, the `max_executed_due` / `processed_through` watermark pair, and the lane-domain fingerprints at close); the exit summary additionally reports the **effective configuration** (budget, near reservation with provenance, catch-up bound), the **no-discard time accounting** (`ticks due = campaign + outstanding` over the total advanced simulation time), and **per-tick** time percentiles (one sample per logical tick, catch-up batches included). Elapsed simulation time is never silently discarded: rendering stalls and minimized periods accrue in full — the campaign clock keeps advancing while the application runs, with no pause policy — and only camera movement is capped against post-stall view jumps. The 10 Hz simulation rate is a default for this demonstration workload, configurable via `--rate` — not an engine-wide rate for future systems.
 
 ## Tested environments
 
 | Environment | Method | Result |
 |---|---|---|
-| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 65/65 tests, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke incl. a validation-enabled run (correctness only) |
+| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 90 passed + 1 ignored soak, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke incl. a validation-enabled run (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
 | Real-window GUI | manual, lead's rig | instructions above; evidence pending the lead's run |
 

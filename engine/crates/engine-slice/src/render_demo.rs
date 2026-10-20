@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
+use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::npc::NpcConfig;
 use crate::sim::{SimConfig, SimDriver};
@@ -31,6 +32,10 @@ pub struct RenderOptions {
     /// Stage 3: artificially constrained event budget for the integrated
     /// simulation (verification — measurable backlog, never silent loss).
     pub sim_budget: Option<u32>,
+    /// Stage 3: explicit near-lane reservation for the integrated
+    /// simulation. `None` keeps the documented default, which scales
+    /// proportionally when the budget is reduced (corrective finding C).
+    pub sim_near_reserve: Option<u32>,
 }
 
 impl Default for RenderOptions {
@@ -43,6 +48,7 @@ impl Default for RenderOptions {
             validation: ValidationPreference::Auto,
             resize_test: false,
             sim_budget: None,
+            sim_near_reserve: None,
         }
     }
 }
@@ -115,6 +121,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     if let Some(budget) = options.sim_budget {
         sim_config.budget = budget;
     }
+    sim_config.near_reserve = options.sim_near_reserve;
     let mut sim = SimDriver::new(NpcConfig::default(), sim_config);
 
     {
@@ -151,20 +158,10 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             1.0 / f64::from(options.fps.clamp(1, 1000)),
         ))
     };
-    let mut last_frame_start = Instant::now();
+    let mut timing = FrameTiming::new();
 
     loop {
         let frame_start = Instant::now();
-        // Full frame interval — includes the previous iteration's
-        // pacing sleep; distinct from the CPU work measurement below.
-        let dt = (frame_start - last_frame_start).as_secs_f64().min(0.1);
-        last_frame_start = frame_start;
-        frame_intervals_ms.push((dt * 1000.0).min(1000.0));
-        let len = frame_intervals_ms.len();
-        if len > 600 {
-            frame_intervals_ms.drain(0..len - 600);
-        }
-
         let snapshot = app.frame();
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
@@ -172,17 +169,44 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         if snapshot.keys_pressed.contains(&Keycode::O) {
             renderer.set_overlay_enabled(!renderer.overlay_enabled());
         }
+        // Frame-boundary timing (corrective finding A): the simulation
+        // accrues the FULL raw interval — rendering stalls and minimized
+        // periods included, never silently discarded; camera movement is
+        // capped against post-stall view jumps. `rendering` is false
+        // while the window is minimized, but the campaign clock keeps
+        // advancing while the application runs.
+        let split = timing.begin_frame(frame_start, !snapshot.minimized);
+        // Full frame interval — includes the previous iteration's
+        // pacing sleep; distinct from the CPU work measurement below.
+        // Capped at 100 ms in the readout (it measures pacing quality,
+        // not stall length).
+        frame_intervals_ms.push((split.sim_advance.as_secs_f64() * 1000.0).min(100.0));
+        let len = frame_intervals_ms.len();
+        if len > 600 {
+            frame_intervals_ms.drain(0..len - 600);
+        }
+
         if snapshot.minimized {
+            // Rendering is unavailable, but the application is still
+            // running: the campaign clock advances by the full interval
+            // — no silent pause policy (corrective finding A). Poll
+            // quietly; the next frame's interval includes this sleep.
+            sim.advance(split.sim_advance);
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
 
-        camera.update(&snapshot, &app, dt as f32);
+        camera.update(
+            &snapshot,
+            &app,
+            split.camera_dt.unwrap_or_default().as_secs_f32(),
+        );
 
-        // Fixed-step simulation advance: elapsed monotonic time accrues
-        // due ticks (bounded per-frame catch-up; outstanding obligations
-        // are retained and reported, never silently discarded).
-        sim.advance(Duration::from_secs_f64(dt));
+        // Fixed-step simulation advance: the full raw elapsed interval
+        // accrues due ticks (bounded per-frame catch-up; outstanding
+        // obligations are retained and reported, never silently
+        // discarded).
+        sim.advance(split.sim_advance);
 
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
@@ -325,6 +349,20 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     let sim_stats = spine.stats();
     let totals = spine.lane_totals();
     println!(
+        "config: {} Hz tick rate · budget {} · near reserve {} · catch-up {}/frame",
+        sim.config().tick_rate_hz,
+        spine.budget(),
+        sim.config().near_reserve_description(),
+        sim.config().max_catchup_per_frame
+    );
+    println!(
+        "sim time: advanced {:.1} ms · ticks due {} = campaign {} + outstanding {} (accounted, never discarded)",
+        timing.total_sim_advanced().as_secs_f64() * 1000.0,
+        sim.ticks_due_total(),
+        spine.clock(),
+        sim.outstanding_ticks()
+    );
+    println!(
         "campaign tick {} · executed {} · late arrivals {} · late executions {}",
         spine.clock(),
         sim_stats.executed,
@@ -347,7 +385,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         totals.far_backlogged_ticks
     );
     println!(
-        "sim tick time: p50 {:.3} ms · p95 {:.3} ms ({} samples)",
+        "sim tick time: p50 {:.3} ms · p95 {:.3} ms (per-tick, {} samples)",
         sim.tick_ms_percentile(0.50),
         sim.tick_ms_percentile(0.95),
         sim.tick_sample_count()

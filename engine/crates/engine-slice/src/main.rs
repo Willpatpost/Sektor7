@@ -3,9 +3,10 @@
 //! `--soak <secs>`), the Stage 2 Vulkan render demo (`--render`, with
 //! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
 //! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`,
-//! `--simulate-resize`, `--sim-budget <n>`), and the Stage 3 headless
-//! simulation (`--sim`, with `--seed`, `--ticks`, `--budget`,
-//! `--near-reserve`, `--rate`, `--cadence <hz>|irregular`).
+//! `--simulate-resize`, `--sim-budget <n>`, `--sim-near-reserve <n>`),
+//! and the Stage 3 headless simulation (`--sim`, with `--seed`,
+//! `--ticks`, `--budget`, `--near-reserve`, `--rate`, `--cadence
+//! <hz>|irregular`).
 
 use std::io::{self, Write};
 
@@ -59,7 +60,7 @@ fn main() {
                     if let Some(value) = args.get(index + 1)
                         && let Ok(reserve) = value.parse::<u32>()
                     {
-                        sim_config.near_reserve = reserve;
+                        sim_config.near_reserve = Some(reserve);
                         index += 1;
                     }
                 }
@@ -134,6 +135,14 @@ fn main() {
                         && let Ok(budget) = value.parse::<u32>()
                     {
                         options.sim_budget = Some(budget.clamp(1, 100_000));
+                        index += 1;
+                    }
+                }
+                "--sim-near-reserve" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(reserve) = value.parse::<u32>()
+                    {
+                        options.sim_near_reserve = Some(reserve.clamp(1, 100_000));
                         index += 1;
                     }
                 }
