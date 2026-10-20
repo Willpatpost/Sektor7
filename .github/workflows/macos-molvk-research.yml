@@ -11,6 +11,15 @@ name: macos-molvk-research
 
 on:
   workflow_dispatch:
+  # workflow_dispatch cannot start a workflow that exists only on a
+  # non-default branch (GitHub registers workflows from main — the
+  # API returns 404 for branch-only files), so the probe also runs on
+  # pushes that modify this file: the only way to dispatch it from
+  # macos-port before any merge to main.
+  push:
+    branches: [macos-port]
+    paths:
+      - ".github/workflows/macos-molvk-research.yml"
 
 jobs:
   probe:
