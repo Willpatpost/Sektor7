@@ -9,7 +9,7 @@ use std::time::Duration;
 use engine_core::{PresenceSample, Spine, Tick};
 
 use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
-use crate::region::{RegionConfig, RegionDirector};
+use crate::region::{PresenceScenario, RegionConfig, RegionDirector};
 
 /// Default simulation tick rate for the Stage 3 NPC scheduling
 /// demonstration: 10 Hz. This is a *demo default, not an engine-wide
@@ -134,6 +134,14 @@ pub struct SimDriver {
     /// simulation input (the graphical loop feeds the camera; headless
     /// scenarios feed scripted samples); never wall-clock.
     presence: Vec<PresenceSample>,
+    /// Stage 4 scripted presence (Batch 2 corrective finding B): when
+    /// set, every completed logical tick samples the scenario at THAT
+    /// tick's index before the director applies — transition history is
+    /// a function of logical time, so frame cadence cannot change it.
+    /// Camera presence (graphical) stays frame-sampled: a live external
+    /// input, genuinely cadence-dependent, with no cross-cadence
+    /// equivalence claim.
+    presence_scenario: Option<PresenceScenario>,
 }
 
 impl SimDriver {
@@ -155,6 +163,7 @@ impl SimDriver {
             tick_ms_history: Vec::new(),
             director: None,
             presence: Vec::new(),
+            presence_scenario: None,
         }
     }
 
@@ -190,6 +199,7 @@ impl SimDriver {
             tick_ms_history: Vec::new(),
             director: Some(director),
             presence: initial_presence.to_vec(),
+            presence_scenario: None,
         })
     }
 
@@ -203,9 +213,25 @@ impl SimDriver {
     }
 
     /// Sets the presence the next tick boundary consumes. Explicit
-    /// simulation input — never wall-clock.
+    /// simulation input — never wall-clock. This is the FRAME-SAMPLED
+    /// path: the graphical loop feeds the camera here once per frame,
+    /// and a multi-tick catch-up batch legitimately consumes the same
+    /// live sample for each of its ticks (a genuinely cadence-dependent
+    /// external input — no cross-cadence equivalence is claimed for
+    /// camera presence).
     pub fn set_presence(&mut self, presence: Vec<PresenceSample>) {
         self.presence = presence;
+    }
+
+    /// Sets the scripted presence scenario — the headless deterministic
+    /// input (Batch 2 corrective finding B): every completed logical
+    /// tick receives the scenario's sample at THAT tick's index, so
+    /// multi-tick catch-up batches inside one frame cannot blur
+    /// transition history across frame cadences. Requires a region
+    /// driver to take effect; without one the scenario is inert
+    /// (presence-driven LOD is a Stage 4 region concept).
+    pub fn set_presence_scenario(&mut self, scenario: PresenceScenario) {
+        self.presence_scenario = Some(scenario);
     }
 
     /// Schedules a new obligation under the director's policy (Stage 4
@@ -220,29 +246,6 @@ impl SimDriver {
             Some(director) => director.schedule(&mut self.spine, spec),
             None => self.spine.schedule(spec),
         }
-    }
-
-    /// Runs `ticks` headless ticks with scripted presence per tick — a
-    /// deterministic input function of the tick index. Requires a
-    /// director (the region configuration).
-    pub fn run_headless_with_presence<F>(
-        &mut self,
-        ticks: u64,
-        presence_at: F,
-    ) -> Result<(), String>
-    where
-        F: Fn(u64) -> Vec<PresenceSample>,
-    {
-        if self.director.is_none() {
-            return Err("run_headless_with_presence requires a region driver".to_string());
-        }
-        for _ in 0..ticks {
-            let tick = self.spine.clock().as_u64();
-            self.presence = presence_at(tick);
-            self.run_ticks(1);
-        }
-        self.headless_ticks += ticks;
-        Ok(())
     }
 
     pub fn spine(&self) -> &Spine<NpcWorld> {
@@ -304,6 +307,21 @@ impl SimDriver {
         // entry is one logical tick, so the percentiles represent real
         // tick costs including catch-up batches — not batch averages.
         for _ in 0..ticks {
+            // Batch 2 corrective finding B: scripted presence is a
+            // function of the LOGICAL tick — each completed tick
+            // consumes the sample at its own index, so multi-tick
+            // catch-up batches inside one frame cannot blur transition
+            // history across cadences. Camera presence (set per frame
+            // by the graphical loop) is a live external input and stays
+            // frame-sampled by design.
+            if let (Some(scenario), Some(centers)) = (
+                &self.presence_scenario,
+                self.director
+                    .as_ref()
+                    .map(|director| director.config().centers),
+            ) {
+                self.presence = vec![scenario.sample_at(self.spine.clock().as_u64(), &centers)];
+            }
             // Stage 4 tick-boundary transitions: the director reshapes
             // the queues from the current presence BEFORE the tick.
             // Absent a director this path is identical to the previous

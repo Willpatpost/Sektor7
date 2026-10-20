@@ -23,7 +23,7 @@ use engine_core::{
     LodLevel, PresenceSample, ScheduleError, Spine, Tick,
 };
 
-use crate::npc::{NPC_COUNT, NpcWorld, REGION_COUNT, payload_activity, payload_npc};
+use crate::npc::{NpcWorld, REGION_COUNT, routine_payload_parts};
 
 /// In-memory capture-before-discard ledger (E-07/I1 in miniature):
 /// keyed captures with pending/applied status and an applied-key ledger
@@ -45,6 +45,24 @@ pub enum CaptureStatus {
     Unknown,
 }
 
+/// Outcome of an exactly-once application attempt (Batch 2 corrective
+/// finding C: application success is explicit, so activation can fail
+/// coherently instead of half-promoting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// Applied now — the delta is returned for commitment.
+    Applied(u64),
+    /// Already applied earlier: a duplicate attempt, a no-op.
+    AlreadyApplied,
+}
+
+/// An application failure: the key is neither pending nor applied —
+/// the checkpoint claims a consequence the ledger never captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyError {
+    Unknown,
+}
+
 impl CaptureLedger {
     /// Captures a keyed delta as pending. Idempotent: a duplicate key is
     /// a no-op returning `false`.
@@ -56,12 +74,20 @@ impl CaptureLedger {
         true
     }
 
-    /// Applies a pending capture exactly once, returning its delta.
-    /// `None` for unknown keys or duplicates (no-ops by contract).
-    pub fn apply(&mut self, key: u64) -> Option<u64> {
-        let delta = self.pending.remove(&key)?;
+    /// Applies a pending capture exactly once. A duplicate attempt is
+    /// `Ok(AlreadyApplied)` (a no-op by contract); an unknown key is an
+    /// `Err` — the caller's recovery state references a consequence the
+    /// ledger never captured, which must fail coherently rather than
+    /// silently promote.
+    pub fn apply(&mut self, key: u64) -> Result<ApplyOutcome, ApplyError> {
+        let Some(delta) = self.pending.remove(&key) else {
+            if self.applied.contains(&key) {
+                return Ok(ApplyOutcome::AlreadyApplied);
+            }
+            return Err(ApplyError::Unknown);
+        };
         self.applied.insert(key);
-        Some(delta)
+        Ok(ApplyOutcome::Applied(delta))
     }
 
     pub fn status(&self, key: u64) -> CaptureStatus {
@@ -82,8 +108,16 @@ impl CaptureLedger {
         self.applied.len()
     }
 
+    /// Sum of unapplied captured deltas — the consequence-conservation
+    /// term for dormant regions (corrective finding A's proof).
+    pub fn pending_total(&self) -> u64 {
+        self.pending.values().sum()
+    }
+
     fn fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/capture-ledger/1");
+        // Domain version 2 (Batch 2 corrective): keys moved from
+        // per-episode timestamps to per-NPC consequence deltas.
+        fp.write_str("engine-slice/capture-ledger/2");
         fp.write_usize(self.pending.len());
         for (key, delta) in &self.pending {
             fp.write_u64(*key);
@@ -141,24 +175,41 @@ impl Default for RegionConfig {
     }
 }
 
+/// Capture key for one NPC's consequences in one deactivation episode:
+/// region (bits 54+) | episode (bits 10+) | npc. Episodes increment per
+/// deactivation, so every episode's captures are keyed fresh; the
+/// applied-key ledger is the exactly-once guard across retries and
+/// duplicate activation attempts.
+pub fn consequence_key(region: usize, episode: u64, npc: usize) -> u64 {
+    ((region as u64) << 54) | (episode << 10) | (npc as u64)
+}
+
 /// One NPC's checkpoint entry — a REFERENCE to the spine-held
 /// obligation carrying its chain (the spine owns the obligation; this
-/// duplicates no authoritative state), plus the routine cursor at
-/// suspension for reconstruction math.
+/// duplicates no authoritative state), plus the reconstructible state
+/// captured at suspension for reconstruction: the routine cursor and
+/// grid position (corrective finding A — the world's copies are
+/// discarded at deactivation; reactivation restores from here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionEntry {
     pub npc: usize,
     pub event: EventId,
     pub due: Tick,
     pub cursor: u64,
+    /// The grid position captured at deactivation (reconstructible
+    /// state held by the checkpoint).
+    pub position: (u8, u8),
+    /// The checkpoint's claim that this NPC carried an uncommitted
+    /// consequential signal at deactivation — the ledger owns the
+    /// exactly-once application; a claimed key unknown to the ledger
+    /// fails activation coherently (corrective finding C).
+    pub has_signal: bool,
 }
 
 /// A region's dormancy checkpoint: written at deactivation
 /// (capture-before-discard), consumed at reactivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionCheckpoint {
-    /// Episode idempotency key (region << 32 | episode).
-    pub key: u64,
     /// The deactivation tick (the dormant span's label start).
     pub dormant_since: Tick,
     /// The level before dormancy — its cadence governed the suspended
@@ -286,6 +337,11 @@ pub struct RegionDirector {
     ledger: CaptureLedger,
     diagnostics: RegionDiagnostics,
     activation_latencies_ms: Vec<f64>,
+    /// Test-only fault injection (corrective finding C): makes the
+    /// NAMED region's next activation fail its capture application
+    /// BEFORE any mutation — other regions activating at the same tick
+    /// boundary are unaffected. Engine code never sets it.
+    fail_next_apply_region: Option<usize>,
 }
 
 impl RegionDirector {
@@ -298,7 +354,18 @@ impl RegionDirector {
             ledger: CaptureLedger::default(),
             diagnostics: RegionDiagnostics::default(),
             activation_latencies_ms: Vec::new(),
+            fail_next_apply_region: None,
         })
+    }
+
+    /// Test-only fault injection (corrective finding C): the named
+    /// region's next activation fails its capture application before
+    /// any state changes, leaving that region safely dormant with its
+    /// checkpoint and held obligations intact — the coherent-failure
+    /// contract under test. Engine code never calls this.
+    #[doc(hidden)]
+    pub fn debug_inject_apply_failure(&mut self, region: usize) {
+        self.fail_next_apply_region = Some(region);
     }
 
     pub fn config(&self) -> &RegionConfig {
@@ -393,12 +460,15 @@ impl RegionDirector {
         }
     }
 
-    /// Capture-before-discard deactivation: hold the region's
-    /// obligations (identity-preserving), write the checkpoint from the
-    /// held view (references only), capture the episode delta, freeze
-    /// the handler's cadence view. The dormant region costs the spine
-    /// nothing per tick — its obligations are held, its handler never
-    /// runs.
+    /// Capture-before-discard deactivation (corrective finding A):
+    /// hold the region's obligations (identity-preserving), write the
+    /// checkpoint from the held view (references plus the captured
+    /// reconstructible cursor/position — routine-typed chains only),
+    /// capture every uncommitted consequential signal into the
+    /// in-memory ledger, and only then DISCARD the region's
+    /// reconstructible routine representation and signal scratch. The
+    /// dormant region costs the spine nothing per tick — its
+    /// obligations are held, its handler never runs.
     fn deactivate(
         &mut self,
         spine: &mut Spine<NpcWorld>,
@@ -409,34 +479,55 @@ impl RegionDirector {
         let class = EventClass::new(region as u16);
         spine.suspend_matching(|view| view.class == class);
         spine.world_mut().set_region_lod(region, LodLevel::Dormant);
-        let held = spine.held_view();
-        let entries: Vec<RegionEntry> = held
+        // Gather the region's held references first (the spine owns the
+        // obligations); only routine-typed payloads become checkpoint
+        // entries — foreign events stay spine-held without entries.
+        let held: Vec<(EventId, Tick, u64)> = spine
+            .held_view()
             .iter()
             .filter(|view| view.class == class)
-            .filter_map(|view| {
-                let npc = payload_npc(view.payload);
-                if npc < NPC_COUNT {
-                    Some(RegionEntry {
-                        npc,
-                        event: view.id,
-                        due: view.due,
-                        cursor: payload_activity(view.payload),
-                    })
-                } else {
-                    None
-                }
-            })
+            .map(|view| (view.id, view.due, view.payload))
             .collect();
         let episode = self.states[region].episode + 1;
-        let key = ((region as u64) << 32) | episode;
-        if self.ledger.capture(key, now.as_u64()) {
-            self.diagnostics.captured_deltas += 1;
+        let mut entries = Vec::with_capacity(held.len());
+        let mut captures: Vec<(usize, u64)> = Vec::new();
+        {
+            let world = spine.world();
+            for (event, due, payload) in &held {
+                if let Some((npc, cursor)) = routine_payload_parts(*payload) {
+                    let pending = world.pending_signals()[npc];
+                    entries.push(RegionEntry {
+                        npc,
+                        event: *event,
+                        due: *due,
+                        cursor,
+                        position: world.positions()[npc],
+                        has_signal: pending > 0,
+                    });
+                    if pending > 0 {
+                        captures.push((npc, pending));
+                    }
+                }
+            }
         }
+        // Capture BEFORE discard: every uncommitted consequential signal
+        // is captured into the in-memory ledger (keyed per region,
+        // episode, and NPC — exactly-once application, explicit
+        // pending status) — only then is the scratch and the
+        // reconstructible representation discarded.
+        for (npc, delta) in captures {
+            if self
+                .ledger
+                .capture(consequence_key(region, episode, npc), delta)
+            {
+                self.diagnostics.captured_deltas += 1;
+            }
+        }
+        spine.world_mut().discard_region_routine(region);
         self.states[region] = RegionState {
             level: LodLevel::Dormant,
             episode,
             checkpoint: Some(RegionCheckpoint {
-                key,
                 dormant_since: now,
                 from_level: from,
                 entries,
@@ -448,15 +539,22 @@ impl RegionDirector {
         self.diagnostics.deactivations += 1;
     }
 
-    /// Reactivation: reconstruct against the current campaign tick
-    /// (labeled replay or synthesis, chosen adaptively), then resume the
-    /// held obligations with their original identity and reclassify to
-    /// the new lane — the dynamic near/far policy applies immediately
-    /// (reviewer priority C: zero priority-transition latency).
+    /// Reactivation (corrective findings A and C): commit the captured
+    /// consequences exactly once, reconstruct against the current
+    /// campaign tick (labeled replay or synthesis, chosen adaptively,
+    /// seeded from the checkpoint's captured cursor/position), then
+    /// resume the held obligations with their original identity and
+    /// reclassify to the new lane — the dynamic near/far policy applies
+    /// immediately (reviewer priority C: zero priority-transition
+    /// latency). Validation precedes mutation: an activation that
+    /// cannot apply its captures coherently leaves the region safely
+    /// dormant — checkpoint retained, obligations still held, level
+    /// unchanged — never half-promoted.
     fn activate(&mut self, spine: &mut Spine<NpcWorld>, region: usize, to: LodLevel, now: Tick) {
-        let start = Instant::now();
         let class = EventClass::new(region as u16);
-        let Some(checkpoint) = self.states[region].checkpoint.take() else {
+        // Phase 0 — validation, no state mutations (the fault-injection
+        // flag is test-only state).
+        let Some(checkpoint) = self.states[region].checkpoint.clone() else {
             // Dormant with nothing held (never deactivated in this
             // session) — a level change only, reported.
             self.diagnostics.invalid_transitions += 1;
@@ -464,15 +562,54 @@ impl RegionDirector {
             self.states[region].level = to;
             return;
         };
-        // Exactly-once episode application: a duplicate activation finds
-        // the key applied and is a no-op for the capture ledger.
-        let Some(dormant_since) = self.ledger.apply(checkpoint.key) else {
+        if self.fail_next_apply_region == Some(region) {
+            self.fail_next_apply_region = None;
             self.diagnostics.invalid_transitions += 1;
-            spine.world_mut().set_region_lod(region, to);
-            self.states[region].level = to;
             return;
-        };
-        let dormancy_span = now.as_u64().saturating_sub(dormant_since);
+        }
+        let episode = self.states[region].episode;
+        for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
+            if matches!(
+                self.ledger
+                    .status(consequence_key(region, episode, entry.npc)),
+                CaptureStatus::Unknown
+            ) {
+                // The checkpoint claims a consequence the ledger never
+                // captured — a coherent failure: the region stays
+                // dormant with its checkpoint and held obligations
+                // intact.
+                self.diagnostics.invalid_transitions += 1;
+                return;
+            }
+        }
+        let start = Instant::now();
+        // Phase 1 — commit captured consequences exactly once. The
+        // applied-key ledger makes applications idempotent, so a
+        // retried activation never double-commits.
+        for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
+            match self
+                .ledger
+                .apply(consequence_key(region, episode, entry.npc))
+            {
+                Ok(ApplyOutcome::Applied(delta)) => {
+                    if delta > 0 {
+                        spine.world_mut().apply_captured_signal(entry.npc, delta);
+                        self.diagnostics.reapplied_deltas += 1;
+                    }
+                }
+                Ok(ApplyOutcome::AlreadyApplied) => {}
+                Err(ApplyError::Unknown) => {
+                    // Unreachable after validation; treated as a
+                    // coherent failure. Keys already applied stay
+                    // applied, so a retry commits only the remainder.
+                    self.diagnostics.invalid_transitions += 1;
+                    return;
+                }
+            }
+        }
+        let dormancy_span = now
+            .as_u64()
+            .saturating_sub(checkpoint.dormant_since.as_u64());
         // Adaptive selection by estimated replay work per NPC (E-09
         // crossover-informed experimental configuration): the span
         // estimate over the pre-dormancy cadence.
@@ -494,12 +631,16 @@ impl RegionDirector {
         } else {
             ReconstructionMethod::Replay
         };
-        // Reconstruction: labeled routine-state advancement only —
-        // never steps, milestones, or the execution ledger.
+        // Phase 2 — reconstruction: restore each chain's captured
+        // cursor/position from the checkpoint (the world's copies were
+        // DISCARDED at deactivation), then advance the dormant span —
+        // labeled routine-state reconstruction only; never steps,
+        // milestones, credits, or the execution ledger.
         let mut reconstructed = 0u64;
         {
             let world = spine.world_mut();
             for entry in &checkpoint.entries {
+                world.restore_routine(entry.npc, entry.cursor, entry.position);
                 let count = match method {
                     ReconstructionMethod::Replay => {
                         world.replay_routine_span(entry.npc, entry.due, now, cadence)
@@ -511,16 +652,16 @@ impl RegionDirector {
                 reconstructed += count;
             }
         }
-        // Resume with original identity, then reclassify to the
-        // activation's lane — the reservation protects the region
-        // immediately.
+        // Phase 3 — resume with original identity, reclassify to the
+        // activation's lane (the reservation protects the region
+        // immediately), and promote.
         spine.resume_matching(|view| view.class == class);
         let field = spine.world().config().lod_field(to);
         spine.reclassify_matching(|view| view.class == class, field);
         spine.world_mut().set_region_lod(region, to);
         self.states[region] = RegionState {
             level: to,
-            episode: self.states[region].episode,
+            episode,
             checkpoint: None,
             last_method: Some(method),
             reconstructed_activities: reconstructed,
@@ -528,7 +669,6 @@ impl RegionDirector {
         };
         self.diagnostics.activations += 1;
         self.diagnostics.reconstructed_activities += reconstructed;
-        self.diagnostics.reapplied_deltas += 1;
         match method {
             ReconstructionMethod::Replay => self.diagnostics.replay_activations += 1,
             ReconstructionMethod::Synthesis => self.diagnostics.synthesis_activations += 1,
@@ -542,18 +682,20 @@ impl RegionDirector {
     }
 
     /// Stage 4 authoritative region-state fingerprint (domain
-    /// "engine-slice/region-state/1"): per-region level, episode,
-    /// checkpoint references, reconstruction labels and counts, plus
-    /// the capture ledger. Observational diagnostics and latency
-    /// history are excluded.
+    /// "engine-slice/region-state/2" — version 2 per the Batch 2
+    /// corrective: checkpoint entries now carry the captured
+    /// reconstructible position and the consequence claim, and the
+    /// ledger keys are per-NPC): per-region level, episode, checkpoint
+    /// references, reconstruction labels and counts, plus the capture
+    /// ledger. Observational diagnostics and latency history are
+    /// excluded.
     pub fn region_fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/region-state/1");
+        fp.write_str("engine-slice/region-state/2");
         for state in &self.states {
             fp.write_u8(lod_byte(state.level));
             fp.write_u64(state.episode);
             fp.write_u8(u8::from(state.checkpoint.is_some()));
             if let Some(checkpoint) = &state.checkpoint {
-                fp.write_u64(checkpoint.key);
                 fp.write_tick(checkpoint.dormant_since);
                 fp.write_u8(lod_byte(checkpoint.from_level));
                 fp.write_usize(checkpoint.entries.len());
@@ -562,6 +704,9 @@ impl RegionDirector {
                     fp.write_u64(entry.event.seq);
                     fp.write_tick(entry.due);
                     fp.write_u64(entry.cursor);
+                    fp.write_u8(entry.position.0);
+                    fp.write_u8(entry.position.1);
+                    fp.write_u8(u8::from(entry.has_signal));
                 }
             }
             fp.write_u8(match state.last_method {

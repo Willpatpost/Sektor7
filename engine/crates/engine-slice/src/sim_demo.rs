@@ -30,12 +30,20 @@ pub fn run_sim_demo(
     let rate = sim_config.tick_rate_hz;
     let region_config = RegionConfig::default();
     let mut driver = match &presence {
-        Some(scenario) => SimDriver::with_regions(
-            npc_config.clone(),
-            sim_config,
-            region_config.clone(),
-            &[scenario.sample_at(0, &region_config.centers)],
-        )?,
+        Some(scenario) => {
+            let mut driver = SimDriver::with_regions(
+                npc_config.clone(),
+                sim_config,
+                region_config.clone(),
+                &[scenario.sample_at(0, &region_config.centers)],
+            )?;
+            // Corrective finding B: scripted presence is PER-TICK — the
+            // driver samples the scenario at each logical tick inside
+            // the tick loop, so the synthetic frame cadence (including
+            // catch-up batches) cannot change the transition history.
+            driver.set_presence_scenario(*scenario);
+            driver
+        }
         None => SimDriver::new(npc_config.clone(), sim_config),
     };
     let period_ns = 1_000_000_000u64 / u64::from(rate.max(1));
@@ -45,12 +53,10 @@ pub fn run_sim_demo(
         if clock >= target_ticks {
             break;
         }
-        // Stage 4: feed the scripted presence — a function of the
-        // logical tick, so the input is deterministic (never
-        // wall-clock).
-        if let Some(scenario) = &presence {
-            driver.set_presence(vec![scenario.sample_at(clock, &region_config.centers)]);
-        }
+        // Stage 4 scripted presence is set once above; the driver
+        // samples it per logical tick inside `advance`/`run_headless`
+        // (corrective finding B) — this loop no longer feeds presence
+        // per frame.
         let outstanding = driver.outstanding_ticks();
         let remaining = (target_ticks - clock) as u32;
         if outstanding >= remaining {

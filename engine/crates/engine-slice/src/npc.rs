@@ -133,6 +133,45 @@ pub fn payload_activity(payload: u64) -> u64 {
     payload & 0xFFFF
 }
 
+/// Stage 4 routine-chain type tag: Lod-mode chain obligations carry an
+/// explicit marker, so a held obligation is treated as an NPC routine
+/// chain only when the payload says so (Batch 2 corrective finding A /
+/// reviewer addition) — an obligation scheduled into a dormant region
+/// after the checkpoint exists resumes with its own identity and is
+/// never mistaken for a routine chain, and no foreign payload can
+/// advance NPC state under the Legacy layout's decode.
+pub const ROUTINE_MAGIC: u64 = 0x5E47;
+
+/// Encodes a Lod-mode routine-chain payload: magic(16) | npc(16) |
+/// cursor(32). The 32-bit cursor bounds a chain at ~4 billion
+/// activities — unreachable at demo cadences.
+pub fn routine_payload(npc: usize, cursor: u64) -> u64 {
+    (ROUTINE_MAGIC << 48) | ((npc as u64) << 32) | (cursor & 0xFFFF_FFFF)
+}
+
+/// Decodes a routine-chain payload: `Some((npc, cursor))` only when the
+/// payload carries the routine type tag AND the identity field is a
+/// valid NPC. Foreign payloads — including ones that would decode as
+/// an NPC under the Legacy layout — stay foreign.
+pub fn routine_payload_parts(payload: u64) -> Option<(usize, u64)> {
+    if payload >> 48 != ROUTINE_MAGIC {
+        return None;
+    }
+    let npc = ((payload >> 32) & 0xFFFF) as usize;
+    if npc >= NPC_COUNT {
+        return None;
+    }
+    Some((npc, payload & 0xFFFF_FFFF))
+}
+
+/// Sentinel for a dormant NPC's discarded routine cursor: deactivation
+/// discards the reconstructible representation (corrective finding A)
+/// and reconstruction restores it from the region checkpoint.
+pub const ROUTINE_CURSOR_DISCARDED: u64 = u64::MAX;
+
+/// Sentinel for a dormant NPC's discarded grid position.
+pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
+
 /// splitmix64 finalizer — a fully specified, stable mixer (no `std`
 /// hasher nondeterminism reaches fingerprinted state).
 fn mix64(mut x: u64) -> u64 {
@@ -164,6 +203,20 @@ pub struct NpcWorld {
     /// actual activity. Irreversible consequences — never fabricated by
     /// reconstruction.
     milestones: Vec<u64>,
+    /// Stage 4 uncommitted consequential signals per NPC: every
+    /// MILESTONE_PERIOD-th real activity accrues one pending signal —
+    /// the demo's consequential application state. SCRATCH by contract:
+    /// deactivation captures every uncommitted signal into the region
+    /// director's in-memory ledger (exactly-once keyed application)
+    /// BEFORE this scratch is cleared — the E-07/I1
+    /// capture-before-discard miniature (Batch 2 corrective finding A).
+    /// Never touched by reconstruction.
+    pending_signals: Vec<u64>,
+    /// Committed consequential signals per NPC — durable state grown
+    /// ONLY by exactly-once ledger application at reactivation. Never
+    /// touched by reconstruction; replay and synthesis cannot fabricate
+    /// a credit.
+    credits: Vec<u64>,
     /// The director's current LOD per region — the handler's cadence and
     /// classification view. The director (region state) owns the
     /// authoritative levels; this copy is what execution actually
@@ -188,6 +241,8 @@ impl NpcWorld {
             routine_cursor: vec![0; NPC_COUNT],
             positions,
             milestones: vec![0; NPC_COUNT],
+            pending_signals: vec![0; NPC_COUNT],
+            credits: vec![0; NPC_COUNT],
             region_lods: [LodLevel::Full; REGION_COUNT],
         }
     }
@@ -221,6 +276,18 @@ impl NpcWorld {
         &self.milestones
     }
 
+    /// Per-NPC uncommitted consequential signals (read-only view) —
+    /// the scratch captured into the region ledger at deactivation.
+    pub fn pending_signals(&self) -> &[u64] {
+        &self.pending_signals
+    }
+
+    /// Per-NPC committed consequential signals (read-only view) —
+    /// durable state grown only by exactly-once ledger application.
+    pub fn credits(&self) -> &[u64] {
+        &self.credits
+    }
+
     /// The handler's current LOD view per region.
     pub fn region_lods(&self) -> [LodLevel; REGION_COUNT] {
         self.region_lods
@@ -239,6 +306,40 @@ impl NpcWorld {
         } else {
             Field::Far
         }
+    }
+
+    /// Discards a dormant region's reconstructible routine
+    /// representation (Batch 2 corrective finding A): the routine
+    /// cursor and grid position become sentinels — the representation
+    /// is GONE, not merely flagged — and the uncommitted signal scratch
+    /// is cleared AFTER the director captured its consequences into the
+    /// ledger. Steps, milestones, and credits — authoritative
+    /// consequential state — are retained untouched.
+    pub fn discard_region_routine(&mut self, region: usize) {
+        for npc in 0..NPC_COUNT {
+            if npc % REGION_COUNT == region {
+                self.routine_cursor[npc] = ROUTINE_CURSOR_DISCARDED;
+                self.positions[npc] = POSITION_DISCARDED;
+                self.pending_signals[npc] = 0;
+            }
+        }
+    }
+
+    /// Restores one NPC's routine cursor and grid position from the
+    /// region checkpoint (the reconstructible state captured at
+    /// deactivation) — the seed the span reconstruction advances from
+    /// at reactivation.
+    pub fn restore_routine(&mut self, npc: usize, cursor: u64, position: (u8, u8)) {
+        self.routine_cursor[npc] = cursor;
+        self.positions[npc] = position;
+    }
+
+    /// Commits one captured signal delta — the reactivation-side
+    /// application of a captured consequence. Only the director calls
+    /// this, and only with a capture-ledger `Applied` outcome, so each
+    /// delta commits exactly once.
+    pub fn apply_captured_signal(&mut self, npc: usize, delta: u64) {
+        self.credits[npc] += delta;
     }
 
     /// Exact step-by-step replay of a dormant span (reviewer priority
@@ -338,12 +439,15 @@ impl NpcWorld {
     }
 
     /// Stage 4 authoritative workload state beyond the frozen Stage 3
-    /// domain: routine cursor, grid positions, milestones, and the
-    /// region-LOD view execution actually consumed. New domain
-    /// "engine-slice/npc-spatial/1" — hashed only by the Stage 4
+    /// domain: routine cursor (with discard sentinels while dormant),
+    /// grid positions, milestones, the region-LOD view execution
+    /// actually consumed, and the consequential signal state —
+    /// uncommitted scratch plus committed credits (Batch 2 corrective
+    /// finding A). Domain version 2: the corrective added the signal
+    /// state; version 1 never reached main. Hashed only by the Stage 4
     /// combined fingerprint; the Stage 3 domains never see it.
     pub fn spatial_fingerprint(&self, fp: &mut Fingerprinter) {
-        fp.write_str("engine-slice/npc-spatial/1");
+        fp.write_str("engine-slice/npc-spatial/2");
         fp.write_u64(self.config.seed);
         fp.write_usize(self.routine_cursor.len());
         for cursor in &self.routine_cursor {
@@ -355,6 +459,12 @@ impl NpcWorld {
         }
         for milestone in &self.milestones {
             fp.write_u64(*milestone);
+        }
+        for signal in &self.pending_signals {
+            fp.write_u64(*signal);
+        }
+        for credit in &self.credits {
+            fp.write_u64(*credit);
         }
         for lod in &self.region_lods {
             fp.write_u8(match lod {
@@ -390,7 +500,7 @@ pub fn install_initial_schedules(spine: &mut Spine<NpcWorld>, config: &NpcConfig
                         Schedule::AtLogicalTime {
                             due: Tick(1 + offset),
                         },
-                        payload(npc, 0),
+                        routine_payload(npc, 0),
                     )
                     .in_field(field),
                 )
@@ -422,17 +532,17 @@ pub fn install_initial_schedules(spine: &mut Spine<NpcWorld>, config: &NpcConfig
 
 impl World for NpcWorld {
     fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
-        let npc = payload_npc(event.payload);
-        // Payloads outside the identity space (headless burst/diagnostics
-        // injections) are not NPC activities: the spine counts them in
-        // its ledger; the workload ignores them.
-        if npc >= NPC_COUNT {
-            return;
-        }
-        let activity = payload_activity(event.payload);
         if !self.config.region_lods_enabled {
             // Stage 3 Legacy path, character-for-character — the frozen
-            // npc-world/1 baselines hash this exact behavior.
+            // npc-world/1 baselines hash this exact behavior. Payloads
+            // outside the identity space (headless burst/diagnostics
+            // injections) are not NPC activities: the spine counts them
+            // in its ledger; the workload ignores them.
+            let npc = payload_npc(event.payload);
+            if npc >= NPC_COUNT {
+                return;
+            }
+            let activity = payload_activity(event.payload);
             self.steps[npc] += 1;
             // Chain the next activity: execution-relative (anchored to actual
             // execution), same region class, same lane (follow-ups inherit
@@ -443,16 +553,26 @@ impl World for NpcWorld {
             ctx.follow_up(delay, event.class, payload(npc, activity + 1), Vec::new());
             return;
         }
-        // Stage 4 region-LOD path (reviewer priority A): `steps` counts
-        // actual executions only; the routine cursor — advanced here AND
-        // by labeled reconstruction — re-bases the chained payload, so a
-        // reconstructed span never double-counts and a resumed
-        // obligation performs the next activity after the reconstructed
-        // state. Milestones — irreversible consequences — arise only
-        // from this real-execution counter.
+        // Stage 4 region-LOD path: routine chains are EXPLICITLY TYPED
+        // (corrective finding A) — only payloads carrying the routine
+        // tag advance NPC state; foreign payloads are counted in the
+        // spine's ledger and ignored here, never mistaken for a chain.
+        let Some((npc, cursor)) = routine_payload_parts(event.payload) else {
+            return;
+        };
+        // `steps` counts actual executions only; the routine cursor —
+        // advanced here AND by labeled reconstruction — re-bases the
+        // chained payload, so a reconstructed span never double-counts
+        // and a resumed obligation performs the next activity after the
+        // reconstructed state. Milestones — irreversible consequences —
+        // arise only from this real-execution counter, and each crossing
+        // accrues one PENDING consequential signal: scratch until the
+        // region's deactivation captures it into the ledger and its
+        // reactivation commits it exactly once.
         self.steps[npc] += 1;
         if self.steps[npc].is_multiple_of(MILESTONE_PERIOD) {
             self.milestones[npc] += 1;
+            self.pending_signals[npc] += 1;
         }
         self.routine_cursor[npc] += 1;
         self.advance_position(npc);
@@ -460,15 +580,15 @@ impl World for NpcWorld {
         let lod = self.region_lods[region];
         let cadence = self.config.cadence_factor(lod);
         // Jitter derives from logical data only — seed, identity,
-        // activity — never wall-clock time.
-        let jitter = mix64(self.config.seed ^ ((npc as u64) << 32) ^ activity) % 2;
+        // cursor — never wall-clock time.
+        let jitter = mix64(self.config.seed ^ ((npc as u64) << 32) ^ cursor) % 2;
         let delay = self.config.activity_period * cadence + jitter;
         let field = self.config.lod_field(lod);
         ctx.follow_up_in_field(
             field,
             delay,
             event.class,
-            payload(npc, self.routine_cursor[npc]),
+            routine_payload(npc, self.routine_cursor[npc]),
             Vec::new(),
         );
     }

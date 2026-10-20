@@ -8,6 +8,7 @@
 use engine_core::{Fingerprinter, LodLevel, Spine, Tick};
 use engine_slice::npc::{
     MILESTONE_PERIOD, NPC_COUNT, NpcConfig, NpcWorld, REGION_GRID, install_initial_schedules,
+    payload, routine_payload, routine_payload_parts,
 };
 use engine_slice::sim::{SimConfig, SimDriver};
 
@@ -47,6 +48,18 @@ fn legacy_mode_reproduces_the_accepted_stage3_baseline() {
             .iter()
             .all(|milestone| *milestone == 0),
         "Legacy mode never records milestones"
+    );
+    assert!(
+        spine
+            .world()
+            .pending_signals()
+            .iter()
+            .all(|signal| *signal == 0),
+        "Legacy mode never accrues signal scratch"
+    );
+    assert!(
+        spine.world().credits().iter().all(|credit| *credit == 0),
+        "Legacy mode never commits credits"
     );
 }
 
@@ -112,9 +125,14 @@ fn milestones_count_real_executions_only() {
             );
         }
     }
-    let (before_steps, before_milestones) = {
+    let (before_steps, before_milestones, before_pending, before_credits) = {
         let world = spine.world();
-        (world.steps().to_vec(), world.milestones().to_vec())
+        (
+            world.steps().to_vec(),
+            world.milestones().to_vec(),
+            world.pending_signals().to_vec(),
+            world.credits().to_vec(),
+        )
     };
     let replayed = spine
         .world_mut()
@@ -137,6 +155,16 @@ fn milestones_count_real_executions_only() {
         world.milestones(),
         before_milestones.as_slice(),
         "milestones untouched by reconstruction"
+    );
+    assert_eq!(
+        world.pending_signals(),
+        before_pending.as_slice(),
+        "signal scratch untouched by reconstruction"
+    );
+    assert_eq!(
+        world.credits(),
+        before_credits.as_slice(),
+        "credits untouched by reconstruction — neither replay nor synthesis can fabricate a consequence"
     );
     assert!(
         world.routine_cursor()[0] > world.steps()[0],
@@ -224,5 +252,37 @@ fn spatial_fingerprint_is_deterministic_and_sensitive() {
         hash_of(100),
         hash_of(200),
         "different progression hashes differently"
+    );
+}
+
+#[test]
+fn routine_payloads_are_explicitly_typed() {
+    // Batch 2 corrective finding A / reviewer addition: Lod-mode
+    // routine chains carry an explicit type tag — a payload is a
+    // routine chain only when the tag says so. Foreign payloads,
+    // including ones that would decode as an NPC under the Legacy
+    // layout, stay foreign.
+    let (npc, cursor) = routine_payload_parts(routine_payload(123, 456)).unwrap();
+    assert_eq!((npc, cursor), (123, 456));
+    assert_eq!(
+        routine_payload_parts(routine_payload(7, 0xFFFF_FFFF)).unwrap(),
+        (7, 0xFFFF_FFFF),
+        "the full 32-bit cursor round-trips"
+    );
+    assert!(
+        routine_payload_parts(routine_payload(NPC_COUNT, 0)).is_none(),
+        "out-of-range identities are not routine chains"
+    );
+    assert!(
+        routine_payload_parts(4).is_none(),
+        "a Legacy-layout payload (would decode as npc 0) is foreign in Lod mode"
+    );
+    assert!(
+        routine_payload_parts(0x8000_0000_0000_0001).is_none(),
+        "an untagged high payload is foreign"
+    );
+    assert!(
+        routine_payload_parts(payload(123, 456)).is_none(),
+        "Legacy payloads are not Lod routine payloads"
     );
 }
