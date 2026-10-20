@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-61 tests (33 Stage 0 + 15 Stage 1 + 13 Stage 2: 9 renderer, 4 camera math). The 60-second soak is a measurement, ignored by default:
+65 tests (33 Stage 0 + 15 Stage 1 + 17 Stage 2: 13 renderer, 4 camera math). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
@@ -76,7 +76,7 @@ Verify: **depth ordering** (the three overlapping depth-demo cubes intersect cor
 
 | Environment | Method | Result |
 |---|---|---|
-| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 61/61 tests, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke (correctness only) |
+| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 65/65 tests, fmt/clippy clean, headless smoke + 60 s soak + lavapipe offscreen render smoke incl. a validation-enabled run (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
 | Real-window GUI | manual, lead's rig | instructions above; evidence pending the lead's run |
 

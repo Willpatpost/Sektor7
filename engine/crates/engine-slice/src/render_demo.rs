@@ -118,7 +118,8 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     }
 
     let mut camera = Camera::default();
-    let mut cpu_intervals_ms: Vec<f64> = Vec::new();
+    let mut cpu_work_ms: Vec<f64> = Vec::new();
+    let mut frame_intervals_ms: Vec<f64> = Vec::new();
     let mut presented: u64 = 0;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
@@ -132,8 +133,15 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
 
     loop {
         let frame_start = Instant::now();
+        // Full frame interval — includes the previous iteration's
+        // pacing sleep; distinct from the CPU work measurement below.
         let dt = (frame_start - last_frame_start).as_secs_f64().min(0.1);
         last_frame_start = frame_start;
+        frame_intervals_ms.push((dt * 1000.0).min(1000.0));
+        let len = frame_intervals_ms.len();
+        if len > 600 {
+            frame_intervals_ms.drain(0..len - 600);
+        }
 
         let snapshot = app.frame();
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
@@ -163,9 +171,9 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
             format!(
-                "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
+                "Sektor7 Stage 2 - Vulkan\nFPS {:.0} (cpu work p95 {:.2} ms / gpu p95 {:.2} ms)\npresent {} / {}x{} / {} images / recreations {}\n{} {} / Vulkan {}\nvalidation {} (err {} / warn {})\ncam ({:.1}, {:.1}, {:.1}) yaw {:.2} pitch {:.2}",
                 presented as f64 / elapsed,
-                math::percentile(&cpu_intervals_ms, 0.95),
+                math::percentile(&cpu_work_ms, 0.95),
                 stats.gpu_ms_p95(),
                 stats.present_mode,
                 width,
@@ -192,10 +200,13 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
 
         if frame_result.presented {
             presented += 1;
-            cpu_intervals_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
-            let len = cpu_intervals_ms.len();
+            // CPU work duration: poll → camera → overlay build → render
+            // → present call, excluding the pacing sleep (distinct from
+            // the paced frame interval above).
+            cpu_work_ms.push((frame_start.elapsed().as_secs_f64() * 1000.0).min(1000.0));
+            let len = cpu_work_ms.len();
             if len > 600 {
-                cpu_intervals_ms.drain(0..len - 600);
+                cpu_work_ms.drain(0..len - 600);
             }
         }
         if let Some(limit) = options.frames
@@ -221,10 +232,20 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         presented as f64 / elapsed.as_secs_f64().max(0.001)
     );
     println!(
-        "cpu frame+present: p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
-        math::percentile(&cpu_intervals_ms, 0.50),
-        math::percentile(&cpu_intervals_ms, 0.95),
-        math::percentile(&cpu_intervals_ms, 0.99)
+        "cpu work (poll→present, excl. pacing sleep): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
+        math::percentile(&cpu_work_ms, 0.50),
+        math::percentile(&cpu_work_ms, 0.95),
+        math::percentile(&cpu_work_ms, 0.99)
+    );
+    println!(
+        "paced frame interval (incl. pacing sleep; target {}): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
+        match options.fps {
+            0 => "uncapped".to_string(),
+            fps => format!("{fps} fps"),
+        },
+        math::percentile(&frame_intervals_ms, 0.50),
+        math::percentile(&frame_intervals_ms, 0.95),
+        math::percentile(&frame_intervals_ms, 0.99)
     );
     println!(
         "gpu render (timestamps, {} samples): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms",
@@ -242,6 +263,16 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     );
     for message in &stats.recent_validation {
         println!("  validation: {message}");
+    }
+    // Verification requirement: with the validation layer ACTIVE, any
+    // recorded error is a hard failure — this is what the CI validation
+    // smoke gates on. An unavailable layer is an environment limitation,
+    // not an application error, and is reported honestly above instead.
+    if stats.validation_active && stats.validation_errors > 0 {
+        return Err(format!(
+            "validation layer reported {} error(s) while active — see the messages above",
+            stats.validation_errors
+        ));
     }
     println!(
         "note: instrument readings of the simple Stage 2 scene — not \

@@ -8,7 +8,7 @@ use crate::config::{RenderConfig, present_mode_str};
 use crate::overlay::build_overlay_vertices;
 use crate::vulkan::{
     self, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
-    drain_validation_messages, pick_surface_format,
+    drain_validation_messages, pick_depth_format, pick_surface_format,
 };
 
 /// Per-frame result surfaced to the application.
@@ -94,19 +94,53 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(window: &SdlWindow, config: RenderConfig) -> Result<Renderer, RendererError> {
-        let (ctx, validation_active) = VulkanContext::new(window, &config)?;
-        let (format, color_space) = pick_surface_format(&ctx)?;
-        let pipes = PipelineState::new(&ctx, format)?;
+        let (mut ctx, validation_active) = VulkanContext::new(window, &config)?;
+        // Cross-stage cleanup (corrective finding G): each constructor
+        // cleans up its own partials; this ladder releases completed
+        // stages when a later stage fails.
+        let (format, color_space) = match pick_surface_format(&ctx) {
+            Ok(picked) => picked,
+            Err(error) => {
+                ctx.destroy();
+                return Err(error);
+            }
+        };
+        // The depth format is chosen once and shared by the render pass
+        // and every depth attachment (corrective finding F).
+        let depth_format = pick_depth_format(&ctx.instance, ctx.physical_device);
+        let mut pipes = match PipelineState::new(&ctx, format, depth_format) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                ctx.destroy();
+                return Err(error);
+            }
+        };
         let (width, height) = window.size();
-        let swapchain = SwapchainState::new(
+        let mut swapchain = match SwapchainState::new(
             &ctx,
             (width, height),
             config.present_mode,
             format,
             color_space,
             pipes.render_pass,
-        )?;
-        let frames = FrameState::new(&ctx, swapchain.image_count)?;
+            depth_format,
+        ) {
+            Ok(swapchain) => swapchain,
+            Err(error) => {
+                pipes.destroy(&ctx);
+                ctx.destroy();
+                return Err(error);
+            }
+        };
+        let frames = match FrameState::new(&ctx, swapchain.image_count) {
+            Ok(frames) => frames,
+            Err(error) => {
+                swapchain.destroy(&ctx);
+                pipes.destroy(&ctx);
+                ctx.destroy();
+                return Err(error);
+            }
+        };
         let stats = RenderStats {
             gpu_name: ctx.gpu_name.clone(),
             device_type: ctx.device_type.clone(),
@@ -231,8 +265,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         vulkan::device_idle(&self.ctx).ok();
         self.frames.destroy(&self.ctx);
-        self.pipes.destroy(&self.ctx);
+        // Framebuffers before the render pass they reference.
         self.swapchain.destroy(&self.ctx);
+        self.pipes.destroy(&self.ctx);
         self.ctx.destroy();
     }
 }
