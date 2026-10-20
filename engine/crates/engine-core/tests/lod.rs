@@ -184,3 +184,142 @@ fn targeting_is_pure_and_deterministic() {
     let second = controller.next_lod(LodLevel::EventDriven, center, &presence);
     assert_eq!(first, second);
 }
+
+#[test]
+fn segment_crossing_activates_regions_both_endpoints_miss() {
+    // Batch 1 review item A: a high-speed presence whose projected
+    // movement segment passes through a region must activate it even
+    // though both endpoints lie far outside every threshold.
+    let controller = controller();
+    let center = (0.0, 0.0);
+    // Stationary at distance 120 — beyond event_exit (100): stays
+    // Dormant.
+    let stationary = [sample_at(-120.0, 0.0)];
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &stationary),
+        LodLevel::Dormant
+    );
+    // Crossing at velocity 120 with lookahead 2: the bounded segment
+    // runs from (-120, 0) to (120, 0) — straight through the center —
+    // so the minimum segment distance is 0 and the region activates
+    // fully, endpoint distances notwithstanding.
+    let crossing = [sample_moving(-120.0, 0.0, 120.0, 0.0)];
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &crossing),
+        LodLevel::Full
+    );
+}
+
+#[test]
+fn segment_near_miss_respects_thresholds() {
+    // A projected path passing near — but outside every activation
+    // threshold — must not activate; the same crossing pulled inside a
+    // band reaches exactly the level the band warrants.
+    let controller = controller();
+    let center = (0.0, 0.0);
+    let near_miss = [sample_moving(-120.0, 105.0, 120.0, 0.0)];
+    // Segment at constant height 105 — beyond event_exit (100).
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &near_miss),
+        LodLevel::Dormant
+    );
+    let grazing = [sample_moving(-120.0, 70.0, 120.0, 0.0)];
+    // Segment at height 70 — inside event_enter (80) but outside
+    // simplified_enter (30): a crossing presence reaches EventDriven.
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &grazing),
+        LodLevel::EventDriven
+    );
+    let band = [sample_moving(-120.0, 90.0, 120.0, 0.0)];
+    // Height 90 sits in the event hysteresis band (80..100): stable for
+    // its adjacent levels via segment geometry, as via points.
+    assert_eq!(
+        controller.next_lod(LodLevel::EventDriven, center, &band),
+        LodLevel::EventDriven
+    );
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &band),
+        LodLevel::Dormant
+    );
+}
+
+#[test]
+fn negative_or_oversized_thresholds_are_rejected() {
+    // Batch 1 review item B: negative distances change meaning when
+    // squared, and thresholds whose squares overflow are unusable on
+    // the squared-distance decision path.
+    let mut negative = config();
+    negative.full_enter = -10.0;
+    assert_eq!(
+        LodController::new(negative).unwrap_err(),
+        LodConfigError::InvalidValues
+    );
+    let mut oversized = config();
+    oversized.event_exit = 1e200; // squared overflows to infinity
+    assert_eq!(
+        LodController::new(oversized).unwrap_err(),
+        LodConfigError::InvalidValues
+    );
+}
+
+#[test]
+fn non_finite_presence_samples_do_not_participate() {
+    // Batch 1 review item B policy: NaN/Infinity in a sample's position
+    // or velocity never determines an authoritative transition — the
+    // sample is ignored entirely. A lone non-finite sample behaves like
+    // no presence at all (level unchanged); a finite sibling decides.
+    let controller = controller();
+    let center = (0.0, 0.0);
+    let nan_position = [PresenceSample {
+        position: (f64::NAN, 0.0),
+        velocity: (0.0, 0.0),
+    }];
+    assert_eq!(
+        controller.next_lod(LodLevel::Simplified, center, &nan_position),
+        LodLevel::Simplified,
+        "a lone non-finite sample is no presence"
+    );
+    let inf_velocity = [PresenceSample {
+        position: (5.0, 0.0),
+        velocity: (f64::INFINITY, 0.0),
+    }];
+    assert_eq!(
+        controller.next_lod(LodLevel::Simplified, center, &inf_velocity),
+        LodLevel::Simplified,
+        "the whole sample is ignored, even with a finite near position"
+    );
+    let mixed = [
+        PresenceSample {
+            position: (f64::NAN, f64::NAN),
+            velocity: (0.0, 0.0),
+        },
+        sample_at(5.0, 0.0),
+    ];
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &mixed),
+        LodLevel::Full,
+        "finite samples decide when non-finite ones are ignored"
+    );
+}
+
+#[test]
+fn overflowed_projection_degenerates_to_stationary() {
+    // A finite sample whose lookahead projection overflows to infinity
+    // keeps a finite, deterministic distance by falling back to its
+    // current position — never fabricating proximity or NaN.
+    let controller = controller();
+    let center = (0.0, 0.0);
+    let overflowing = [PresenceSample {
+        position: (1e150, 0.0),
+        velocity: (1e308, 0.0),
+    }];
+    let distance = controller
+        .effective_distance(center, &overflowing)
+        .expect("finite fallback distance");
+    assert!(distance.is_finite());
+    assert_eq!(
+        controller.next_lod(LodLevel::Dormant, center, &overflowing),
+        LodLevel::Dormant,
+        "an overflowing projection never fabricates proximity"
+    );
+}

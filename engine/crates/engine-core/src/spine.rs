@@ -756,12 +756,15 @@ impl<W: World> Spine<W> {
         self.clock
     }
 
-    /// Runs until no *runnable* work remains (queue and blocked set both
-    /// empty) or `max_ticks` elapse; returns the ticks consumed. Held
-    /// (suspended) obligations are unfinished work that cannot execute
-    /// while suspended — stopping does **not** imply all obligations
-    /// have completed; see [`Self::has_unfinished_work`] (Stage 4
-    /// reviewer clarification C: no runnable work ≠ no unfinished work).
+    /// Runs until no *progressible* work remains (the queues are empty —
+    /// a blocked obligation whose unmet dependencies all resolve to
+    /// held, or to blocked chains beneath held roots, can never execute,
+    /// so advancing campaign time would be pointless — Batch 1 review
+    /// item C) or `max_ticks` elapse; returns the ticks consumed. Held
+    /// obligations are unfinished but not executable, and stopping never
+    /// implies all obligations completed — see
+    /// [`Self::has_unfinished_work`] (no runnable work ≠ no unfinished
+    /// work).
     ///
     /// Termination is guaranteed only for **finite** event graphs: within a
     /// fixed scheduled set, dependency chains are acyclic by construction
@@ -772,7 +775,7 @@ impl<W: World> Spine<W> {
     /// `pending_count`/`blocked_count` rather than being assumed absent.
     pub fn run_to_completion(&mut self, max_ticks: u64) -> u64 {
         let mut used = 0;
-        while used < max_ticks && self.has_any_work() {
+        while used < max_ticks && self.has_progressible_work() {
             self.run_tick();
             used += 1;
         }
@@ -1146,6 +1149,17 @@ impl<W: World> Spine<W> {
 
     fn has_any_work(&self) -> bool {
         !self.near_queue.is_empty() || !self.far_queue.is_empty() || !self.blocked.is_empty()
+    }
+
+    /// True while work exists that can eventually execute: queued events
+    /// — the advancing clock reaches their dues, and executing them
+    /// releases blocked dependents. A blocked-only graph whose unmet
+    /// dependencies resolve to held obligations can make no progress
+    /// (no execution can ever occur), so `run_to_completion` stops
+    /// rather than burning its tick budget on motionless time (Batch 1
+    /// review item C).
+    fn has_progressible_work(&self) -> bool {
+        !self.near_queue.is_empty() || !self.far_queue.is_empty()
     }
 }
 

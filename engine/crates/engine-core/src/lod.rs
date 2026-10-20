@@ -19,7 +19,11 @@
 //! Arithmetic is IEEE-754 `f64` (`+`/`*`/comparisons — correctly rounded
 //! and cross-platform deterministic for these operations); the decision
 //! path compares **squared** distances against squared thresholds, so no
-//! `sqrt` is needed to choose a level.
+//! `sqrt` is needed to choose a level. Sample geometry policy (Batch 1
+//! review item B): a presence sample with any non-finite position or
+//! velocity coordinate never participates — NaN/Infinity cannot
+//! determine an authoritative transition — and a lookahead projection
+//! that overflows to non-finite degenerates to the stationary position.
 
 /// Simulation level of detail, ordered from most to least detailed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -98,20 +102,27 @@ pub struct LodConfig {
 }
 
 impl LodConfig {
-    /// Validates finiteness, non-negative lookahead, and threshold
-    /// ordering (`full_enter < full_exit ≤ simplified_enter <
-    /// simplified_exit ≤ event_enter < event_exit`).
+    /// Validates finiteness, non-negative thresholds and lookahead, the
+    /// finiteness of every **squared** threshold (the decision path
+    /// compares squared distances, so a threshold whose square
+    /// overflows would silently change meaning — Batch 1 review item
+    /// B), and threshold ordering (`full_enter < full_exit ≤
+    /// simplified_enter < simplified_exit ≤ event_enter < event_exit`).
     pub fn validated(self) -> Result<Self, LodConfigError> {
-        let values = [
+        let thresholds = [
             self.full_enter,
             self.full_exit,
             self.simplified_enter,
             self.simplified_exit,
             self.event_enter,
             self.event_exit,
-            self.lookahead,
         ];
-        if values.iter().any(|value| !value.is_finite()) || self.lookahead < 0.0 {
+        let values_ok = thresholds
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0 && (*value * *value).is_finite())
+            && self.lookahead.is_finite()
+            && self.lookahead >= 0.0;
+        if !values_ok {
             return Err(LodConfigError::InvalidValues);
         }
         let ordered = self.full_enter < self.full_exit
@@ -129,7 +140,8 @@ impl LodConfig {
 /// Rejection reasons for an invalid [`LodConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LodConfigError {
-    /// A threshold is non-finite, or the lookahead is negative.
+    /// A threshold is non-finite or negative, its square is not finite,
+    /// or the lookahead is negative or non-finite.
     InvalidValues,
     /// Thresholds violate the required enter/exit and cross-boundary
     /// ordering.
@@ -169,9 +181,12 @@ impl LodController {
 
     /// Effective distance from the presence set to a region center
     /// (diagnostic form, with sqrt). The nearest sample wins, and each
-    /// sample counts the nearer of its current and lookahead-projected
-    /// position — approaching regions activate before arrival, receding
-    /// velocity never counts against.
+    /// sample contributes the minimum distance from the center to its
+    /// bounded movement segment — approaching regions activate before
+    /// arrival, a crossing path activates even with distant endpoints,
+    /// and receding velocity never counts beyond the current position.
+    /// Non-finite samples do not participate (see
+    /// [`Self::next_lod`]'s policy note).
     pub fn effective_distance(
         &self,
         center: (f64, f64),
@@ -215,7 +230,18 @@ impl LodController {
     }
 
     /// Nearest effective squared distance over the presence set: per
-    /// sample, the smaller of the current and projected distances.
+    /// sample, the minimum squared distance from the center to the
+    /// **bounded movement segment** `[position, position + velocity ×
+    /// lookahead]` — a projected path that crosses a region activates
+    /// it even when both endpoints lie outside every threshold (Batch 1
+    /// review item A), and receding movement never counts beyond the
+    /// current position (the segment includes it).
+    ///
+    /// Non-finite policy (Batch 1 review item B): a sample with any
+    /// non-finite position or velocity coordinate does not participate
+    /// — NaN/Infinity never determines an authoritative transition. A
+    /// projection that overflows to non-finite degenerates to the
+    /// stationary position, keeping the result finite and deterministic.
     fn effective_distance_sq(
         &self,
         center: (f64, f64),
@@ -223,12 +249,22 @@ impl LodController {
     ) -> Option<f64> {
         presence
             .iter()
-            .map(|sample| {
+            .filter_map(|sample| {
+                let (px, py) = sample.position;
+                let (vx, vy) = sample.velocity;
+                if !px.is_finite() || !py.is_finite() || !vx.is_finite() || !vy.is_finite() {
+                    return None;
+                }
                 let projected = (
-                    sample.position.0 + sample.velocity.0 * self.config.lookahead,
-                    sample.position.1 + sample.velocity.1 * self.config.lookahead,
+                    px + vx * self.config.lookahead,
+                    py + vy * self.config.lookahead,
                 );
-                dist_sq(sample.position, center).min(dist_sq(projected, center))
+                let end = if projected.0.is_finite() && projected.1.is_finite() {
+                    projected
+                } else {
+                    sample.position
+                };
+                Some(segment_dist_sq(sample.position, end, center))
             })
             .reduce(f64::min)
     }
@@ -262,4 +298,21 @@ fn dist_sq(a: (f64, f64), b: (f64, f64)) -> f64 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
     dx * dx + dy * dy
+}
+
+/// Minimum squared distance from `center` to the bounded segment
+/// `[start, end]`, endpoints included (Batch 1 review item A): a
+/// projected path passing near — or through — a region counts even when
+/// both endpoints are distant. Zero-length segments (stationary
+/// presence) fall back to the point distance. IEEE-754 arithmetic only,
+/// deterministic; the caller has already filtered non-finite inputs.
+fn segment_dist_sq(start: (f64, f64), end: (f64, f64), center: (f64, f64)) -> f64 {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length_sq = dx * dx + dy * dy;
+    if length_sq == 0.0 {
+        return dist_sq(start, center);
+    }
+    let t = (((center.0 - start.0) * dx + (center.1 - start.1) * dy) / length_sq).clamp(0.0, 1.0);
+    dist_sq((start.0 + t * dx, start.1 + t * dy), center)
 }

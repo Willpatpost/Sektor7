@@ -470,3 +470,46 @@ fn suspension_cycle_is_invisible_to_historical_fingerprint_domains() {
         "a full suspend+resume cycle is invisible to the historical domains"
     );
 }
+
+#[test]
+fn run_to_completion_does_not_advance_time_on_held_blocked_graphs() {
+    // Batch 1 review item C: with A held and B blocked on A, no queued
+    // event can make progress — a completion run must consume zero ticks
+    // instead of burning its budget advancing motionless campaign time.
+    // Resumption then completes the graph.
+    let mut spine = Spine::with_reservation(RecordingWorld::new(), 100, 50);
+    let a = spine.schedule(at(Field::Near, 5, 1)).expect("a");
+    let b = spine
+        .schedule(at(Field::Near, 2, 2).with_dependencies(vec![a]))
+        .expect("b");
+    spine.run_ticks(2); // tick 2: B due, blocked on unexecuted A
+    assert_eq!(spine.blocked_count(), 1);
+    spine.suspend_matching(|view| view.payload == 1); // A held; B blocked
+    let clock_before = spine.clock();
+    assert_eq!(
+        spine.run_to_completion(1_000),
+        0,
+        "no progressible work: zero ticks consumed"
+    );
+    assert_eq!(
+        spine.clock(),
+        clock_before,
+        "campaign time does not advance on a motionless graph"
+    );
+    assert_eq!(spine.blocked_count(), 1, "B still waits on the held A");
+    assert!(spine.has_unfinished_work());
+    assert!(conservation(&spine));
+    // Resumption completes: A re-enters with its original due, executes,
+    // releases B; B executes late with its original due intact.
+    spine.resume_matching(|view| view.payload == 1);
+    let used = spine.run_to_completion(1_000);
+    assert!(used > 0, "resumed work progresses again");
+    assert!(!spine.has_unfinished_work());
+    let b_record = spine
+        .ledger()
+        .iter()
+        .find(|record| record.id.seq == b.seq)
+        .expect("b executes after resumption");
+    assert!(b_record.late);
+    assert!(conservation(&spine));
+}
