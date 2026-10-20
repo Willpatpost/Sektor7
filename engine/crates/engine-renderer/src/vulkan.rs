@@ -77,6 +77,12 @@ use sdl3::video::Window as SdlWindow;
 const VALIDATION_LAYER_NAME: &str = "VK_LAYER_KHRONOS_validation";
 /// Shader entry point for all Stage 2 pipelines.
 const ENTRY_MAIN: &CStr = c"main";
+/// Upper bound for any host-side fence wait (nanoseconds). A stuck
+/// submission must surface as an error the application can report,
+/// never as an unresponsive window (rig finding 2026-10-20: pacing
+/// faster than a vsync-locked present mode can drain wedged the frame
+/// loop — 240 fps pacing against FIFO on a 60 Hz display).
+const WAIT_TIMEOUT_NS: u64 = 2_000_000_000;
 
 /// Validation messages from the driver callback: (class, text) where
 /// class 2 = error, 1 = warning, 0 = info. Bounded; drained by
@@ -1681,8 +1687,8 @@ pub(crate) fn render_frame(
     // Wait for this slot's previous submission.
     unsafe {
         ctx.device
-            .wait_for_fences(&[frames.in_flight[slot]], true, u64::MAX)
-            .map_err(|error| RendererError::vk(error, "wait_for_fences"))?;
+            .wait_for_fences(&[frames.in_flight[slot]], true, WAIT_TIMEOUT_NS)
+            .map_err(|error| RendererError::vk(error, "wait_for_fences (slot fence timed out — a submission never completed; presenting faster than the present mode drains?)"))?;
         ctx.device
             .reset_fences(&[frames.in_flight[slot]])
             .map_err(|error| RendererError::vk(error, "reset_fences"))?;
@@ -1734,6 +1740,13 @@ pub(crate) fn render_frame(
             }
             return Ok(outcome);
         }
+        Err(vk::Result::TIMEOUT) => {
+            return Err(RendererError::Vulkan(
+                "acquire_next_image timed out: no swapchain image became available in 100 ms \
+                 (present mode not draining — vsync-locked FIFO paced beyond the display rate?)"
+                    .into(),
+            ));
+        }
         Err(error) => return Err(RendererError::vk(error, "acquire_next_image")),
     };
     outcome.suboptimal = suboptimal;
@@ -1742,8 +1755,13 @@ pub(crate) fn render_frame(
         if *image_fence != vk::Fence::null() {
             unsafe {
                 ctx.device
-                    .wait_for_fences(&[*image_fence], true, u64::MAX)
-                    .map_err(|error| RendererError::vk(error, "wait image fence"))?;
+                    .wait_for_fences(&[*image_fence], true, WAIT_TIMEOUT_NS)
+                    .map_err(|error| {
+                        RendererError::vk(
+                            error,
+                            "wait image fence (timed out — a submission never completed)",
+                        )
+                    })?;
             }
         }
         *image_fence = frames.in_flight[slot];
