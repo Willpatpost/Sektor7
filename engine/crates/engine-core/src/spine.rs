@@ -167,6 +167,40 @@ pub struct LaneTotals {
     pub far_backlogged_ticks: u64,
 }
 
+/// Observational suspension counters (Stage 4 diagnostics — like
+/// `LaneTotals`, never fingerprinted; the held set itself is the
+/// authoritative suspended state).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuspensionStats {
+    /// Total obligations moved into the held set.
+    pub suspended_total: u64,
+    /// Total obligations returned from the held set.
+    pub resumed_total: u64,
+}
+
+/// Where an obligation currently lives (Stage 4 suspension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationLocation {
+    Queued,
+    Blocked,
+    Held,
+}
+
+/// Read-only view of one pending or held obligation, for suspension and
+/// resumption matching. The spine treats `class` and `payload` as
+/// opaque — the mapping between event classes and spatial regions is
+/// application policy (Stage 4 reviewer clarification B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObligationView<'a> {
+    pub id: EventId,
+    pub due: Tick,
+    pub class: EventClass,
+    pub payload: u64,
+    pub field: Field,
+    pub depends_on: &'a [EventId],
+    pub location: ObligationLocation,
+}
+
 /// Queue entry, ordered by `(due, seq)`. Each dequeue selects the minimum
 /// key among currently queued, due events; a causality-blocked event leaves
 /// the queue and reenters with its original priority once its dependencies
@@ -188,6 +222,18 @@ impl Pending {
             due,
             seq: event.id.seq,
             event,
+        }
+    }
+
+    fn view(&self, location: ObligationLocation) -> ObligationView<'_> {
+        ObligationView {
+            id: self.event.id,
+            due: self.due,
+            class: self.event.class,
+            payload: self.event.payload,
+            field: self.event.field,
+            depends_on: &self.event.depends_on,
+            location,
         }
     }
 }
@@ -228,6 +274,19 @@ pub struct Spine<W: World> {
     diag: Diagnostics,
     last_report: LaneReport,
     lane_totals: LaneTotals,
+    /// Stage 4 suspended obligations, keyed by seq (canonical order —
+    /// the authoritative held state). Identity-preserving: records keep
+    /// their original `(due, seq)`, lane, schedule, payload, and
+    /// dependencies; `stats.scheduled` is never decremented (suspension
+    /// changes an obligation's location, not the fact it was scheduled).
+    held: BTreeMap<u64, Pending>,
+    /// Incrementally maintained `(due, seq)` index over the held set —
+    /// updated only at suspension/resumption, so the watermark's held
+    /// contribution is O(log n) and dormant cost never scales with the
+    /// number of held obligations per tick (Stage 4 reviewer
+    /// constraint). Derived state; the held map is canonical.
+    held_index: BTreeSet<(Tick, u64)>,
+    suspension: SuspensionStats,
 }
 
 impl<W: World> Spine<W> {
@@ -276,6 +335,9 @@ impl<W: World> Spine<W> {
             diag,
             last_report: LaneReport::default(),
             lane_totals: LaneTotals::default(),
+            held: BTreeMap::new(),
+            held_index: BTreeSet::new(),
+            suspension: SuspensionStats::default(),
         }
     }
 
@@ -348,6 +410,34 @@ impl<W: World> Spine<W> {
         self.blocked.len()
     }
 
+    /// Suspended (held) obligations — authoritative unfinished work that
+    /// cannot execute while suspended (Stage 4).
+    pub fn held_count(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Read-only held-obligation views, in canonical seq order.
+    pub fn held_view(&self) -> Vec<ObligationView<'_>> {
+        self.held
+            .values()
+            .map(|pending| pending.view(ObligationLocation::Held))
+            .collect()
+    }
+
+    /// Observational suspension counters (never fingerprinted).
+    pub fn suspension_stats(&self) -> SuspensionStats {
+        self.suspension
+    }
+
+    /// True while any obligation remains unfinished — runnable (queued
+    /// or blocked) **or held**. [`Self::run_to_completion`] stops when
+    /// no *runnable* work remains; held obligations are unfinished work
+    /// that cannot execute while suspended — no runnable work is not no
+    /// unfinished work (Stage 4 reviewer clarification C).
+    pub fn has_unfinished_work(&self) -> bool {
+        self.has_any_work() || !self.held.is_empty()
+    }
+
     pub fn is_executed(&self, id: EventId) -> bool {
         self.executed.contains(&id.seq)
     }
@@ -358,7 +448,11 @@ impl<W: World> Spine<W> {
         self.ledger.iter().map(|r| r.intended_due).max()
     }
 
-    /// Smallest intended due among pending events (queued or blocked).
+    /// Smallest intended due among pending events — queued, blocked, or
+    /// held (suspended obligations are authoritative, so suspension can
+    /// never let the safe watermark advance past them; Stage 4 reviewer
+    /// clarification B). The held contribution reads the incrementally
+    /// maintained `(due, seq)` index — O(log n), never a scan.
     pub fn min_pending_due(&self) -> Option<Tick> {
         let mut min = self
             .near_queue
@@ -371,6 +465,9 @@ impl<W: World> Spine<W> {
             let due = event.schedule.due();
             min = Some(min.map_or(due, |m| m.min(due)));
         }
+        if let Some((due, _)) = self.held_index.first() {
+            min = Some(min.map_or(*due, |m| m.min(*due)));
+        }
         min
     }
 
@@ -380,8 +477,9 @@ impl<W: World> Spine<W> {
     /// 1. `T <= max_executed_due` — completeness is never claimed beyond
     ///    work that has actually run, because a future late arrival may
     ///    still carry an earlier due; and
-    /// 2. no pending event — queued, executing, or blocked by unresolved
-    ///    causal dependencies — has an intended due `<= T`.
+    /// 2. no pending event — queued, executing, blocked by unresolved
+    ///    causal dependencies, **or held (suspended)** — has an intended
+    ///    due `<= T`.
     ///
     /// Returns `None` when no such `T` exists: nothing has executed yet, or
     /// a pending event sits at tick 0 (independent audit 2026-10-19, item 1
@@ -463,6 +561,140 @@ impl<W: World> Spine<W> {
         Ok(id)
     }
 
+    // ---------------------------------------------------------- suspension
+
+    /// Suspends matching pending (queued or blocked) obligations into
+    /// the held set — **identity-preserving** relocation (Stage 4
+    /// reviewer clarification A): each record keeps its original
+    /// `EventId`, due, class, schedule, payload, lane, and dependencies;
+    /// nothing is re-scheduled, and `stats.scheduled` is never
+    /// decremented (clarification B — suspension changes an obligation's
+    /// location, not the fact it was scheduled).
+    ///
+    /// Suspending a *queued* event leaves `waiting_on` registrations
+    /// intact, so dependents of the suspended event correctly remain
+    /// blocked until it resumes and executes. Suspending a *blocked*
+    /// event also removes its `waiting_on` registrations, keeping the
+    /// dependency-release path hold-unaware; `resume` re-validates
+    /// dependencies through the normal path. Held ids remain valid
+    /// dependency targets (`known` is untouched). Already-held matches
+    /// are no-ops. The caller's predicate decides what matches — the
+    /// spine never assumes event classes mean regions (clarification B).
+    /// Suspension happens between ticks; an executing event cannot be
+    /// suspended.
+    pub fn suspend_matching(&mut self, mut matches: impl FnMut(&ObligationView) -> bool) -> u32 {
+        let mut suspended = 0u32;
+        suspended += Self::suspend_from_queue(
+            &mut self.near_queue,
+            &mut self.held,
+            &mut self.held_index,
+            &mut matches,
+        );
+        suspended += Self::suspend_from_queue(
+            &mut self.far_queue,
+            &mut self.held,
+            &mut self.held_index,
+            &mut matches,
+        );
+        let blocked_matches: Vec<u64> = self
+            .blocked
+            .values()
+            .filter(|event| matches(&event_view(event, ObligationLocation::Blocked)))
+            .map(|event| event.id.seq)
+            .collect();
+        for seq in blocked_matches {
+            if let Some(event) = self.blocked.remove(&seq) {
+                // Leave the dependency-release path hold-unaware: drop
+                // this event's registrations on its unexecuted deps.
+                for dep in &event.depends_on {
+                    if !self.executed.contains(&dep.seq)
+                        && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
+                    {
+                        waiters.retain(|&waiter| waiter != seq);
+                        if waiters.is_empty() {
+                            self.waiting_on.remove(&dep.seq);
+                        }
+                    }
+                }
+                let pending = Pending::new(event);
+                self.held_index.insert((pending.due, pending.seq));
+                self.held.insert(pending.seq, pending);
+                suspended += 1;
+            }
+        }
+        self.suspension.suspended_total += u64::from(suspended);
+        suspended
+    }
+
+    /// Returns matching held obligations to pending state with their
+    /// original `(due, seq)`, lane, schedule, payload, and dependencies
+    /// — identity preserved through the entire suspension. An event
+    /// suspended while queued simply re-enters its lane with its
+    /// original priority; an event suspended while blocked re-validates
+    /// its dependencies — queueing if all have executed, re-entering the
+    /// blocked set with fresh `waiting_on` registrations otherwise
+    /// (execution statistics are untouched either way). Non-held
+    /// matches are no-ops.
+    ///
+    /// Resumed obligations that became overdue during suspension keep
+    /// their original due and record lateness upon actual execution —
+    /// clock coherence is a property of the reconstructed state, never
+    /// an erasure of historical due times (reviewer clarification C).
+    pub fn resume_matching(&mut self, mut matches: impl FnMut(&ObligationView) -> bool) -> u32 {
+        let to_resume: Vec<u64> = self
+            .held
+            .values()
+            .filter(|pending| matches(&pending.view(ObligationLocation::Held)))
+            .map(|pending| pending.seq)
+            .collect();
+        let mut resumed = 0u32;
+        for seq in to_resume {
+            if let Some(pending) = self.held.remove(&seq) {
+                self.held_index.remove(&(pending.due, pending.seq));
+                let unmet = self.unmet_dependencies(&pending.event);
+                if unmet.is_empty() {
+                    match pending.event.field {
+                        Field::Near => self.near_queue.push(Reverse(pending)),
+                        Field::Far => self.far_queue.push(Reverse(pending)),
+                    }
+                } else {
+                    self.register_waiters(seq, &unmet);
+                    self.blocked.insert(seq, pending.event);
+                }
+                resumed += 1;
+            }
+        }
+        self.suspension.resumed_total += u64::from(resumed);
+        resumed
+    }
+
+    /// Drains one lane, holding matching entries and re-pushing the
+    /// rest. Heap layout is rebuild-order-dependent but every observable
+    /// behavior (pop order, fingerprints) derives from the canonical
+    /// `(due, seq)` keys, so a rebuild is invisible.
+    fn suspend_from_queue(
+        queue: &mut BinaryHeap<Reverse<Pending>>,
+        held: &mut BTreeMap<u64, Pending>,
+        held_index: &mut BTreeSet<(Tick, u64)>,
+        matches: &mut impl FnMut(&ObligationView) -> bool,
+    ) -> u32 {
+        let mut suspended = 0u32;
+        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
+        while let Some(Reverse(pending)) = queue.pop() {
+            if matches(&pending.view(ObligationLocation::Queued)) {
+                held_index.insert((pending.due, pending.seq));
+                held.insert(pending.seq, pending);
+                suspended += 1;
+            } else {
+                retained.push(Reverse(pending));
+            }
+        }
+        for item in retained {
+            queue.push(item);
+        }
+        suspended
+    }
+
     // -------------------------------------------------------------- ticking
 
     /// Advances one tick and processes due events under the per-tick
@@ -524,8 +756,12 @@ impl<W: World> Spine<W> {
         self.clock
     }
 
-    /// Runs until no pending work remains (queue and blocked set both
-    /// empty) or `max_ticks` elapse; returns the ticks consumed.
+    /// Runs until no *runnable* work remains (queue and blocked set both
+    /// empty) or `max_ticks` elapse; returns the ticks consumed. Held
+    /// (suspended) obligations are unfinished work that cannot execute
+    /// while suspended — stopping does **not** imply all obligations
+    /// have completed; see [`Self::has_unfinished_work`] (Stage 4
+    /// reviewer clarification C: no runnable work ≠ no unfinished work).
     ///
     /// Termination is guaranteed only for **finite** event graphs: within a
     /// fixed scheduled set, dependency chains are acyclic by construction
@@ -715,6 +951,33 @@ impl<W: World> Spine<W> {
         format!("{:016x}", self.lane_state_fingerprint())
     }
 
+    /// Stage 4 held-state fingerprint (domain "engine-core/spine-held/1"):
+    /// the authoritative suspension state, canonically ordered by seq.
+    /// The existing domains ("engine-core/spine/2", "spine-lanes/1")
+    /// deliberately exclude the held set, so every historical baseline
+    /// stays byte-identical when suspension is unused; authoritative
+    /// Stage 4 comparisons compose this domain with the lane and world
+    /// domains at the application level (the combined fingerprint lives
+    /// in `engine-slice`, reviewer clarification C).
+    pub fn held_fingerprint(&self) -> u64 {
+        let mut fp = Fingerprinter::new();
+        fp.write_str("engine-core/spine-held/1");
+        fp.write_usize(self.held.len());
+        for pending in self.held.values() {
+            fp.write_u64(pending.seq);
+            fp.write_u8(field_byte(pending.event.field));
+            fp.write_u32(u32::from(pending.event.class.0));
+            fp.write_u64(pending.event.payload);
+            fingerprint_schedule(&mut fp, &pending.event.schedule);
+            fingerprint_deps(&mut fp, &pending.event);
+        }
+        fp.finish()
+    }
+
+    pub fn held_fingerprint_hex(&self) -> String {
+        format!("{:016x}", self.held_fingerprint())
+    }
+
     // ------------------------------------------------------------ internals
 
     /// Drains due events from one lane, executing up to `cap`.
@@ -883,6 +1146,18 @@ impl<W: World> Spine<W> {
 
     fn has_any_work(&self) -> bool {
         !self.near_queue.is_empty() || !self.far_queue.is_empty() || !self.blocked.is_empty()
+    }
+}
+
+fn event_view(event: &Event, location: ObligationLocation) -> ObligationView<'_> {
+    ObligationView {
+        id: event.id,
+        due: event.schedule.due(),
+        class: event.class,
+        payload: event.payload,
+        field: event.field,
+        depends_on: &event.depends_on,
+        location,
     }
 }
 

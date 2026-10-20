@@ -44,6 +44,7 @@ pub mod clock;
 pub mod diag;
 pub mod event;
 pub mod fingerprint;
+pub mod lod;
 pub mod spine;
 
 pub use clock::Tick;
@@ -52,4 +53,8 @@ pub use event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 pub use fingerprint::Fingerprinter;
-pub use spine::{ExecCtx, LaneReport, LaneTotals, ScheduleError, Spine, Stats, World};
+pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
+pub use spine::{
+    ExecCtx, LaneReport, LaneTotals, ObligationLocation, ObligationView, ScheduleError, Spine,
+    Stats, SuspensionStats, World,
+};
