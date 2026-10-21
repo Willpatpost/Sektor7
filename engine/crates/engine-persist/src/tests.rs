@@ -1049,3 +1049,439 @@ fn insert_once_mismatch_referenced_fails_closed() {
     );
     assert_eq!(medium.head().expect("head"), Some(r1_id), "HEAD unchanged");
 }
+
+// ------------------------------------------- review corrective A–D (regressions)
+
+/// A: an external revision claiming an arbitrary epoch over the
+/// trusted head fails closed at the suffix boundary (and the fallback
+/// cold walk agrees — no cursor poisoning between attempts).
+#[test]
+fn a_suffix_boundary_epoch_enforced() {
+    let dir = TestDir::new("a-boundary-epoch");
+    let (mut stale, f) = founded_store(dir.path());
+
+    // An externally installed revision claiming epoch 47 while
+    // pointing at the trusted epoch-0 head — hash-consistent, decode
+    // valid, semantically invalid.
+    let mut external = regular(f, 0, 1);
+    external.epoch = 47;
+    install_object(dir.path(), &external.canonical_bytes());
+    install_head(dir.path(), &external.id());
+
+    let record = regular(f, 0, 2);
+    let error = stale
+        .append(&record, &[], Some(f))
+        .expect_err("the boundary epoch must fail closed");
+    expect_chain(error, "epoch-regression");
+    // Fail-closed determinism: a second attempt errs identically.
+    let error = stale
+        .append(&record, &[], Some(f))
+        .expect_err("the boundary epoch must fail closed again");
+    expect_chain(error, "epoch-regression");
+}
+
+/// A: a dependency naming a nonexistent revision fails the cold walk.
+#[test]
+fn a_dependency_on_nonexistent_revision_fails_closed() {
+    let dir = TestDir::new("a-dep-missing");
+    let root = dir.path();
+    let f = founding(0);
+    let f_id = install_object(root, &f.canonical_bytes());
+    let phantom = hash_object(b"no-such-revision");
+    let r = regular(f_id, 0, 1).with_depends_on(vec![phantom]);
+    let r_id = install_object(root, &r.canonical_bytes());
+    install_head(root, &r_id);
+
+    let error = open_expect_err(root, "dependency must resolve");
+    expect_chain(error, "depends-on-unresolvable");
+}
+
+/// A: a dependency naming an existing-but-unrelated object (not a
+/// chain ancestor) fails closed — membership in objects/ is never
+/// ancestry.
+#[test]
+fn a_dependency_on_unrelated_object_fails_closed() {
+    let dir = TestDir::new("a-dep-unrelated");
+    let root = dir.path();
+    let f = founding(0);
+    let f_id = install_object(root, &f.canonical_bytes());
+    // A standalone hash-consistent record that is NOT part of the
+    // authoritative chain.
+    let stranger = regular(Hash::ZERO, 0, 9);
+    let stranger_id = install_object(root, &stranger.canonical_bytes());
+    let r = regular(f_id, 0, 1).with_depends_on(vec![stranger_id]);
+    let r_id = install_object(root, &r.canonical_bytes());
+    install_head(root, &r_id);
+
+    let error = open_expect_err(root, "unrelated dependency must fail");
+    expect_chain(error, "depends-on-unresolvable");
+}
+
+/// A: a dependency naming a content hash (reachable, but not a
+/// revision) fails closed — dependencies name revisions, never
+/// content.
+#[test]
+fn a_dependency_on_content_hash_fails_closed() {
+    let dir = TestDir::new("a-dep-content");
+    let root = dir.path();
+    let f = founding(0);
+    let f_id = install_object(root, &f.canonical_bytes());
+    // The record references a content object AND names its hash as a
+    // dependency — reachable, but not a revision.
+    let object = content_object(b"a-dep-content");
+    install_object(root, object.bytes());
+    let r = regular(f_id, 0, 1)
+        .with_content_refs(vec![object.hash()])
+        .with_depends_on(vec![object.hash()]);
+    let r_id = install_object(root, &r.canonical_bytes());
+    install_head(root, &r_id);
+
+    let error = open_expect_err(root, "content-hash dependency must fail");
+    expect_chain(error, "depends-on-unresolvable");
+}
+
+/// A: epoch-overflow boundaries fail closed with checked arithmetic —
+/// u64::MAX epochs never wrap and never panic.
+#[test]
+fn a_epoch_overflow_fails_closed() {
+    // A head claiming u64::MAX over an epoch-0 parent.
+    {
+        let dir = TestDir::new("a-overflow-max");
+        let root = dir.path();
+        let f = founding(0);
+        let f_id = install_object(root, &f.canonical_bytes());
+        let mut r = regular(f_id, 0, 1);
+        r.epoch = u64::MAX;
+        let r_id = install_object(root, &r.canonical_bytes());
+        install_head(root, &r_id);
+        let error = open_expect_err(root, "MAX epoch over epoch 0 must fail");
+        expect_chain(error, "epoch-regression");
+    }
+    // Two records both claiming u64::MAX: the linkage's checked add
+    // has no successor — the exact overflow boundary.
+    {
+        let dir = TestDir::new("a-overflow-pair");
+        let root = dir.path();
+        let f = founding(0);
+        let f_id = install_object(root, &f.canonical_bytes());
+        let mut r1 = regular(f_id, 0, 1);
+        r1.epoch = u64::MAX;
+        let r1_id = install_object(root, &r1.canonical_bytes());
+        let mut r2 = regular(r1_id, 0, 2);
+        r2.epoch = u64::MAX;
+        let r2_id = install_object(root, &r2.canonical_bytes());
+        install_head(root, &r2_id);
+        let error = open_expect_err(root, "MAX-to-MAX linkage must fail");
+        expect_chain(error, "epoch-regression");
+    }
+}
+
+/// B: a multi-revision external suffix is absorbed with the cursor's
+/// head, epoch, and indexes mutually consistent — the stale session
+/// appends a valid direct descendant afterwards with no further walk.
+#[test]
+fn b_multi_revision_suffix_absorbed_consistently() {
+    let dir = TestDir::new("b-multi-suffix");
+    let (mut stale, f) = founded_store(dir.path());
+
+    // An external session appends two revisions.
+    let mut external = LocalFileMedium::open(dir.path()).expect("open external");
+    let r1 = regular(f, 0, 1);
+    let r1_id = append_accepted(&mut external, &r1, &[], Some(f));
+    let r2 = regular(r1_id, 1, 2);
+    let r2_id = append_accepted(&mut external, &r2, &[], Some(r1_id));
+    drop(external);
+
+    // The stale session still expects f: the complete two-record
+    // suffix is validated and absorbed, then the append is
+    // stale-rejected.
+    let stale_record = regular(f, 0, 3);
+    match stale
+        .append(&stale_record, &[], Some(f))
+        .expect("stale append completes")
+    {
+        AppendOutcome::RejectedStaleParent { observed } => assert_eq!(observed, Some(r2_id)),
+        other => panic!("expected stale rejection, got {other:?}"),
+    }
+    assert_eq!(
+        stale.walk_stats().last_append_walked,
+        2,
+        "the complete two-record suffix was walked"
+    );
+
+    // The cursor is consistent: a direct descendant of r2 at epoch 3
+    // is accepted (the cursor's epoch must be 2, not 1) with no
+    // further walk.
+    let r3 = regular(r2_id, 2, 4);
+    let r3_id = append_accepted(&mut stale, &r3, &[], Some(r2_id));
+    assert_eq!(
+        stale.walk_stats().last_append_walked,
+        0,
+        "the next ordinary append requires no additional history walk"
+    );
+
+    let summary = stale.validate().expect("validate");
+    assert_eq!(summary.records, 4);
+    assert_eq!(summary.height, 3);
+    assert_eq!(summary.head, r3_id);
+}
+
+/// C: reconciliation never returns Installed from unverified history —
+/// the ancestor candidate's own object bytes are corrupted.
+#[test]
+fn c_reconcile_ancestor_corrupt_candidate_fails_closed() {
+    let dir = TestDir::new("c-corrupt-candidate");
+    let (mut medium, f) = founded_store(dir.path());
+    let r1 = regular(f, 0, 1);
+    let r1_id = append_accepted(&mut medium, &r1, &[], Some(f));
+    let r2 = regular(r1_id, 1, 2);
+    append_accepted(&mut medium, &r2, &[], Some(r1_id));
+
+    // Corrupt the candidate's own bytes after the session opened.
+    let path = object_path(dir.path(), &r1_id);
+    let mut bytes = fs::read(&path).expect("read candidate");
+    bytes[0] ^= 0xff;
+    fs::write(&path, &bytes).expect("corrupt candidate");
+
+    let error = medium
+        .reconcile_unknown(&r1_id)
+        .expect_err("a corrupt candidate must fail closed");
+    assert!(
+        matches!(error, MediumError::ReferencedObjectCorrupt { hash } if hash == r1_id),
+        "expected ReferencedObjectCorrupt, got {error}"
+    );
+}
+
+/// C: a content object referenced by the candidate is corrupted —
+/// reconciliation fails closed instead of confirming.
+#[test]
+fn c_reconcile_ancestor_corrupt_candidate_content_fails_closed() {
+    let dir = TestDir::new("c-corrupt-candidate-content");
+    let (mut medium, f) = founded_store(dir.path());
+    let object = content_object(b"c-candidate-content");
+    let object_hash = object.hash();
+    let r1 = regular(f, 0, 1).with_content_refs(vec![object_hash]);
+    let r1_id = append_accepted(&mut medium, &r1, std::slice::from_ref(&object), Some(f));
+    let r2 = regular(r1_id, 1, 2);
+    append_accepted(&mut medium, &r2, &[], Some(r1_id));
+
+    let path = object_path(dir.path(), &object_hash);
+    let mut bytes = fs::read(&path).expect("read content");
+    bytes[0] ^= 0xff;
+    fs::write(&path, &bytes).expect("corrupt content");
+
+    let error = medium
+        .reconcile_unknown(&r1_id)
+        .expect_err("corrupt candidate content must fail closed");
+    assert!(
+        matches!(error, MediumError::ReferencedObjectCorrupt { hash } if hash == object_hash),
+        "expected ReferencedObjectCorrupt, got {error}"
+    );
+}
+
+/// C: a descendant's hash-failing content fails closed — the whole
+/// authoritative chain is verified before any classification.
+#[test]
+fn c_reconcile_ancestor_descendant_corrupt_content_fails_closed() {
+    let dir = TestDir::new("c-corrupt-descendant-content");
+    let (mut medium, f) = founded_store(dir.path());
+    let r1 = regular(f, 0, 1);
+    let r1_id = append_accepted(&mut medium, &r1, &[], Some(f));
+    let object = content_object(b"c-descendant-content");
+    let object_hash = object.hash();
+    let r2 = regular(r1_id, 1, 2).with_content_refs(vec![object_hash]);
+    append_accepted(&mut medium, &r2, std::slice::from_ref(&object), Some(r1_id));
+
+    let path = object_path(dir.path(), &object_hash);
+    let mut bytes = fs::read(&path).expect("read content");
+    bytes[0] ^= 0xff;
+    fs::write(&path, &bytes).expect("corrupt content");
+
+    let error = medium
+        .reconcile_unknown(&r1_id)
+        .expect_err("corrupt descendant content must fail closed");
+    assert!(
+        matches!(error, MediumError::ReferencedObjectCorrupt { hash } if hash == object_hash),
+        "expected ReferencedObjectCorrupt, got {error}"
+    );
+}
+
+/// C: a descendant violating epoch integrity fails closed.
+#[test]
+fn c_reconcile_ancestor_descendant_epoch_violation_fails_closed() {
+    let dir = TestDir::new("c-descendant-epoch");
+    let root = dir.path();
+    // A session open while the chain is valid.
+    let (mut medium, f) = founded_store(root);
+    let r1 = regular(f, 0, 1);
+    let r1_id = append_accepted(&mut medium, &r1, &[], Some(f));
+    let r2 = regular(r1_id, 1, 2);
+    let r2_id = append_accepted(&mut medium, &r2, &[], Some(r1_id));
+
+    // Externally replace the head with a hash-consistent record
+    // claiming a skipping epoch over r1.
+    let mut bad = regular(r1_id, 0, 3);
+    bad.epoch = 5;
+    let bad_id = install_object(root, &bad.canonical_bytes());
+    fs::remove_file(object_path(root, &r2_id)).expect("remove the valid head object");
+    install_head(root, &bad_id);
+
+    let error = medium
+        .reconcile_unknown(&r1_id)
+        .expect_err("epoch-violating history must fail closed");
+    expect_chain(error, "epoch-regression");
+}
+
+/// C: a descendant with an unresolvable dependency fails closed.
+#[test]
+fn c_reconcile_ancestor_descendant_dependency_violation_fails_closed() {
+    let dir = TestDir::new("c-descendant-dependency");
+    let root = dir.path();
+    // A session open while the chain is valid.
+    let (mut medium, f) = founded_store(root);
+    let r1 = regular(f, 0, 1);
+    let r1_id = append_accepted(&mut medium, &r1, &[], Some(f));
+    let r2 = regular(r1_id, 1, 2);
+    let r2_id = append_accepted(&mut medium, &r2, &[], Some(r1_id));
+
+    // Externally replace the head with a hash-consistent record
+    // carrying a dependency on a revision that does not exist.
+    let phantom = hash_object(b"c-descendant-phantom");
+    let bad = regular(r1_id, 1, 3).with_depends_on(vec![phantom]);
+    let bad_id = install_object(root, &bad.canonical_bytes());
+    fs::remove_file(object_path(root, &r2_id)).expect("remove the valid head object");
+    install_head(root, &bad_id);
+
+    let error = medium
+        .reconcile_unknown(&r1_id)
+        .expect_err("dependency-violating history must fail closed");
+    expect_chain(error, "depends-on-unresolvable");
+}
+
+/// D2: repeated quarantine of distinct objects under the same
+/// original name preserves every incident's bytes and provenance.
+#[test]
+fn d2_repeated_quarantine_same_name_preserves_both_incidents() {
+    let dir = TestDir::new("d2-repeat-quarantine");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    // First incident: junk under a valid hash name.
+    let junk_hash = hash_object(b"first-incident");
+    let objects = root.join(OBJECTS_DIR);
+    fs::write(objects.join(junk_hash.hex()), b"first-garbage").expect("place first junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen sweeps");
+        medium.validate().expect("chain still validates");
+    }
+    let quarantine = root.join(QUARANTINE_DIR);
+    assert_eq!(
+        fs::read(quarantine.join(junk_hash.hex())).expect("first incident preserved"),
+        b"first-garbage"
+    );
+
+    // Second incident under the same name: the collision-safe
+    // placement must not destroy the first evidence.
+    fs::write(objects.join(junk_hash.hex()), b"second-garbage").expect("place second junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen sweeps again");
+        medium.validate().expect("chain still validates");
+    }
+    assert_eq!(
+        fs::read(quarantine.join(junk_hash.hex())).expect("first incident still preserved"),
+        b"first-garbage"
+    );
+    assert_eq!(
+        fs::read(quarantine.join(format!("{}.1", junk_hash.hex())))
+            .expect("second incident preserved"),
+        b"second-garbage"
+    );
+    // Provenance notes accompany both incidents.
+    assert!(
+        quarantine
+            .join(format!("{}.reason", junk_hash.hex()))
+            .exists()
+    );
+    assert!(
+        quarantine
+            .join(format!("{}.1.reason", junk_hash.hex()))
+            .exists()
+    );
+}
+
+/// D2: an interrupted quarantine (bytes moved, note never written)
+/// leaves the earlier incident untouched on the next pass.
+#[test]
+fn d2_quarantine_collision_with_interrupted_note() {
+    let dir = TestDir::new("d2-interrupted-note");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    let junk_hash = hash_object(b"interrupted-incident");
+    let objects = root.join(OBJECTS_DIR);
+    let quarantine = root.join(QUARANTINE_DIR);
+    // Simulate an interrupted quarantine: bytes moved, no reason note.
+    fs::write(objects.join(junk_hash.hex()), b"first-garbage").expect("place junk");
+    fs::rename(
+        objects.join(junk_hash.hex()),
+        quarantine.join(junk_hash.hex()),
+    )
+    .expect("move without a note");
+
+    // A later incident under the same name must not overwrite the
+    // noteless evidence.
+    fs::write(objects.join(junk_hash.hex()), b"second-garbage").expect("place second junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen sweeps");
+        medium.validate().expect("chain still validates");
+    }
+    assert_eq!(
+        fs::read(quarantine.join(junk_hash.hex())).expect("noteless evidence untouched"),
+        b"first-garbage"
+    );
+    assert_eq!(
+        fs::read(quarantine.join(format!("{}.1", junk_hash.hex())))
+            .expect("second incident preserved"),
+        b"second-garbage"
+    );
+}
+
+/// D2: a session open with HEAD absent (an interrupted founding
+/// attempt) sweeps every object into quarantine — evidence preserved,
+/// no founding revision manufactured — and a fresh founding succeeds.
+#[test]
+fn d2_head_absent_sweep_preserves_evidence() {
+    let dir = TestDir::new("d2-head-absent");
+    let root = dir.path();
+    // An interrupted founding attempt: a founding record's object and
+    // a content object exist, but HEAD was never published.
+    let f = founding(0);
+    let f_id = install_object(root, &f.canonical_bytes());
+    let object = content_object(b"d2-orphan-content");
+    install_object(root, object.bytes());
+
+    let mut medium = LocalFileMedium::open(root).expect("open sweeps the HEAD-absent store");
+    // Everything was unreferenced: moved to quarantine, never deleted.
+    let quarantine = root.join(QUARANTINE_DIR);
+    assert!(
+        quarantine.join(f_id.hex()).exists(),
+        "the founding attempt's record is preserved"
+    );
+    assert!(
+        quarantine.join(object.hash().hex()).exists(),
+        "the founding attempt's content is preserved"
+    );
+    assert!(!object_path(root, &f_id).exists());
+    assert!(!object_path(root, &object.hash()).exists());
+    // No founding revision was manufactured.
+    assert_eq!(medium.head().expect("head"), None);
+
+    // A fresh founding attempt starts cleanly and succeeds.
+    let fresh = founding(7);
+    let fresh_id = append_accepted(&mut medium, &fresh, &[], None);
+    let summary = medium.validate().expect("validate");
+    assert_eq!(summary.records, 1);
+    assert_eq!(summary.head, fresh_id);
+}

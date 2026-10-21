@@ -54,7 +54,7 @@
 //! outcome, so a stale `HEAD.tmp` is simply overwritten by the next
 //! publish.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -98,6 +98,10 @@ struct Cursor {
     seen_keys: BTreeSet<Vec<u8>>,
     /// Every record id and content hash reachable from HEAD.
     reachable: BTreeSet<Hash>,
+    /// The chain's revision ids alone (dependency resolution requires
+    /// a *prior revision*, never a content hash that happens to be
+    /// reachable).
+    record_ids: BTreeSet<Hash>,
     founding: Hash,
     authority: AuthorityMode,
     campaign_id: String,
@@ -196,7 +200,14 @@ impl LocalFileMedium {
                 medium.sweep_unreferenced()?;
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                // No authoritative HEAD (never founded, or an
+                // interrupted founding attempt): nothing is
+                // referenced — sweep every object into quarantine,
+                // preserving the attempt's evidence without
+                // manufacturing a founding revision.
+                medium.sweep_unreferenced().map(|_| ())
+            }
             Err(error) => Err(error),
         };
         let _ = medium.unlock();
@@ -372,7 +383,9 @@ impl LocalFileMedium {
                     .cursor
                     .as_ref()
                     .expect("validation established the cursor");
-                if record.epoch != cursor.epoch + 1 {
+                // Checked arithmetic: an epoch at u64::MAX has no
+                // valid successor and must fail closed, never wrap.
+                if cursor.epoch.checked_add(1) != Some(record.epoch) {
                     return Err(MediumError::Chain {
                         rule: "epoch-regression",
                     });
@@ -396,8 +409,11 @@ impl LocalFileMedium {
             });
         }
         if let Some(cursor) = &self.cursor {
+            // A dependency must name a prior revision of the
+            // authoritative chain — the record-id index, never the
+            // mixed reachable set (a content hash is not a revision).
             for dependency in &record.depends_on {
-                if !cursor.reachable.contains(dependency) {
+                if !cursor.record_ids.contains(dependency) {
                     return Err(MediumError::Chain {
                         rule: "depends-on-unresolvable",
                     });
@@ -626,15 +642,18 @@ impl LocalFileMedium {
     /// external divergence, a cold walk with no cursor, and fail-closed
     /// divergence when HEAD vanished or is not a descendant.
     fn validate_observed(&mut self, observed: Option<Hash>) -> Result<(), MediumError> {
-        match (observed, self.cursor.as_mut()) {
+        let trusted = self
+            .cursor
+            .as_ref()
+            .map(|cursor| (cursor.head, cursor.epoch));
+        match (observed, trusted) {
             (None, None) => Ok(()),
-            (Some(id), Some(cursor)) if id == cursor.head => {
+            (Some(id), Some((cursor_head, _))) if id == cursor_head => {
                 self.walks.last_append_walked = 0;
                 Ok(())
             }
-            (Some(id), Some(cursor)) => {
-                let trusted_head = cursor.head;
-                match self.walk_suffix(id, trusted_head) {
+            (Some(id), Some((trusted_head, trusted_epoch))) => {
+                match self.walk_suffix(id, trusted_head, trusted_epoch) {
                     Ok(suffix) => {
                         self.walks.last_append_walked = suffix.len() as u64;
                         self.absorb_suffix(suffix, id);
@@ -664,25 +683,67 @@ impl LocalFileMedium {
     /// suffix newest-first; reaching the founding record without
     /// encountering `until` is divergence. Bounded: a corrupt external
     /// chain whose parents cycle without passing through `until` fails
-    /// closed (the no-hang obligation), and the suffix must satisfy
-    /// the same idempotency-key uniqueness the cold walk enforces.
+    /// closed (the no-hang obligation). The suffix must satisfy the
+    /// same invariants the cold walk enforces: idempotency-key
+    /// uniqueness, checked epoch linkage **including the trusted-cursor
+    /// boundary** (the oldest suffix revision sits exactly one epoch
+    /// above the trusted head), and dependency ancestry (every
+    /// depends_on reference names a trusted revision or a strictly
+    /// older suffix revision).
     fn walk_suffix(
         &self,
         target: Hash,
         until: Hash,
+        trusted_epoch: u64,
     ) -> Result<Vec<(Hash, RevisionRecord)>, MediumError> {
-        let mut suffix = Vec::new();
+        let mut suffix: Vec<(Hash, RevisionRecord)> = Vec::new();
         let mut current = target;
         let mut newer_epoch: Option<u64> = None;
         let mut visited = BTreeSet::new();
         let mut suffix_keys = BTreeSet::new();
-        let trusted_keys = self
+        let (trusted_keys, trusted_record_ids) = self
             .cursor
             .as_ref()
-            .map(|cursor| cursor.seen_keys.clone())
+            .map(|cursor| (cursor.seen_keys.clone(), cursor.record_ids.clone()))
             .unwrap_or_default();
         loop {
             if current == until {
+                // The trusted-cursor boundary: the oldest suffix
+                // revision must sit exactly one epoch above the
+                // trusted head (checked arithmetic — no epoch above
+                // u64::MAX can satisfy it, so the boundary can never
+                // wrap).
+                if let Some((_, boundary)) = suffix.last()
+                    && trusted_epoch.checked_add(1) != Some(boundary.epoch)
+                {
+                    return Err(MediumError::Chain {
+                        rule: "epoch-regression",
+                    });
+                }
+                // Dependency ancestry, deferred until the suffix is
+                // complete: newest-first, a record at index i may
+                // depend only on trusted revisions (all older) or on
+                // suffix revisions at indices > i (strictly older) —
+                // a dependency naming a newer suffix record, itself,
+                // or anything outside the authoritative history is
+                // unresolvable.
+                let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
+                for (index, (id, _)) in suffix.iter().enumerate() {
+                    positions.insert(*id, index);
+                }
+                for (index, (_, record)) in suffix.iter().enumerate() {
+                    for dependency in &record.depends_on {
+                        let resolves = trusted_record_ids.contains(dependency)
+                            || positions
+                                .get(dependency)
+                                .is_some_and(|position| *position > index);
+                        if !resolves {
+                            return Err(MediumError::Chain {
+                                rule: "depends-on-unresolvable",
+                            });
+                        }
+                    }
+                }
                 return Ok(suffix);
             }
             if !visited.insert(current) {
@@ -690,8 +751,10 @@ impl LocalFileMedium {
             }
             let bytes = self.load_referenced(&current)?;
             let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            // Checked linkage: an epoch of u64::MAX has no successor —
+            // it must fail closed, never wrap.
             if let Some(epoch) = newer_epoch
-                && record.epoch + 1 != epoch
+                && record.epoch.checked_add(1) != Some(epoch)
             {
                 return Err(MediumError::Chain {
                     rule: "epoch-regression",
@@ -719,16 +782,20 @@ impl LocalFileMedium {
     }
 
     /// Merges a verified suffix (newest-first) into the cursor and
-    /// points it at the new head.
+    /// points it at the new head. Absorption runs oldest-first so the
+    /// final epoch written is the newest verified epoch — for a
+    /// multi-revision suffix the cursor's head, epoch, reachable set,
+    /// seen-key index, and record-id index stay mutually consistent.
     fn absorb_suffix(&mut self, suffix: Vec<(Hash, RevisionRecord)>, new_head: Hash) {
         let Some(cursor) = self.cursor.as_mut() else {
             return;
         };
-        for (id, record) in suffix {
+        for (id, record) in suffix.into_iter().rev() {
             if let Some(key) = &record.idempotency_key {
                 cursor.seen_keys.insert(key.clone());
             }
             cursor.reachable.insert(id);
+            cursor.record_ids.insert(id);
             for reference in &record.content_refs {
                 if cursor.reachable.insert(*reference) {
                     cursor.content_objects += 1;
@@ -740,8 +807,11 @@ impl LocalFileMedium {
     }
 
     /// The cold founding → HEAD walk: every record hash-verified,
-    /// epoch-linked, key-unique; every referenced object loaded and
-    /// hash-verified. Rebuilds the cursor and returns the summary.
+    /// epoch-linked with checked arithmetic, key-unique; every
+    /// referenced object loaded and hash-verified; every depends_on
+    /// reference resolving to a strictly earlier revision of the same
+    /// authoritative history. Rebuilds the cursor and returns the
+    /// summary.
     fn cold_walk_from(&mut self, head: Hash) -> Result<ChainSummary, MediumError> {
         let mut seen_ids = BTreeSet::new();
         let mut seen_keys = BTreeSet::new();
@@ -751,6 +821,9 @@ impl LocalFileMedium {
         let mut current = head;
         let mut newer_epoch: Option<u64> = None;
         let mut head_epoch = 0u64;
+        // (id, depends_on) per record in walk order (newest first) —
+        // dependency ancestry is validated once the chain is complete.
+        let mut walked: Vec<(Hash, Vec<Hash>)> = Vec::new();
         let (founding_id, authority, campaign_id) = loop {
             if !seen_ids.insert(current) {
                 return Err(MediumError::Chain { rule: "cycle" });
@@ -760,8 +833,10 @@ impl LocalFileMedium {
             if records == 0 {
                 head_epoch = record.epoch;
             }
+            // Checked linkage: an epoch of u64::MAX has no successor —
+            // it must fail closed, never wrap.
             if let Some(epoch) = newer_epoch
-                && record.epoch + 1 != epoch
+                && record.epoch.checked_add(1) != Some(epoch)
             {
                 return Err(MediumError::Chain {
                     rule: "epoch-regression",
@@ -781,6 +856,7 @@ impl LocalFileMedium {
                 }
             }
             reachable.insert(current);
+            walked.push((current, record.depends_on.clone()));
             records += 1;
             newer_epoch = Some(record.epoch);
             match record.parent {
@@ -805,12 +881,35 @@ impl LocalFileMedium {
                 },
             }
         };
+        // Dependency ancestry, deferred until the chain is complete:
+        // the walk runs newest-first, so a record at position i can
+        // only depend on revisions at positions > i (strictly earlier).
+        // A dependency naming a nonexistent revision, a content hash,
+        // itself, or any later revision is unresolvable — hash
+        // consistency alone never makes a chain semantically valid.
+        let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
+        for (index, (id, _)) in walked.iter().enumerate() {
+            positions.insert(*id, index);
+        }
+        for (index, (_, dependencies)) in walked.iter().enumerate() {
+            for dependency in dependencies {
+                if !positions
+                    .get(dependency)
+                    .is_some_and(|position| *position > index)
+                {
+                    return Err(MediumError::Chain {
+                        rule: "depends-on-unresolvable",
+                    });
+                }
+            }
+        }
         self.walks.cold_walk_records = records;
         self.cursor = Some(Cursor {
             head,
             epoch: head_epoch,
             seen_keys,
             reachable,
+            record_ids: seen_ids,
             founding: founding_id,
             authority,
             campaign_id: campaign_id.clone(),
@@ -846,6 +945,8 @@ impl LocalFileMedium {
                 }
                 let mut reachable = BTreeSet::new();
                 reachable.insert(*id);
+                let mut record_ids = BTreeSet::new();
+                record_ids.insert(*id);
                 let mut content_objects = 0u64;
                 for reference in refs {
                     if reachable.insert(*reference) {
@@ -857,6 +958,7 @@ impl LocalFileMedium {
                     epoch: record.epoch,
                     seen_keys,
                     reachable,
+                    record_ids,
                     founding: *id,
                     authority: *authority,
                     campaign_id: campaign_id.clone(),
@@ -870,6 +972,7 @@ impl LocalFileMedium {
                     cursor.seen_keys.insert(key.clone());
                 }
                 cursor.reachable.insert(*id);
+                cursor.record_ids.insert(*id);
                 for reference in refs {
                     if cursor.reachable.insert(*reference) {
                         cursor.content_objects += 1;
@@ -887,15 +990,40 @@ impl LocalFileMedium {
         self.quarantine_named(&hash.hex(), reason)
     }
 
+    /// Incident-suffix ceiling for collision-safe quarantine placement.
+    const QUARANTINE_NAME_ATTEMPTS: u32 = 10_000;
+
     fn quarantine_named(&self, name: &str, reason: &str) -> Result<(), MediumError> {
-        let source = self.root.join(OBJECTS_DIR).join(name);
-        let target = self.root.join(QUARANTINE_DIR).join(name);
+        let objects = self.root.join(OBJECTS_DIR);
+        let quarantine = self.root.join(QUARANTINE_DIR);
+        let source = objects.join(name);
+        // Collision-safe and never overwriting: the first incident
+        // keeps the plain name; later incidents under the same name
+        // append .1, .2, … — previously preserved evidence is never
+        // destroyed by a rename that replaces its destination. Every
+        // quarantine site runs under HEAD.lock, so the
+        // exists-then-rename sequence is serialized; an interrupted
+        // move leaves the source in place (idempotent on retry) and
+        // an interrupted note-write leaves the bytes preserved under
+        // their incident name.
+        let mut incident = format!("{name}.reason");
+        let mut target = quarantine.join(name);
+        let mut attempt = 0u32;
+        while target.exists() {
+            attempt += 1;
+            if attempt > Self::QUARANTINE_NAME_ATTEMPTS {
+                return Err(io_err(
+                    "quarantine collision limit",
+                    &target,
+                    io::Error::other("too many quarantine incidents under one name"),
+                ));
+            }
+            target = quarantine.join(format!("{name}.{attempt}"));
+            incident = format!("{name}.{attempt}.reason");
+        }
         match fs::rename(&source, &target) {
             Ok(()) => {
-                let note = self
-                    .root
-                    .join(QUARANTINE_DIR)
-                    .join(format!("{name}.reason"));
+                let note = quarantine.join(incident);
                 fs::write(&note, reason).map_err(|e| io_err("write quarantine reason", &note, e))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -942,46 +1070,34 @@ impl LocalFileMedium {
         }
         let mut walked = 0u64;
         let result = match observed {
-            Some(head) if head == *candidate => {
-                // Installed as HEAD: full verification — the cold walk
-                // verifies the candidate, its references, and all
-                // ancestry; a failure propagates fail-closed (never a
-                // false confirmation).
+            Some(head) => {
+                // Full verification before any classification: the
+                // cold walk establishes a fully valid authoritative
+                // chain — the candidate's own revision, its content,
+                // its dependencies, and every descendant are
+                // hash-verified and coherence-checked. `Installed` is
+                // only ever returned when the candidate's presence in
+                // that verified chain is established (HEAD itself, or
+                // a member of the walked revision-id set); a matching
+                // parent hash alone is never proof. Corruption
+                // anywhere fails closed (a typed error), never a
+                // false confirmation.
                 self.cursor = None;
                 let summary = self.cold_walk_from(head)?;
                 walked = summary.records;
-                Reconciliation::Installed { id: *candidate }
-            }
-            Some(head) => {
-                // Ancestor check: if the candidate is anywhere in
-                // HEAD's chain, its effect is installed — a retry must
-                // not duplicate it.
-                let mut current = head;
-                let mut seen = BTreeSet::new();
-                let mut found = false;
-                loop {
-                    if !seen.insert(current) {
-                        return Err(MediumError::Chain { rule: "cycle" });
-                    }
-                    if current == *candidate {
-                        found = true;
-                        break;
-                    }
-                    let bytes = self.load_referenced(&current)?;
-                    let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
-                    walked += 1;
-                    match record.parent {
-                        Some(parent) => current = parent,
-                        None => break,
-                    }
-                }
-                if found {
+                let installed = head == *candidate
+                    || self
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|cursor| cursor.record_ids.contains(candidate));
+                if installed {
                     Reconciliation::Installed { id: *candidate }
                 } else {
-                    // Never installed: the candidate object, if present,
-                    // is unreferenced evidence of the ambiguous attempt —
-                    // quarantine it (never delete), then report
-                    // retry-safe absence.
+                    // Never installed in a verified chain: the
+                    // candidate object, if present, is unreferenced
+                    // evidence of the ambiguous attempt — quarantine
+                    // it (never delete), then report retry-safe
+                    // absence.
                     if self.object_path(candidate).exists() {
                         self.quarantine_object(
                             candidate,
@@ -992,6 +1108,11 @@ impl LocalFileMedium {
                 }
             }
             None => {
+                // No authoritative history exists (never founded, or
+                // HEAD vanished): nothing can be verified installed —
+                // the candidate object, if present, is unreferenced
+                // evidence; quarantine it and report retry-safe
+                // absence.
                 if self.object_path(candidate).exists() {
                     self.quarantine_object(
                         candidate,
@@ -1009,10 +1130,14 @@ impl LocalFileMedium {
 impl CanonicalMedium for LocalFileMedium {
     fn head(&mut self) -> Result<Option<Hash>, MediumError> {
         self.lock()?;
-        let observed = self.read_head_file()?;
-        let validated = self.validate_observed(observed);
+        // Capture-then-unlock (the reviewed open() discipline): no
+        // early return between lock and unlock — an error path must
+        // never leak the OS lock while the medium stays alive.
+        let outcome = self
+            .read_head_file()
+            .and_then(|observed| self.validate_observed(observed).map(|()| observed));
         let _ = self.unlock();
-        validated.map(|()| observed)
+        outcome
     }
 
     fn append(
@@ -1073,12 +1198,16 @@ impl CanonicalMedium for LocalFileMedium {
 
     fn validate(&mut self) -> Result<ChainSummary, MediumError> {
         self.lock()?;
-        let result = match self.read_head_file()? {
-            Some(id) => {
+        // Capture-then-unlock (the reviewed open() discipline): no
+        // early return between lock and unlock — an error path must
+        // never leak the OS lock while the medium stays alive.
+        let result = match self.read_head_file() {
+            Ok(Some(id)) => {
                 self.cursor = None;
                 self.cold_walk_from(id)
             }
-            None => Err(MediumError::Chain { rule: "unfounded" }),
+            Ok(None) => Err(MediumError::Chain { rule: "unfounded" }),
+            Err(error) => Err(error),
         };
         let _ = self.unlock();
         result

@@ -56,6 +56,12 @@ const RESULT_ENV: &str = "S7_B2_RESULT";
 const FAULT_ENV: &str = "S7_B2_FAULT";
 const ACTION_ENV: &str = "S7_B2_ACTION";
 const CANDIDATE_ENV: &str = "S7_B2_CANDIDATE";
+const CORRUPT_TRIGGER_ENV: &str = "S7_B2_CORRUPT_GO";
+const PROBE_TRIGGER_ENV: &str = "S7_B2_PROBE_GO";
+const READY_ENV: &str = "S7_B2_READY";
+const CORRUPT_MODE_ENV: &str = "S7_B2_CORRUPT_MODE";
+const TARGET_ENV: &str = "S7_B2_TARGET";
+const OP_ENV: &str = "S7_B2_OP";
 
 const WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(10);
@@ -107,6 +113,8 @@ fn child_entry() {
         "faulted-writer" => child_faulted_writer(&root_env()),
         "reconciler" => child_reconciler(&root_env()),
         "opener" => child_opener(&root_env()),
+        "error-holder" => child_error_holder(&root_env()),
+        "lock-prober" => child_lock_prober(&root_env()),
         "sleeper" => child_sleeper(),
         other => panic!("unknown role: {other}"),
     }
@@ -204,6 +212,76 @@ fn child_opener(root: &Path) {
 fn child_sleeper() {
     // A deliberately runaway child for the bounded-wait proof (G).
     std::thread::sleep(Duration::from_secs(600));
+}
+
+/// The D1 lock-lifecycle holder: opens while the store is valid,
+/// signals readiness, corrupts per the phase trigger, calls the
+/// erroring operation, reports the error, and then STAYS ALIVE — a
+/// leaked lock would persist until the parent kills us, which is
+/// exactly what the lock-prober must prove cannot happen.
+fn child_error_holder(root: &Path) {
+    wait_for_go();
+    let mut medium = LocalFileMedium::open(root).expect("holder open");
+    write_ready();
+    wait_for_phase(CORRUPT_TRIGGER_ENV);
+    match env::var(CORRUPT_MODE_ENV).unwrap_or_default().as_str() {
+        "head" => flip_byte(&root.join("HEAD")),
+        "record" => {
+            let target = hash_env(TARGET_ENV);
+            flip_byte(&root.join("objects").join(target.hex()));
+        }
+        other => panic!("unknown corrupt mode {other}"),
+    }
+    let result = match env::var(OP_ENV).unwrap_or_default().as_str() {
+        "head" => match medium.head() {
+            Ok(observed) => format!("head-ok:{}", hex_or_none(observed)),
+            Err(error) => format!("head-error:{error}"),
+        },
+        "validate" => match medium.validate() {
+            Ok(summary) => format!("validate-ok:records={}", summary.records),
+            Err(error) => format!("validate-error:{error}"),
+        },
+        other => panic!("unknown op {other}"),
+    };
+    write_result(&result);
+    std::thread::sleep(Duration::from_secs(600));
+}
+
+/// The D1 lock prober: opens while the store is valid, waits for the
+/// probe phase (after the holder's error), then exercises lock-taking
+/// operations — completing within the parent's bound proves the
+/// holder's error path released the OS lock.
+fn child_lock_prober(root: &Path) {
+    wait_for_go();
+    let mut medium = LocalFileMedium::open(root).expect("prober open");
+    write_ready();
+    wait_for_phase(PROBE_TRIGGER_ENV);
+    let head = match medium.head() {
+        Ok(observed) => format!("head-ok:{}", hex_or_none(observed)),
+        Err(error) => format!("head-error:{error}"),
+    };
+    let validation = match medium.validate() {
+        Ok(summary) => format!("validate-ok:records={}", summary.records),
+        Err(error) => format!("validate-error:{error}"),
+    };
+    write_result(&format!("{head};{validation}"));
+}
+
+fn write_ready() {
+    let path = env::var(READY_ENV).expect("ready env");
+    fs::write(&path, "ready").expect("write ready marker");
+}
+
+fn wait_for_phase(name: &str) {
+    let path = env::var(name).expect("phase env");
+    let deadline = Instant::now() + WAIT;
+    while !Path::new(&path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the {name} phase deadline was exceeded"
+        );
+        std::thread::sleep(POLL);
+    }
 }
 
 fn number_env(name: &str) -> u64 {
@@ -340,6 +418,21 @@ fn flip_byte(path: &Path) {
     let mut bytes = fs::read(path).expect("read");
     bytes[0] ^= 0xff;
     fs::write(path, bytes).expect("write back");
+}
+
+/// Bounded wait for a harness file (ready markers, phase results) —
+/// every parental wait carries a deadline, no hang is accepted.
+fn wait_for_file(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    let deadline = Instant::now() + WAIT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the file {} never appeared within the bound",
+            path.display()
+        );
+        std::thread::sleep(POLL);
+    }
 }
 
 /// A founding + one regular revision carrying one content object.
@@ -887,4 +980,253 @@ fn g_bounded_waits_kill_runaway_children() {
             panic!("the sleeper should have outlived the bound, exited: {status:?}")
         }
     }
+}
+
+// -------------------------------------- review corrective B + D1 (cross-process)
+
+fn run_writer_expect_accepted(
+    dir: &TestDir,
+    store: &Path,
+    parent: Hash,
+    epoch: u64,
+    payload: &str,
+    tick: u64,
+    index: usize,
+) {
+    let mut child = spawn_child(
+        "writer",
+        &[
+            (ROOT_ENV, store.display().to_string()),
+            (PARENT_ENV, parent.hex()),
+            (EPOCH_ENV, epoch.to_string()),
+            (PAYLOAD_ENV, payload.to_owned()),
+            (TICK_ENV, tick.to_string()),
+        ],
+        dir.path(),
+        index,
+    );
+    release_barrier(dir.path());
+    let status = wait_bounded(&mut child, "external writer");
+    assert!(status.success(), "the writer exited: {status:?}");
+    let result = read_result(dir.path(), index);
+    assert!(result.starts_with("accepted:"), "got: {result}");
+}
+
+/// B: another process appends two revisions before the stale session
+/// observes the new HEAD — the stale session absorbs the complete
+/// suffix, stale-rejects against the winner, and then appends a valid
+/// direct descendant with no further walk.
+#[test]
+fn b_external_multi_revision_suffix_absorbed_cross_process() {
+    let dir = TestDir::new("b-cross-suffix");
+    let store = dir.store();
+    let f = found_in_process(&store);
+    // The stale session, opened before the external writers append.
+    let mut stale = LocalFileMedium::open(&store).expect("stale open");
+
+    // Writer 1 appends the first external revision.
+    let (w1_record, _w1_object) = writer_record(f, 0, 1, "b-cross-one");
+    let w1 = w1_record.id();
+    run_writer_expect_accepted(&dir, &store, f, 0, "b-cross-one", 1, 0);
+
+    // Writer 2 appends the second external revision on top of w1.
+    let (w2_record, _w2_object) = writer_record(w1, 1, 2, "b-cross-two");
+    let w2 = w2_record.id();
+    run_writer_expect_accepted(&dir, &store, w1, 1, "b-cross-two", 2, 1);
+
+    // The stale session still expects f: the complete two-record
+    // suffix is validated and absorbed; the append is stale-rejected
+    // with the winner observed.
+    let (stale_record, stale_object) = writer_record(f, 0, 3, "b-cross-stale");
+    match stale
+        .append(&stale_record, std::slice::from_ref(&stale_object), Some(f))
+        .expect("stale append completes")
+    {
+        AppendOutcome::RejectedStaleParent { observed } => assert_eq!(observed, Some(w2)),
+        other => panic!("expected stale rejection, got {other:?}"),
+    }
+    assert_eq!(
+        stale.walk_stats().last_append_walked,
+        2,
+        "the complete two-record suffix was walked"
+    );
+
+    // The absorbed cursor is consistent: a direct descendant of w2 at
+    // epoch 3 is accepted with no further walk.
+    let (next_record, next_object) = writer_record(w2, 2, 4, "b-cross-next");
+    let next_id = accepted_id(
+        &mut stale,
+        &next_record,
+        std::slice::from_ref(&next_object),
+        Some(w2),
+    );
+    assert_eq!(next_id, next_record.id());
+    assert_eq!(
+        stale.walk_stats().last_append_walked,
+        0,
+        "the next ordinary append requires no additional history walk"
+    );
+
+    let summary = stale.validate().expect("validate");
+    assert_eq!(summary.records, 4);
+    assert_eq!(summary.height, 3);
+    assert_eq!(summary.head, next_id);
+}
+
+/// D1: `head()`'s error path must release HEAD.lock while the medium
+/// stays alive — a separate process (its medium already open from
+/// before the corruption) acquires the lock and completes within the
+/// bound. Corrupt-HEAD variant.
+#[test]
+fn d1_lock_released_after_head_error_cross_process() {
+    let dir = TestDir::new("d1-head-error");
+    let store = dir.store();
+    founded_content_store(&store);
+    let harness = dir.path();
+
+    let mut holder = spawn_child(
+        "error-holder",
+        &[
+            (ROOT_ENV, store.display().to_string()),
+            (
+                CORRUPT_TRIGGER_ENV,
+                harness.join("corrupt-go").display().to_string(),
+            ),
+            (
+                READY_ENV,
+                harness.join("ready-holder").display().to_string(),
+            ),
+            (CORRUPT_MODE_ENV, "head".into()),
+            (OP_ENV, "head".into()),
+        ],
+        harness,
+        0,
+    );
+    let mut prober = spawn_child(
+        "lock-prober",
+        &[
+            (ROOT_ENV, store.display().to_string()),
+            (
+                PROBE_TRIGGER_ENV,
+                harness.join("probe-go").display().to_string(),
+            ),
+            (
+                READY_ENV,
+                harness.join("ready-prober").display().to_string(),
+            ),
+        ],
+        harness,
+        1,
+    );
+
+    // Both children open while the store is valid.
+    release_barrier(harness);
+    wait_for_file(harness.join("ready-holder"));
+    wait_for_file(harness.join("ready-prober"));
+
+    // The holder corrupts HEAD and calls head() — the error path runs
+    // while the medium stays alive.
+    fs::write(harness.join("corrupt-go"), b"go").expect("release the corrupt phase");
+    wait_for_file(harness.join("result-0"));
+    let holder_result = read_result(harness, 0);
+    assert!(
+        holder_result.starts_with("head-error:"),
+        "the holder must report the corrupt-HEAD error: {holder_result}"
+    );
+    assert!(holder_result.contains("authoritative HEAD is corrupt"));
+
+    // The prober must acquire the lock and complete within the bound;
+    // a leaked lock would block it forever and fail the bounded wait.
+    fs::write(harness.join("probe-go"), b"go").expect("release the probe phase");
+    let status = wait_bounded(&mut prober, "lock prober");
+    assert!(status.success(), "the prober exited: {status:?}");
+    let prober_result = read_result(harness, 1);
+    assert!(
+        prober_result.starts_with("head-error:"),
+        "the prober's head() must fail closed on the corrupt HEAD: {prober_result}"
+    );
+    assert!(
+        prober_result.contains("validate-error:"),
+        "the prober's validate() must fail closed too: {prober_result}"
+    );
+
+    // The holder sleeps by design; kill it.
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+/// D1: `validate()`'s error path must release HEAD.lock while the
+/// medium stays alive — failed-validation variant (a corrupted record
+/// object, HEAD itself intact).
+#[test]
+fn d1_lock_released_after_validation_error_cross_process() {
+    let dir = TestDir::new("d1-validation-error");
+    let store = dir.store();
+    let (_f, r, _content) = founded_content_store(&store);
+    let harness = dir.path();
+
+    let mut holder = spawn_child(
+        "error-holder",
+        &[
+            (ROOT_ENV, store.display().to_string()),
+            (
+                CORRUPT_TRIGGER_ENV,
+                harness.join("corrupt-go").display().to_string(),
+            ),
+            (
+                READY_ENV,
+                harness.join("ready-holder").display().to_string(),
+            ),
+            (CORRUPT_MODE_ENV, "record".into()),
+            (TARGET_ENV, r.hex()),
+            (OP_ENV, "validate".into()),
+        ],
+        harness,
+        0,
+    );
+    let mut prober = spawn_child(
+        "lock-prober",
+        &[
+            (ROOT_ENV, store.display().to_string()),
+            (
+                PROBE_TRIGGER_ENV,
+                harness.join("probe-go").display().to_string(),
+            ),
+            (
+                READY_ENV,
+                harness.join("ready-prober").display().to_string(),
+            ),
+        ],
+        harness,
+        1,
+    );
+
+    release_barrier(harness);
+    wait_for_file(harness.join("ready-holder"));
+    wait_for_file(harness.join("ready-prober"));
+
+    fs::write(harness.join("corrupt-go"), b"go").expect("release the corrupt phase");
+    wait_for_file(harness.join("result-0"));
+    let holder_result = read_result(harness, 0);
+    assert!(
+        holder_result.starts_with("validate-error:"),
+        "the holder must report the validation error: {holder_result}"
+    );
+    assert!(holder_result.contains("chain-referenced object"));
+
+    fs::write(harness.join("probe-go"), b"go").expect("release the probe phase");
+    let status = wait_bounded(&mut prober, "lock prober");
+    assert!(status.success(), "the prober exited: {status:?}");
+    let prober_result = read_result(harness, 1);
+    assert!(
+        prober_result.starts_with("head-ok:"),
+        "the prober's head() succeeds on the valid HEAD (the cursor path): {prober_result}"
+    );
+    assert!(
+        prober_result.contains("validate-error:"),
+        "the prober's validate() must fail closed on the corrupted record: {prober_result}"
+    );
+
+    let _ = holder.kill();
+    let _ = holder.wait();
 }

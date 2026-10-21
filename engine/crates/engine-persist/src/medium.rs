@@ -112,8 +112,10 @@ pub enum MediumError {
     /// A chain or append validation violation; the rule names it:
     /// `epoch-regression`, `parent-mismatch`, `kind-incoherent`,
     /// `duplicate-idempotency-key`, `cycle`, `divergence`,
-    /// `content-set-mismatch`, `depends-on-unresolvable`,
-    /// `record-noncanonical`.
+    /// `content-set-mismatch`, `depends-on-unresolvable` (a
+    /// dependency must name a strictly earlier revision of the
+    /// authoritative chain), `record-noncanonical`, `founding-missing`,
+    /// `unfounded`.
     Chain { rule: &'static str },
     /// A chain-referenced object failed its hash — referenced
     /// corruption is fail-closed and evidence-preserving (never
