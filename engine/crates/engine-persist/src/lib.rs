@@ -41,6 +41,7 @@ pub mod consequence;
 pub mod envelope;
 pub mod fault;
 pub mod hash;
+pub mod journal;
 pub mod local;
 pub mod medium;
 pub mod record;
@@ -57,6 +58,12 @@ pub use envelope::{
 };
 pub use fault::{FaultAction, FaultControl, FaultPoint};
 pub use hash::Hash;
+pub use journal::{
+    CancellationReason, CommitStage, CommittedTransaction, FrontierEntry, JournalError,
+    JournalFaultControl, JournalFaultPoint, JournalReceipt, JournalScan, RecordedCancellation,
+    T1Journal, TailKind, TailState, TransactionDurability, TransactionId, TransactionInput,
+    WriteReconciliation,
+};
 pub use local::{AppendTimings, LocalFileMedium, WalkStats};
 pub use medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
