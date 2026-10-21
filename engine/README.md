@@ -134,7 +134,7 @@ CI's lavapipe regional smokes are **correctness evidence only**; the acceptance 
 
 ## macOS (Apple Silicon) — experimental `macos-port` build and Mac 2 acceptance procedure
 
-> **Status:** Mac 2 implementation (Vulkan via MoltenVK) is delivered on `macos-port` with CI green on macOS ARM64; **physical M1 acceptance has NOT been performed** — the procedure below is the reproducible run for the lead's MacBook Air. macOS support is experimental and isolated to `macos-port` (branched from the Stage 4 code at `2e71770`); `main` and `stage4-review` are unaffected. Full audit, stage records, and the loader-consistency investigation: `docs/MACOS-PORT-FEASIBILITY.md`.
+> **Status:** Mac 2 **PASS (2026-10-20)** — implementation and CI green on macOS ARM64, and the physical M1 MacBook Air acceptance (Tests A–F below) passed: rendering with active validation 0/0, region visualization (`invalid 0`, conservation true), a 29-recreation resize run, presentation-mode observations (mailbox→FIFO · immediate 225.9 fps), and single-loader confirmation (the SDK's `libvulkan.dylib` and `libvulkan.1.dylib` both resolve to `libvulkan.1.4.363.dylib`). Full evidence and the preserved limitations: `docs/MACOS-PORT-FEASIBILITY.md` §15. The procedure below remains the reproducible run. macOS support is experimental and isolated to `macos-port` (branched from the Stage 4 code at `2e71770`, not merged); `main` and `stage4-review` are unaffected. Full audit, stage records, and the loader-consistency investigation: `docs/MACOS-PORT-FEASIBILITY.md`.
 
 **One-time environment setup** (nothing here disables SIP or weakens macOS security):
 
@@ -185,7 +185,8 @@ The first build compiles vendored SDL 3.4.18 (a few minutes). Expected: a 1280×
 | Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 148 passed + 1 ignored soak, fmt/clippy clean, headless smoke + presence-scenario double runs + per-LOD/activation-latency measurement tests + lavapipe offscreen render smokes incl. `--render --regions` (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
 | Real-window GUI | manual, lead's rig | instructions above (Stage 2 checklist + the Stage 4 acceptance plan); evidence pending the lead's run |
-| macOS (macos-15 ARM64 runner, `macos-port` branch) | CI `engine-ci` on macos-port | Mac 1 CPU gates green (fmt/clippy/build/tests, exact fingerprints on aarch64-apple-darwin); Mac 2 portability code green incl. the new policy tests — physical M1 graphics acceptance pending (procedure above) |
+| macOS (macos-15 ARM64 runner, `macos-port` branch) | CI `engine-ci` on macos-port | Mac 1 CPU gates green; Mac 2 code green — 158 passed + 1 ignored, exact fingerprints on aarch64-apple-darwin |
+| macOS (Apple M1 MacBook Air, macOS 26.6.2, Vulkan SDK 1.4.363.0 + MoltenVK 1.4.2) | manual, lead's run — Mac 2 acceptance Tests A–F | **PASS 2026-10-20** — rendering with active validation 0/0 (1,955 frames / 34.7 s), regions (2,475 frames, `invalid 0`, conservation true), 29-recreation resize run, mailbox→FIFO 60.5 / immediate 225.9 / 240-target→FIFO 60.9 fps, single Khronos loader confirmed (feasibility doc §15) |
 
 ## What is deliberately absent
 
