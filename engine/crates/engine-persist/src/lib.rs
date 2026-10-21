@@ -37,6 +37,7 @@
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
+pub mod consequence;
 pub mod fault;
 pub mod hash;
 pub mod local;
@@ -46,6 +47,7 @@ pub mod record;
 #[cfg(test)]
 mod tests;
 
+pub use consequence::{AwardCheckpoint, AwardState, ConsequenceId, OccurrenceSpan, SpanError};
 pub use fault::{FaultAction, FaultControl, FaultPoint};
 pub use hash::Hash;
 pub use local::{AppendTimings, LocalFileMedium, WalkStats};
