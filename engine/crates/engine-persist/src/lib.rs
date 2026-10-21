@@ -44,6 +44,7 @@ pub mod hash;
 pub mod journal;
 pub mod local;
 pub mod medium;
+pub mod pipeline;
 pub mod record;
 
 #[cfg(test)]
@@ -68,5 +69,9 @@ pub use local::{AppendTimings, LocalFileMedium, WalkStats};
 pub use medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
+};
+pub use pipeline::{
+    BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
+    ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
