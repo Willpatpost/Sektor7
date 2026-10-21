@@ -1,6 +1,6 @@
 # Sektor7 Original Engine — Workspace
 
-> **Status:** Stages 0–4 complete. **Stage 4 (regions & LOD) formally accepted 2026-10-21** (T-15 — independent reviewer PASS at `2e71770` + the lead's physical Windows RTX 5070 Ti acceptance run; record: `docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md`). The Stage 5 persistence & commit pipeline architecture is accepted as the v1.8 reference (T-16) with implementation batch-gated, and the experimental macOS ARM64 port (Mac 2 PASS incl. the physical M1 run) is merged into `main`. Stage 5 implementation is **not begun** — it requires the lead's explicit authorization (`docs/TECH-ARCHITECTURE.md` §6; `docs/DECISIONS.md` T-15/T-16).
+> **Status:** Stages 0–4 complete. **Stage 4 (regions & LOD) formally accepted 2026-10-21** (T-15 — independent reviewer PASS at `2e71770` + the lead's physical Windows RTX 5070 Ti acceptance run; record: `docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md`). The Stage 5 persistence & commit pipeline architecture is accepted as the v1.8 reference (T-16) with implementation batch-gated, and the experimental macOS ARM64 port (Mac 2 PASS incl. the physical M1 run) is merged into `main`. **Stage 5 Batch 1 (canonical encoding + full-fidelity spine round-trip) is implemented on the `stage5` branch awaiting independent review** — the wire format is specified in `docs/STAGE5-B1-WIRE-FORMAT.md`; Batches 2–5 remain gated (`docs/TECH-ARCHITECTURE.md` §6; `docs/DECISIONS.md` T-16).
 
 Rust workspace holding the first foundations of the reusable original engine. Scope stays deliberately minimal per stage gate — only what the current authorization ratifies, each mechanism exercised by its own tests (anti-abstraction ledger, `docs/TECH-ARCHITECTURE.md` §8).
 
@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-158 tests + 1 ignored soak (90 through Stage 3 + 58 Stage 4 regions/LOD + 10 macOS-portability policy tests). The 60-second soak is a measurement, ignored by default:
+196 tests + 1 ignored soak (158 post-consolidation baseline + 38 Stage 5 Batch 1 save tests: 10 wire primitives, 11 round-trip/continuation/golden, 17 corruption). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
