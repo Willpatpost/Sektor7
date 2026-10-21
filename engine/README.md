@@ -132,6 +132,52 @@ CI's lavapipe regional smokes are **correctness evidence only**; the acceptance 
 7. **Conservation + invalid counters** — every run's exit summary must print `conservation true` and `invalid 0`; anything else is a reportable anomaly.
 8. **Activation latency under realistic backlog** — `cargo run --release -p engine-slice -- --render --regions --sim-budget 30`: walk to a dormant region; its reactivation faces real backlog (125 overdue obligations against a 30/tick budget). The exit summary's `activation latency p50/p95/worst` must stay **< 50 ms** — the Stage 4 acceptance budget for a 125-NPC region. That latency is CPU simulation work inside the tick boundary (commit consequences → reconstruct → resume), distinct from GPU render time (the gpu percentiles), presentation blocking (present mode), and frame pacing (the paced-interval percentiles) — four separate measurements, all in the summaries.
 
+## macOS (Apple Silicon) — experimental `macos-port` build and Mac 2 acceptance procedure
+
+> **Status:** Mac 2 **PASS (2026-10-20)** — implementation and CI green on macOS ARM64, and the physical M1 MacBook Air acceptance (Tests A–F below) passed: rendering with active validation 0/0, region visualization (`invalid 0`, conservation true), a 29-recreation resize run, presentation-mode observations (mailbox→FIFO · immediate 225.9 fps), and single-loader confirmation (the SDK's `libvulkan.dylib` and `libvulkan.1.dylib` both resolve to `libvulkan.1.4.363.dylib`). Full evidence and the preserved limitations: `docs/MACOS-PORT-FEASIBILITY.md` §15. The procedure below remains the reproducible run. macOS support is experimental and isolated to `macos-port` (branched from the Stage 4 code at `2e71770`, not merged); `main` and `stage4-review` are unaffected. Full audit, stage records, and the loader-consistency investigation: `docs/MACOS-PORT-FEASIBILITY.md`.
+
+**One-time environment setup** (nothing here disables SIP or weakens macOS security):
+
+1. Xcode Command Line Tools: `xcode-select --install` (skip if already installed).
+2. CMake ≥ 3.16: check `cmake --version`; if absent, `brew install cmake` (or the cmake.org universal installer).
+3. Rust, pinned toolchain: install via rustup (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`), then from `engine/` run `rustup toolchain install` — it reads `rust-toolchain.toml` (1.99.1). Verify: `uname -m` must print `arm64`; `rustc -vV` must print `host: aarch64-apple-darwin` and `release: 1.99.1`.
+4. Vulkan SDK for macOS (Khronos loader + MoltenVK + validation layers): download the current macOS package from the official LunarG SDK page (https://vulkan.lunarg.com/sdk/home) and run its installer. **Verify rather than assume the layout** — record the output of:
+   - `ls -li /usr/local/lib/libvulkan*` (wherever the installer placed the loader — `-i` shows whether `libvulkan.1.dylib` and `libvulkan.dylib` are links to the same file or separate copies; ash loads `libvulkan.dylib`, SDL prefers `libvulkan.1.dylib` — see Test F),
+   - `vulkaninfo --summary` if the SDK installed it — the device should be Apple silicon via MoltenVK and the instance extensions should list `VK_KHR_portability_enumeration`,
+   - `ls /usr/local/share/vulkan/icd.d 2>/dev/null; ls /usr/local/share/vulkan/explicit_layer.d 2>/dev/null` (ICD/layer registration, adjusted to wherever the SDK installed).
+5. **Do not place `libMoltenVK.dylib` beside the engine binary** — SDL's Cocoa loader prefers a bundled MoltenVK over the Khronos loader while ash loads the SDK loader directly, which is the split-loader hazard the acceptance explicitly tests for (feasibility doc §6.3).
+
+**Build and run** (from a clone of `macos-port`):
+
+```sh
+git clone https://github.com/Willpatpost/Sektor7.git
+cd Sektor7 && git checkout macos-port
+cd engine
+cargo run -p engine-slice -- --render
+```
+
+The first build compiles vendored SDL 3.4.18 (a few minutes). Expected: a 1280×720 window with the Stage 2 scene (three overlapping depth-demo cubes), clean exit on Esc/close. **Capture the full exit summary** — it prints GPU name, API version, present mode, swapchain image count, validation activity/counts, and per-tick timing; that summary is the primary acceptance evidence for every test below.
+
+**Mac 2 acceptance checklist (run from `engine/`; `--release` where latency matters):**
+
+- **A — basic Vulkan rendering:** `cargo run -p engine-slice -- --render`. Window opens; instance creation succeeds with the portability-enumeration flag (the macOS loader advertises it); a physical device (Apple GPU via MoltenVK) is selected; the SDL surface, swapchain, and pipeline initialize; the scene renders with correct depth ordering; presentation continues; clean close. Record GPU name, API version, swapchain image count, present mode, and GPU-timestamp support from the summary.
+- **B — regions + LOD:** `cargo run -p engine-slice -- --render --regions` — the eight plates (F green · S blue · E amber · D near-black), NPC proxies appearing/disappearing with camera distance (WASD, `Shift` sprint), coherent overlay region lines; rendering stays read-only-derived from simulation state.
+- **C — active validation:** `cargo run --release -p engine-slice -- --render --regions --validation on` — the exit summary must report validation **active** with zero errors and zero warnings (a run where the layer is silently absent does not pass; the summary distinguishes active from absent). Record any layer/loader availability limitation separately from application defects.
+- **D — recreation paths:** manual resize, minimize/restore, and relaunch, plus the forced-recreation variants (real Cocoa window — no offscreen driver needed): `cargo run -p engine-slice -- --render --regions --frames 20 --fps uncapped --validation on --simulate-resize` and the same with `--replace-pipelines` — no hangs, `recreations N > 0`, the dynamic region buffer carries across replacement, zero validation errors/warnings. (Numeric `--fps` values are clamped to ≥ 1 FPS — `uncapped` is the finite-frame no-pacing form.)
+- **E — presentation behavior:** `--present mailbox` and `--present immediate --fps uncapped` (unsupported modes must fall back to FIFO per existing policy — record the resolved mode), and `--fps 240` for a high-refresh pacing observation with CPU/GPU percentiles. These are portability observations, not first-game performance claims.
+- **F — SDL3/ash loader compatibility (the Mac 0 review gate):** build first, then run the binary directly so cargo's own process does not pollute the log:
+
+  ```sh
+  cargo build -p engine-slice
+  DYLD_PRINT_LIBRARIES=1 ./target/debug/engine-slice --render --frames 60 --fps uncapped 2> dyld.log
+  grep -iE 'vulkan|molten' dyld.log
+  otool -L ./target/debug/engine-slice
+  ```
+
+  The binary links no Vulkan library statically (both APIs dlopen at runtime — that is why the dyld log, not `otool`, is the evidence). Report: which library **files** the process actually loaded (`libvulkan.dylib` vs `libvulkan.1.dylib` vs `vulkan.framework/vulkan` vs MoltenVK directly), whether ash's and SDL's choices resolve to the same underlying file (cross-check the `ls -li` output from setup step 4), the ICD in use, and that Test C's validation was active. An unexplained split-loader configuration blocks acceptance.
+
+**Testing on macOS:** `cargo test --workspace --exclude engine-shell` runs everything multi-threaded; the three SDL-touching engine-shell suites must run one test per process (SDL3 on Apple platforms requires every video (re)init in a process to share the thread that first initialized SDL, while the Rust test harness gives each test a fresh thread — the CI job on this branch does this automatically). To run them manually: `cargo test -p engine-shell --test input_dispatch -- --list --format terse`, then invoke each listed test with `--exact <name>`; same for `lifecycle` and `soak`.
+
 ## Tested environments
 
 | Environment | Method | Result |
@@ -139,6 +185,8 @@ CI's lavapipe regional smokes are **correctness evidence only**; the acceptance 
 | Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 148 passed + 1 ignored soak, fmt/clippy clean, headless smoke + presence-scenario double runs + per-LOD/activation-latency measurement tests + lavapipe offscreen render smokes incl. `--render --regions` (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
 | Real-window GUI | manual, lead's rig | instructions above (Stage 2 checklist + the Stage 4 acceptance plan); evidence pending the lead's run |
+| macOS (macos-15 ARM64 runner, `macos-port` branch) | CI `engine-ci` on macos-port | Mac 1 CPU gates green; Mac 2 code green — 158 passed + 1 ignored, exact fingerprints on aarch64-apple-darwin |
+| macOS (Apple M1 MacBook Air, macOS 26.6.2, Vulkan SDK 1.4.363.0 + MoltenVK 1.4.2) | manual, lead's run — Mac 2 acceptance Tests A–F | **PASS 2026-10-20** — rendering with active validation 0/0 (1,955 frames / 34.7 s), regions (2,475 frames, `invalid 0`, conservation true), 29-recreation resize run, mailbox→FIFO 60.5 / immediate 225.9 / 240-target→FIFO 60.9 fps, single Khronos loader confirmed (feasibility doc §15) |
 
 ## What is deliberately absent
 

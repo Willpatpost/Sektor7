@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage4-review]
+    branches: [main, stage4-review, macos-port]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
@@ -100,3 +100,122 @@ jobs:
           # surface-format-change lifecycle (region-scene buffer
           # carry-over) that same-format resizing cannot reach.
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize --replace-pipelines
+
+  # Mac 1 (macos-port authorization 2026-10-20, independent Mac 0 review
+  # GO): additive macOS ARM64 job — CPU portability only (no GPU, no
+  # Vulkan SDK, no MoltenVK; graphical acceptance is Mac 2 on the lead's
+  # M1 rig). The ubuntu/windows matrix job above stays byte-identical to
+  # the reviewed workflow; this job mirrors its CPU gates, additionally
+  # pins the Stage 4 per-scenario fingerprints, and gates the runner
+  # architecture explicitly (arm64 / aarch64-apple-darwin) instead of
+  # trusting the macos-15 label. Bash steps avoid bash-4 constructs
+  # (case, not associative arrays) because `shell: bash` on macOS
+  # runners resolves to the system bash 3.2. GitHub's standard macos-15
+  # runner is an M1 with ~7 GB RAM and limited disk; if parallel
+  # compilation ever exceeds those resources, reduce build parallelism
+  # here — never engine semantics, never continue-on-error.
+  macos-arm64:
+    name: macos-15 ARM64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Confirm ARM64 runner and Rust host
+        shell: bash
+        run: |
+          uname -m
+          rustc_vv=$(rustc -vV)
+          echo "$rustc_vv"
+          [ "$(uname -m)" = "arm64" ] || { echo "runner is not arm64"; exit 1; }
+          # Pipe-free by design (run 39510072079, Mac 1 review): BSD grep -q
+          # exits on the first match while a live producer's line-buffered
+          # stdout may still be writing — SIGPIPE plus `pipefail` failed a
+          # correctly-matching host. Input is captured first, then the line
+          # is compared exactly, so partial matches are rejected as well.
+          rustc_host=$(grep "^host:" <<< "$rustc_vv")
+          [ "$rustc_host" = "host: aarch64-apple-darwin" ] || { echo "Rust host is not aarch64-apple-darwin (got: $rustc_host)"; exit 1; }
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      # SDL 3.4.18 on Apple platforms asserts that every video (re)init in
+      # a process happens on the thread that first initialized SDL (vendored
+      # SDL/src/SDL.c, #ifdef SDL_PLATFORM_APPLE; other platforms carry no
+      # such assert, so the ubuntu/windows jobs keep the default
+      # multi-threaded harness). The Rust libtest harness runs each test on
+      # a fresh thread — even with --test-threads=1 (verified empirically)
+      # — so a test binary whose tests repeatedly init SDL (engine-shell's
+      # lifecycle contract) aborts by SDL's own assertion (run 39510757458,
+      # signal 6). The real application is single-threaded per process and
+      # unaffected. CI-level correction only — no engine or test changes:
+      # every test still runs, with the three SDL-touching engine-shell
+      # suites executed one test per process (--exact), restoring the
+      # one-thread-per-process invariant SDL requires.
+      - name: Tests (workspace, SDL-free suites)
+        run: cargo test --workspace --exclude engine-shell
+      - name: Tests (engine-shell, one test per process)
+        shell: bash
+        run: |
+          for suite in input_dispatch lifecycle soak; do
+            list=$(cargo test -q -p engine-shell --test "$suite" -- --list --format terse)
+            while IFS= read -r line; do
+              case "$line" in
+                *": test") name=${line%": test"} ;;
+                *) continue ;;
+              esac
+              echo "== $suite :: $name"
+              cargo test -q -p engine-shell --test "$suite" -- --exact "$name"
+            done <<< "$list"
+          done
+      - name: Fingerprint self-test double run (pinned Stage 0 values)
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --fingerprint-selftest)
+          b=$(cargo run -q -p engine-slice -- --fingerprint-selftest)
+          if [ "$a" != "$b" ]; then
+            echo "fingerprint self-test mismatch between runs"
+            exit 1
+          fi
+          echo "$a"
+          # Stage 0 historical baseline compatibility: the pinned values.
+          # Herestring input is fully materialized before grep runs, so the
+          # BSD grep -q early-exit/SIGPIPE hazard cannot occur (Mac 1
+          # review guidance after run 39510072079).
+          grep -Fq "engine=6504123a47cab66f" <<< "$a" || { echo "Stage 0 engine fingerprint changed"; exit 1; }
+          grep -Fq "state=937bd3b6f56f07e0" <<< "$a" || { echo "Stage 0 state fingerprint changed"; exit 1; }
+      - name: Stage 3 headless simulation smoke (deterministic, no GPU required)
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --sim --ticks 300 --cadence 60)
+          b=$(cargo run -q -p engine-slice -- --sim --ticks 300 --cadence 60)
+          if [ "$a" != "$b" ]; then
+            echo "headless simulation diverged between runs"
+            exit 1
+          fi
+          echo "$a"
+          # Stage 3 historical baseline compatibility: the pinned values
+          # (herestring form — see the fingerprint step note).
+          grep -Fq "executed 45717" <<< "$a" || { echo "Stage 3 baseline execution count changed"; exit 1; }
+          grep -Fq "engine-lanes=5591d3eb05643e78" <<< "$a" || { echo "Stage 3 lane fingerprint changed"; exit 1; }
+          grep -Fq "state-lanes=9d90cb3bbd45b032" <<< "$a" || { echo "Stage 3 state-lanes fingerprint changed"; exit 1; }
+      - name: Stage 4 presence scenarios (double run per scenario, pinned values)
+        shell: bash
+        run: |
+          for scenario in stationary walk tour; do
+            a=$(cargo run -q -p engine-slice -- --sim --presence $scenario)
+            b=$(cargo run -q -p engine-slice -- --sim --presence $scenario)
+            if [ "$a" != "$b" ]; then
+              echo "presence scenario $scenario diverged between runs"
+              exit 1
+            fi
+            echo "$scenario: $(grep -o 'stage4=[0-9a-f]*' <<< "$a")"
+            case "$scenario" in
+              stationary) pinned=da1b2d1a7e5cd49e ;;
+              walk) pinned=1df391ad488848bf ;;
+              tour) pinned=495ab27b37549e93 ;;
+            esac
+            grep -Fq "stage4=$pinned" <<< "$a" || { echo "Stage 4 $scenario fingerprint changed (expected stage4=$pinned)"; exit 1; }
+          done
