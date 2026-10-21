@@ -223,6 +223,36 @@ fn read_class(dec: &mut Decoder<'_>) -> Result<DurabilityClass, SaveError> {
     }
 }
 
+/// One coverage list's canonical form: per-span validity, sorted,
+/// non-overlapping; same-class touching spans would have composed
+/// (non-canonical); **different-class adjacency is the legitimate
+/// class-homogeneous partition boundary** — a mixed aggregate's
+/// sub-spans meet exactly there (envelope/1's rule, carried into the
+/// canonical batch).
+fn validate_coverage(coverage: &[ClassifiedSpan]) -> Result<(), SaveError> {
+    for classified in coverage {
+        if classified.span.lo >= classified.span.hi {
+            return Err(SaveError::Integrity(
+                "consequence-batch/coverage-span-inverted",
+            ));
+        }
+    }
+    for pair in coverage.windows(2) {
+        let (prior, next) = (&pair[0], &pair[1]);
+        if next.span.lo < prior.span.hi {
+            return Err(SaveError::Integrity(
+                "consequence-batch/coverage-span-overlap",
+            ));
+        }
+        if next.span.lo == prior.span.hi && prior.class == next.class {
+            return Err(SaveError::Integrity(
+                "consequence-batch/coverage-span-noncanonical",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_coverage(enc: &mut Encoder, coverage: &[ClassifiedSpan]) -> Result<(), SaveError> {
     const SECTION: &str = "consequence-batch";
     if coverage.len() as u64 > MAX_BATCH_SPANS {
@@ -233,6 +263,7 @@ fn write_coverage(enc: &mut Encoder, coverage: &[ClassifiedSpan]) -> Result<(), 
             max: MAX_BATCH_SPANS,
         });
     }
+    validate_coverage(coverage)?;
     enc.write_count(coverage.len());
     for classified in coverage {
         enc.write_u64(classified.span.lo);
@@ -258,24 +289,13 @@ fn read_coverage(dec: &mut Decoder<'_>) -> Result<Vec<ClassifiedSpan>, SaveError
     for _ in 0..count {
         let lo = dec.read_u64()?;
         let hi = dec.read_u64()?;
-        if lo >= hi {
-            return Err(SaveError::Integrity(
-                "consequence-batch/coverage-span-inverted",
-            ));
-        }
-        if let Some(prior) = coverage.last()
-            && lo <= prior.span.hi
-        {
-            return Err(SaveError::Integrity(
-                "consequence-batch/coverage-span-noncanonical",
-            ));
-        }
         let class = read_class(dec)?;
         coverage.push(ClassifiedSpan {
             span: crate::consequence::OccurrenceSpan { lo, hi },
             class,
         });
     }
+    validate_coverage(&coverage)?;
     Ok(coverage)
 }
 
@@ -583,6 +603,22 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         );
         self.staged.push(envelope);
         Ok(())
+    }
+
+    /// Discards staged (in-memory, uncaptured) envelopes for the given
+    /// identities — the failed-boundary path: effects staged but never
+    /// captured are in-memory pending only; discarding them never
+    /// touches journaled or confirmed keys (P0-5 — in-memory state is
+    /// honestly lost). A retried boundary re-stages identical bytes.
+    pub fn discard_staged(&mut self, ids: &[ConsequenceId]) {
+        self.staged.retain(|envelope| !ids.contains(&envelope.id));
+        for id in ids {
+            if let Some(status) = self.keys.get(id)
+                && status.phase == KeyPhase::InMemory
+            {
+                self.keys.remove(id);
+            }
+        }
     }
 
     /// The capture boundary: journals the staged consequences as one
@@ -1852,6 +1888,31 @@ mod tests {
         };
         let bytes = batch.canonical_bytes().unwrap();
         assert_eq!(ConsequenceBatch::decode(&bytes).unwrap(), batch);
+        // The class-homogeneous partition boundary: cross-class
+        // adjacent sub-spans are legitimate (a mixed aggregate — the
+        // encounter envelope's shape); same-class adjacent spans
+        // would have composed.
+        let partitioned = ConsequenceBatch {
+            entries: vec![BatchEntry {
+                id: ConsequenceId::new(1, 2, 3),
+                transaction: TransactionId(Hash::from_bytes(&[7u8; 32]).unwrap()),
+                coverage: vec![
+                    ClassifiedSpan {
+                        span: OccurrenceSpan::new(0, 2).unwrap(),
+                        class: DurabilityClass::DurableEligible,
+                    },
+                    ClassifiedSpan {
+                        span: OccurrenceSpan::new(2, 4).unwrap(),
+                        class: DurabilityClass::EncounterProvisional,
+                    },
+                ],
+            }],
+        };
+        let bytes = partitioned.canonical_bytes().unwrap();
+        assert_eq!(ConsequenceBatch::decode(&bytes).unwrap(), partitioned);
+        let mut composed = partitioned;
+        composed.entries[0].coverage[1].class = DurabilityClass::DurableEligible;
+        assert!(composed.canonical_bytes().is_err());
         // Truncation at every boundary, trailing bytes, a wrong
         // schema, and descending entries all fail closed.
         for cut in 0..bytes.len() {
