@@ -164,8 +164,12 @@ fn duplicate_identity_is_rejected() {
     // identity gate, not the order gate, fires).
     let bytes = golden_bytes();
     let mut parsed = ref_read(&bytes);
-    let far_event = parsed.far.first().expect("far entry").clone();
-    parsed.near.push(far_event);
+    let mut injected = parsed.far.first().expect("far entry").clone();
+    // Correction A's lane-field-coherence gate fires during the section
+    // read, so the injected identity carries the target lane's field —
+    // the cross-section identity gate is what this test exercises.
+    injected.field = 0;
+    parsed.near.push(injected);
     parsed
         .near
         .sort_by_key(|event| (effective_due(event), event.seq));
@@ -342,4 +346,81 @@ fn world_section_trailing_bytes_are_rejected() {
     parsed.world_bytes.push(0);
     let mutated = ref_write(&parsed);
     assert!(matches!(expect_error(&mutated), SaveError::Trailing { .. }));
+}
+
+#[test]
+fn lane_field_mismatch_is_rejected() {
+    // Review correction A: a serialized field disagreeing with its
+    // containing lane section is not a live state — the spine routes
+    // every obligation to the queue matching its field — and is
+    // rejected, never silently re-laned.
+    let bytes = golden_bytes();
+    let parsed = ref_read(&bytes);
+    let near = parsed.near.first().expect("a near-lane entry");
+    let mut far_in_near = bytes.clone();
+    patch_u8(&mut far_in_near, near.field_at, 1);
+    assert!(matches!(
+        expect_error(&far_in_near),
+        SaveError::Integrity("spine-save/lane-field-coherence")
+    ));
+    let far = parsed.far.first().expect("a far-lane entry");
+    let mut near_in_far = bytes.clone();
+    patch_u8(&mut near_in_far, far.field_at, 0);
+    assert!(matches!(
+        expect_error(&near_in_far),
+        SaveError::Integrity("spine-save/lane-field-coherence")
+    ));
+}
+
+#[test]
+fn late_execution_counter_reconciliation_is_enforced() {
+    // Review correction B: the statistic must equal the ledger's count
+    // of late records exactly — the individual records unchanged, the
+    // statistic mutated in both directions.
+    let bytes = golden_bytes();
+    let parsed = ref_read(&bytes);
+    assert!(parsed.stats[3] > 0, "the golden scenario executes late");
+    let mut inflated = bytes.clone();
+    patch_u64(&mut inflated, parsed.stats_at[3], parsed.stats[3] + 1);
+    assert!(matches!(
+        expect_error(&inflated),
+        SaveError::Integrity("spine-save/late-execution-count")
+    ));
+    let mut deflated = bytes.clone();
+    patch_u64(&mut deflated, parsed.stats_at[3], parsed.stats[3] - 1);
+    assert!(matches!(
+        expect_error(&deflated),
+        SaveError::Integrity("spine-save/late-execution-count")
+    ));
+}
+
+#[test]
+fn decreasing_execution_tick_is_rejected() {
+    // Review correction C: an otherwise structurally consistent ledger
+    // whose executed ticks regress. The purpose-built scenario (budget
+    // 1, four due-1 obligations) executes one per tick at ticks 1..4;
+    // patching the final record's executed tick down to 2 keeps every
+    // per-record invariant (due ≤ executed ≤ clock; the lateness flag
+    // still matches its derivation — 2 > 1) while breaking the
+    // chronological nondecrease.
+    let mut spine = engine_core::Spine::with_reservation(common::GoldenWorld::new(), 1, 1);
+    for payload in [3u64, 7, 11, 15] {
+        spine.schedule(common::at(1, payload)).unwrap();
+    }
+    spine.run_ticks(4);
+    let bytes = spine.save_bytes();
+    assert!(
+        restore_golden(&bytes).is_ok(),
+        "the purpose-built save must be valid before mutation"
+    );
+    let mut parsed = ref_read(&bytes);
+    let last = parsed.ledger.len() - 1;
+    assert_eq!(parsed.ledger[last].executed_tick, 4);
+    assert_eq!(parsed.ledger[last].late, 1);
+    parsed.ledger[last].executed_tick = 2;
+    let mutated = ref_write(&parsed);
+    assert!(matches!(
+        expect_error(&mutated),
+        SaveError::Integrity("spine-save/ledger-order")
+    ));
 }

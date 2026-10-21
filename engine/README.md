@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-196 tests + 1 ignored soak (158 post-consolidation baseline + 38 Stage 5 Batch 1 save tests: 10 wire primitives, 11 round-trip/continuation/golden, 17 corruption). The 60-second soak is a measurement, ignored by default:
+199 tests + 1 ignored soak (158 post-consolidation baseline + 41 Stage 5 Batch 1 save tests: 10 wire primitives, 11 round-trip/continuation/golden, 20 corruption). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture

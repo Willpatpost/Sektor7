@@ -1493,8 +1493,8 @@ impl<W: SaveWorld> Spine<W> {
             return Err(SaveError::Integrity("spine-save/reserve-exceeds-budget"));
         }
 
-        let near = read_lane(&mut dec, "spine-save/near")?;
-        let far = read_lane(&mut dec, "spine-save/far")?;
+        let near = read_lane(&mut dec, "spine-save/near", Field::Near)?;
+        let far = read_lane(&mut dec, "spine-save/far", Field::Far)?;
         let blocked = read_seq_section(&mut dec, "spine-save/blocked")?;
         let held = read_seq_section(&mut dec, "spine-save/held")?;
         let ledger = read_ledger(&mut dec)?;
@@ -1569,11 +1569,16 @@ impl<W: SaveWorld> Spine<W> {
         }
 
         // The execution ledger: full-fidelity count, unique and disjoint
-        // from unfinished work, clock-coherent, with the encoded lateness
-        // flag agreeing with its derivation.
+        // from unfinished work, clock-coherent per record and
+        // chronologically nondecreasing (live execution appends within
+        // nondecreasing campaign ticks — one clock advance per tick,
+        // every execution of that tick at it — so a regressing
+        // `executed_tick` is not a live state), with the encoded
+        // lateness flag agreeing with its derivation.
         if stats.executed != ledger.len() as u64 {
             return Err(SaveError::Integrity("spine-save/ledger-count"));
         }
+        let mut prev_executed_tick: Option<u64> = None;
         for record in &ledger {
             let seq = record.id.seq;
             if seq >= next_seq {
@@ -1590,6 +1595,23 @@ impl<W: SaveWorld> Spine<W> {
             {
                 return Err(SaveError::Integrity("spine-save/clock-coherence"));
             }
+            if let Some(prior) = prev_executed_tick
+                && record.executed_tick.as_u64() < prior
+            {
+                return Err(SaveError::Integrity("spine-save/ledger-order"));
+            }
+            prev_executed_tick = Some(record.executed_tick.as_u64());
+        }
+
+        // The authoritative ledger reconciles the statistic exactly: the
+        // live spine increments `late_executions` precisely when it
+        // appends a record carrying the lateness flag, so the two counts
+        // can never legitimately disagree.
+        let late_records = ledger.iter().filter(|record| record.late).count();
+        let late_records =
+            u64::try_from(late_records).expect("counts are bounded by the input length");
+        if stats.late_executions != late_records {
+            return Err(SaveError::Integrity("spine-save/late-execution-count"));
         }
 
         // Counter bounds, each structurally implied by live behavior:
@@ -1854,9 +1876,16 @@ fn read_late(dec: &mut Decoder, section: &'static str) -> Result<bool, SaveError
 }
 
 /// Reads a lane section: entries in canonical `(due, seq)` order with
-/// unique identities — duplicates or disorder are integrity failures,
-/// never repaired.
-fn read_lane(dec: &mut Decoder, section: &'static str) -> Result<Vec<Event>, SaveError> {
+/// unique identities and the lane's own field on every entry — the
+/// live spine routes each obligation to the queue matching its field,
+/// so a serialized disagreement is not a live state and is rejected,
+/// never silently re-laned. Duplicates or disorder are integrity
+/// failures, never repaired.
+fn read_lane(
+    dec: &mut Decoder,
+    section: &'static str,
+    lane: Field,
+) -> Result<Vec<Event>, SaveError> {
     let count = dec.read_count(MAX_COLLECTION_COUNT, section, "entry-count")?;
     if count > dec.remaining() as u64 / ENTRY_MIN_BYTES {
         return Err(SaveError::Limit {
@@ -1871,6 +1900,9 @@ fn read_lane(dec: &mut Decoder, section: &'static str) -> Result<Vec<Event>, Sav
     let mut prev: Option<(u64, u64)> = None;
     for _ in 0..count {
         let event = read_event_entry(dec, section)?;
+        if event.field != lane {
+            return Err(SaveError::Integrity("spine-save/lane-field-coherence"));
+        }
         let key = (event.schedule.due().as_u64(), event.id.seq);
         if let Some(prior) = prev
             && key <= prior
