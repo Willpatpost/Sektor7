@@ -1,0 +1,12 @@
+[package]
+name = "engine-persist"
+version.workspace = true
+edition.workspace = true
+description = "Sektor7 original engine — Stage 5 B2: content-addressed revision store and local canonical medium"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+sha2 = "0.11"
+
+[lints]
+workspace = true
