@@ -2,7 +2,7 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage4-review, macos-port]
+    branches: [main, stage5, macos-port]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
@@ -48,6 +48,22 @@ jobs:
           # Stage 0 historical baseline compatibility: the pinned values.
           echo "$a" | grep -q "engine=6504123a47cab66f" || { echo "Stage 0 engine fingerprint changed"; exit 1; }
           echo "$a" | grep -q "state=937bd3b6f56f07e0" || { echo "Stage 0 state fingerprint changed"; exit 1; }
+      - name: Stage 5 spine-save self-test (double run, pinned canonical bytes)
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --save-selftest)
+          b=$(cargo run -q -p engine-slice -- --save-selftest)
+          if [ "$a" != "$b" ]; then
+            echo "spine-save self-test diverged between runs"
+            exit 1
+          fi
+          echo "$a"
+          # Stage 5 B1 canonical-bytes baseline: the pinned length and
+          # FNV-1a digest of the fixed demo scenario's save — identical
+          # on every platform (the full pinned golden bytes live in
+          # engine-core's save tests, which run in the Tests step).
+          echo "$a" | grep -q "save-len=1209" || { echo "Stage 5 canonical save length changed"; exit 1; }
+          echo "$a" | grep -q "save-fnv=c6c1b46c7d21843b" || { echo "Stage 5 canonical save digest changed"; exit 1; }
       - name: Stage 3 headless simulation smoke (deterministic, no GPU required)
         shell: bash
         run: |
@@ -186,6 +202,21 @@ jobs:
           # review guidance after run 39510072079).
           grep -Fq "engine=6504123a47cab66f" <<< "$a" || { echo "Stage 0 engine fingerprint changed"; exit 1; }
           grep -Fq "state=937bd3b6f56f07e0" <<< "$a" || { echo "Stage 0 state fingerprint changed"; exit 1; }
+      - name: Stage 5 spine-save self-test (double run, pinned values)
+        shell: bash
+        run: |
+          a=$(cargo run -q -p engine-slice -- --save-selftest)
+          b=$(cargo run -q -p engine-slice -- --save-selftest)
+          if [ "$a" != "$b" ]; then
+            echo "spine-save self-test diverged between runs"
+            exit 1
+          fi
+          echo "$a"
+          # Stage 5 B1 canonical-bytes baseline (herestring form — the
+          # BSD grep discipline noted in the fingerprint step above):
+          # identical on every platform, including this ARM64 runner.
+          grep -Fq "save-len=1209" <<< "$a" || { echo "Stage 5 canonical save length changed"; exit 1; }
+          grep -Fq "save-fnv=c6c1b46c7d21843b" <<< "$a" || { echo "Stage 5 canonical save digest changed"; exit 1; }
       - name: Stage 3 headless simulation smoke (deterministic, no GPU required)
         shell: bash
         run: |

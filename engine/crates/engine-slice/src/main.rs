@@ -9,7 +9,9 @@
 //! and the Stage 3 headless simulation (`--sim`, with `--seed`,
 //! `--ticks`, `--budget`, `--near-reserve`, `--rate`, `--cadence
 //! <hz>|irregular`, and the Stage 4 region scenarios `--presence
-//! stationary|walk|tour`).
+//! stationary|walk|tour`), and the Stage 5 Batch 1 canonical-save
+//! self-test (`--save-selftest`: the fixed demo scenario's save length
+//! and FNV-1a digest over the canonical bytes).
 
 use std::io::{self, Write};
 
@@ -22,6 +24,16 @@ fn main() {
         let (engine, state) = run_selftest();
         println!("engine={engine}");
         println!("state={state}");
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--save-selftest") {
+        // Stage 5 Batch 1: canonical save bytes of a fixed scenario —
+        // length + FNV-1a digest, deterministic across processes and
+        // platforms (CI double-runs this and pins both values).
+        let (len, digest) = engine_slice::save_demo::run_save_selftest();
+        println!("save-len={len}");
+        println!("save-fnv={digest}");
         return;
     }
 

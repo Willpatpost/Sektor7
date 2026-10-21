@@ -9,6 +9,7 @@ pub mod npc;
 pub mod region;
 pub mod region_render;
 pub mod render_demo;
+pub mod save_demo;
 pub mod session;
 pub mod sim;
 pub mod sim_demo;
