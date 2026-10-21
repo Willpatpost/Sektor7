@@ -1,6 +1,6 @@
 # Sektor7 Original Engine — Workspace
 
-> **Status:** Stage 0 (workspace) and Stage 1 (SDL3 application shell) complete — lead-authorized 2026-10-19. Stage 2 (Vulkan presentation) is **not begun** and requires explicit approval (`docs/TECH-ARCHITECTURE.md` §6; `docs/DECISIONS.md` T-08/T-10).
+> **Status:** Stages 0–4 complete. **Stage 4 (regions & LOD) formally accepted 2026-10-21** (T-15 — independent reviewer PASS at `2e71770` + the lead's physical Windows RTX 5070 Ti acceptance run; record: `docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md`). The Stage 5 persistence & commit pipeline architecture is accepted as the v1.8 reference (T-16) with implementation batch-gated, and the experimental macOS ARM64 port (Mac 2 PASS incl. the physical M1 run) is merged into `main`. Stage 5 implementation is **not begun** — it requires the lead's explicit authorization (`docs/TECH-ARCHITECTURE.md` §6; `docs/DECISIONS.md` T-15/T-16).
 
 Rust workspace holding the first foundations of the reusable original engine. Scope stays deliberately minimal per stage gate — only what the current authorization ratifies, each mechanism exercised by its own tests (anti-abstraction ledger, `docs/TECH-ARCHITECTURE.md` §8).
 
@@ -30,7 +30,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-90 tests (33 Stage 0 + 15 Stage 1 + 21 Stage 2 + 21 Stage 3: 9 spine lanes, 8 simulation determinism, 4 frame timing). The 60-second soak is a measurement, ignored by default:
+158 tests + 1 ignored soak (90 through Stage 3 + 58 Stage 4 regions/LOD + 10 macOS-portability policy tests). The 60-second soak is a measurement, ignored by default:
 
 ```sh
 cargo test -p engine-shell --test soak -- --ignored --nocapture
@@ -123,6 +123,8 @@ Eight area plates colored by LOD (F green · S blue · E amber · D near-black) 
 
 CI's lavapipe regional smokes are **correctness evidence only**; the acceptance below establishes real-GPU behavior and the activation-latency budget. Run from `engine/`; use `--release` wherever latency matters.
 
+**Completed 2026-10-21 — PASS** (independent reviewer acceptance of `2e71770` + the lead's rig run; evidence and measured results: [`docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md`](../docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md) with the verbatim raw terminal output linked there). The plan below remains the reproducible procedure.
+
 1. **Normal graphics regression** — `cargo run -p engine-slice -- --render`: the full Stage 2 checklist still holds (depth ordering, resize, minimize/restore, close/relaunch, `O` overlay, no LNK4098). The default path is untouched by the region system.
 2. **Regional graphics + the four LODs** — `cargo run --release -p engine-slice -- --render --regions`: walk (WASD, `Shift` to sprint) from region 0's plate toward region 1's (world +X then +Z, ~75–106 units per hop). Watch plates go green → blue → amber → dark as you leave, and the destination's proxies appear as you approach (velocity lookahead activates it early). A full lap visits all eight plates; every plate should pass through all four states. The overlay's `regions F S E D …` line tracks levels live.
 3. **Validation enabled** — `cargo run --release -p engine-slice -- --render --regions --validation on`: zero validation errors/warnings for the whole run, including through region transitions (the exit summary prints the counts; nonzero errors fail the run by design).
@@ -134,7 +136,7 @@ CI's lavapipe regional smokes are **correctness evidence only**; the acceptance 
 
 ## macOS (Apple Silicon) — experimental `macos-port` build and Mac 2 acceptance procedure
 
-> **Status:** Mac 2 **PASS (2026-10-20)** — implementation and CI green on macOS ARM64, and the physical M1 MacBook Air acceptance (Tests A–F below) passed: rendering with active validation 0/0, region visualization (`invalid 0`, conservation true), a 29-recreation resize run, presentation-mode observations (mailbox→FIFO · immediate 225.9 fps), and single-loader confirmation (the SDK's `libvulkan.dylib` and `libvulkan.1.dylib` both resolve to `libvulkan.1.4.363.dylib`). Full evidence and the preserved limitations: `docs/MACOS-PORT-FEASIBILITY.md` §15. The procedure below remains the reproducible run. macOS support is experimental and isolated to `macos-port` (branched from the Stage 4 code at `2e71770`, not merged); `main` and `stage4-review` are unaffected. Full audit, stage records, and the loader-consistency investigation: `docs/MACOS-PORT-FEASIBILITY.md`.
+> **Status:** Mac 2 **PASS (2026-10-20)** — implementation and CI green on macOS ARM64, and the physical M1 MacBook Air acceptance (Tests A–F below) passed: rendering with active validation 0/0, region visualization (`invalid 0`, conservation true), a 29-recreation resize run, presentation-mode observations (mailbox→FIFO · immediate 225.9 fps), and single-loader confirmation (the SDK's `libvulkan.dylib` and `libvulkan.1.dylib` both resolve to `libvulkan.1.4.363.dylib`). Full evidence and the preserved limitations: `docs/MACOS-PORT-FEASIBILITY.md` §15. The procedure below remains the reproducible run. macOS support is experimental, developed on `macos-port` (branched from the Stage 4 code at `2e71770`) and **merged into `main` 2026-10-21** as part of the lead-authorized branch consolidation; the `macos-port` branch and worktree remain for the deferred Mac 3. Full audit, stage records, and the loader-consistency investigation: `docs/MACOS-PORT-FEASIBILITY.md`.
 
 **One-time environment setup** (nothing here disables SIP or weakens macOS security):
 
@@ -182,9 +184,9 @@ The first build compiles vendored SDL 3.4.18 (a few minutes). Expected: a 1280×
 
 | Environment | Method | Result |
 |---|---|---|
-| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 148 passed + 1 ignored soak, fmt/clippy clean, headless smoke + presence-scenario double runs + per-LOD/activation-latency measurement tests + lavapipe offscreen render smokes incl. `--render --regions` (correctness only) |
+| Linux (dev pod, x86_64, rustc 1.99.1, user-local CMake 3.30.5) | direct build/test | green — 158 passed + 1 ignored soak post-consolidation (148 Stage 4 + 10 macOS-portability), fmt/clippy clean, headless smoke + presence-scenario double runs + per-LOD/activation-latency measurement tests + lavapipe offscreen render smokes incl. `--render --regions` (correctness only) |
 | Windows (windows-latest runner) | CI `engine-ci` | see CI runs |
-| Real-window GUI | manual, lead's rig | instructions above (Stage 2 checklist + the Stage 4 acceptance plan); evidence pending the lead's run |
+| Real-window GUI (RTX 5070 Ti / Ryzen 7 9800X3D, Windows, rustc 1.99.1) | manual, lead's run — Stage 4 acceptance 2026-10-21 | **PASS** — 148+1 tests, release fingerprints byte-identical, validation err/warn 0/0, activation latency worst 0.06 ms vs the < 50 ms budget, conservation true / invalid 0 ([record](../docs/STAGE4-WINDOWS-ACCEPTANCE-RECORD-2026-10-21.md)) |
 | macOS (macos-15 ARM64 runner, `macos-port` branch) | CI `engine-ci` on macos-port | Mac 1 CPU gates green; Mac 2 code green — 158 passed + 1 ignored, exact fingerprints on aarch64-apple-darwin |
 | macOS (Apple M1 MacBook Air, macOS 26.6.2, Vulkan SDK 1.4.363.0 + MoltenVK 1.4.2) | manual, lead's run — Mac 2 acceptance Tests A–F | **PASS 2026-10-20** — rendering with active validation 0/0 (1,955 frames / 34.7 s), regions (2,475 frames, `invalid 0`, conservation true), 29-recreation resize run, mailbox→FIFO 60.5 / immediate 225.9 / 240-target→FIFO 60.9 fps, single Khronos loader confirmed (feasibility doc §15) |
 

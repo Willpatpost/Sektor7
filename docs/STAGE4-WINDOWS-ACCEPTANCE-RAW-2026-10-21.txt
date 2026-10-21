@@ -1,0 +1,672 @@
+================================================================================
+Sektor7 — Stage 4 Windows acceptance — raw terminal evidence (2026-10-20/21)
+Provenance: the lead's PowerShell session on the acceptance rig, pasted verbatim 2026-10-21; the original paste is retained unchanged outside the repository. The session was additionally captured on the rig via Start-Transcript to %TEMP%\Sektor7-Stage4-Windows.txt.
+Redaction: the local username in file paths only (C:\Users\<redacted>\). No measured value, error line, or output was altered or omitted.
+================================================================================
+
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> git branch --show-current
+>> git rev-parse HEAD
+>> git status --short
+>> 
+>> rustc --version
+>> cargo --version
+stage4-review
+2e7177077656c4cbd97d0d56aa0dd02c64da9fea
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> $Stage4Log = Join-Path $env:TEMP "Sektor7-Stage4-Windows.txt"
+>> Start-Transcript -Path $Stage4Log -Force
+Transcript started, output file is C:\Users\<redacted>\AppData\Local\Temp\Sektor7-Stage4-Windows.txt
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> cargo test --workspace
+>> cargo build --release -p engine-slice
+   Compiling engine-core v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-core)
+   Compiling engine-shell v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-shell)                    
+   Compiling engine-renderer v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-renderer)
+   Compiling engine-slice v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-slice)                    
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.55s                                            
+     Running unittests src\lib.rs (target\debug\deps\engine_core-3b3c5f32a7941dd9.exe)
+
+running 7 tests
+test diag::tests::level_parse_round_trips ... ok
+test diag::tests::off_suppresses_everything ... ok
+test diag::tests::threshold_drops_less_severe_records ... ok
+test fingerprint::tests::embedded_nul_strings_do_not_collide ... ok
+test fingerprint::tests::hex_form_is_sixteen_lowercase_characters ... ok
+test fingerprint::tests::write_str_length_prefix_separates_splits ... ok
+test fingerprint::tests::fnv1a_reference_vectors ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\determinism.rs (target\debug\deps\determinism-c259fede2bcadd4b.exe)
+
+running 2 tests
+test double_run_fingerprints_are_identical ... ok
+test fingerprints_are_sensitive_to_scenario_changes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\lanes.rs (target\debug\deps\lanes-1a9092c084210fbc.exe)
+
+running 9 tests
+test legacy_single_lane_is_deterministic_in_the_stage0_domain ... ok
+test causal_blocking_spans_lanes_without_budget_consumption ... ok
+test lane_fingerprint_distinguishes_meaningful_configuration ... ok
+test far_work_uses_genuinely_unused_near_capacity ... ok
+test lane_determinism_double_run ... ok
+test near_saturation_backlogs_only_at_total_exhaustion ... ok
+test three_phase_redistribution_executes_all_available_work ... ok
+test mutual_saturation_splits_by_guarantee ... ok
+test synchrony_burst_of_200_drains_with_lateness_zero_drops ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\lod.rs (target\debug\deps\lod-38f336f80ec1e82e.exe)
+
+running 12 tests
+test hysteresis_prevents_boundary_oscillation ... ok
+test config_validation_rejects_invalid_thresholds ... ok
+test distance_bands_target_levels_with_hysteresis_stability ... ok
+test multiple_presence_inputs_use_the_nearest ... ok
+test non_finite_presence_samples_do_not_participate ... ok
+test overflowed_projection_degenerates_to_stationary ... ok
+test segment_crossing_activates_regions_both_endpoints_miss ... ok
+test segment_distance_is_nan_free_under_huge_coordinates ... ok
+test segment_near_miss_respects_thresholds ... ok
+test targeting_is_pure_and_deterministic ... ok
+test velocity_lookahead_activates_approaching_regions_earlier ... ok
+test negative_or_oversized_thresholds_are_rejected ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\spine_contracts.rs (target\debug\deps\spine_contracts-1fbb52e5c13b6937.exe)
+
+running 15 tests
+test clock_advances_one_tick_per_run ... ok
+test blocked_event_caps_watermark_until_dependency_executes ... ok
+test audit_counterexample_blocking_reorders_in_class_execution ... ok
+test audit_counterexample_late_arrival_reorders_in_class_execution ... ok
+test budget_leaves_due_work_queued_and_reported ... ok
+test watermark_is_max_executed_when_idle_and_never_reaches_clock ... ok
+test earlier_due_executes_first_even_if_scheduled_later ... ok
+test follow_up_anchors_to_execution_not_intended_time ... ok
+test in_class_same_due_executes_in_schedule_order ... ok
+test late_arrival_retreats_watermark ... ok
+test unknown_dependency_is_rejected_at_schedule_time ... ok
+test watermark_is_none_while_a_pending_event_sits_at_tick_zero ... ok
+test dependency_on_already_executed_event_does_not_block ... ok
+test every_scheduled_event_eventually_executes ... ok
+test max_executed_due_is_incremental_exact_and_query_bounded ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests\suspension.rs (target\debug\deps\suspension-88914ae118250ae8.exe)
+
+running 16 tests
+test follow_up_in_field_classifies_new_obligations ... ok
+test run_to_completion_distinguishes_runnable_from_unfinished ... ok
+test watermark_cannot_advance_past_held_overdue_work ... ok
+test scheduled_is_historical_and_conservation_extends_to_held ... ok
+test run_to_completion_does_not_advance_time_on_held_blocked_graphs ... ok
+test blocked_event_suspension_revalidates_on_resume ... ok
+test new_dependencies_on_held_events_are_valid_and_wait ... ok
+test schedule_held_targets_dormant_regions_without_execution ... ok
+test suspension_cycle_is_invisible_to_historical_fingerprint_domains ... ok
+test suspension_preserves_identity_priority_and_lane ... ok
+test held_fingerprint_is_deterministic_and_sensitive ... ok
+test cross_region_dependency_survives_suspension ... ok
+test repeated_cycles_and_duplicate_attempts_are_stable ... ok
+test held_min_due_index_stays_consistent_with_the_held_set ... ok
+test reclassify_protects_promoted_regions_under_far_overload ... ok
+test watermark_queries_do_not_scale_with_held_obligations ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running unittests src\lib.rs (target\debug\deps\engine_renderer-ecfda81b15a89597.exe)
+
+running 17 tests
+test config::tests::fifo_is_always_selected_for_auto ... ok
+test config::tests::immediate_prefers_immediate_when_supported ... ok
+test config::tests::immediate_falls_back_to_fifo_when_unsupported ... ok
+test config::tests::mailbox_falls_back_to_fifo_when_unsupported ... ok
+test vulkan::policy_tests::overlay_slot_regions_are_disjoint ... ok
+test overlay::tests::known_glyph_produces_expected_quads ... ok
+test vulkan::policy_tests::timestamp_gate_requires_support_and_a_resolved_sample ... ok
+test vulkan::policy_tests::extent_selection_respects_pinned_and_unspecified_surfaces ... ok
+test vulkan::policy_tests::present_semaphore_table_only_grows ... ok
+test vulkan::policy_tests::suboptimal_present_schedules_recreation_until_consumed ... ok
+test config::tests::mailbox_prefers_mailbox_when_supported ... ok
+test vulkan::policy_tests::valid_and_unspecified_surfaces_remain_renderable ... ok
+test scene::tests::scene_is_nonempty_and_consistent ... ok
+test vulkan::policy_tests::extent_selection_never_fabricates_nonzero_from_zero ... ok
+test config::tests::preference_parsing_round_trips ... ok
+test vulkan::policy_tests::zero_sized_surface_capabilities_defer_rendering ... ok
+test overlay::tests::newline_advances_rows_and_cap_holds ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\engine_shell-a3175a7eed6aa5b5.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\input_dispatch.rs (target\debug\deps\input_dispatch-742f2d2d426fca83.exe)
+
+running 13 tests
+test close_request_is_reported_as_requested_when_callback_quits ... ok
+test close_request_quits_stickily ... ok
+test look_deltas_require_relative_capture_and_do_not_accumulate ... ok
+test focus_regain_requires_a_fresh_press ... ok
+test focus_transitions_are_recorded_in_diagnostics ... ok
+test key_repeats_are_counted_not_repressed ... ok
+test mouse_button_edges_are_reported ... ok
+test focus_loss_clears_held_keys_and_pending_deltas ... ok
+test paced_loop_runs_and_stops_via_callback ... ok
+test paced_loop_stops_on_close_request ... ok
+test resize_is_reported_once ... ok
+test sdl_quit_event_quits ... ok
+test wasd_axes_and_key_edges ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests\lifecycle.rs (target\debug\deps\lifecycle-7a7b8af9f40aa328.exe)
+
+running 2 tests
+test hundred_create_close_cycles ... ok
+test linked_sdl_version_is_the_vendored_3_4_18 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\soak.rs (target\debug\deps\soak-75406c68c217aaca.exe)
+
+running 1 test
+test application_loop_soak_60_seconds ... ignored, long-running measurement (60 s); run explicitly with --ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\engine_slice-c128a61aa30117a7.exe)
+
+running 4 tests
+test math::tests::camera_view_inverts_camera_transform ... ok
+test math::tests::identity_multiplication_is_identity ... ok
+test math::tests::zero_orientation_looks_down_negative_z ... ok
+test math::tests::vulkan_perspective_maps_mid_depth_into_unit_range ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\engine_slice-39f182f98e6f1186.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\frame_timing.rs (target\debug\deps\frame_timing-fd5e993a83a006c6.exe)
+
+running 4 tests
+test minimized_frames_keep_the_campaign_clock_advancing ... ok
+test no_simulation_time_discarded_across_mixed_frames ... ok
+test rendering_stall_feeds_the_full_interval_to_the_simulation ... ok
+test timing_policy_with_driver_costs_no_simulation_time ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\npc_lod.rs (target\debug\deps\npc_lod-b5a22f4d72c9db59.exe)
+
+running 7 tests
+test replay_is_exact_and_synthesis_is_bounded_drift ... ok
+test routine_payloads_are_explicitly_typed ... ok
+test lod_mode_cadence_scales_execution_rates ... ok
+test positions_stay_within_region_bounds ... ok
+test milestones_count_real_executions_only ... ok
+test legacy_mode_reproduces_the_accepted_stage3_baseline ... ok
+test spatial_fingerprint_is_deterministic_and_sensitive ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests\region_render.rs (target\debug\deps\region_render-a11ad9f14a3d58d2.exe)
+
+running 5 tests
+test camera_presence_maps_render_xz_to_region_xy ... ok
+test levels_compact_renders_one_char_per_region ... ok
+test dormant_sentinel_positions_produce_no_proxies ... ok
+test region_scene_reflects_levels_and_proxy_policy ... ok
+test lod_levels_have_distinct_plate_colors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\regions.rs (target\debug\deps\regions-39e66be520875fa6.exe)
+
+running 17 tests
+test capture_ledger_is_exactly_once ... ok
+test director_routes_new_dormant_targeted_obligations_to_held ... ok
+test activation_protects_promoted_regions_under_load ... ok
+test stationary_presence_assigns_levels_and_true_dormancy ... ok
+test watermark_stays_safe_during_dormancy ... ok
+test activation_without_a_recovery_checkpoint_fails_closed ... ok
+test activation_failure_preserves_a_coherent_dormant_state ... ok
+test post_checkpoint_dormant_obligations_resume_without_routine_confusion ... ok
+test malformed_routine_events_cannot_corrupt_a_foreign_region ... ok
+test per_lod_work_scales_across_levels ... ok
+test reconstruction_labels_and_adaptive_selection ... ok
+test capture_before_discard_survives_repeated_cycles ... ok
+test rapid_transitions_reconstruct_only_the_unrepresented_interval ... ok
+test activation_latency_stays_under_the_delivery_budget ... ok
+test tour_preserves_identities_and_conservation_through_cycles ... ok
+test scripted_presence_is_equivalent_across_frame_cadences ... ok
+test region_runs_are_deterministic_across_double_runs ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests\session.rs (target\debug\deps\session-7ad2d37cd05cf41d.exe)
+
+running 10 tests
+test missing_arguments_report_usage ... ok
+test crlf_lines_are_tolerated ... ok
+test max_payload_terminates_without_panic_or_wrap ... ok
+test quit_returns_quit_outcome ... ok
+test late_arrival_is_reported ... ok
+test dependency_commands_block_and_release ... ok
+test fingerprint_format_and_determinism ... ok
+test unknown_command_is_an_error ... ok
+test schedules_executes_and_reports ... ok
+test selftest_is_deterministic ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\sim_determinism.rs (target\debug\deps\sim_determinism-a6f8dd9e28711ba9.exe)
+
+running 8 tests
+test catch_up_bound_retains_reports_and_eventually_executes_overflow ... ok
+test artificially_low_budget_produces_measurable_backlog_never_silent_loss ... ok
+test synchrony_burst_of_200_processes_completely_with_recorded_lateness ... ok
+test near_field_starvation_free_under_far_field_pressure ... ok
+test different_seeds_produce_different_logical_states ... ok
+test tick_rate_does_not_change_logical_results_at_equal_ticks ... ok
+test identical_configuration_and_ticks_produce_identical_fingerprints ... ok
+test render_cadence_does_not_change_logical_results ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+   Doc-tests engine_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests engine_renderer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests engine_shell
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests engine_slice
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling rpkg-config v0.1.2
+   Compiling sdl3-src v3.4.18
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.34
+   Compiling libm v0.2.16
+   Compiling ash v0.38.0+1.3.281
+   Compiling autocfg v1.5.1
+   Compiling zerocopy v0.8.63
+   Compiling thiserror v2.0.21
+   Compiling windows-link v0.2.1
+   Compiling cfg_aliases v0.2.2                                                                                     
+   Compiling libloading v0.8.9                                                                                      
+   Compiling libc v0.2.191                                                                                          
+   Compiling bitflags v2.13.2                                                                                       
+   Compiling naga v29.0.4
+   Compiling bit-vec v0.9.1                                                                                         
+   Compiling hashbrown v0.17.1                                                                                      
+   Compiling unicode-xid v0.2.6
+   Compiling cfg-if v1.0.5                                                                                          
+   Compiling cc v1.9.0                                                                                              
+   Compiling num-traits v0.2.19                                                                                     
+   Compiling equivalent v1.0.3                                                                                      
+   Compiling foldhash v0.2.0                                                                                        
+   Compiling unicode-width v0.2.2                                                                                   
+   Compiling bit-set v0.9.1                                                                                         
+   Compiling pp-rs v0.2.1                                                                                           
+   Compiling spirv v0.4.0+sdk-1.4.341.0                                                                             
+   Compiling hashbrown v0.16.1                                                                                      
+   Compiling rustc-hash v1.1.0                                                                                      
+   Compiling log v0.4.34                                                                                            
+   Compiling arrayvec v0.7.8
+   Compiling codespan-reporting v0.13.1                                                                             
+   Compiling once_cell v1.21.4                                                                                      
+   Compiling engine-core v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-core)                      
+   Compiling font8x8 v0.3.1                                                                                         
+   Compiling indexmap v2.14.2                                                                                       
+   Compiling syn v3.0.9                                                                                             
+   Compiling syn v2.0.119
+   Compiling cmake v0.1.58                                                                                          
+   Compiling sdl3-sys v0.7.2+SDL-3.4.18                                                                             
+   Compiling thiserror-impl v2.0.21                                                                                 
+   Compiling bytemuck_derive v1.12.1
+   Compiling zerocopy-derive v0.8.63                                                                                
+   Compiling bytemuck v1.25.2                                                                                       
+   Compiling half v2.7.1                                                                                            
+   Compiling sdl3 v0.20.0                                                                                           
+   Compiling engine-renderer v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-renderer)              
+   Compiling engine-shell v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-shell)                    
+   Compiling engine-slice v0.1.0 (C:\Users\<redacted>\Code\GitHub\Sektor7\engine\crates\engine-slice)                    
+    Finished `release` profile [optimized] target(s) in 39.71s                                                      
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --sim --presence stationary
+Sektor7 Stage 3 — headless simulation
+  config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · seed 1337 · cadence 60 Hz
+  campaign: tick 600 · executed 13741 · late arrivals 0 · late executions 0
+  backlog: pending 375 (near 125 / far 250) · blocked 0 · budget-exhausted ticks 0
+  lanes: near executed 11491 (backlogged ticks 0) · far executed 2250 (backlogged ticks 0)
+  watermark: max_executed_due 600 · processed_through 0
+  npc: total activity steps 13741
+  fingerprints: engine-lanes=d9b63b65bbd6e80c state-lanes=f18b987de81a98fd
+--- regions ---
+  levels: [Full, EventDriven, Dormant, Dormant, Dormant, Dormant, Dormant, EventDriven]
+  transitions: activations 0 (replay 0 / synthesis 0) · deactivations 5 · invalid 0
+  reconstruction: activities 0 · captured 0 · reapplied 0
+  obligations: queued 375 · blocked 0 · held 625 · conservation true
+  fingerprints: stage4=da1b2d1a7e5cd49e · held=debd94d1d5adaf80
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --sim --presence walk
+Sektor7 Stage 3 — headless simulation
+  config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · seed 1337 · cadence 60 Hz
+  campaign: tick 600 · executed 11712 · late arrivals 0 · late executions 643
+  backlog: pending 375 (near 125 / far 250) · blocked 0 · budget-exhausted ticks 2
+  lanes: near executed 7712 (backlogged ticks 0) · far executed 4000 (backlogged ticks 2)
+  watermark: max_executed_due 600 · processed_through 216
+  npc: total activity steps 11712
+  fingerprints: engine-lanes=9e7f4d4048778dda state-lanes=276ae244c2adbeae
+--- regions ---
+  levels: [Dormant, Dormant, Dormant, EventDriven, Full, EventDriven, Dormant, Dormant]
+  transitions: activations 5 (replay 2 / synthesis 3) · deactivations 10 · invalid 0
+  reconstruction: activities 8536 · captured 0 · reapplied 0
+  obligations: queued 375 · blocked 0 · held 625 · conservation true
+  fingerprints: stage4=1df391ad488848bf · held=3fd88e07f7a84fe0
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --sim --presence tour
+Sektor7 Stage 3 — headless simulation
+  config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · seed 1337 · cadence 60 Hz
+  campaign: tick 600 · executed 18150 · late arrivals 0 · late executions 875
+  backlog: pending 500 (near 250 / far 250) · blocked 0 · budget-exhausted ticks 0
+  lanes: near executed 14929 (backlogged ticks 0) · far executed 3221 (backlogged ticks 0)
+  watermark: max_executed_due 600 · processed_through 300
+  npc: total activity steps 18150
+  fingerprints: engine-lanes=31d3f6224aab62ed state-lanes=a1e9e43fda4c8956
+--- regions ---
+  levels: [Full, EventDriven, Dormant, Dormant, Dormant, Dormant, EventDriven, Full]
+  transitions: activations 7 (replay 3 / synthesis 4) · deactivations 11 · invalid 0
+  reconstruction: activities 16230 · captured 615 · reapplied 125
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4=495ab27b37549e93 · held=e6d7019c30efe6c9
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --sim --presence tour
+Sektor7 Stage 3 — headless simulation
+  config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · seed 1337 · cadence 60 Hz
+  campaign: tick 600 · executed 18150 · late arrivals 0 · late executions 875
+  backlog: pending 500 (near 250 / far 250) · blocked 0 · budget-exhausted ticks 0
+  lanes: near executed 14929 (backlogged ticks 0) · far executed 3221 (backlogged ticks 0)
+  watermark: max_executed_due 600 · processed_through 300
+  npc: total activity steps 18150
+  fingerprints: engine-lanes=31d3f6224aab62ed state-lanes=a1e9e43fda4c8956
+--- regions ---
+  levels: [Full, EventDriven, Dormant, Dormant, Dormant, Dormant, EventDriven, Full]
+  transitions: activations 7 (replay 3 / synthesis 4) · deactivations 11 · invalid 0
+  reconstruction: activities 16230 · captured 615 · reapplied 125
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4=495ab27b37549e93 · held=e6d7019c30efe6c9
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:false
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+--- run summary ---
+presented 1304 frames over 30.2s (43.1 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.52 ms · p95 0.90 ms · p99 4.19 ms
+paced frame interval (incl. pacing sleep; target 60 fps): p50 17.00 ms · p95 17.15 ms · p99 17.22 ms
+gpu render (timestamps, 600 samples): p50 0.04 ms · p95 0.06 ms · p99 0.07 ms
+present mode fifo · swapchain recreations 3 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 30206.4 ms · ticks due 302 = campaign 302 + outstanding 0 (accounted, never discarded)
+campaign tick 302 · executed 46001 · late arrivals 0 · late executions 169
+backlog pending 1000 (near 250 / far 750) · blocked 0 · budget-exhausted ticks 6
+lanes near 11501 (backlogged ticks 3) · far 34500 (backlogged ticks 6)
+sim tick time (spine execution): p50 0.067 ms · p95 0.121 ms (per-tick, 302 samples)
+watermark max_executed_due 302 · processed_through 302
+npc activity steps 46001 · fingerprints engine-lanes b729032ee8c9d1fe · state-lanes 5b85a1ba4690460c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --validation on
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:true
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 2467 frames over 77.6s (31.8 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.22 ms · p95 0.49 ms · p99 0.54 ms
+paced frame interval (incl. pacing sleep; target 60 fps): p50 17.01 ms · p95 17.17 ms · p99 17.19 ms
+gpu render (timestamps, 600 samples): p50 0.01 ms · p95 0.01 ms · p99 0.01 ms
+present mode fifo · swapchain recreations 0 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 77552.8 ms · ticks due 775 = campaign 775 + outstanding 0 (accounted, never discarded)
+campaign tick 775 · executed 12192 · late arrivals 0 · late executions 519
+backlog pending 1000 (near 0 / far 1000) · blocked 0 · budget-exhausted ticks 1
+lanes near 2317 (backlogged ticks 0) · far 9875 (backlogged ticks 1)
+sim tick time (spine execution): p50 0.000 ms · p95 0.032 ms (per-tick, 600 samples)
+region director time (presence sampling + transitions): p50 0.000 ms · p95 0.001 ms (per-tick, 600 samples)
+watermark max_executed_due 762 · processed_through 762
+npc activity steps 12192 · fingerprints engine-lanes ff0fba2849c9bbba · state-lanes 440b2f6ed21f1423
+--- regions ---
+  levels: E E E E E E E E
+  transitions: activations 4 · deactivations 4 · invalid 0
+  reconstruction: activities 10520 · replay 0 / synthesis 4 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.04 ms · p95 0.06 ms · worst 0.06 ms
+  obligations: queued 1000 · blocked 0 · held 0 · conservation true
+  fingerprints: stage4 8c742d2843c784ae · held 3812fa0899c9f96f
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --validation on --frames 20 --fps uncapped --simulate-resize
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:true
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 20 frames over 0.1s (278.3 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.88 ms · p95 14.55 ms · p99 27.70 ms
+paced frame interval (incl. pacing sleep; target uncapped): p50 0.75 ms · p95 14.55 ms · p99 27.70 ms
+gpu render (timestamps, 18 samples): p50 0.05 ms · p95 0.31 ms · p99 0.31 ms
+present mode fifo · swapchain recreations 1 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 69.1 ms · ticks due 0 = campaign 0 + outstanding 0 (accounted, never discarded)
+campaign tick 0 · executed 0 · late arrivals 0 · late executions 0
+backlog pending 500 (near 125 / far 375) · blocked 0 · budget-exhausted ticks 0
+lanes near 0 (backlogged ticks 0) · far 0 (backlogged ticks 0)
+sim tick time (spine execution): p50 0.000 ms · p95 0.000 ms (per-tick, 0 samples)
+region director time (presence sampling + transitions): p50 0.000 ms · p95 0.000 ms (per-tick, 0 samples)
+watermark max_executed_due none · processed_through none
+npc activity steps 0 · fingerprints engine-lanes 1fa5272eb6f28ae7 · state-lanes 7dffc8d4077112c2
+--- regions ---
+  levels: F E E D D D D E
+  transitions: activations 0 · deactivations 4 · invalid 0
+  reconstruction: activities 0 · replay 0 / synthesis 0 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.00 ms · p95 0.00 ms · worst 0.00 ms
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4 cbfa6d4b61e0c7c4 · held 5ae1d16610435b8c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --validation on --frames 20 --fps uncapped --simulate-resize --replace-pipelines
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:true
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 20 frames over 0.1s (232.5 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.69 ms · p95 21.59 ms · p99 35.03 ms
+paced frame interval (incl. pacing sleep; target uncapped): p50 0.65 ms · p95 21.59 ms · p99 35.03 ms
+gpu render (timestamps, 18 samples): p50 0.05 ms · p95 0.07 ms · p99 0.07 ms
+present mode fifo · swapchain recreations 1 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 83.0 ms · ticks due 0 = campaign 0 + outstanding 0 (accounted, never discarded)
+campaign tick 0 · executed 0 · late arrivals 0 · late executions 0
+backlog pending 500 (near 125 / far 375) · blocked 0 · budget-exhausted ticks 0
+lanes near 0 (backlogged ticks 0) · far 0 (backlogged ticks 0)
+sim tick time (spine execution): p50 0.000 ms · p95 0.000 ms (per-tick, 0 samples)
+region director time (presence sampling + transitions): p50 0.000 ms · p95 0.000 ms (per-tick, 0 samples)
+watermark max_executed_due none · processed_through none
+npc activity steps 0 · fingerprints engine-lanes 1fa5272eb6f28ae7 · state-lanes 7dffc8d4077112c2
+--- regions ---
+  levels: F E E D D D D E
+  transitions: activations 0 · deactivations 4 · invalid 0
+  reconstruction: activities 0 · replay 0 / synthesis 0 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.00 ms · p95 0.00 ms · worst 0.00 ms
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4 cbfa6d4b61e0c7c4 · held 5ae1d16610435b8c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --present fifo --fps 240
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:false
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 1327 frames over 11.5s (115.9 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.64 ms · p95 1.04 ms · p99 1.14 ms
+paced frame interval (incl. pacing sleep; target 240 fps): p50 4.51 ms · p95 4.67 ms · p99 4.70 ms
+gpu render (timestamps, 600 samples): p50 0.05 ms · p95 0.08 ms · p99 0.09 ms
+present mode fifo · swapchain recreations 0 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 11445.7 ms · ticks due 114 = campaign 114 + outstanding 0 (accounted, never discarded)
+campaign tick 114 · executed 2899 · late arrivals 0 · late executions 0
+backlog pending 500 (near 125 / far 375) · blocked 0 · budget-exhausted ticks 0
+lanes near 2149 (backlogged ticks 0) · far 750 (backlogged ticks 0)
+sim tick time (spine execution): p50 0.011 ms · p95 0.031 ms (per-tick, 114 samples)
+region director time (presence sampling + transitions): p50 0.000 ms · p95 0.001 ms (per-tick, 114 samples)
+watermark max_executed_due 114 · processed_through 0
+npc activity steps 2899 · fingerprints engine-lanes f29560f9c6dbdf29 · state-lanes 10e01ed445cbdffe
+--- regions ---
+  levels: F E E D D D D E
+  transitions: activations 0 · deactivations 4 · invalid 0
+  reconstruction: activities 0 · replay 0 / synthesis 0 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.00 ms · p95 0.00 ms · worst 0.00 ms
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4 057fa121a60d8a0a · held 5ae1d16610435b8c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --present mailbox --fps 240
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: mailbox (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation: false
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 914 frames over 4.1s (224.0 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.68 ms · p95 1.04 ms · p99 1.14 ms
+paced frame interval (incl. pacing sleep; target 240 fps): p50 4.50 ms · p95 4.68 ms · p99 4.70 ms
+gpu render (timestamps, 600 samples): p50 0.05 ms · p95 0.05 ms · p99 0.06 ms
+present mode mailbox · swapchain recreations 0 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 4076.7 ms · ticks due 40 = campaign 40 + outstanding 0 (accounted, never discarded)
+campaign tick 40 · executed 1098 · late arrivals 0 · late executions 0
+backlog pending 500 (near 125 / far 375) · blocked 0 · budget-exhausted ticks 0
+lanes near 723 (backlogged ticks 0) · far 375 (backlogged ticks 0)
+sim tick time (spine execution): p50 0.015 ms · p95 0.035 ms (per-tick, 40 samples)
+region director time (presence sampling + transitions): p50 0.001 ms · p95 0.001 ms (per-tick, 40 samples)
+watermark max_executed_due 40 · processed_through 0
+npc activity steps 1098 · fingerprints engine-lanes 6f947f89be3dfc54 · state-lanes 2eaceaf677a41f52
+--- regions ---
+  levels: F E E D D D D E
+  transitions: activations 0 · deactivations 4 · invalid 0
+  reconstruction: activities 0 · replay 0 / synthesis 0 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.00 ms · p95 0.00 ms · worst 0.00 ms
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4 7b88db7c3762890e · held 5ae1d16610435b8c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --present immediate --fps uncapped
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: immediate (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation: false
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 7373 frames over 4.2s (1744.3 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.54 ms · p95 0.62 ms · p99 0.72 ms
+paced frame interval (incl. pacing sleep; target uncapped): p50 0.54 ms · p95 0.62 ms · p99 0.72 ms
+gpu render (timestamps, 600 samples): p50 0.05 ms · p95 0.06 ms · p99 0.08 ms
+present mode immediate · swapchain recreations 0 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 200 · near reserve 60 (default) · catch-up 8/frame
+sim time: advanced 4225.7 ms · ticks due 42 = campaign 42 + outstanding 0 (accounted, never discarded)
+campaign tick 42 · executed 1139 · late arrivals 0 · late executions 0
+backlog pending 500 (near 125 / far 375) · blocked 0 · budget-exhausted ticks 0
+lanes near 764 (backlogged ticks 0) · far 375 (backlogged ticks 0)
+sim tick time (spine execution): p50 0.013 ms · p95 0.036 ms (per-tick, 42 samples)
+region director time (presence sampling + transitions): p50 0.000 ms · p95 0.001 ms (per-tick, 42 samples)
+watermark max_executed_due 42 · processed_through 0
+npc activity steps 1139 · fingerprints engine-lanes b437624b4d9062d5 · state-lanes cd2280687ce68f73
+--- regions ---
+  levels: F E E D D D D E
+  transitions: activations 0 · deactivations 4 · invalid 0
+  reconstruction: activities 0 · replay 0 / synthesis 0 · captured 0 · reapplied 0
+  activation latency (observational): p50 0.00 ms · p95 0.00 ms · worst 0.00 ms
+  obligations: queued 500 · blocked 0 · held 500 · conservation true
+  fingerprints: stage4 1a4a22f6dbe7932e · held 5ae1d16610435b8c
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> .\target\release\engine-slice.exe --render --regions --validation on --sim-budget 30
+Sektor7 Stage 2 — Vulkan first render
+  device: discrete NVIDIA GeForce RTX 5070 Ti (Vulkan 1.4.351)
+  present: fifo (supported: fifo/fifo-relaxed/mailbox/immediate/other) · 3 swapchain images · 1280x720 · validation:true
+  controls: WASD move · mouse look · Q/E roll · R/F up/down · Shift fast · O overlay · Esc/close quit
+  regions: 8 area plates colored by LOD (F/S/E/D) · NPC proxies for Full/Simplified only · camera = live presence source
+--- run summary ---
+presented 2492 frames over 51.4s (48.4 fps avg)
+cpu work (poll→present, excl. pacing sleep): p50 0.88 ms · p95 1.19 ms · p99 1.41 ms
+paced frame interval (incl. pacing sleep; target 60 fps): p50 17.01 ms · p95 17.15 ms · p99 17.19 ms
+gpu render (timestamps, 600 samples): p50 0.05 ms · p95 0.09 ms · p99 0.09 ms
+present mode fifo · swapchain recreations 0 · validation err/warn 0/0
+--- simulation summary ---
+config: 10 Hz tick rate · budget 30 · near reserve 9 (default, scaled from 60 for budget 30) · catch-up 8/frame
+sim time: advanced 51425.3 ms · ticks due 514 = campaign 514 + outstanding 0 (accounted, never discarded)
+campaign tick 514 · executed 10556 · late arrivals 0 · late executions 3108
+backlog pending 625 (near 250 / far 375) · blocked 0 · budget-exhausted ticks 168
+lanes near 7645 (backlogged ticks 164) · far 2911 (backlogged ticks 59)
+sim tick time (spine execution): p50 0.013 ms · p95 0.028 ms (per-tick, 514 samples)
+region director time (presence sampling + transitions): p50 0.001 ms · p95 0.001 ms (per-tick, 514 samples)
+watermark max_executed_due 514 · processed_through 289
+npc activity steps 10556 · fingerprints engine-lanes 0514d1adf9e6257b · state-lanes b990b5e04021aaa2
+--- regions ---
+  levels: D D D E S S E E
+  transitions: activations 4 · deactivations 7 · invalid 0
+  reconstruction: activities 29354 · replay 0 / synthesis 4 · captured 125 · reapplied 0
+  activation latency (observational): p50 0.05 ms · p95 0.06 ms · worst 0.06 ms
+  obligations: queued 625 · blocked 0 · held 375 · conservation true
+  fingerprints: stage4 25600cdda6cc6d8a · held c9a4c75260b40170
+note: instrument readings of the simple Stage 2 scene — not first-game performance claims; no growth observed is notproof that leaks are impossible.
+evidence note: real-GPU GUI evidence requires a graphical session with hardware Vulkan; software-ICD runs (lavapipe)are correctness smoke only.
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> Stop-Transcript
+>> Write-Host "Stage 4 log saved to: $Stage4Log"
+Transcript stopped, output file is C:\Users\<redacted>\AppData\Local\Temp\Sektor7-Stage4-Windows.txt
+Stage 4 log saved to: C:\Users\<redacted>\AppData\Local\Temp\Sektor7-Stage4-Windows.txt
+PS C:\Users\<redacted>\Code\GitHub\Sektor7\engine> 
