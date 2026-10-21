@@ -497,12 +497,19 @@ impl AwardState {
     }
 
     /// Encounter-failure rollback: restores the **provisional**
-    /// coverage wholesale from the checkpoint; the **durable** lane
-    /// is never rolled back (durable-classified awards from during
-    /// the encounter are retained — their eligibility protection
-    /// stands).
+    /// coverage from the checkpoint — minus any occurrences the
+    /// durable lane has covered since (a durable promotion survives
+    /// per its classification; restoring it to the provisional lane
+    /// as well would place one occurrence in both lanes). The
+    /// **durable** lane is never rolled back (durable-classified
+    /// awards from during the encounter are retained — their
+    /// eligibility protection stands).
     pub fn rollback(&mut self, checkpoint: AwardCheckpoint) {
-        self.provisional = checkpoint.provisional;
+        let mut restored = checkpoint.provisional;
+        for span in self.durable.spans().to_vec() {
+            restored.remove_span(&span);
+        }
+        self.provisional = restored;
     }
 
     /// Encounter commit: the transaction's provisional contributions
@@ -1027,6 +1034,52 @@ mod tests {
         state.rollback(checkpoint);
         assert!(state.covers(5) && state.covers(6));
         assert!(!state.covers(7));
+    }
+
+    #[test]
+    fn promotion_survives_rollback_without_cross_lane_overlap() {
+        // The reviewer's targeted regression: the checkpoint's
+        // provisional coverage contains occurrence 5; 5 is promoted
+        // to durable; the encounter fails — restoring the checkpoint
+        // must not place 5 back into the provisional lane alongside
+        // its durable promotion (one occurrence, two lanes).
+        let mut state = AwardState::new();
+        state.award_provisional(5);
+        let checkpoint = state.checkpoint();
+        state.promote_provisional(&OccurrenceSpan::new(4, 5).unwrap());
+        assert!(state.durable.covers(5));
+        assert!(state.provisional.is_empty());
+        state.rollback(checkpoint);
+        assert!(
+            state.durable.covers(5),
+            "the durable promotion survives per its classification"
+        );
+        assert!(
+            !state.provisional.covers(5),
+            "rollback never restores a promoted occurrence to the provisional lane"
+        );
+        assert!(state.validate().is_ok());
+        // The restored state serializes (cross-lane coherent).
+        assert!(state.canonical_bytes().is_ok());
+    }
+
+    #[test]
+    fn partial_promotion_rollback_restores_only_unpromoted_coverage() {
+        // A mixed checkpoint: provisional {5, 7}; only 5 is promoted;
+        // rollback restores provisional {7} with 5 durable-only.
+        let mut state = AwardState::new();
+        state.award_provisional(5);
+        state.award_provisional(7);
+        let checkpoint = state.checkpoint();
+        state.promote_provisional(&OccurrenceSpan::new(4, 5).unwrap());
+        state.rollback(checkpoint);
+        assert!(state.durable.covers(5));
+        assert!(!state.provisional.covers(5));
+        assert!(
+            state.provisional.covers(7),
+            "the unpromoted provisional occurrence is restored and earnable-on-reattempt"
+        );
+        assert!(state.validate().is_ok());
     }
 
     #[test]
