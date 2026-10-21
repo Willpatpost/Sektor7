@@ -1485,3 +1485,194 @@ fn d2_head_absent_sweep_preserves_evidence() {
     assert_eq!(summary.records, 1);
     assert_eq!(summary.head, fresh_id);
 }
+
+/// D2 final: the metadata namespace can never collide with preserved
+/// evidence — quarantining `junk.reason` first, then `junk`, keeps
+/// both originals' bytes intact (the second incident's reason note
+/// would otherwise land on the first incident's evidence path).
+#[test]
+fn d2_metadata_namespace_collision_reason_first() {
+    let dir = TestDir::new("d2-ns-reason-first");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    let objects = root.join(OBJECTS_DIR);
+    let quarantine = root.join(QUARANTINE_DIR);
+
+    // First: an object literally named `junk.reason`.
+    fs::write(objects.join("junk.reason"), b"reason-named-evidence").expect("place first junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join("junk.reason")).expect("first incident preserved"),
+        b"reason-named-evidence"
+    );
+    assert!(quarantine.join("junk.reason.reason").exists());
+
+    // Then: an object named `junk` — its reason note would land on
+    // `junk.reason`, which now holds preserved evidence; the incident
+    // must take a suffix instead of overwriting it.
+    fs::write(objects.join("junk"), b"plain-junk").expect("place second junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join("junk.reason")).expect("first incident still preserved"),
+        b"reason-named-evidence",
+        "preserved evidence is never overwritten by a reason note"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("junk.1")).expect("second incident preserved"),
+        b"plain-junk"
+    );
+    assert!(quarantine.join("junk.1.reason").exists());
+    assert!(!quarantine.join("junk").exists());
+}
+
+/// D2 final: the reverse order — `junk` first, then `junk.reason` —
+/// also preserves both originals (the second incident's evidence path
+/// would otherwise land on the first incident's note).
+#[test]
+fn d2_metadata_namespace_collision_plain_first() {
+    let dir = TestDir::new("d2-ns-plain-first");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    let objects = root.join(OBJECTS_DIR);
+    let quarantine = root.join(QUARANTINE_DIR);
+
+    // First: an object named `junk` (evidence `junk`, note
+    // `junk.reason`).
+    fs::write(objects.join("junk"), b"plain-junk").expect("place first junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join("junk")).expect("first incident preserved"),
+        b"plain-junk"
+    );
+    let first_note = fs::read(quarantine.join("junk.reason")).expect("first note preserved");
+
+    // Then: an object named `junk.reason` — its evidence path collides
+    // with the first incident's note, so it takes a suffix.
+    fs::write(objects.join("junk.reason"), b"reason-named-evidence").expect("place second junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join("junk")).expect("first evidence still preserved"),
+        b"plain-junk"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("junk.reason")).expect("first note still preserved"),
+        first_note,
+        "the first incident's provenance is never overwritten"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("junk.reason.1")).expect("second incident preserved"),
+        b"reason-named-evidence"
+    );
+    assert!(quarantine.join("junk.reason.1.reason").exists());
+}
+
+/// D2 final: a pre-existing metadata-named file colliding with a
+/// proposed evidence path forces suffixing without overwriting —
+/// whatever occupies a pathname, evidence or metadata, it is
+/// preserved.
+#[test]
+fn d2_preexisting_metadata_collides_with_evidence_path() {
+    let dir = TestDir::new("d2-preexisting-metadata");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    let junk_hash = hash_object(b"preexisting-metadata");
+    let objects = root.join(OBJECTS_DIR);
+    let quarantine = root.join(QUARANTINE_DIR);
+
+    // A pre-existing metadata-named file (a prior incident's note, or
+    // a stray) occupying the proposed note path for the plain name.
+    fs::write(
+        quarantine.join(format!("{}.reason", junk_hash.hex())),
+        b"preexisting-metadata-bytes",
+    )
+    .expect("place pre-existing metadata");
+
+    // A junk object under the same name: the plain placement's note
+    // path is occupied, so the incident suffixed.
+    fs::write(objects.join(junk_hash.hex()), b"the-junk").expect("place junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join(format!("{}.reason", junk_hash.hex())))
+            .expect("pre-existing metadata preserved"),
+        b"preexisting-metadata-bytes",
+        "the pre-existing metadata file is never overwritten"
+    );
+    assert_eq!(
+        fs::read(quarantine.join(format!("{}.1", junk_hash.hex()))).expect("junk preserved"),
+        b"the-junk"
+    );
+    assert!(
+        quarantine
+            .join(format!("{}.1.reason", junk_hash.hex()))
+            .exists()
+    );
+    assert!(!quarantine.join(junk_hash.hex()).exists());
+}
+
+/// D2 final: a stray metadata filename colliding with a proposed
+/// metadata pathname skips that suffix — incident suffixing never
+/// overwrites existing bytes, in either namespace.
+#[test]
+fn d2_stray_metadata_collides_with_note_path() {
+    let dir = TestDir::new("d2-stray-metadata");
+    let root = dir.path();
+    {
+        let (_medium, _f) = founded_store(root);
+    }
+    let objects = root.join(OBJECTS_DIR);
+    let quarantine = root.join(QUARANTINE_DIR);
+
+    // First incident under `junk` (evidence `junk`, note
+    // `junk.reason`), plus a stray file occupying the `.1` note path.
+    fs::write(objects.join("junk"), b"first-junk").expect("place first junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    fs::write(quarantine.join("junk.1.reason"), b"stray-metadata-bytes")
+        .expect("place stray metadata");
+
+    // A second incident under `junk`: the `.1` suffix's note path is
+    // occupied by the stray, so the incident takes `.2`.
+    fs::write(objects.join("junk"), b"second-junk").expect("place second junk");
+    {
+        let mut medium = LocalFileMedium::open(root).expect("reopen");
+        medium.validate().expect("valid");
+    }
+    assert_eq!(
+        fs::read(quarantine.join("junk")).expect("first evidence preserved"),
+        b"first-junk"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("junk.1.reason")).expect("stray metadata preserved"),
+        b"stray-metadata-bytes",
+        "the stray metadata file is never overwritten"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("junk.2")).expect("second incident preserved"),
+        b"second-junk"
+    );
+    assert!(quarantine.join("junk.2.reason").exists());
+    assert!(!quarantine.join("junk.1").exists());
+}

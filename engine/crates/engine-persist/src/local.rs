@@ -997,19 +997,32 @@ impl LocalFileMedium {
         let objects = self.root.join(OBJECTS_DIR);
         let quarantine = self.root.join(QUARANTINE_DIR);
         let source = objects.join(name);
-        // Collision-safe and never overwriting: the first incident
-        // keeps the plain name; later incidents under the same name
-        // append .1, .2, … — previously preserved evidence is never
-        // destroyed by a rename that replaces its destination. Every
-        // quarantine site runs under HEAD.lock, so the
-        // exists-then-rename sequence is serialized; an interrupted
-        // move leaves the source in place (idempotent on retry) and
-        // an interrupted note-write leaves the bytes preserved under
-        // their incident name.
-        let mut incident = format!("{name}.reason");
-        let mut target = quarantine.join(name);
+        // Collision-safe across BOTH namespaces — evidence and
+        // metadata: an incident is placed only where its evidence
+        // path AND its .reason note path are both free, whatever
+        // those paths currently hold (a preserved evidence file
+        // named `x.reason` is exactly as protected as a note file),
+        // and the note is created with create-new semantics so no
+        // quarantine operation can ever overwrite an existing file.
+        // The first incident keeps the plain name; later incidents
+        // append .1, .2, … — preserved evidence and provenance are
+        // never destroyed. All quarantine sites run under HEAD.lock,
+        // so the exists-then-place sequence is serialized; an
+        // interrupted move leaves the source in place (idempotent on
+        // retry), and an interrupted note-write leaves the bytes
+        // preserved under their incident name.
         let mut attempt = 0u32;
-        while target.exists() {
+        let (target, note) = loop {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!(".{attempt}")
+            };
+            let target = quarantine.join(format!("{name}{suffix}"));
+            let note = quarantine.join(format!("{name}{suffix}.reason"));
+            if !target.exists() && !note.exists() {
+                break (target, note);
+            }
             attempt += 1;
             if attempt > Self::QUARANTINE_NAME_ATTEMPTS {
                 return Err(io_err(
@@ -1018,13 +1031,20 @@ impl LocalFileMedium {
                     io::Error::other("too many quarantine incidents under one name"),
                 ));
             }
-            target = quarantine.join(format!("{name}.{attempt}"));
-            incident = format!("{name}.{attempt}.reason");
-        }
+        };
         match fs::rename(&source, &target) {
             Ok(()) => {
-                let note = quarantine.join(incident);
-                fs::write(&note, reason).map_err(|e| io_err("write quarantine reason", &note, e))
+                // Non-overwriting provenance creation: even an
+                // overlooked collision fails loudly rather than
+                // destroying evidence.
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&note)
+                    .map_err(|e| io_err("create quarantine reason", &note, e))?;
+                file.write_all(reason.as_bytes())
+                    .map_err(|e| io_err("write quarantine reason", &note, e))?;
+                Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_err("quarantine object", &source, e)),
