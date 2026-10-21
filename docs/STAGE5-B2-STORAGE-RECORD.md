@@ -1,0 +1,131 @@
+# Sektor7 — Stage 5 Batch 2 storage record (content-addressed revision store + local canonical medium)
+
+> **Status:** Implementation record for the Stage 5 Batch 2 delivery on `stage5`, per the lead's formal GO authorization (2026-10-21). Baseline: `stage5@6e379ff` (Batch 1 CLOSED-PASS at `2addc19`). Scope: the `engine-persist` crate — SHA-256 content addressing with structural domain separation, the versioned hash-chained revision record, immutable insert-once objects with the quarantine-never-delete orphan protocol, the `CanonicalMedium` boundary with the three append outcomes, and `LocalFileMedium` implementing the accepted v1.8 architecture's §5.3 nine-step CAS protocol, §5.3.2 validation cost model, and §5.3.3 v1.4 orphan protocol. **Only Batch 2 was authorized — Batch 3 and every later batch remain gated** regardless of this delivery's success. The five-state gameplay CommitPipeline, T1 encounter journals, NpcWorld/RegionDirector codecs, networking, compaction/retention, and asynchronous storage are explicitly out of scope (GO §13).
+>
+> **Dependency direction (ratified, unchanged):** `engine-core → engine-persist → application`. The crate's dependencies are exactly `engine-core` (the Batch 1 wire primitives) and `sha2` (the single approved addition); engine-core stays zero-dependency and is never reversed into persistence. `cargo tree` for the crate: engine-core (workspace) + sha2 → the RustCrypto digest stack, nothing else.
+>
+> **Verification summary:** 61 new tests (14 codec/hash unit tests in-module; 38 local-medium unit tests including the corruption corpus and orphan protocol; 9 real-process integration tests implementing the GO's A–G list — in-process mocks are insufficient for this batch, so children are real OS processes). Workspace: **260 passed + 1 ignored** (the 199 + 1 B1 baseline, every one still green, plus the 61 new). `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --workspace` green; every historical fingerprint byte-identical (Stage 0 selftest ×2, Stage 3 lanes + `executed 45717`, Stage 4 presence stationary/walk/tour, `save-len=1209` / `save-fnv=c6c1b46c7d21843b` — engine-core is untouched by this batch). CI (`engine-ci`) runs all of this on ubuntu/windows/macos-15-ARM64; the `engine/**` path filter already covers the new crate.
+
+## 1. On-disk layout
+
+A store is a directory. Every path is relative to the store root; every name is fixed by this record (tests pin these names the way VCS tests pin theirs):
+
+```
+<root>/objects/<hex>    immutable content-addressed objects (records and content)
+<root>/quarantine/      orphaned/corrupt evidence, never deleted (§10)
+<root>/HEAD             the authoritative head pointer (head/1, see §3)
+<root>/HEAD.lock        the persistent OS-managed lock file — created once, NEVER unlinked (§3)
+<root>/HEAD.tmp         the staging file for atomic publication, truncated on every use (§4)
+```
+
+`<hex>` is the 64-character lowercase hex of a SHA-256 (§2) — the object's content identity and its file name are the same thing. `quarantine/` entries carry the displaced object's bytes plus a `<hex>.reason` note naming why it was moved. The session-open sweep (§10) moves every `objects/` entry not reachable from HEAD into quarantine; junk names that are not valid hashes are swept the same way. Opening a store creates the layout idempotently (`create_dir_all`). `MAX_OBJECT_BYTES` matches the Batch 1 wire maximum (`MAX_BYTE_LEN`), enforced by stat before any read allocates.
+
+## 2. Domain separation and content addressing
+
+An object's identity is the SHA-256 of its **complete canonical bytes**, and every canonical object **begins with its length-prefixed domain tag** (`hash.rs`). So the architecture's §5.1 `SHA-256(domain-tag || canonical bytes)` holds structurally: the tag is the first field of the hashed content, and the u64 length prefix makes the domain/payload split unambiguous (the bytes `("ab", "c")` and `("a", "bc")` cannot alias — tested). A `Hash` is a 32-byte newtype with canonical lowercase-hex display, ordered by raw bytes (the canonical collection order for reference lists). SHA-256 here is **object integrity, never signer authentication** — no field claims who wrote an object. FNV-1a remains engine-core's regression instrument and is never substituted for cryptographic integrity.
+
+Domains on the wire this batch: `sektor7/engine-persist/revision-record/1` (§3), `sektor7/engine-persist/head/1` (§4), and content objects under application-owned tags (a Batch 1 `sektor7/save/1` snapshot is one such object — the store is domain-agnostic and verifies only integrity; `StoredObject::new` validates the leading tag parses, the payload's interpretation belongs to the domain's reader).
+
+## 3. The revision record and the HEAD/lock protocol (the nine-step CAS)
+
+**The revision record (`record.rs`).** One canonical revision: `kind` (founding = authority mode + campaign id, or regular), `epoch` (founding is 0; every regular record is parent epoch + 1 — walk-enforced, regressions fail closed), `parent: Option<Hash>` (None only for founding; decode enforces kind/parent coherence), optional `idempotency_key` (chain-unique, the B3 pipeline's dedup anchor), `tick`, `content_refs` (the revision's content objects — strictly ascending canonical order, unique), `depends_on` (additional prior revisions this record explicitly requires — same canonical order). The identity is the SHA-256 of the canonical bytes (domain tag first, version, kind, epoch, parent, key, tick, the two count-prefixed hash lists). Decode is strict and fail-closed via the Batch 1 decoder: domain, version, enum discriminants, kind/parent coherence, per-entry bounds (each count also bounded by remaining input ÷ per-entry minimum before any allocation), strictly ascending unique hash lists, no trailing bytes. The builders normalize reference order so noncanonical input is unrepresentable through the builder; a hand-built noncanonical record cannot round-trip and is rejected at append (`record-noncanonical` defense — decode rejects it first as a typed `Format` error).
+
+**P1-flagged provisional choices (per the GO, flagged not resolved):** the idempotency key's shape and semantics (B2 enforces chain-wide uniqueness; the B3 pipeline assigns meaning) and the campaign-id semantics. No signature fields exist and none are fabricated.
+
+**The nine-step CAS (`local.rs`).** Steps per §5.3, under the OS-managed `HEAD.lock` (std `File::lock`, exclusive, blocking; the lock file is **persistent — created at open, never unlinked, never deleted to "recover"**; the OS releases ownership at handle close or process death, which is the entire stale-lock story — there is no application-level lock lifecycle to corrupt):
+
+1. **Lock** `HEAD.lock`.
+2. **Validate the observed HEAD** against the trusted cursor (§9): O(0) walks on the verified head, a bounded suffix walk on external divergence (fail-closed `divergence` when the observed history is not a descendant of the trusted one — never silently switching branches), a cold walk with no cursor.
+3. **Compare** `expected_parent` against the observed HEAD.
+4. **Reject stale writers** (`RejectedStaleParent { observed }`) — authoritative state untouched.
+5. **Write every object** the candidate needs — content objects first, the record last, each `create_new` (insert-once, §10); then fsync every file in the set; then (Unix) fsync the objects directory.
+6. **Publish HEAD**: write `HEAD.tmp` (create + truncate), fsync, **`rename` onto `HEAD`** — the linearization point.
+7. (Unix) fsync the root directory (the rename's parent-dir persistence).
+8. **Release the lock** after the defined outcome — an unlock failure never alters a reached outcome.
+9. **Reconcile** ambiguous outcomes under the lock (§5).
+
+Coherence gates at append (after the stale comparison, before any write): founding ⇒ epoch 0, no parent, no depends-on; regular ⇒ epoch exactly cursor.epoch + 1 and parent exactly the observed head; the idempotency key must be unseen across the chain; `depends_on` must resolve against the reachable set. Structural pre-validation (before the lock): the record must round-trip its own canonical bytes, and the supplied object set must equal `content_refs` exactly (re-supplying an already-stored object is required and costs a hash-verify reuse — insert-once). Reads (`head`, `read_record`, `read_object`, `validate`, `reconcile_unknown`) also serialize on the lock, so a concurrent sweep can never race a read.
+
+## 4. Atomic publication
+
+`HEAD.tmp` is written with `create(true).truncate(true).write(true)`, fsynced, then `rename`d onto `HEAD`. The rename is the single linearization point: before it, the store's authoritative state is exactly the old head; after it, exactly the new revision — and the new revision's objects were fully written **and fsynced before the rename is attempted**, so a HEAD that names a revision always finds its objects present. `HEAD.tmp` leftovers from an interrupted publication are harmless (the next publication truncates the file; nothing reads it). `read_head_file` decodes `head/1` strictly (domain, version, 32-byte hash, no trailing) and treats any malformation as `CorruptHead` — **fail-closed, never rolled back**: a valid previous prefix is never silently promoted (an empty or torn HEAD fails the session open; tested with truncation and empty files).
+
+## 5. Outcome semantics
+
+The three §5.3.1 outcomes, exactly:
+
+- **`Accepted { id, tier }`** — this platform's documented publication sequence completed, to the tier the outcome carries (§6). `Accepted` never claims more than the tier.
+- **`RejectedStaleParent { observed }`** — another revision won the CAS; the observed authoritative HEAD is returned; nothing was altered. Exactly one concurrent writer per expected parent can be Accepted.
+- **`Unknown { reason }`** — the operation may or may not have installed, or its durability cannot be established. **`Unknown` is classified strictly from the first object write onward** (reasons: `ObjectWriteFailed`, `ObjectSyncFailed`, `HeadPublishFailed`, `PostPublishSyncFailed`); a failure before the uncertain window is a clean `Err` (retryable, nothing written — tested for `before-lock` through `after-comparison`). An `Unknown` is reconciled under the lock (§5.4): `Installed` (the candidate is HEAD or an ancestor of it — a retry must not duplicate), `NotInstalled` (HEAD is as observed; the same record bytes produce the same identity, so an idempotent retry is safe), or `Unverifiable` (uncertainty retained, never converted into a confirmation).
+
+## 6. Platform durability
+
+`SyncTier` is attached to every `Accepted`:
+
+- **`FullPosixSequence`** (Unix): every object file fsynced, the objects directory fsynced, `HEAD.tmp` fsynced, renamed onto `HEAD`, and the root directory fsynced, each returning success — the acknowledged-revision-persistence tier across process crash, OS crash, and power loss **per the documented std fsync contract**. macOS note: std exposes no `F_FULLFSYNC`, so the claim is the documented std semantics, never stronger.
+- **`ProcessCrashOnly`** (Windows): the documented std sequence (file fsync + rename ordering) completed — the **process-crash tier**. Acknowledged-revision persistence across OS crash or sudden power loss is **not claimed from std**: std offers no pre-rename parent-directory flush on Windows, so the N−1-valid/N-lost scenario of §5.3.3 is possible and **undetectable by chain validation** (the rename and the objects can vanish together, or the old HEAD can persist — both leave a valid chain). Development / process-crash qualification only; the production selection gate is §11.
+
+The four failure classes, honestly: (1) clean application-visible failure — typed errors, pre-window; (2) process crash — covered on all platforms, proven by real child termination (§7–8); (3) OS crash — claimed on Unix via the full POSIX sequence, **not claimed on Windows from std**; (4) sudden power loss — same boundary as (3). **SQLite is the identified production fallback and was NOT added as a dependency** (GO: the crate's deps stay engine-core + sha2); the evidence comparison for the selection gate is §11, and the lead selects at review.
+
+## 7. The crash-window matrix
+
+`fault.rs` is the test-infrastructure seam (production paths carry one `Option` check per boundary; a medium constructed without a `FaultControl` never consults it). Fourteen named boundaries: `before-lock`, `after-lock`, `after-validation`, `after-comparison`, `mid-object-write`, `objects-written`, `objects-synced`, `after-objects-dir-sync`, `head-tmp-written`, `head-tmp-synced`, `after-head-rename`, `after-root-dir-sync`, `reconcile-locked`, `reconcile-head-read`. Actions: **`Abort`** (`std::process::abort` — a real crash at a real boundary; the OS releases any held lock) and **`InjectError`** (the boundary's operation fails; the medium must classify honestly).
+
+The append-path matrix (12 points × both actions = 24 real-process cases) asserts, for every case: the child's result classification (pre-window injections are clean `error:` results; in-window injections are `unknown:` with the phase's exact reason; aborts terminate the child), and — the central property — the store afterwards **opens and validates with HEAD exactly old or new, never torn, never partial**: points at or before `head-tmp-synced` leave the old HEAD (unreferenced candidate objects exist only until the next session's sweep); `after-head-rename` and `after-root-dir-sync` have installed the revision with all objects present and synced before the rename. `HEAD.lock` is never unlinked in any case. The two reconcile-path points are exercised by the Unknown/reconcile tests (`Unverifiable` on injected failure).
+
+## 8. Real-process testing (the GO's A–G)
+
+`tests/process.rs` — children are **independent OS processes** (the parent spawns this same test binary with `--exact child_entry` and a role environment; `child_entry` is a no-op in a normal run). Roles: `writer`, `faulted-writer`, `reconciler`, `opener`, `sleeper`. Synchronization via a go-file barrier; outcomes via result files; **every parental wait is bounded (30 s deadline, kill on expiry — no hang is accepted)**; blocking OS lock waits are safe by construction (the holder always releases or dies).
+
+- **A — multi-writer CAS race:** 4 writer processes against the same founding parent. Result, deterministically: exactly one `accepted`, three `stale` observing the winner's head; the chain afterwards is founding + the single winner.
+- **B — killed lock holder:** a child aborts at `after-lock` while genuinely holding `HEAD.lock`. The process dies (non-success status), `HEAD.lock` still exists (never unlinked), and a fresh session opens, validates, and appends — the OS released the lock at process death; no stale-lock file deletion exists to get wrong.
+- **C — the crash-window matrix** (§7, 24 cases).
+- **D — ambiguous acknowledgment, both directions across processes:** an `Unknown` after the rename reconciles `installed` and a same-bytes retry stale-rejects (no duplication); an `Unknown` before the rename reconciles `not-installed` (the reconciler's session-open sweep quarantines the unreferenced candidate), the same-bytes retry installs exactly once, and re-reconciling then classifies `installed`.
+- **E — corrupt-history corpus via independent processes:** torn HEAD, flipped record bytes, HEAD naming a missing object, flipped content bytes — each opened by a child process that fails closed with the typed condition.
+- **F — repeated-crash recovery:** eight rounds of aborting writers rotating across the uncertain window and past the rename; after every crash the store opens and validates old-or-new, and the chain keeps growing; the final cold walk confirms the exact expected record count and head.
+- **G — bounded waits:** the harness property (every wait carries a deadline and kills on expiry), plus a dedicated proof: a deliberately runaway sleeper child is killed at a 2-second bound.
+
+## 9. Cold validation and the trusted cursor (§5.3.2)
+
+The session open performs the cold founding → HEAD walk under the lock: every record loaded and hash-verified, decoded, epoch-linked, key-unique, every referenced content object loaded and hash-verified, the reachable set built — then the unreferenced sweep (§10). **There is no persistent cache file** — the cursor is session-scoped derived state, rebuilt by the cold walk, never persisted.
+
+The trusted cursor makes a straightforward append **O(1) in validation work**: when the observed HEAD equals the cursor's head, the validation phase walks nothing (`last_append_walked == 0`, asserted deterministically — timing assertions are never used for this property). External divergence takes a bounded suffix walk: `walk_suffix` verifies each suffix record (hash, decode, epoch linkage, key uniqueness within the suffix and against the trusted history, content references), is cycle-guarded (a corrupt chain whose parents never reach the trusted head fails closed rather than hanging — note: a *hash-verifiable* cycle would require a SHA-256 fixed point, so the guards are defense in depth behind content addressing; the reachable corruption form, an object claiming a name its bytes do not hash to, is tested and fails closed at the hash check), and the verified suffix is absorbed into the cursor so the next append is O(1) again. A suffix that is not a descendant of the trusted head is `divergence` — fail-closed, never merged.
+
+Measured scaling (dev pod, Linux, observational — B5 owns hardware analysis; the deterministic counters above are the property proof):
+
+| chain length | build | cold open (session) | cold records | cursor append, validation phase |
+|---|---|---|---|---|
+| 10 | 0.015 s | 0.001 s | 10 | 28 µs (walked 0) |
+| 100 | 0.180 s | 0.011 s | 100 | 31 µs (walked 0) |
+| 500 | 0.769 s | 0.038 s | 500 | 27 µs (walked 0) |
+| 1000 | 1.512 s | 0.077 s | 1000 | 24 µs (walked 0) |
+
+Cold open grows with the chain (full verification is the cost of trusting nothing); cursor-append validation is flat across every size. A full append is dominated by the object fsyncs and HEAD publication (~2–4 ms on this pod), not validation. Cursor memory is O(chain) (the reachable set and seen keys) — documented honestly; compaction of session memory is future scope.
+
+## 10. Corruption, orphans, and quarantine (§5.3.3 v1.4)
+
+**Referenced corruption fails closed and preserves evidence.** During any validation walk, an object whose bytes do not hash to the identity it is stored under is `ReferencedObjectCorrupt` — the file is never replaced, never deleted, never quarantined; the bytes stay exactly as found for forensics (tested for records and content objects, in-process and across processes). Missing referenced objects are `MissingObject`. A torn/empty HEAD is `CorruptHead` with no rollback (§4). Chain-rule violations fail closed with the rule named: `epoch-regression`, `parent-mismatch`, `kind-incoherent`, `duplicate-idempotency-key` (at append against the cursor's seen keys, and on every walk), `cycle`, `divergence`, `content-set-mismatch`, `depends-on-unresolvable`, `record-noncanonical`, `founding-missing`, `unfounded`.
+
+**Unreferenced orphans are quarantined, never deleted.** The session-open sweep moves every `objects/` entry not reachable from HEAD into `quarantine/` (bytes intact, plus a `.reason` note) — including junk names that are not valid hashes. Insert-once collisions: pre-existing bytes under a candidate's hash name are accepted on a hash match (reuse — a prior interrupted writer's unsynced object also gets re-fsynced); on a mismatch, the identity is chain-referenced ⇒ fail-closed `ReferencedObjectCorrupt` (evidence preserved), otherwise the squatter is quarantined and the correct bytes written. `reconcile_unknown` quarantines a not-installed candidate's record object (retry-safe absence) — the retry re-writes it with the same identity, exactly once.
+
+## 11. Windows alternatives and evidence (selection gate — the lead selects)
+
+The GO named SQLite the identified fallback and **forbade introducing it this batch**; the comparison is delivered here as evidence:
+
+- **Custom std provider (delivered):** zero storage dependencies; the full §5.3 protocol is directly auditable and every boundary is crash-tested by real processes (§7–8); Unix reaches the full POSIX durability tier. On Windows it is qualified for the **process-crash tier only** — std gives no pre-rename parent-directory flush, so OS-crash/power-loss can produce N−1-valid/N-lost (a lost rename with objects present, or a persisted old HEAD — both chain-valid, undetectable by validation; the SyncTier carries this honestly on every Accepted).
+- **SQLite fallback (not added):** a single database file with WAL and `synchronous=FULL` gives documented OS-crash and power-loss durability on Windows from its own battle-tested machinery, plus mature concurrency — at the cost of a new dependency (binary size, supply chain, CI surface), a different corruption/failure model (database-level recovery instead of content-addressed files), and mapping the content-addressed object model into blobs (or a hybrid: records/HEAD in SQLite, content objects as files — two durability stories to keep coherent).
+
+**Selection is the project lead's, at this batch's review, on this comparison.** No production Windows durability claim may exceed verified evidence (the ratified limitation stands); until a selection is made, Windows carries `ProcessCrashOnly` explicitly.
+
+## 12. Limitations and P1 flags (nothing claimed beyond evidence)
+
+- **Windows durability is process-crash-tier only** (§6, §11); the selection gate is open at review.
+- **P1-flagged provisional format choices:** the idempotency key's shape/semantics and the campaign-id semantics (§3). Changing either before B3 is a format decision, not a patch.
+- **SHA-256 is integrity, not authentication** — no signature fields exist; authority modes are stored metadata, and `Shared` providers (plus the standalone→shared conversion protocol) are future authorized scope.
+- **The cursor is O(chain) session memory** (§9); no persistent cache exists by design.
+- **Single-store, single-authority per directory** — cross-store merges and shared-campaign mediums are future scope; divergence is detected and refused, never merged.
+- **No compaction/retention** — quarantine grows monotonically (evidence is never deleted); retention policy is future scope.
+- **Cycle guards are defense in depth** behind content addressing (§9) — a hash-verifiable cycle is infeasible; the reachable corruption forms fail closed at the hash check.
+- **B3+ exclusions (GO §13):** the five-state gameplay CommitPipeline, T1 encounter journals, NpcWorld/RegionDirector codecs (`NpcWorld` integration is B4), networking, compaction, asynchronous storage.
+
+**Batch 2 delivered on `stage5`; stopping for independent review. Batch 3 is NOT authorized.** Correctness, verification, and honesty about durability take priority over any nominal completion — the record above claims exactly what the tests establish and nothing more.
