@@ -47,7 +47,9 @@ pub mod record;
 #[cfg(test)]
 mod tests;
 
-pub use consequence::{AwardCheckpoint, AwardState, ConsequenceId, OccurrenceSpan, SpanError};
+pub use consequence::{
+    AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, SpanError,
+};
 pub use fault::{FaultAction, FaultControl, FaultPoint};
 pub use hash::Hash;
 pub use local::{AppendTimings, LocalFileMedium, WalkStats};
