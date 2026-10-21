@@ -25,6 +25,10 @@ use crate::event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 use crate::fingerprint::Fingerprinter;
+use crate::wire::{
+    Decoder, Encoder, MAX_BYTE_LEN, MAX_COLLECTION_COUNT, SAVE_DOMAIN, SAVE_FORMAT_VERSION,
+    SPINE_DOMAIN, SaveError, SaveWorld,
+};
 
 /// Game-side event handler. Implemented by the application, never by the
 /// engine — game policy stays outside reusable engine mechanisms by
@@ -1381,4 +1385,587 @@ fn fingerprint_deps(fp: &mut Fingerprinter, event: &Event) {
     for dep in &event.depends_on {
         fp.write_u64(dep.seq);
     }
+}
+
+// ------------------------------------------------------------ save/load
+//
+// Stage 5 Batch 1 (`docs/STAGE5-PERSISTENCE-ARCHITECTURE-PROPOSAL.md`
+// §5.1/§5.2; the frozen layout lives in `docs/STAGE5-B1-WIRE-FORMAT.md`):
+// the full-fidelity reference encoding of authoritative spine state,
+// fail-closed load-time integrity gates, and derived-state
+// reconstruction.
+//
+// Authoritative on the wire: clock, `next_seq`, budget and reservation,
+// every Stats counter, both lane queues (canonical `(due, seq)` order —
+// heap layout is rebuild-dependent and invisible), the blocked set (seq
+// order), the held set (seq order), and the full execution ledger
+// (execution order). Derived — `known` (dense allocation), `executed`
+// (the complement of unfinished), `waiting_on`, `held_index`,
+// `max_executed_index` — is rebuilt from those canonical sources through
+// the same code paths the live spine uses. Observational — `LaneReport`,
+// `LaneTotals`, `SuspensionStats`, `Diagnostics` — is not logical state:
+// a restored spine resumes them at defaults, they never affect
+// scheduling, accounting, or fingerprints, and the boundary is documented
+// in the wire spec.
+
+/// Minimum encoded size of one obligation entry (wire-format spec
+/// §maxima): seq 8 + class 4 + field 1 + schedule kind 1 + due 8 +
+/// payload 8 + dependency count 8.
+const ENTRY_MIN_BYTES: u64 = 38;
+
+/// Encoded size of one execution-record entry: seq 8 + class 4 + field
+/// 1 + intended due 8 + executed tick 8 + schedule kind 1 + late flag
+/// 1.
+const RECORD_BYTES: u64 = 31;
+
+/// Encoded size of one dependency identity (a bare seq).
+const DEP_BYTES: u64 = 8;
+
+impl<W: SaveWorld> Spine<W> {
+    /// Encodes the complete save — header, spine section, world
+    /// section — into `enc`, so a save can nest inside larger canonical
+    /// streams (the revision objects of later batches).
+    pub fn save(&self, enc: &mut Encoder) {
+        enc.write_str(SAVE_DOMAIN);
+        enc.write_u32(SAVE_FORMAT_VERSION);
+        self.save_spine_section(enc);
+        let mut world_enc = Encoder::new();
+        self.world.save(&mut world_enc);
+        enc.write_str(W::SAVE_DOMAIN);
+        enc.write_bytes(&world_enc.into_bytes());
+    }
+
+    /// The complete save as standalone canonical bytes.
+    pub fn save_bytes(&self) -> Vec<u8> {
+        let mut enc = Encoder::new();
+        self.save(&mut enc);
+        enc.into_bytes()
+    }
+
+    /// Restores a spine from complete save bytes (fail-closed).
+    ///
+    /// Every §5.2 integrity gate is enforced with a typed
+    /// [`SaveError`]: domain/schema match; the dense-allocation identity
+    /// (`scheduled == next_seq`); conservation (`scheduled == executed +
+    /// queued + blocked + held`, and its structural form `executed ==
+    /// next_seq - unfinished`); the ledger-count identity; identity
+    /// uniqueness and frontier bounds; clock coherence; dependency
+    /// resolvability against `[0, next_seq)`; coherent blocked state.
+    /// Corrupted input is rejected, never repaired — no best-effort
+    /// reconstruction of unverified history.
+    ///
+    /// The clock is initialized from the verified save — the one
+    /// sanctioned deviation from tick-zero construction, meaningful only
+    /// after every gate above has passed (an incoherent save is rejected
+    /// rather than time-traveled).
+    pub fn restore(bytes: &[u8], diag: Diagnostics) -> Result<Spine<W>, SaveError> {
+        let mut dec = Decoder::new(bytes);
+        dec.read_domain(SAVE_DOMAIN)?;
+        let version = dec.read_u32()?;
+        if version != SAVE_FORMAT_VERSION {
+            return Err(SaveError::Version {
+                observed: version,
+                supported: SAVE_FORMAT_VERSION,
+            });
+        }
+        dec.read_domain(SPINE_DOMAIN)?;
+        let clock = dec.read_tick()?;
+        let next_seq = dec.read_u64()?;
+        let budget = dec.read_u32()?;
+        let near_reserve = dec.read_u32()?;
+        let stats = Stats {
+            scheduled: dec.read_u64()?,
+            executed: dec.read_u64()?,
+            late_arrivals: dec.read_u64()?,
+            late_executions: dec.read_u64()?,
+            blocked_transitions: dec.read_u64()?,
+            invalid_dropped: dec.read_u64()?,
+            budget_exhausted_ticks: dec.read_u64()?,
+        };
+
+        // Configuration bounds. The live constructors normalize
+        // (`budget >= 1`, `near_reserve <= budget`); a save holding
+        // unnormalized values is corrupt, not quietly re-normalized.
+        if budget == 0 {
+            return Err(SaveError::Integrity("spine-save/budget-zero"));
+        }
+        if near_reserve > budget {
+            return Err(SaveError::Integrity("spine-save/reserve-exceeds-budget"));
+        }
+
+        let near = read_lane(&mut dec, "spine-save/near")?;
+        let far = read_lane(&mut dec, "spine-save/far")?;
+        let blocked = read_seq_section(&mut dec, "spine-save/blocked")?;
+        let held = read_seq_section(&mut dec, "spine-save/held")?;
+        let ledger = read_ledger(&mut dec)?;
+
+        // ---- integrity gates -----------------------------------------
+
+        // Identity uniqueness across every unfinished structure, frontier
+        // bounds, and dependency resolvability: dense allocation issues
+        // exactly `[0, next_seq)`, so every identity lives below the
+        // frontier, appears at most once anywhere, and every dependency
+        // references the same range (the live `known` gate).
+        let mut unfinished = BTreeSet::new();
+        for event in near.iter().chain(far.iter()).chain(&blocked).chain(&held) {
+            let seq = event.id.seq;
+            if seq >= next_seq {
+                return Err(SaveError::Integrity("spine-save/frontier"));
+            }
+            if !unfinished.insert(seq) {
+                return Err(SaveError::Duplicate {
+                    section: "spine-save/identities",
+                    seq,
+                });
+            }
+            for dep in &event.depends_on {
+                if dep.seq >= next_seq {
+                    return Err(SaveError::Integrity("spine-save/dependency-frontier"));
+                }
+            }
+        }
+
+        // Dense allocation: `scheduled` counts every issued identity.
+        if stats.scheduled != next_seq {
+            return Err(SaveError::Integrity("spine-save/dense-allocation"));
+        }
+
+        // Structural conservation: allocation is dense and
+        // cancellation-free, so `executed == next_seq - unfinished`
+        // exactly — the derivation the complement rebuild below rests
+        // on, and the no-cancellation invariant in one check.
+        let unfinished_count =
+            u64::try_from(unfinished.len()).expect("counts are bounded by the input length");
+        let executed_derived =
+            next_seq
+                .checked_sub(unfinished_count)
+                .ok_or(SaveError::Overflow {
+                    section: "spine-save/conservation",
+                })?;
+        if stats.executed != executed_derived {
+            return Err(SaveError::Integrity("spine-save/structural-conservation"));
+        }
+
+        // The §5.2 conservation identity in its stated form, each
+        // section counted once: `scheduled == executed + queued +
+        // blocked + held`. (Algebraically implied by dense allocation
+        // plus the structural gate above — kept as the named gate the
+        // spec states, with checked arithmetic guarding the sums.)
+        let queued =
+            u64::try_from(near.len() + far.len()).expect("counts are bounded by the input length");
+        let blocked_count =
+            u64::try_from(blocked.len()).expect("counts are bounded by the input length");
+        let held_count = u64::try_from(held.len()).expect("counts are bounded by the input length");
+        let conserved = stats
+            .executed
+            .checked_add(queued)
+            .and_then(|sum| sum.checked_add(blocked_count))
+            .and_then(|sum| sum.checked_add(held_count))
+            .ok_or(SaveError::Overflow {
+                section: "spine-save/conservation",
+            })?;
+        if stats.scheduled != conserved {
+            return Err(SaveError::Integrity("spine-save/conservation"));
+        }
+
+        // The execution ledger: full-fidelity count, unique and disjoint
+        // from unfinished work, clock-coherent, with the encoded lateness
+        // flag agreeing with its derivation.
+        if stats.executed != ledger.len() as u64 {
+            return Err(SaveError::Integrity("spine-save/ledger-count"));
+        }
+        for record in &ledger {
+            let seq = record.id.seq;
+            if seq >= next_seq {
+                return Err(SaveError::Integrity("spine-save/frontier"));
+            }
+            if unfinished.contains(&seq) {
+                return Err(SaveError::Integrity(
+                    "spine-save/ledger-overlaps-unfinished",
+                ));
+            }
+            if record.intended_due > record.executed_tick
+                || record.executed_tick > clock
+                || record.late != (record.executed_tick > record.intended_due)
+            {
+                return Err(SaveError::Integrity("spine-save/clock-coherence"));
+            }
+        }
+
+        // Counter bounds, each structurally implied by live behavior:
+        // late executions are counted per executed event, late arrivals
+        // per scheduled event, blocked transitions at most once per
+        // obligation, and a tick is budget-exhausted at most once.
+        if stats.late_executions > stats.executed
+            || stats.late_arrivals > stats.scheduled
+            || stats.blocked_transitions > stats.scheduled
+            || stats.budget_exhausted_ticks > clock.as_u64()
+        {
+            return Err(SaveError::Integrity("spine-save/counter-bounds"));
+        }
+
+        // ---- world section -------------------------------------------
+
+        dec.read_domain(W::SAVE_DOMAIN)?;
+        let world_bytes = dec.read_bytes(MAX_BYTE_LEN, "spine-save/world")?;
+        let mut world_dec = Decoder::new(world_bytes);
+        let world = W::restore(&mut world_dec)?;
+        world_dec.finish()?;
+        dec.finish()?;
+
+        // ---- derived-state reconstruction -----------------------------
+
+        // `known` is the dense allocation range; `executed` is the
+        // complement of unfinished — both exact by the gates above.
+        let known: BTreeSet<u64> = (0..next_seq).collect();
+        let executed: BTreeSet<u64> = (0..next_seq)
+            .filter(|seq| !unfinished.contains(seq))
+            .collect();
+
+        let mut spine = Spine {
+            clock,
+            next_seq,
+            near_queue: BinaryHeap::new(),
+            far_queue: BinaryHeap::new(),
+            blocked: BTreeMap::new(),
+            waiting_on: BTreeMap::new(),
+            known,
+            executed,
+            ledger,
+            max_executed_index: None,
+            world,
+            budget,
+            near_reserve,
+            stats,
+            diag,
+            last_report: LaneReport::default(),
+            lane_totals: LaneTotals::default(),
+            held: BTreeMap::new(),
+            held_index: BTreeSet::new(),
+            suspension: SuspensionStats::default(),
+        };
+
+        // Queues: heap layout is rebuild-order-dependent and invisible —
+        // every observable behavior (pop order, fingerprints) derives
+        // from the canonical `(due, seq)` keys (the
+        // `suspend_from_queue` argument).
+        for event in near {
+            spine.near_queue.push(Reverse(Pending::new(event)));
+        }
+        for event in far {
+            spine.far_queue.push(Reverse(Pending::new(event)));
+        }
+
+        // Blocked obligations and their waiter registrations, through
+        // the live code paths (`unmet_dependencies` against the rebuilt
+        // executed set, `register_waiters` with its dedup) — identical
+        // structures by construction. A blocked obligation without
+        // unmet dependencies is not a live state (the release path
+        // would have returned it to its queue): rejected, not repaired.
+        // Waiter-vec order may differ from the original registration
+        // history; it is behaviorally invisible (queues are
+        // `(due, seq)`-keyed and no fingerprint hashes `waiting_on`) —
+        // proven so by the continuation-invisibility tests.
+        for event in blocked {
+            let seq = event.id.seq;
+            let unmet = spine.unmet_dependencies(&event);
+            if unmet.is_empty() {
+                return Err(SaveError::Integrity(
+                    "spine-save/blocked-without-unmet-deps",
+                ));
+            }
+            spine.register_waiters(seq, &unmet);
+            spine.blocked.insert(seq, event);
+        }
+
+        // Held obligations and the incrementally maintained
+        // `(due, seq)` index.
+        for event in held {
+            let pending = Pending::new(event);
+            spine.held_index.insert((pending.due, pending.seq));
+            spine.held.insert(pending.seq, pending);
+        }
+
+        // The derived max-intended-due index, recomputed from the
+        // canonical ledger — value-identical to the incrementally
+        // maintained index by construction.
+        spine.max_executed_index = spine.ledger.iter().map(|record| record.intended_due).max();
+
+        Ok(spine)
+    }
+
+    fn save_spine_section(&self, enc: &mut Encoder) {
+        enc.write_str(SPINE_DOMAIN);
+        enc.write_tick(self.clock);
+        enc.write_u64(self.next_seq);
+        enc.write_u32(self.budget);
+        enc.write_u32(self.near_reserve);
+        enc.write_u64(self.stats.scheduled);
+        enc.write_u64(self.stats.executed);
+        enc.write_u64(self.stats.late_arrivals);
+        enc.write_u64(self.stats.late_executions);
+        enc.write_u64(self.stats.blocked_transitions);
+        enc.write_u64(self.stats.invalid_dropped);
+        enc.write_u64(self.stats.budget_exhausted_ticks);
+        for queue in [&self.near_queue, &self.far_queue] {
+            // Canonical `(due, seq)` order — heap layout is
+            // rebuild-dependent and never observable.
+            let mut lane: Vec<&Pending> = queue.iter().map(|item| &item.0).collect();
+            lane.sort_by_key(|pending| (pending.due, pending.seq));
+            enc.write_count(lane.len());
+            for pending in lane {
+                write_event_entry(enc, &pending.event);
+            }
+        }
+        enc.write_count(self.blocked.len());
+        for event in self.blocked.values() {
+            write_event_entry(enc, event);
+        }
+        enc.write_count(self.held.len());
+        for pending in self.held.values() {
+            write_event_entry(enc, &pending.event);
+        }
+        enc.write_count(self.ledger.len());
+        for record in &self.ledger {
+            write_record_entry(enc, record);
+        }
+    }
+}
+
+fn write_event_entry(enc: &mut Encoder, event: &Event) {
+    enc.write_u64(event.id.seq);
+    enc.write_u32(u32::from(event.class.0));
+    enc.write_u8(field_byte(event.field));
+    match event.schedule {
+        Schedule::AtLogicalTime { due } => {
+            enc.write_u8(0);
+            enc.write_tick(due);
+        }
+        Schedule::ExecutionRelative { origin, delay } => {
+            enc.write_u8(1);
+            enc.write_tick(origin);
+            enc.write_u64(delay);
+        }
+    }
+    enc.write_u64(event.payload);
+    enc.write_count(event.depends_on.len());
+    for dep in &event.depends_on {
+        enc.write_u64(dep.seq);
+    }
+}
+
+fn write_record_entry(enc: &mut Encoder, record: &ExecutionRecord) {
+    enc.write_u64(record.id.seq);
+    enc.write_u32(u32::from(record.class.0));
+    enc.write_u8(field_byte(record.field));
+    enc.write_tick(record.intended_due);
+    enc.write_tick(record.executed_tick);
+    enc.write_u8(match record.schedule_kind {
+        ScheduleKind::AtLogicalTime => 0,
+        ScheduleKind::ExecutionRelative => 1,
+    });
+    enc.write_u8(u8::from(record.late));
+}
+
+fn read_event_entry(dec: &mut Decoder, section: &'static str) -> Result<Event, SaveError> {
+    let seq = dec.read_u64()?;
+    let wide_class = dec.read_u32()?;
+    let class = u16::try_from(wide_class).map_err(|_| SaveError::Limit {
+        section,
+        kind: "class",
+        value: u64::from(wide_class),
+        max: u64::from(u16::MAX),
+    })?;
+    let field = read_field(dec, section)?;
+    let schedule = read_schedule(dec, section)?;
+    let payload = dec.read_u64()?;
+    let dep_count = dec.read_count(MAX_COLLECTION_COUNT, section, "dependency-count")?;
+    if dep_count > dec.remaining() as u64 / DEP_BYTES {
+        return Err(SaveError::Limit {
+            section,
+            kind: "dependency-count",
+            value: dep_count,
+            max: dec.remaining() as u64 / DEP_BYTES,
+        });
+    }
+    let mut depends_on = Vec::with_capacity(dep_count as usize);
+    for _ in 0..dep_count {
+        depends_on.push(EventId {
+            seq: dec.read_u64()?,
+        });
+    }
+    Ok(Event {
+        id: EventId { seq },
+        class: EventClass::new(class),
+        schedule,
+        payload,
+        field,
+        depends_on,
+    })
+}
+
+fn read_field(dec: &mut Decoder, section: &'static str) -> Result<Field, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(Field::Near),
+        1 => Ok(Field::Far),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+fn read_schedule(dec: &mut Decoder, section: &'static str) -> Result<Schedule, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(Schedule::AtLogicalTime {
+            due: dec.read_tick()?,
+        }),
+        1 => Ok(Schedule::ExecutionRelative {
+            origin: dec.read_tick()?,
+            delay: dec.read_u64()?,
+        }),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+fn read_schedule_kind(dec: &mut Decoder, section: &'static str) -> Result<ScheduleKind, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(ScheduleKind::AtLogicalTime),
+        1 => Ok(ScheduleKind::ExecutionRelative),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+fn read_late(dec: &mut Decoder, section: &'static str) -> Result<bool, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+/// Reads a lane section: entries in canonical `(due, seq)` order with
+/// unique identities — duplicates or disorder are integrity failures,
+/// never repaired.
+fn read_lane(dec: &mut Decoder, section: &'static str) -> Result<Vec<Event>, SaveError> {
+    let count = dec.read_count(MAX_COLLECTION_COUNT, section, "entry-count")?;
+    if count > dec.remaining() as u64 / ENTRY_MIN_BYTES {
+        return Err(SaveError::Limit {
+            section,
+            kind: "entry-count",
+            value: count,
+            max: dec.remaining() as u64 / ENTRY_MIN_BYTES,
+        });
+    }
+    let mut events = Vec::with_capacity(count as usize);
+    let mut seen = BTreeSet::new();
+    let mut prev: Option<(u64, u64)> = None;
+    for _ in 0..count {
+        let event = read_event_entry(dec, section)?;
+        let key = (event.schedule.due().as_u64(), event.id.seq);
+        if let Some(prior) = prev
+            && key <= prior
+        {
+            return Err(SaveError::Order { section });
+        }
+        if !seen.insert(event.id.seq) {
+            return Err(SaveError::Duplicate {
+                section,
+                seq: event.id.seq,
+            });
+        }
+        prev = Some(key);
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Reads a seq-ordered section (blocked or held): strictly ascending
+/// identities — the BTreeMap canonical order.
+fn read_seq_section(dec: &mut Decoder, section: &'static str) -> Result<Vec<Event>, SaveError> {
+    let count = dec.read_count(MAX_COLLECTION_COUNT, section, "entry-count")?;
+    if count > dec.remaining() as u64 / ENTRY_MIN_BYTES {
+        return Err(SaveError::Limit {
+            section,
+            kind: "entry-count",
+            value: count,
+            max: dec.remaining() as u64 / ENTRY_MIN_BYTES,
+        });
+    }
+    let mut events = Vec::with_capacity(count as usize);
+    let mut prev_seq: Option<u64> = None;
+    for _ in 0..count {
+        let event = read_event_entry(dec, section)?;
+        if let Some(prior) = prev_seq {
+            if event.id.seq == prior {
+                return Err(SaveError::Duplicate {
+                    section,
+                    seq: prior,
+                });
+            }
+            if event.id.seq < prior {
+                return Err(SaveError::Order { section });
+            }
+        }
+        prev_seq = Some(event.id.seq);
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Reads the ledger section: the authoritative execution order (append
+/// order), with unique identities.
+fn read_ledger(dec: &mut Decoder) -> Result<Vec<ExecutionRecord>, SaveError> {
+    const SECTION: &str = "spine-save/ledger";
+    let count = dec.read_count(MAX_COLLECTION_COUNT, SECTION, "entry-count")?;
+    if count > dec.remaining() as u64 / RECORD_BYTES {
+        return Err(SaveError::Limit {
+            section: SECTION,
+            kind: "entry-count",
+            value: count,
+            max: dec.remaining() as u64 / RECORD_BYTES,
+        });
+    }
+    let mut records = Vec::with_capacity(count as usize);
+    let mut seen = BTreeSet::new();
+    for _ in 0..count {
+        let seq = dec.read_u64()?;
+        let wide_class = dec.read_u32()?;
+        let class = u16::try_from(wide_class).map_err(|_| SaveError::Limit {
+            section: SECTION,
+            kind: "class",
+            value: u64::from(wide_class),
+            max: u64::from(u16::MAX),
+        })?;
+        let field = read_field(dec, SECTION)?;
+        let intended_due = dec.read_tick()?;
+        let executed_tick = dec.read_tick()?;
+        let schedule_kind = read_schedule_kind(dec, SECTION)?;
+        let late = read_late(dec, SECTION)?;
+        if !seen.insert(seq) {
+            return Err(SaveError::Duplicate {
+                section: SECTION,
+                seq,
+            });
+        }
+        records.push(ExecutionRecord {
+            id: EventId { seq },
+            class: EventClass::new(class),
+            field,
+            intended_due,
+            executed_tick,
+            schedule_kind,
+            late,
+        });
+    }
+    Ok(records)
 }

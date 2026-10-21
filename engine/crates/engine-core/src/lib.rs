@@ -46,6 +46,7 @@ pub mod event;
 pub mod fingerprint;
 pub mod lod;
 pub mod spine;
+pub mod wire;
 
 pub use clock::Tick;
 pub use diag::{Diagnostics, Level, Record};
@@ -58,3 +59,4 @@ pub use spine::{
     ExecCtx, LaneReport, LaneTotals, ObligationLocation, ObligationView, ScheduleError, Spine,
     Stats, SuspensionStats, World,
 };
+pub use wire::{Decoder, Encoder, SaveError, SaveWorld};
