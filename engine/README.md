@@ -163,13 +163,13 @@ The first build compiles vendored SDL 3.4.18 (a few minutes). Expected: a 1280×
 - **A — basic Vulkan rendering:** `cargo run -p engine-slice -- --render`. Window opens; instance creation succeeds with the portability-enumeration flag (the macOS loader advertises it); a physical device (Apple GPU via MoltenVK) is selected; the SDL surface, swapchain, and pipeline initialize; the scene renders with correct depth ordering; presentation continues; clean close. Record GPU name, API version, swapchain image count, present mode, and GPU-timestamp support from the summary.
 - **B — regions + LOD:** `cargo run -p engine-slice -- --render --regions` — the eight plates (F green · S blue · E amber · D near-black), NPC proxies appearing/disappearing with camera distance (WASD, `Shift` sprint), coherent overlay region lines; rendering stays read-only-derived from simulation state.
 - **C — active validation:** `cargo run --release -p engine-slice -- --render --regions --validation on` — the exit summary must report validation **active** with zero errors and zero warnings (a run where the layer is silently absent does not pass; the summary distinguishes active from absent). Record any layer/loader availability limitation separately from application defects.
-- **D — recreation paths:** manual resize, minimize/restore, and relaunch, plus the forced-recreation variants (real Cocoa window — no offscreen driver needed): `cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize` and the same with `--replace-pipelines` — no hangs, `recreations N > 0`, the dynamic region buffer carries across replacement, zero validation errors/warnings.
+- **D — recreation paths:** manual resize, minimize/restore, and relaunch, plus the forced-recreation variants (real Cocoa window — no offscreen driver needed): `cargo run -p engine-slice -- --render --regions --frames 20 --fps uncapped --validation on --simulate-resize` and the same with `--replace-pipelines` — no hangs, `recreations N > 0`, the dynamic region buffer carries across replacement, zero validation errors/warnings. (Numeric `--fps` values are clamped to ≥ 1 FPS — `uncapped` is the finite-frame no-pacing form.)
 - **E — presentation behavior:** `--present mailbox` and `--present immediate --fps uncapped` (unsupported modes must fall back to FIFO per existing policy — record the resolved mode), and `--fps 240` for a high-refresh pacing observation with CPU/GPU percentiles. These are portability observations, not first-game performance claims.
 - **F — SDL3/ash loader compatibility (the Mac 0 review gate):** build first, then run the binary directly so cargo's own process does not pollute the log:
 
   ```sh
   cargo build -p engine-slice
-  DYLD_PRINT_LIBRARIES=1 ./target/debug/engine-slice --render --frames 60 --fps 0 2> dyld.log
+  DYLD_PRINT_LIBRARIES=1 ./target/debug/engine-slice --render --frames 60 --fps uncapped 2> dyld.log
   grep -iE 'vulkan|molten' dyld.log
   otool -L ./target/debug/engine-slice
   ```

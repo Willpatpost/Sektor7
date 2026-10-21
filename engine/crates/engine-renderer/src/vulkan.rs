@@ -97,6 +97,18 @@ pub(crate) fn drain_validation_messages() -> Vec<(u8, String)> {
     }
 }
 
+/// Records a renderer-observed environment limitation into the
+/// validation diagnostics queue (class 1 = warning) — the existing
+/// channel every run summary drains, so the limitation is explicitly
+/// diagnosable without new architecture (Mac 2 review follow-up B).
+fn queue_environment_message(text: String) {
+    if let Ok(mut queue) = VALIDATION_QUEUE.lock()
+        && queue.len() < 256
+    {
+        queue.push((1, text));
+    }
+}
+
 unsafe extern "system" fn validation_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _types: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -224,17 +236,29 @@ impl VulkanContext {
         // Mac 2, change A: the loader's advertised instance extensions
         // decide portability enumeration. Enumeration failure is an
         // environment limitation, not an application error — an empty
-        // advertised set preserves the pre-Mac-2 behavior exactly.
+        // advertised set preserves the pre-Mac-2 behavior exactly — but
+        // it is recorded through the renderer's existing diagnostics
+        // queue so the run summary makes the limitation explicit (Mac 2
+        // review follow-up B).
         let loader_advertised: Vec<String> =
-            unsafe { entry.enumerate_instance_extension_properties(None) }
-                .unwrap_or_default()
-                .iter()
-                .map(|property| {
-                    unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect();
+            match unsafe { entry.enumerate_instance_extension_properties(None) } {
+                Ok(properties) => properties
+                    .iter()
+                    .map(|property| {
+                        unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect(),
+                Err(error) => {
+                    queue_environment_message(format!(
+                        "vkEnumerateInstanceExtensionProperties failed ({error:?}) — \
+                         VK_KHR_portability_enumeration not enabled: environment \
+                         limitation, not an application error"
+                    ));
+                    Vec::new()
+                }
+            };
         let mut plan =
             InstanceExtensionPlan::select(&sdl_extensions, &loader_advertised, want_validation);
         let mut layer_cstrings: Vec<CString> = Vec::new();
@@ -259,7 +283,8 @@ impl VulkanContext {
             // portability enumeration and its flag survive (Mac 2
             // authorization §4), so a missing layer can never hide
             // MoltenVK devices.
-            let (_extension_cstrings, extension_names) = extension_name_pointers(&plan.extensions);
+            let (_extension_cstrings, extension_names) =
+                extension_name_pointers(&plan.extensions());
             let layer_names: Vec<*const core::ffi::c_char> =
                 layer_cstrings.iter().map(|c| c.as_ptr()).collect();
             let mut debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -298,7 +323,7 @@ impl VulkanContext {
                 // validation — portability enumeration and its flag are
                 // the same decision in both attempts.
                 let (_extension_cstrings, extension_names) =
-                    extension_name_pointers(&plan.extensions);
+                    extension_name_pointers(&plan.extensions());
                 let create_info = vk::InstanceCreateInfo::default()
                     .application_info(&app_info)
                     .flags(plan.create_flags())
@@ -468,35 +493,38 @@ impl VulkanContext {
     }
 }
 
-/// Instance-creation extension plan (Mac 2, change A): a pure selection
-/// policy over SDL's driver-required extensions and the loader's
-/// advertised instance extensions. `VK_KHR_portability_enumeration` is
-/// enabled when the loader advertises it — without the extension and
-/// the matching instance flag, a conformant loader hides portability
-/// devices such as MoltenVK, which today surfaces as the designed
-/// transparent `RendererError::NoDevice`. The validation-only
-/// `VK_EXT_debug_utils` extension is appended last and removed **by
-/// name** on fallback — the Mac 0-era `pop()` relied on debug-utils
-/// being last, an ordering invariant the portability insertion would
-/// silently break (Mac 2 authorization §4 hazard).
+/// Instance-creation extension plan (Mac 2, change A; corrected per the
+/// Mac 2 review follow-up A): the enabled extension list is **derived**
+/// from three components rather than stored — SDL's driver-required
+/// extensions (deduplicated, first occurrence first), the
+/// portability-enumeration decision, and validation-**added**
+/// debug-utils state. Derivation makes the review's correctness
+/// properties structural: no input can produce a duplicate entry, and
+/// `without_validation` clears only validation-added state, so an
+/// SDL-required extension (including an SDL-required
+/// `VK_EXT_debug_utils`) can never be removed by the fallback. The
+/// Mac 0-era `pop()` ordering hazard and the name-filter hazard are
+/// both eliminated by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstanceExtensionPlan {
-    /// Enabled extensions in creation order: SDL-required first, then
-    /// portability enumeration (when enabled), then debug-utils last.
-    extensions: Vec<String>,
-    /// `VK_KHR_portability_enumeration` is enabled — the instance must
+    /// SDL's driver-required extensions, deduplicated, first occurrence
+    /// first — never removed by any later state change.
+    sdl_required: Vec<String>,
+    /// `VK_KHR_portability_enumeration` is enabled — appended at
+    /// creation time unless SDL itself required it; the instance must
     /// set `ENUMERATE_PORTABILITY_KHR`.
     portability_enumeration: bool,
-    /// The validation debug-utils extension is included (an instance
-    /// created from this plan can report validation active).
+    /// Validation-added `VK_EXT_debug_utils` state — appended at
+    /// creation time unless SDL itself required it; the only component
+    /// the validation fallback clears.
     validation: bool,
 }
 
 impl InstanceExtensionPlan {
-    /// SDL-required extensions keep their order and content; the
-    /// loader's portability enumeration is appended when advertised and
-    /// not already required; the validation extension is appended only
-    /// when validation is wanted. No duplicates.
+    /// SDL's required list is deduplicated (first occurrence first);
+    /// the loader's advertised extensions enable portability
+    /// enumeration unless SDL already required it; validation wanting
+    /// adds debug-utils state.
     fn select(
         sdl_required: &[String],
         loader_advertised: &[String],
@@ -506,39 +534,49 @@ impl InstanceExtensionPlan {
             .to_string_lossy()
             .into_owned();
         let advertised = loader_advertised.contains(&portability);
-        let already_required = sdl_required.contains(&portability);
-        let mut extensions = sdl_required.to_vec();
-        if advertised && !already_required {
-            extensions.push(portability);
-        }
-        if want_validation {
-            extensions.push(ext::debug_utils::NAME.to_string_lossy().into_owned());
-        }
+        let sdl_requires_portability = sdl_required.contains(&portability);
         InstanceExtensionPlan {
-            extensions,
-            portability_enumeration: advertised || already_required,
+            sdl_required: dedup_keep_first(sdl_required),
+            portability_enumeration: advertised || sdl_requires_portability,
             validation: want_validation,
         }
     }
 
-    /// Validation fallback: remove the debug-utils extension by name,
-    /// leaving the SDL-required and portability extensions — and hence
-    /// the instance flag — untouched.
+    /// The enabled extension list in creation order: SDL-required
+    /// (deduplicated) first, then portability enumeration when enabled
+    /// and not already required, then the validation-added debug-utils
+    /// extension when wanted and not already required. No duplicates by
+    /// construction.
+    fn extensions(&self) -> Vec<String> {
+        let mut extensions = self.sdl_required.clone();
+        let portability = khr::portability_enumeration::NAME
+            .to_string_lossy()
+            .into_owned();
+        if self.portability_enumeration && !extensions.contains(&portability) {
+            extensions.push(portability);
+        }
+        if self.validation {
+            let debug_utils = ext::debug_utils::NAME.to_string_lossy().into_owned();
+            if !extensions.contains(&debug_utils) {
+                extensions.push(debug_utils);
+            }
+        }
+        extensions
+    }
+
+    /// Validation fallback: clear the validation-ADDED component only —
+    /// SDL-required entries (including an SDL-required debug-utils) and
+    /// the portability decision are untouched, so the instance flag
+    /// survives too.
     fn without_validation(&self) -> InstanceExtensionPlan {
-        let debug_utils = ext::debug_utils::NAME.to_string_lossy().into_owned();
         InstanceExtensionPlan {
-            extensions: self
-                .extensions
-                .iter()
-                .filter(|name| name.as_str() != debug_utils)
-                .cloned()
-                .collect(),
+            sdl_required: self.sdl_required.clone(),
             portability_enumeration: self.portability_enumeration,
             validation: false,
         }
     }
 
-    /// Instance flags derived from the same plan that produced the
+    /// Instance flags derived from the same plan that produces the
     /// extension list — flag and extension cannot diverge in either
     /// creation attempt.
     fn create_flags(&self) -> vk::InstanceCreateFlags {
@@ -548,6 +586,19 @@ impl InstanceExtensionPlan {
             vk::InstanceCreateFlags::empty()
         }
     }
+}
+
+/// First-occurrence deduplication of a name list (Mac 2 review
+/// follow-up A): SDL's required list is authoritative but not
+/// guaranteed duplicate-free.
+fn dedup_keep_first(items: &[String]) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        if !unique.contains(item) {
+            unique.push(item.clone());
+        }
+    }
+    unique
 }
 
 /// Owned CString copies of an extension list plus raw pointers into
@@ -2578,7 +2629,7 @@ mod policy_tests {
             vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
         );
         assert_eq!(
-            plan.extensions,
+            plan.extensions(),
             strings(&[
                 "VK_KHR_surface",
                 "VK_EXT_metal_surface",
@@ -2597,7 +2648,7 @@ mod policy_tests {
         assert!(!plan.portability_enumeration);
         assert_eq!(plan.create_flags(), vk::InstanceCreateFlags::empty());
         assert_eq!(
-            plan.extensions,
+            plan.extensions(),
             strings(&["VK_KHR_surface", "VK_EXT_headless_surface"])
         );
     }
@@ -2613,7 +2664,7 @@ mod policy_tests {
             false,
         );
         assert_eq!(
-            plan.extensions,
+            plan.extensions(),
             strings(&[
                 "VK_KHR_surface",
                 "VK_EXT_metal_surface",
@@ -2628,7 +2679,7 @@ mod policy_tests {
             false,
         );
         assert_eq!(
-            already.extensions,
+            already.extensions(),
             strings(&["VK_KHR_surface", "VK_KHR_portability_enumeration"])
         );
         assert!(already.portability_enumeration);
@@ -2650,7 +2701,7 @@ mod policy_tests {
         assert!(without.portability_enumeration);
         assert_eq!(without.create_flags(), with.create_flags());
         assert_eq!(
-            without.extensions,
+            without.extensions(),
             strings(&[
                 "VK_KHR_surface",
                 "VK_EXT_metal_surface",
@@ -2667,7 +2718,11 @@ mod policy_tests {
             false,
         );
         assert!(!plan.validation);
-        assert!(!plan.extensions.contains(&"VK_EXT_debug_utils".to_string()));
+        assert!(
+            !plan
+                .extensions()
+                .contains(&"VK_EXT_debug_utils".to_string())
+        );
         // Fallback on a plan that never had validation is a no-op.
         assert_eq!(plan.without_validation(), plan);
     }
@@ -2701,5 +2756,80 @@ mod policy_tests {
         let subset_only = device_extension_capabilities(&strings(&["VK_KHR_portability_subset"]));
         assert!(!subset_only.swapchain);
         assert!(subset_only.portability_subset);
+    }
+
+    #[test]
+    fn sdl_input_duplicates_are_deduplicated_first_occurrence_first() {
+        // Mac 2 review follow-up A: SDL's required list is authoritative
+        // but not guaranteed duplicate-free — the enabled list must be.
+        let plan = InstanceExtensionPlan::select(
+            &strings(&[
+                "VK_KHR_surface",
+                "VK_KHR_surface",
+                "VK_EXT_metal_surface",
+                "VK_KHR_surface",
+            ]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            false,
+        );
+        assert_eq!(
+            plan.extensions(),
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_metal_surface",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+    }
+
+    #[test]
+    fn validation_fallback_preserves_sdl_required_debug_utils() {
+        // Mac 2 review follow-up A: if SDL itself required
+        // VK_EXT_debug_utils, the fallback removes only the
+        // validation-ADDED state — the required entry survives,
+        // unduplicated.
+        let with = InstanceExtensionPlan::select(
+            &strings(&["VK_KHR_surface", "VK_EXT_debug_utils"]),
+            &strings(&["VK_KHR_portability_enumeration"]),
+            true,
+        );
+        // Validation wanting adds no duplicate on top of the required
+        // entry.
+        assert_eq!(
+            with.extensions(),
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_debug_utils",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+        let without = with.without_validation();
+        assert!(!without.validation);
+        assert_eq!(
+            without.extensions(),
+            strings(&[
+                "VK_KHR_surface",
+                "VK_EXT_debug_utils",
+                "VK_KHR_portability_enumeration",
+            ])
+        );
+        assert_eq!(without.create_flags(), with.create_flags());
+    }
+
+    #[test]
+    fn environment_enumeration_failure_is_queued_as_a_warning() {
+        // Mac 2 review follow-up B: a loader-enumeration failure must
+        // be explicitly diagnosable — it rides the existing validation
+        // diagnostics queue the run summary drains.
+        {
+            let mut queue = VALIDATION_QUEUE.lock().expect("queue lock");
+            queue.clear();
+        }
+        queue_environment_message("enumeration probe".to_string());
+        let queued = {
+            let mut queue = VALIDATION_QUEUE.lock().expect("queue lock");
+            std::mem::take(&mut *queue)
+        };
+        assert_eq!(queued, vec![(1, String::from("enumeration probe"))]);
     }
 }
