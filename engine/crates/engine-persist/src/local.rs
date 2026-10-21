@@ -481,12 +481,18 @@ impl LocalFileMedium {
 
         // Phase B — sync every object in the set (including
         // idempotently reused ones: a prior interrupted writer may
-        // have left them unsynced).
+        // have left them unsynced). The handles open with WRITE
+        // access: Windows `FlushFileBuffers` requires it (a read-only
+        // handle fails with ERROR_ACCESS_DENIED), while POSIX fsync
+        // accepts any descriptor — write access is the portable
+        // intersection.
         let mut hashes: Vec<Hash> = objects.iter().map(StoredObject::hash).collect();
         hashes.push(*record_id);
         for hash in &hashes {
             let path = self.object_path(hash);
-            let file = File::open(&path)
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
                 .map_err(|_| ObjectWriteFailure::Unknown(UnknownReason::ObjectSyncFailed))?;
             file.sync_all()
                 .map_err(|_| ObjectWriteFailure::Unknown(UnknownReason::ObjectSyncFailed))?;
