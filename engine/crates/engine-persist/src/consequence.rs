@@ -331,17 +331,16 @@ impl Coverage {
     /// Whether the two coverages share any occurrence (cross-lane
     /// overlap — an invalid award state).
     pub fn overlaps(&self, other: &Coverage) -> bool {
-        self.spans.iter().any(|a| {
-            other
-                .spans
-                .iter()
-                .any(|b| a.lo < b.hi && b.lo < a.hi)
-        })
+        self.spans
+            .iter()
+            .any(|a| other.spans.iter().any(|b| a.lo < b.hi && b.lo < a.hi))
     }
 
     /// Wire encoding (bounded: the interval count is checked against
-    /// the documented maximum before serializing).
-    fn encode_into(&self, enc: &mut Encoder) -> Result<(), SaveError> {
+    /// the documented maximum before serializing). Crate-internal:
+    /// the award-state domain and the envelope's source baseline
+    /// embed the same span-list form.
+    pub(crate) fn encode_into(&self, enc: &mut Encoder) -> Result<(), SaveError> {
         if self.spans.len() as u64 > MAX_COVERAGE_SPANS {
             return Err(SaveError::Limit {
                 section: "award-state",
@@ -362,8 +361,9 @@ impl Coverage {
     /// count — also bounded by the remaining input — per-span
     /// validity, sorted, disjoint, and **non-adjacent** canonical
     /// form; adjacent spans would have composed and are therefore
-    /// non-canonical).
-    fn decode_from(dec: &mut Decoder<'_>) -> Result<Self, SaveError> {
+    /// non-canonical). Crate-internal: shared with the envelope's
+    /// source-baseline decoding.
+    pub(crate) fn decode_from(dec: &mut Decoder<'_>) -> Result<Self, SaveError> {
         const SECTION: &str = "award-state";
         let count = dec.read_count(MAX_COVERAGE_SPANS, SECTION, "coverage-span-count")?;
         // Each encoded span is exactly 16 bytes.
@@ -526,9 +526,7 @@ impl AwardState {
     /// invalid state (never two awards) — rejected, never repaired.
     pub fn validate(&self) -> Result<(), SaveError> {
         if self.durable.overlaps(&self.provisional) {
-            return Err(SaveError::Integrity(
-                "award-state/cross-lane-overlap",
-            ));
+            return Err(SaveError::Integrity("award-state/cross-lane-overlap"));
         }
         Ok(())
     }
@@ -919,7 +917,10 @@ mod tests {
         state.rollback(checkpoint);
         assert!(state.covers(4), "the retained durable occurrence 4");
         assert!(state.covers(6), "the retained durable occurrence 6");
-        assert!(!state.covers(5), "the rolled-back provisional occurrence 5 is earnable again");
+        assert!(
+            !state.covers(5),
+            "the rolled-back provisional occurrence 5 is earnable again"
+        );
         // The reattempt legitimately re-earns occurrence 5 — and the
         // hole fills, composing back to one span.
         state.award_durable(5);
@@ -938,7 +939,10 @@ mod tests {
         state.award_durable(5);
         state.rollback(checkpoint);
         for retained in [1, 3, 5] {
-            assert!(state.covers(retained), "durable occurrence {retained} is retained");
+            assert!(
+                state.covers(retained),
+                "durable occurrence {retained} is retained"
+            );
         }
         for discarded in [2, 4] {
             assert!(
@@ -961,7 +965,10 @@ mod tests {
             assert!(state.covers(retained));
         }
         for discarded in [7, 8] {
-            assert!(!state.covers(discarded), "occurrence {discarded} is earnable again");
+            assert!(
+                !state.covers(discarded),
+                "occurrence {discarded} is earnable again"
+            );
         }
     }
 

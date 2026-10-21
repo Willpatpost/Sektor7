@@ -38,6 +38,7 @@
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
 pub mod consequence;
+pub mod envelope;
 pub mod fault;
 pub mod hash;
 pub mod local;
@@ -49,6 +50,10 @@ mod tests;
 
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, SpanError,
+};
+pub use envelope::{
+    ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, DurabilityClass,
+    PartialApplication, SignalLane, SourceBaseline, SourcePosition,
 };
 pub use fault::{FaultAction, FaultControl, FaultPoint};
 pub use hash::Hash;
