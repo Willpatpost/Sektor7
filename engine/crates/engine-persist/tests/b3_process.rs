@@ -24,11 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use engine_persist::{
-    AppendOutcome, AuthorityMode, AwardCheckpoint, CanonicalMedium, ClassifiedSpan, CommitOutcome,
-    CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
-    FrontierEntry, Hash, KeyPhase, LocalFileMedium, OccurrenceSpan, RecoveryAnchor, RevisionRecord,
-    SignalLane, SourceBaseline, SourcePosition, T1Journal, TransactionDurability, TransactionId,
-    reconcile,
+    AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, ClassifiedSpan,
+    CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterDelta, CounterValues,
+    Coverage, DurabilityClass, FrontierEntry, Hash, KeyPhase, LocalFileMedium, OccurrenceSpan,
+    RecoveryAnchor, RevisionRecord, SignalLane, SourceBaseline, SourcePosition, T1Journal,
+    TransactionDurability, TransactionId, reconcile,
 };
 
 const ROLE_ENV: &str = "S7_B3_ROLE";
@@ -101,6 +101,35 @@ fn envelope(id: ConsequenceId, span: (u64, u64)) -> ConsequenceEnvelope {
     .unwrap()
 }
 
+/// A span-less lane movement (an activation commit): net-zero lane
+/// movement, applied whole-or-not by identity.
+fn movement_envelope(
+    id: ConsequenceId,
+    captured: i64,
+    credits: i64,
+    prior: CounterValues,
+) -> ConsequenceEnvelope {
+    ConsequenceEnvelope::new(id)
+        .with_delta(CounterDelta {
+            milestones: 0,
+            pending_signals: 0,
+            captured,
+            credits,
+        })
+        .with_expected_prior(prior)
+        .with_baseline(SourceBaseline {
+            counters: prior,
+            award: AwardCheckpoint {
+                durable: Coverage::new(),
+                provisional: Coverage::new(),
+            },
+        })
+        .with_position(SourcePosition {
+            head: None,
+            tick: 110,
+        })
+}
+
 fn first_id() -> ConsequenceId {
     ConsequenceId::new(1, 1, 1)
 }
@@ -116,6 +145,16 @@ fn counters(milestones: u64, lane_value: u64) -> CounterValues {
         captured: lane_value,
         credits: 0,
     }
+}
+
+/// An award state whose durable lane covers exactly the given
+/// occurrences (the published anchor's materialized coverage).
+fn durable_award(occurrences: &[u64]) -> AwardState {
+    let mut award = AwardState::new();
+    for occurrence in occurrences {
+        award.award_durable(*occurrence);
+    }
+    award
 }
 
 fn assert_recovery_invariants(outcome: &engine_persist::RecoveryOutcome) {
@@ -145,6 +184,7 @@ fn child_entry() {
     };
     match role.as_str() {
         "pcrasher" => child_crasher(),
+        "w6crasher" => child_w6(),
         other => panic!("unknown role: {other}"),
     }
 }
@@ -201,6 +241,81 @@ fn child_crasher() {
     std::process::exit(6);
 }
 
+/// The W6 crasher: journals ONE span-less movement transaction,
+/// recovers it (the application's act — the recovered counters plus
+/// the identity-exact materialization evidence), publishes the
+/// snapshot as a file (the generic form of the caller's ONE
+/// publication), then HARD-EXITS before any canonical confirmation —
+/// exactly the W6 window with real process death.
+fn child_w6() {
+    wait_for_go();
+    let root = PathBuf::from(env::var(PATH_ENV).expect("path env"));
+    {
+        let mut medium = LocalFileMedium::open(root.join("store")).unwrap();
+        if medium.head().unwrap().is_none() {
+            let founding =
+                RevisionRecord::founding(AuthorityMode::Standalone, "b3-process-campaign", 0);
+            match medium.append(&founding, &[], None).unwrap() {
+                AppendOutcome::Accepted { .. } => {}
+                other => panic!("the founding must accept: {other:?}"),
+            }
+        }
+    }
+    let journal = T1Journal::open(root.join("journal.t1")).unwrap();
+    let medium = LocalFileMedium::open(root.join("store")).unwrap();
+    let mut pipeline = CommitPipeline::open(medium, journal).unwrap();
+    let mover = ConsequenceId::new(1, 1, 1);
+    let prior = counters(8, 8);
+    pipeline
+        .stage(movement_envelope(mover, -2, 2, prior))
+        .unwrap();
+    let receipt = pipeline
+        .capture(
+            SourcePosition {
+                head: None,
+                tick: 110,
+            },
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: 1,
+                episode: 2,
+            }],
+            b"w6-movement-plan".to_vec(),
+        )
+        .unwrap();
+    // The application's recovery: the movement applies from the
+    // pre-movement anchor, and the recovered state carries the
+    // materialization evidence.
+    let scan = T1Journal::scan_file(root.join("journal.t1")).unwrap();
+    let anchor = RecoveryAnchor::new(SourcePosition {
+        head: None,
+        tick: 100,
+    })
+    .with_identity(mover, prior, AwardState::new());
+    let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+    let participant = outcome.recovered.get(&mover).unwrap();
+    let movement = participant
+        .movements
+        .iter()
+        .next()
+        .copied()
+        .expect("the applied movement is recorded");
+    assert_eq!(movement, receipt.journal.id);
+    // The publication (the generic form): the recovered counters PLUS
+    // the identity-exact evidence, atomically in one file — then the
+    // hard death before any canonical confirmation.
+    let publication = format!(
+        "milestones={}\ncaptured={}\ncredits={}\nmovement={}\n",
+        participant.counters.milestones,
+        participant.counters.captured,
+        participant.counters.credits,
+        movement.0.hex(),
+    );
+    fs::write(root.join("published-anchor.txt"), publication).unwrap();
+    std::process::exit(6);
+}
+
 fn wait_for_go() {
     let go = env::var(GO_ENV).expect("go env");
     let deadline = Instant::now() + WAIT;
@@ -220,14 +335,14 @@ fn write_result(text: &str) {
 
 // ------------------------------------------------------------ parent side
 
-fn spawn_child(phase: &str, harness: &Path) -> Child {
+fn spawn_child(role: &str, phase: &str, harness: &Path) -> Child {
     let go = harness.join("go");
     let result = harness.join("result-0");
     let mut command = Command::new(env::current_exe().expect("current exe"));
     command
         .arg("--exact")
         .arg("child_entry")
-        .env(ROLE_ENV, "pcrasher")
+        .env(ROLE_ENV, role)
         .env(PHASE_ENV, phase)
         .env(PATH_ENV, harness.display().to_string())
         .env(GO_ENV, go.display().to_string())
@@ -341,13 +456,36 @@ fn reconstruct_confirm_and_verify(dir: &TestDir, expect_applied_marker: bool) {
     );
     assert_eq!(pipeline.confirmed_coverage(first).unwrap().len(), 1);
     assert_eq!(pipeline.confirmed_coverage(second).unwrap().len(), 1);
-    // Post-confirmation: the chain tier suppresses any re-recovery.
+    // Post-confirmation, the canonical-state coherence contract: from
+    // the old anchor the confirmed-but-unmaterialized effects are
+    // recovered exactly once (never silently discarded on batch
+    // identity alone); from the published anchor the chain tier
+    // suppresses.
     let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
-    let outcome = reconcile(&anchor, &scan, &confirmed).unwrap();
-    assert_recovery_invariants(&outcome);
-    assert!(outcome.report.applied.is_empty());
-    assert!(outcome.report.chain_suppressed.contains(&first));
-    assert!(outcome.report.chain_suppressed.contains(&second));
+    let from_old = reconcile(&anchor, &scan, &confirmed).unwrap();
+    assert_recovery_invariants(&from_old);
+    assert!(from_old.report.applied.is_empty());
+    assert_eq!(from_old.report.confirmed_recovered.len(), 2);
+    assert_eq!(
+        from_old.recovered.get(&first).unwrap().counters,
+        counters(2, 2)
+    );
+    assert_eq!(
+        from_old.recovered.get(&second).unwrap().counters,
+        counters(2, 2)
+    );
+    let published = RecoveryAnchor::new(SourcePosition {
+        head: None,
+        tick: 120,
+    })
+    .with_identity(first, counters(2, 2), durable_award(&[1, 2]))
+    .with_identity(second, counters(2, 2), durable_award(&[3, 4]));
+    let from_published = reconcile(&published, &scan, &confirmed).unwrap();
+    assert_recovery_invariants(&from_published);
+    assert!(from_published.report.applied.is_empty());
+    assert!(from_published.report.confirmed_recovered.is_empty());
+    assert!(from_published.report.chain_suppressed.contains(&first));
+    assert!(from_published.report.chain_suppressed.contains(&second));
     drop(pipeline);
     // The chain on disk: founding + one multi-key revision.
     let mut check = LocalFileMedium::open(dir.store()).unwrap();
@@ -363,7 +501,7 @@ fn reconstruct_confirm_and_verify(dir: &TestDir, expect_applied_marker: bool) {
 #[test]
 fn crash_after_t1_before_live_application_w2() {
     let dir = TestDir::new("w2");
-    let mut child = spawn_child("w2", dir.path());
+    let mut child = spawn_child("pcrasher", "w2", dir.path());
     release_barrier(dir.path());
     let status = wait_bounded(&mut child, "w2 crasher");
     assert!(!status.success(), "the child dies by hard exit: {status:?}");
@@ -378,9 +516,106 @@ fn crash_after_t1_before_live_application_w2() {
 #[test]
 fn crash_after_live_application_before_publication_w4() {
     let dir = TestDir::new("w4");
-    let mut child = spawn_child("w4", dir.path());
+    let mut child = spawn_child("pcrasher", "w4", dir.path());
     release_barrier(dir.path());
     let status = wait_bounded(&mut child, "w4 crasher");
     assert!(!status.success(), "the child dies by hard exit: {status:?}");
     reconstruct_confirm_and_verify(&dir, true);
+}
+
+/// The W6 window with real process death, the review's required
+/// scenario: the child journals a movement, recovers it, publishes
+/// the snapshot (the counters plus the identity-exact materialization
+/// evidence — atomically in one file), then dies before any canonical
+/// confirmation. The parent reconstructs from disk alone: the
+/// movement is NOT reapplied (no duplication — the evidence
+/// suppresses with chain confirmation absent), the counters stay at
+/// the published values, and the re-drive confirms exactly once.
+#[test]
+fn crash_after_movement_publication_before_confirmation_w6() {
+    let dir = TestDir::new("w6");
+    let mut child = spawn_child("w6crasher", "", dir.path());
+    release_barrier(dir.path());
+    let status = wait_bounded(&mut child, "w6 crasher");
+    assert!(!status.success(), "the child dies by hard exit: {status:?}");
+    // The publication file: the recovered counters plus the
+    // movement's transaction — the snapshot the child published.
+    let publication =
+        fs::read_to_string(dir.path().join("published-anchor.txt")).expect("the publication");
+    let mut milestones = None;
+    let mut captured = None;
+    let mut credits = None;
+    let mut movement = None;
+    for line in publication.lines() {
+        let (key, value) = line.split_once('=').expect("key=value line");
+        match key {
+            "milestones" => milestones = Some(value.parse::<u64>().unwrap()),
+            "captured" => captured = Some(value.parse::<u64>().unwrap()),
+            "credits" => credits = Some(value.parse::<u64>().unwrap()),
+            "movement" => movement = Some(value.to_owned()),
+            other => panic!("unknown publication field: {other}"),
+        }
+    }
+    let published = CounterValues {
+        milestones: milestones.expect("milestones"),
+        pending_signals: 0,
+        captured: captured.expect("captured"),
+        credits: credits.expect("credits"),
+    };
+    let movement = TransactionId(Hash::from_hex(&movement.expect("movement")).unwrap());
+    let mover = ConsequenceId::new(1, 1, 1);
+    assert_eq!(
+        published,
+        CounterValues {
+            milestones: 8,
+            pending_signals: 0,
+            captured: 6,
+            credits: 2,
+        },
+        "the publication carries the movement's post-state"
+    );
+    // The W6 reconstruction: the anchor built from the publication
+    // (the counters PLUS the evidence), chain confirmation ABSENT —
+    // the movement must not reapply.
+    let anchor = RecoveryAnchor::new(SourcePosition {
+        head: None,
+        tick: 120,
+    })
+    .with_identity(mover, published, AwardState::new())
+    .with_materialized_movement(mover, [movement]);
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+    assert_recovery_invariants(&outcome);
+    assert!(
+        outcome.report.applied.is_empty(),
+        "the published movement is never reapplied in the W6 window"
+    );
+    assert_eq!(
+        outcome.report.movement_materialized,
+        vec![(mover, movement)]
+    );
+    let participant = outcome.recovered.get(&mover).unwrap();
+    assert_eq!(
+        participant.counters, published,
+        "no duplication: the counters stay at the published values"
+    );
+    assert_eq!(participant.movements.len(), 1);
+    // The re-drive confirms exactly once; the journal never grew.
+    {
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        assert_eq!(journal.transactions().len(), 1);
+    }
+    let mut pipeline = {
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let medium = LocalFileMedium::open(dir.store()).unwrap();
+        CommitPipeline::open(medium, journal).unwrap()
+    };
+    let CommitOutcome::Confirmed(confirmation) = pipeline.commit_canonical().unwrap() else {
+        panic!("expected confirmation");
+    };
+    assert_eq!(confirmation.keys, vec![mover]);
+    assert_eq!(
+        pipeline.status(mover).unwrap().phase,
+        KeyPhase::InConfirmedChain
+    );
 }

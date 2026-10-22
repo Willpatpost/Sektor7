@@ -441,6 +441,24 @@ pub enum PipelineError {
     ConfirmationInvalid {
         detail: &'static str,
     },
+    /// Conflicting reuse of a `ConsequenceId` across valid canonical
+    /// batches: two chain revisions claim the same identity. The
+    /// exact-provenance standard rejects the second — fail closed,
+    /// never overwriting the first revision's evidence, never
+    /// guessing which is authoritative.
+    CanonicalIdentityConflict {
+        id: ConsequenceId,
+        first_revision: Hash,
+        second_revision: Hash,
+    },
+    /// Foreign-confirmed keys span distinct confirming revisions —
+    /// one honest receipt cannot report them; fail closed rather
+    /// than misreport any key's provenance.
+    ForeignProvenanceDivergent {
+        id: ConsequenceId,
+        first_revision: Hash,
+        second_revision: Hash,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -479,6 +497,26 @@ impl fmt::Display for PipelineError {
                 "canonical confirmation failed individual validation ({detail}) — \
                  never a false T3"
             ),
+            PipelineError::CanonicalIdentityConflict {
+                id,
+                first_revision,
+                second_revision,
+            } => write!(
+                f,
+                "consequence identity {id} is claimed by two valid canonical batches \
+                 ({first_revision} and {second_revision}) — conflicting reuse fails \
+                 closed"
+            ),
+            PipelineError::ForeignProvenanceDivergent {
+                id,
+                first_revision,
+                second_revision,
+            } => write!(
+                f,
+                "foreign-confirmed keys span distinct confirming revisions \
+                 ({first_revision} and {second_revision}, first at {id}) — one \
+                 honest receipt cannot report them"
+            ),
         }
     }
 }
@@ -506,10 +544,15 @@ impl From<JournalError> for PipelineError {
     }
 }
 
-/// One chain-confirmed key's evidence (the suppression authority).
+/// One chain-confirmed key's evidence (the suppression authority):
+/// the exact coverage, the producing transaction, and the confirming
+/// revision with its epoch — the full provenance the receipt reports
+/// and the conflict check compares.
 struct ConfirmedEntry {
     coverage: Vec<ClassifiedSpan>,
+    transaction: TransactionId,
     revision: Hash,
+    epoch: u64,
 }
 
 /// A retained canonical attempt — the exact revision, the batch's
@@ -804,6 +847,13 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             .map(|entry| entry.coverage.as_slice())
     }
 
+    /// The producing transaction for one chain-confirmed identity
+    /// (the per-key provenance — the transaction whose captured
+    /// effects the confirming batch installed).
+    pub fn confirmed_transaction(&self, id: ConsequenceId) -> Option<TransactionId> {
+        self.confirmed.get(&id).map(|entry| entry.transaction)
+    }
+
     /// The confirmed key set (the pipeline's session view).
     pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
         self.confirmed.keys().copied().collect()
@@ -1061,20 +1111,41 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     }
 
     /// A confirmation receipt for keys another writer's revision
-    /// confirmed (the re-walk placed them; per-key revisions are
-    /// queryable via the confirmed set).
+    /// confirmed. Per-key exact provenance: the receipt reports the
+    /// revision that ACTUALLY confirmed the keys — never the current
+    /// (possibly unrelated, later) HEAD. Keys confirmed by distinct
+    /// revisions cannot collapse into one honest receipt: fail
+    /// closed rather than misreport any key's provenance.
     fn foreign_receipt(
         &self,
         keys: Vec<ConsequenceId>,
     ) -> Result<ConfirmationReceipt, PipelineError> {
-        let revision = self.verified_head.ok_or(PipelineError::UnfoundedMedium)?;
         let (authority, _) = self
             .founding
             .as_ref()
             .ok_or(PipelineError::UnfoundedMedium)?;
+        let mut confirming: Option<(Hash, u64)> = None;
+        for key in &keys {
+            let entry = self
+                .confirmed
+                .get(key)
+                .ok_or(PipelineError::UnknownKey { id: *key })?;
+            match confirming {
+                None => confirming = Some((entry.revision, entry.epoch)),
+                Some((revision, _)) if revision == entry.revision => {}
+                Some((revision, _)) => {
+                    return Err(PipelineError::ForeignProvenanceDivergent {
+                        id: *key,
+                        first_revision: revision,
+                        second_revision: entry.revision,
+                    });
+                }
+            }
+        }
+        let (revision, epoch) = confirming.ok_or(PipelineError::UnfoundedMedium)?;
         Ok(ConfirmationReceipt {
             revision,
-            epoch: self.verified_epoch,
+            epoch,
             keys,
             tier: self.tier,
             authority: *authority,
@@ -1124,11 +1195,27 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 if peek_domain(&bytes).as_deref() == Some(CONSEQUENCE_BATCH_DOMAIN) {
                     let batch = ConsequenceBatch::decode(&bytes).map_err(PipelineError::Format)?;
                     for entry in batch.entries {
+                        if let Some(existing) = self.confirmed.get(&entry.id) {
+                            // Conflicting reuse of a ConsequenceId
+                            // across valid canonical batches: two
+                            // chain revisions claim the same identity.
+                            // The exact-provenance standard rejects
+                            // the second — never overwriting the first
+                            // revision's evidence, never guessing
+                            // which is authoritative.
+                            return Err(PipelineError::CanonicalIdentityConflict {
+                                id: entry.id,
+                                first_revision: existing.revision,
+                                second_revision: id,
+                            });
+                        }
                         self.confirmed.insert(
                             entry.id,
                             ConfirmedEntry {
                                 coverage: entry.coverage,
+                                transaction: entry.transaction,
                                 revision: id,
+                                epoch: record.epoch,
                             },
                         );
                     }
@@ -1807,6 +1894,134 @@ mod tests {
         let CommitOutcome::Confirmed(_) = recovered.commit_canonical().unwrap() else {
             panic!("expected confirmation");
         };
+    }
+
+    #[test]
+    fn conflicting_canonical_identities_across_batches_rejected() {
+        // The review's finding: two valid canonical batches claiming
+        // the SAME ConsequenceId — the exact-provenance standard
+        // rejects the second, never overwriting the first revision's
+        // evidence. The normal pipeline flow cannot produce the
+        // conflict (the stale-path re-walk filters confirmed keys
+        // before any re-submission), so the second batch is a
+        // hand-crafted valid revision — exactly the defensive scope
+        // of the walk's contract: ANY valid chain.
+        let dir = TestDir::new("canonical-conflict");
+        ensure_founded(&dir);
+        let identity = ConsequenceId::new(1, 1, 1);
+        // The first canonical batch, through the pipeline.
+        let journal = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal).unwrap();
+        let transaction = capture_index(&mut writer, 1);
+        let CommitOutcome::Confirmed(first) = writer.commit_canonical().unwrap() else {
+            panic!("expected the first confirmation");
+        };
+        assert_eq!(first.keys, vec![identity]);
+        let confirming = first.revision;
+        let head_epoch = first.epoch;
+        drop(writer);
+        // The conflicting second batch: a valid revision on top of
+        // the confirming one, carrying the same identity under a
+        // different coverage (a different content hash — the medium
+        // accepts it; only the pipeline's provenance standard
+        // rejects the claim).
+        let batch = ConsequenceBatch {
+            entries: vec![BatchEntry {
+                id: identity,
+                transaction,
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(2, 4).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+            }],
+        };
+        let batch_bytes = batch.canonical_bytes().unwrap();
+        let batch_object = StoredObject::new(batch_bytes).unwrap();
+        let batch_hash = batch_object.hash();
+        let record = RevisionRecord::regular(confirming, head_epoch, 0)
+            .with_idempotency_key(batch_hash.as_bytes().to_vec())
+            .with_content_refs(vec![batch_hash]);
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        match medium
+            .append(
+                &record,
+                std::slice::from_ref(&batch_object),
+                Some(confirming),
+            )
+            .unwrap()
+        {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the conflicting revision must append: {other:?}"),
+        }
+        drop(medium);
+        // A fresh pipeline over the conflicted chain fails closed at
+        // its session-open walk — the second batch's claim on the
+        // identity is rejected, the first's evidence preserved.
+        let journal = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let error = match CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal)
+        {
+            Ok(_) => panic!("the conflicted chain must fail the open"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                PipelineError::CanonicalIdentityConflict {
+                    id,
+                    first_revision,
+                    second_revision: _,
+                } if *id == identity && *first_revision == confirming
+            ),
+            "the conflicting canonical identity fails closed: {error}"
+        );
+    }
+
+    #[test]
+    fn foreign_receipt_reports_the_confirming_revision_not_the_head() {
+        // The review's finding: the foreign receipt must report each
+        // key's ACTUAL confirming revision and epoch — never the
+        // current (unrelated, later) HEAD. Writer B confirms the
+        // identity at revision R1; an unrelated revision R2 lands on
+        // top; writer A's stale-path re-walk then returns the foreign
+        // confirmation — which must name R1, not R2.
+        let dir = TestDir::new("foreign-receipt");
+        ensure_founded(&dir);
+        let identity = ConsequenceId::new(1, 1, 1);
+        // Writer A journals the identity and does NOT commit.
+        let journal_a = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer_a =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_a).unwrap();
+        capture_index(&mut writer_a, 1);
+        // Writer B (a separate journal) confirms the identity at R1.
+        let journal_b = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let mut writer_b =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_b).unwrap();
+        capture_index(&mut writer_b, 1);
+        let CommitOutcome::Confirmed(foreign) = writer_b.commit_canonical().unwrap() else {
+            panic!("expected writer B's confirmation");
+        };
+        assert_eq!(foreign.keys, vec![identity]);
+        let confirming = foreign.revision;
+        let confirming_epoch = foreign.epoch;
+        // An unrelated revision lands on top of the confirming one.
+        capture_index(&mut writer_b, 2);
+        let CommitOutcome::Confirmed(unrelated) = writer_b.commit_canonical().unwrap() else {
+            panic!("expected the unrelated confirmation");
+        };
+        assert_ne!(unrelated.revision, confirming);
+        drop(writer_b);
+        // Writer A's commit: the parent is stale (the head moved past
+        // the confirming revision); the suffix re-walk finds the
+        // identity confirmed by R1 — the foreign receipt names R1
+        // and its epoch, never the unrelated HEAD.
+        let CommitOutcome::Confirmed(receipt) = writer_a.commit_canonical().unwrap() else {
+            panic!("expected the foreign confirmation");
+        };
+        assert_eq!(receipt.keys, vec![identity]);
+        assert_eq!(receipt.revision, confirming);
+        assert_eq!(receipt.epoch, confirming_epoch);
+        assert_ne!(receipt.revision, unrelated.revision);
     }
 
     #[test]

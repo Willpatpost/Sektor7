@@ -53,11 +53,14 @@
 //! closed** ([`RecoveryError::Incompatible`], evidence preserved). A
 //! fully materialized transition (the durable coverage covers every
 //! occurrence) applies nothing — no duplicate. **Span-less movements
-//! apply whole-or-not by identity only** — the chain (tier 1) is
-//! their only durable suppression authority; counter equality is
-//! never evidence of an applied identity (unrelated operations can
+//! apply whole-or-not by identity only** — the durable suppression
+//! authorities are the chain (tier 1) and the snapshot's identity-
+//! exact materialization evidence (the per-identity transaction set,
+//! published atomically WITH the effects: a materialized movement is
+//! never reapplied in the W6 window); counter equality is never
+//! evidence of an applied identity (unrelated operations can
 //! produce identical values, and two journaled movements with
-//! identical deltas each apply exactly once).
+//! identical deltas each apply exactly once per run).
 //!
 //! **Purity and idempotence (the W4 property):** `reconcile` is a
 //! pure function of its inputs — no durable intermediate ever claims
@@ -109,6 +112,15 @@ pub struct RecoveryAnchor {
     /// clears provisional occurrences that its durable promotions
     /// absorb, keeping the lanes disjoint).
     pub awards: BTreeMap<ConsequenceId, AwardState>,
+    /// Per identity, the span-less movements whose effects this
+    /// snapshot MATERIALIZED, by exact producing transaction — the
+    /// identity-exact materialization evidence, published atomically
+    /// WITH the effects in the one snapshot publication (never a
+    /// counter comparison, never a separate durable applied-marker
+    /// log). A movement inserts no coverage span, so this is the
+    /// only snapshot-side proof that its effect is already
+    /// represented — the W6 suppression authority for movements.
+    pub movements: BTreeMap<ConsequenceId, BTreeSet<TransactionId>>,
 }
 
 impl RecoveryAnchor {
@@ -118,6 +130,7 @@ impl RecoveryAnchor {
             position,
             counters: BTreeMap::new(),
             awards: BTreeMap::new(),
+            movements: BTreeMap::new(),
         }
     }
 
@@ -130,6 +143,19 @@ impl RecoveryAnchor {
     ) -> Self {
         self.counters.insert(id, counters);
         self.awards.insert(id, award);
+        self
+    }
+
+    /// Attaches one identity's materialized-movement evidence (the
+    /// producing transactions whose span-less effects the snapshot
+    /// contains — carried into the next anchor's construction
+    /// atomically with the recovered counters).
+    pub fn with_materialized_movement(
+        mut self,
+        id: ConsequenceId,
+        transactions: impl IntoIterator<Item = TransactionId>,
+    ) -> Self {
+        self.movements.entry(id).or_default().extend(transactions);
         self
     }
 
@@ -149,6 +175,10 @@ impl RecoveryAnchor {
             .get(&id)
             .map(|award| award.provisional.clone())
             .unwrap_or_default()
+    }
+
+    fn materialized_movements(&self, id: ConsequenceId) -> BTreeSet<TransactionId> {
+        self.movements.get(&id).cloned().unwrap_or_default()
     }
 }
 
@@ -224,12 +254,27 @@ pub struct RecoveryReport {
     /// Contract B's per-transaction classification.
     pub transitions: Vec<(TransactionId, TransitionClassification)>,
     /// Identities suppressed by verified canonical inclusion (tier 1)
-    /// — never re-applied.
+    /// — never re-applied. The canonical-state coherence contract
+    /// gates this: a confirmed identity is suppressed only when the
+    /// anchor (or the working coverage) MATERIALIZES its effects;
+    /// a confirmed identity absent from the loaded state is
+    /// recovered into `confirmed_recovered` instead — never
+    /// silently discarded on batch identity alone.
     pub chain_suppressed: Vec<ConsequenceId>,
+    /// Confirmed identities whose effects were ABSENT from the
+    /// loaded state, recovered from the canonical evidence (the
+    /// journal envelope under the chain's commitment) — exactly-once
+    /// application, distinctly reported.
+    pub confirmed_recovered: Vec<AppliedEffect>,
     /// Per identity, the occurrences already materialized in the
     /// anchor's (or the working) coverage — suppressed without
     /// duplication (tiers 3–4).
     pub materialized: Vec<(ConsequenceId, u64)>,
+    /// Movements suppressed by the snapshot's identity-exact
+    /// materialization evidence (the anchor's per-identity
+    /// transaction set) — the W6 window: a published movement is
+    /// never re-applied.
+    pub movement_materialized: Vec<(ConsequenceId, TransactionId)>,
     /// Transactions suppressed by their durable cancellation (the
     /// terminated-encounter record) — their effects never apply.
     pub canceled: Vec<TransactionId>,
@@ -240,6 +285,14 @@ pub struct RecoveryReport {
 pub struct RecoveredParticipant {
     pub counters: CounterValues,
     pub award: AwardState,
+    /// The identity's materialized-movement set after this recovery:
+    /// the anchor's inherited evidence ∪ the movements this run
+    /// applied. The caller serializes it WITH the counters and the
+    /// award lanes in the ONE snapshot publication — the evidence is
+    /// atomically published with the effect, so the next recovery's
+    /// W6 window cannot re-apply a movement the snapshot already
+    /// contains.
+    pub movements: BTreeSet<TransactionId>,
 }
 
 /// The reconciliation result: the recovered state for every identity
@@ -271,6 +324,17 @@ pub enum RecoveryError {
     ConservationViolation {
         id: ConsequenceId,
     },
+    /// The canonical-state coherence contract's fail-closed edge: a
+    /// chain-confirmed identity whose effects are neither
+    /// materialized in the loaded anchor nor recoverable from an
+    /// actionable journal envelope — an unaccountable consequence.
+    /// Never silently discarded, never fabricated: fail closed with
+    /// the evidence preserved (the confirmed set, the anchor, and
+    /// the journal scan are the caller's inputs — the resolution is
+    /// governed, outside the pure function).
+    ConfirmedUnmaterialized {
+        id: ConsequenceId,
+    },
 }
 
 impl fmt::Display for RecoveryError {
@@ -289,6 +353,12 @@ impl fmt::Display for RecoveryError {
                 f,
                 "the conservation invariant broke recovering {id} — \
                  never repaired"
+            ),
+            RecoveryError::ConfirmedUnmaterialized { id } => write!(
+                f,
+                "the chain-confirmed identity {id} is absent from the loaded \
+                 state with no recoverable journal envelope — fail closed, \
+                 never silently discarded"
             ),
         }
     }
@@ -343,56 +413,112 @@ pub fn reconcile(
         let mut transaction_classification = TransitionClassification::BenignAbsence;
         let mut classified_any = false;
         for envelope in &transaction.envelopes {
-            // Tier 1 — verified canonical inclusion suppresses always.
-            if confirmed.contains(&envelope.id) {
-                report.chain_suppressed.push(envelope.id);
-                continue;
-            }
-            let classification = classify_transition(anchor, envelope)?;
-            if let TransitionClassification::Incompatible { detail } = classification {
-                return Err(RecoveryError::Incompatible {
-                    transaction: transaction.id,
-                    detail,
-                });
-            }
-            if !classified_any {
-                transaction_classification = classification.clone();
-                classified_any = true;
-            }
-            // Contract A — the exact missing occurrences against the
-            // WORKING coverage (the anchor's materialized coverage ∪
-            // this run's applications: the in-run dedup, which dies
-            // with the process and re-derives identically).
+            // The working participant — hoisted: every identity an
+            // actionable envelope touches passes through (suppressed
+            // or recovered), so the caller's merge carries the
+            // movement evidence either way.
             let participant = working
                 .entry(envelope.id)
                 .or_insert_with(|| RecoveredParticipant {
                     counters: anchor.counters(envelope.id),
                     award: anchor.awards.get(&envelope.id).cloned().unwrap_or_default(),
+                    movements: anchor.materialized_movements(envelope.id),
                 });
+            let span_bearing = !envelope.sub_spans.is_empty();
+            // The partial application against the WORKING coverage
+            // (the anchor's materialized coverage ∪ this run's
+            // applications: the in-run dedup, which dies with the
+            // process and re-derives identically).
+            let application = if span_bearing {
+                Some(envelope.missing_against(&participant.award.durable)?)
+            } else {
+                None
+            };
+            // Tier 1 under the canonical-state coherence contract:
+            // chain inclusion is a COMMITMENT statement, never a
+            // loaded-state statement. A confirmed identity whose
+            // effects the anchor materializes is fully represented
+            // (W7 — no action); a confirmed identity ABSENT from the
+            // loaded state falls through and is recovered from the
+            // canonical evidence below (the journal envelope under
+            // the chain's commitment) — never silently discarded on
+            // batch identity alone.
+            let confirmed_identity = confirmed.contains(&envelope.id);
+            if confirmed_identity {
+                let materialized = match &application {
+                    Some(application) => application.is_empty(),
+                    None => participant.movements.contains(&transaction.id),
+                };
+                if materialized {
+                    report.chain_suppressed.push(envelope.id);
+                    if !span_bearing {
+                        report
+                            .movement_materialized
+                            .push((envelope.id, transaction.id));
+                    }
+                    continue;
+                }
+            } else {
+                // Contract B — unconfirmed envelopes only (a
+                // confirmed identity's transition is canonically
+                // settled; its recovery applies the evidence forward).
+                let classification = classify_transition(anchor, envelope)?;
+                if let TransitionClassification::Incompatible { detail } = classification {
+                    return Err(RecoveryError::Incompatible {
+                        transaction: transaction.id,
+                        detail,
+                    });
+                }
+                if !classified_any {
+                    transaction_classification = classification.clone();
+                    classified_any = true;
+                }
+            }
             // A span-less lane movement (an activation commit):
             // identity-governed whole-or-not — the coverage cannot
             // suppress a movement, and counter equality is never
             // suppression evidence (unrelated operations can produce
-            // identical values). Each journal transaction is
-            // processed exactly once per run (the journal's own
-            // idempotent recognition prevents duplicate transaction
-            // identities); the chain (tier 1) is the only durable
-            // suppression authority.
-            if envelope.sub_spans.is_empty() {
+            // identical values). The durable suppression authorities
+            // are the chain (tier 1) and the snapshot's identity-exact
+            // materialization evidence (checked above — the W6
+            // window); each journal transaction applies exactly once
+            // per run, and the application records its transaction
+            // into the recovered movement set so the caller's next
+            // snapshot publication carries the evidence atomically
+            // with the effect.
+            if !span_bearing {
+                // Tier 3 for movements — the snapshot's identity-exact
+                // materialization evidence (the W6 window): a movement
+                // the published snapshot already contains is never
+                // reapplied, chain-confirmed or not (chain
+                // confirmation is routinely absent in exactly this
+                // window).
+                if participant.movements.contains(&transaction.id) {
+                    report
+                        .movement_materialized
+                        .push((envelope.id, transaction.id));
+                    continue;
+                }
                 let delta = envelope.delta;
                 participant.counters = delta.apply_to(&participant.counters)?;
+                participant.movements.insert(transaction.id);
                 if !participant.counters.conservation_holds() {
                     return Err(RecoveryError::ConservationViolation { id: envelope.id });
                 }
-                report.applied.push(AppliedEffect {
+                let effect = AppliedEffect {
                     id: envelope.id,
                     transaction: transaction.id,
                     applied: Vec::new(),
                     delta,
-                });
+                };
+                if confirmed_identity {
+                    report.confirmed_recovered.push(effect);
+                } else {
+                    report.applied.push(effect);
+                }
                 continue;
             }
-            let application = envelope.missing_against(&participant.award.durable)?;
+            let application = application.expect("span-bearing envelopes computed it above");
             if application.missing.is_empty() {
                 report
                     .materialized
@@ -411,17 +537,36 @@ pub fn reconcile(
             if !participant.counters.conservation_holds() {
                 return Err(RecoveryError::ConservationViolation { id: envelope.id });
             }
-            report.applied.push(AppliedEffect {
+            let effect = AppliedEffect {
                 id: envelope.id,
                 transaction: transaction.id,
                 applied: application.missing,
                 delta,
-            });
+            };
+            if confirmed_identity {
+                report.confirmed_recovered.push(effect);
+            } else {
+                report.applied.push(effect);
+            }
         }
         if classified_any {
             report
                 .transitions
                 .push((transaction.id, transaction_classification));
+        }
+    }
+    // The canonical-state coherence contract's fail-closed edge:
+    // every chain-confirmed identity must be accountable —
+    // materialized in the loaded anchor or recovered from an
+    // actionable journal envelope (the loop above). A confirmed
+    // identity the working state never touched (no envelope in any
+    // actionable transaction — a canceled-only record, an uncommitted
+    // frame, or a journal that never carried it) is an unaccountable
+    // consequence: fail closed, never silently discarded, never
+    // fabricated.
+    for identity in confirmed {
+        if !working.contains_key(identity) {
+            return Err(RecoveryError::ConfirmedUnmaterialized { id: *identity });
         }
     }
     Ok(RecoveryOutcome {
@@ -879,13 +1024,49 @@ mod tests {
     }
 
     #[test]
-    fn chain_confirmation_suppresses_journal_presence() {
-        // T1 journal presence NEVER suppresses a missing effect —
-        // only verified canonical inclusion (tier 1) or materialized
-        // snapshot coverage (tier 3). Here the identity is
-        // chain-confirmed but the anchor lacks the coverage: the
-        // chain suppresses. And conversely (every other test), an
-        // unconfirmed journaled identity applies.
+    fn confirmed_and_materialized_suppresses_w7() {
+        // The canonical-state coherence contract, the represented
+        // side: a chain-confirmed identity whose effects the anchor
+        // MATERIALIZES is fully represented (W7) — the chain tier
+        // suppresses, nothing applies, and the pass-through state is
+        // unchanged.
+        let identity = id(1);
+        let mut award = AwardState::new();
+        award.award_durable(1);
+        award.award_durable(2);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        })
+        .with_identity(identity, unit(SignalLane::Captured, 2), award);
+        let journal = scan(vec![transaction(
+            1,
+            vec![envelope(
+                identity,
+                (0, 2),
+                DurabilityClass::DurableEligible,
+                110,
+                CounterValues::default(),
+            )],
+        )]);
+        let mut confirmed = BTreeSet::new();
+        confirmed.insert(identity);
+        let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
+        assert_eq!(outcome.report.chain_suppressed, vec![identity]);
+        assert!(outcome.report.applied.is_empty());
+        assert!(outcome.report.confirmed_recovered.is_empty());
+        let participant = outcome.recovered.get(&identity).unwrap();
+        assert_eq!(participant.counters, unit(SignalLane::Captured, 2));
+    }
+
+    #[test]
+    fn confirmed_but_unmaterialized_recovers_from_canonical_evidence() {
+        // The review's finding: an older anchor lacking a
+        // chain-confirmed effect must NOT silently discard it —
+        // chain inclusion is a commitment statement, never a
+        // loaded-state statement. The effect is recovered from the
+        // canonical evidence (the journal envelope) exactly once and
+        // reported distinctly, never on batch identity alone.
         let identity = id(1);
         let anchor = RecoveryAnchor::new(SourcePosition {
             head: None,
@@ -904,9 +1085,126 @@ mod tests {
         let mut confirmed = BTreeSet::new();
         confirmed.insert(identity);
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
-        assert_eq!(outcome.report.chain_suppressed, vec![identity]);
+        assert!(outcome.report.chain_suppressed.is_empty());
         assert!(outcome.report.applied.is_empty());
-        assert!(!outcome.recovered.contains_key(&identity));
+        assert_eq!(outcome.report.confirmed_recovered.len(), 1);
+        assert_eq!(outcome.report.confirmed_recovered[0].id, identity);
+        assert_eq!(
+            outcome.report.confirmed_recovered[0].delta.milestones, 2,
+            "the recovery reports the exact recovered delta"
+        );
+        let participant = outcome.recovered.get(&identity).unwrap();
+        assert_eq!(
+            participant.counters,
+            unit(SignalLane::Captured, 2),
+            "the confirmed effect missing from the loaded state is recovered exactly once"
+        );
+        assert!(participant.counters.conservation_holds());
+        assert!(participant.award.durable.covers(1) && participant.award.durable.covers(2));
+    }
+
+    #[test]
+    fn confirmed_without_journal_evidence_fails_closed() {
+        // The coherence contract's fail-closed edge: a chain-confirmed
+        // identity whose effects are neither materialized in the
+        // anchor nor recoverable from an actionable journal envelope
+        // is an unaccountable consequence — never silently
+        // discarded, never fabricated.
+        let identity = id(1);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let journal = scan(vec![]);
+        let mut confirmed = BTreeSet::new();
+        confirmed.insert(identity);
+        let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConfirmedUnmaterialized { id } if id == identity
+        ));
+    }
+
+    #[test]
+    fn movement_materialized_evidence_suppresses_w6_reapplication() {
+        // The W6 window, the review's finding: a span-less movement
+        // already materialized in a verified snapshot is NOT
+        // reapplied when chain confirmation is absent. The
+        // suppression evidence is identity-exact — the snapshot's
+        // per-identity transaction set, atomically published with
+        // the effect — never counter equality (the anchor's counters
+        // here coincide with the post-state, and that alone never
+        // suppresses).
+        let identity = id(1);
+        let movement = CounterDelta {
+            milestones: 0,
+            pending_signals: 0,
+            captured: -2,
+            credits: 2,
+        };
+        let prior = unit(SignalLane::Captured, 8);
+        let build = || {
+            ConsequenceEnvelope::new(identity)
+                .with_delta(movement)
+                .with_expected_prior(prior)
+                .with_baseline(SourceBaseline {
+                    counters: prior,
+                    award: AwardCheckpoint {
+                        durable: Coverage::new(),
+                        provisional: Coverage::new(),
+                    },
+                })
+                .with_position(SourcePosition {
+                    head: None,
+                    tick: 110,
+                })
+        };
+        let journal = scan(vec![transaction(1, vec![build()])]);
+        let transaction = journal.committed[0].id;
+        // The first recovery (the publication's source): the movement
+        // applies, and the recovered state carries its transaction as
+        // the materialization evidence.
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        })
+        .with_identity(identity, prior, AwardState::new());
+        let first = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let participant = first.recovered.get(&identity).unwrap();
+        let published = movement.apply_to(&prior).unwrap();
+        assert_eq!(participant.counters, published);
+        assert_eq!(participant.movements, BTreeSet::from([transaction]));
+        assert_eq!(first.report.applied.len(), 1);
+        // The published snapshot: the post-state counters PLUS the
+        // identity-exact evidence, atomically — the caller's ONE
+        // publication. The W6 window: chain confirmation is absent,
+        // yet the movement must not reapply.
+        let published_anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 120,
+        })
+        .with_identity(identity, published, AwardState::new())
+        .with_materialized_movement(identity, [transaction]);
+        let second = reconcile(&published_anchor, &journal, &BTreeSet::new()).unwrap();
+        assert!(second.report.applied.is_empty());
+        assert_eq!(
+            second.report.movement_materialized,
+            vec![(identity, transaction)]
+        );
+        let participant = second.recovered.get(&identity).unwrap();
+        assert_eq!(
+            participant.counters, published,
+            "the materialized movement is never reapplied in the W6 window"
+        );
+        assert!(participant.counters.conservation_holds());
+        assert!(
+            participant.movements.contains(&transaction),
+            "the evidence survives the pass-through for the caller's next publication"
+        );
+        // Repeated recovery from the same published anchor derives
+        // the identical result (the pure function).
+        let third = reconcile(&published_anchor, &journal, &BTreeSet::new()).unwrap();
+        assert_eq!(second, third);
     }
 
     #[test]

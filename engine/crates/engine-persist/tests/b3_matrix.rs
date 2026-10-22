@@ -377,11 +377,32 @@ fn marker_window_eliminated_w4() {
         KeyPhase::InConfirmedChain
     );
     assert_eq!(pipeline.confirmed_coverage(id).unwrap().len(), 1);
-    // Post-confirmation: the chain tier suppresses any re-recovery.
+    // Post-confirmation, the canonical-state coherence contract: from
+    // the OLD anchor the confirmed-but-unmaterialized effect is
+    // RECOVERED from the canonical evidence (exactly once against
+    // that anchor — never silently discarded on batch identity
+    // alone); from the PUBLISHED anchor (the recovered state) the
+    // chain tier suppresses.
     let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
-    let outcome = reconcile(&anchor, &scan, &confirmed).unwrap();
-    assert!(outcome.report.applied.is_empty());
-    assert!(outcome.report.chain_suppressed.contains(&id));
+    let from_old = reconcile(&anchor, &scan, &confirmed).unwrap();
+    assert_recovery_invariants(&from_old);
+    assert!(from_old.report.applied.is_empty());
+    assert_eq!(from_old.report.confirmed_recovered.len(), 1);
+    assert_eq!(
+        from_old.recovered.get(&id).unwrap().counters,
+        counters(2, SignalLane::Captured, 2),
+        "the confirmed effect absent from the old anchor is recovered exactly once"
+    );
+    let published = anchor_at(120).with_identity(
+        id,
+        counters(2, SignalLane::Captured, 2),
+        durable_award(&[1, 2]),
+    );
+    let from_published = reconcile(&published, &scan, &confirmed).unwrap();
+    assert_recovery_invariants(&from_published);
+    assert!(from_published.report.applied.is_empty());
+    assert!(from_published.report.confirmed_recovered.is_empty());
+    assert!(from_published.report.chain_suppressed.contains(&id));
     drop(pipeline);
     let mut check = LocalFileMedium::open(dir.store()).unwrap();
     assert_eq!(check.validate().unwrap().records, 2);
@@ -1178,11 +1199,21 @@ fn unknown_window_survives_restart_and_resolves_by_the_chain_walk() {
     let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
     assert!(confirmed.contains(&id));
     drop(pipeline);
-    // Recovery against the confirmed set: tier-1 suppression.
+    // Recovery against the confirmed set — the canonical-state
+    // coherence contract: the installed revision's consequences are
+    // part of the loaded state, so from the PUBLISHED anchor (the
+    // coverage materialized) the chain tier suppresses; nothing is
+    // recovered and nothing discarded.
     let scan = T1Journal::scan_file(dir.journal()).unwrap();
-    let outcome = reconcile(&anchor_at(100), &scan, &confirmed).unwrap();
+    let published = anchor_at(120).with_identity(
+        id,
+        counters(2, SignalLane::Captured, 2),
+        durable_award(&[1, 2]),
+    );
+    let outcome = reconcile(&published, &scan, &confirmed).unwrap();
     assert_recovery_invariants(&outcome);
     assert!(outcome.report.applied.is_empty());
+    assert!(outcome.report.confirmed_recovered.is_empty());
     assert!(outcome.report.chain_suppressed.contains(&id));
     let mut check = LocalFileMedium::open(dir.store()).unwrap();
     assert_eq!(check.validate().unwrap().records, 2);
