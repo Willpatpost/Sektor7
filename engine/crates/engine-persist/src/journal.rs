@@ -114,7 +114,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder, SaveError};
@@ -1289,13 +1289,17 @@ fn derive_transaction_id(
 
 // ------------------------------------------------------------- the journal
 
-/// The durable T1 journal. One instance owns the file's exclusive
-/// OS-managed lock for its lifetime (process death releases it); the
-/// single-writer discipline is the precondition of the
-/// corruption-fail-closed rules.
+/// The durable T1 journal. One instance owns the **sidecar lock
+/// file's** exclusive OS-managed lock for its lifetime (process death
+/// releases it); the single-writer discipline is the precondition of
+/// the corruption-fail-closed rules. The lock never covers the
+/// journal data file's bytes — see [`Self::open_with`] for why.
 pub struct T1Journal {
     path: PathBuf,
     file: File,
+    /// The sidecar lock handle, held for the instance's lifetime —
+    /// dropping it (or process death) releases the exclusive lock.
+    _lock: File,
     state: JournalState,
     /// The sessions's caller-observed acknowledgments — never
     /// persisted, never claimed for a prior session.
@@ -1326,14 +1330,24 @@ impl T1Journal {
         }
         let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|e| io_err("open journal", &path, e))?;
-        // The exclusive OS-managed lock for this instance's lifetime
-        // (auto-released on drop or process death — a crashed writer
-        // never leaves a stale lock).
-        file.lock().map_err(|e| io_err("lock journal", &path, e))?;
+        // The exclusive OS-managed lock lives on a dedicated sidecar
+        // lock file — NEVER on the journal data file, whose bytes
+        // other handles must read (the open-time scan, `scan_file`,
+        // and the ambiguous-write reread all read through fresh
+        // handles): a Windows byte-range lock is enforced against
+        // I/O through non-owning handles (ERROR_LOCK_VIOLATION),
+        // while a Unix flock is advisory — the B2 `HEAD.lock`
+        // precedent. The data handle carries full write access
+        // because `set_len` and `FlushFileBuffers` both require
+        // `FILE_WRITE_DATA` on Windows, which an append-only handle
+        // lacks; every write seeks to the end first (the journal is
+        // append-only by design under the single-writer lock).
+        let lock = open_lock_file(&path)?;
         let bytes = fs::read(&path).map_err(|e| io_err("read journal", &path, e))?;
         if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
             return Err(JournalError::Format(SaveError::Limit {
@@ -1346,6 +1360,7 @@ impl T1Journal {
         let mut journal = T1Journal {
             path: path.clone(),
             file,
+            _lock: lock,
             state: JournalState::empty(Hash::ZERO),
             acknowledged: BTreeSet::new(),
             fault,
@@ -1363,8 +1378,7 @@ impl T1Journal {
                     .map_err(|e| io_err("truncate journal", &path, e))?;
                 let header = header_bytes();
                 journal
-                    .file
-                    .write_all(&header)
+                    .append_bytes(&header)
                     .map_err(|e| io_err("write journal header", &path, e))?;
                 journal.sync()?;
                 sync_parent_dir(&path).map_err(|e| io_err("sync journal dir", &path, e))?;
@@ -1381,8 +1395,10 @@ impl T1Journal {
     /// A read-only classification of a journal file (no lock, no
     /// truncation — diagnostics and recovery over a quiescent or
     /// abandoned journal; a concurrent append can at worst add an
-    /// inert-tail classification). An absent file is an empty
-    /// journal: nothing pending.
+    /// inert-tail classification; portable even against a live
+    /// writer, because the writer's exclusive lock lives on the
+    /// sidecar file — the data file's bytes are never range-locked).
+    /// An absent file is an empty journal: nothing pending.
     pub fn scan_file(path: impl AsRef<Path>) -> Result<JournalScan, JournalError> {
         let path = path.as_ref();
         let bytes = match fs::read(path) {
@@ -1518,8 +1534,7 @@ impl T1Journal {
             chain_prev = hash_object(&record);
             capture_concat.extend_from_slice(&record);
             let framed = frame(&record);
-            self.file
-                .write_all(&framed)
+            self.append_bytes(&framed)
                 .map_err(|e| JournalError::AbortedBeforeCommit { source: e })?;
             self.state.append_offset += framed.len() as u64;
             if index == 0 {
@@ -1546,8 +1561,7 @@ impl T1Journal {
         let commit_record = encode_commit(chain_prev, &fields);
         let commit_hash = hash_object(&commit_record);
         let framed = frame(&commit_record);
-        self.file
-            .write_all(&framed)
+        self.append_bytes(&framed)
             .map_err(|e| JournalError::AmbiguousCommit {
                 id,
                 stage: CommitStage::Write,
@@ -1615,8 +1629,7 @@ impl T1Journal {
         let record = encode_cancellation(self.state.chain_prev, target, sequence, reason, detail);
         let record_hash = hash_object(&record);
         let framed = frame(&record);
-        self.file
-            .write_all(&framed)
+        self.append_bytes(&framed)
             .map_err(|e| JournalError::AmbiguousCommit {
                 id: target,
                 stage: CommitStage::Write,
@@ -1788,6 +1801,16 @@ impl T1Journal {
 
     // ---------------------------------------------------------- internals
 
+    /// Appends at the current end of file: the explicit seek keeps
+    /// the full-write-access handle (required for `set_len` and the
+    /// sync barrier on Windows) at append semantics — every write of
+    /// this append-only format lands at the end under the single
+    /// writer's sidecar lock.
+    fn append_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(bytes)
+    }
+
     fn sync(&mut self) -> Result<(), JournalError> {
         self.file
             .sync_all()
@@ -1843,6 +1866,30 @@ impl T1Journal {
             None => Ok(()),
         }
     }
+}
+
+/// Opens and exclusively locks the journal's sidecar lock file (the
+/// B2 `HEAD.lock` pattern): created once, never unlinked; the OS
+/// releases ownership at handle close or process death — a crashed
+/// writer never leaves a stale lock, and there is no application
+/// lock lifecycle to corrupt. A same-process second open blocks here
+/// until the first instance drops. The lock deliberately does NOT
+/// cover the data file's bytes (see [`T1Journal::open_with`]).
+fn open_lock_file(path: &Path) -> Result<File, JournalError> {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("journal"));
+    name.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path.with_file_name(name))
+        .map_err(|e| io_err("open journal lock", path, e))?;
+    lock.lock().map_err(|e| io_err("lock journal", path, e))?;
+    Ok(lock)
 }
 
 fn platform_tier() -> SyncTier {
