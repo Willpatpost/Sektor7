@@ -662,6 +662,46 @@ impl<W: World> Spine<W> {
 
     // ---------------------------------------------------------- suspension
 
+    /// Read-only enumeration of the queued and blocked obligations a
+    /// subsequent [`Self::suspend_matching`] with the same predicate
+    /// would move — the six-phase protocol's non-destructive
+    /// preparation query (the v1.8 proposal §5.5.1: a
+    /// `DeactivationPlan` builds from read-only sources only, so
+    /// phases 1–2 cost nothing and a pre-durable abort leaves the
+    /// pre-transition state intact). No mutation, no accounting
+    /// change, no suspension stats; held obligations are excluded —
+    /// suspension moves only queued and blocked entries. The result
+    /// is canonically ordered by `(due, seq)` — the spine's priority
+    /// key — so binary-heap layout never reaches the caller (the same
+    /// rebuild-invisibility discipline as the suspension mechanics
+    /// themselves).
+    pub fn collect_matching(
+        &self,
+        matches: impl Fn(&ObligationView) -> bool,
+    ) -> Vec<ObligationView<'_>> {
+        let mut collected = Vec::new();
+        for Reverse(pending) in self.near_queue.iter() {
+            let view = pending.view(ObligationLocation::Queued);
+            if matches(&view) {
+                collected.push(view);
+            }
+        }
+        for Reverse(pending) in self.far_queue.iter() {
+            let view = pending.view(ObligationLocation::Queued);
+            if matches(&view) {
+                collected.push(view);
+            }
+        }
+        for event in self.blocked.values() {
+            let view = event_view(event, ObligationLocation::Blocked);
+            if matches(&view) {
+                collected.push(view);
+            }
+        }
+        collected.sort_by_key(|view| (view.due, view.id.seq));
+        collected
+    }
+
     /// Suspends matching pending (queued or blocked) obligations into
     /// the held set — **identity-preserving** relocation (Stage 4
     /// reviewer clarification A): each record keeps its original
@@ -723,6 +763,21 @@ impl<W: World> Spine<W> {
         }
         self.suspension.suspended_total += u64::from(suspended);
         suspended
+    }
+
+    /// The id-exact batch variant of [`Self::suspend_matching`] (the
+    /// v1.8 proposal §5.5.2's staged-install step): suspends exactly
+    /// the obligations a previously collected plan names, with all the
+    /// identity-preserving mechanics of the predicate form. Ids not
+    /// currently queued or blocked (already executed, already held,
+    /// or never allocated) are not moved and not counted — the
+    /// caller's preparation validated presence against
+    /// [`Self::collect_matching`], so a short count is the
+    /// staged-commit discipline's defensive-failure signal, never a
+    /// silent partial install.
+    pub fn suspend_ids(&mut self, ids: &[EventId]) -> u32 {
+        let targets: BTreeSet<u64> = ids.iter().map(|id| id.seq).collect();
+        self.suspend_matching(|view| targets.contains(&view.id.seq))
     }
 
     /// Returns matching held obligations to pending state with their

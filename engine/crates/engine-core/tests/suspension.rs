@@ -743,3 +743,149 @@ fn follow_up_in_field_classifies_new_obligations() {
             + spine.held_count() as u64
     );
 }
+
+// ------------------------------------------- B4: collect/suspend_ids
+
+/// The shared fixture for the collect_matching/suspend_ids contracts
+/// (the six-phase protocol's read-only preparation and id-exact
+/// install): queued near and far work, one blocked near entry, and —
+/// after three ticks — a settled mixed state identical across builds.
+fn collect_fixture() -> Spine<RecordingWorld> {
+    let mut spine = Spine::with_reservation(RecordingWorld::new(), 100, 50);
+    for due in 1..=6u64 {
+        spine.schedule(at(Field::Near, due, due)).expect("schedule");
+    }
+    for due in 1..=4u64 {
+        spine
+            .schedule(at(Field::Far, due, 100 + due))
+            .expect("schedule");
+    }
+    let dep = spine.schedule(at(Field::Far, 50, 900)).expect("schedule");
+    spine
+        .schedule(
+            EventSpec::new(
+                EventClass::new(0),
+                Schedule::AtLogicalTime { due: Tick(2) },
+                901,
+            )
+            .in_field(Field::Near)
+            .with_dependencies(vec![dep]),
+        )
+        .expect("schedule");
+    spine.run_ticks(3);
+    spine
+}
+
+#[test]
+fn collect_matching_enumerates_the_suspension_set_read_only() {
+    // The six-phase preparation query (§5.5.1): collect_matching
+    // enumerates exactly what suspend_matching with the same predicate
+    // would move — queued and blocked entries only, never held — with
+    // NO mutation: no accounting, no suspension stats, no fingerprint
+    // movement. Canonically ordered by (due, seq).
+    let mut spine = collect_fixture();
+    let stats_before = spine.stats();
+    let held_before = spine.held_fingerprint();
+    let lanes_before = spine.lane_state_fingerprint();
+    // The views borrow the spine; the owned payloads and ids are
+    // copied out inside the block so the read-only assertions and the
+    // mutation below never overlap borrows.
+    let (collected_payloads, collected_ids) = {
+        let collected = spine.collect_matching(|view| view.field == Field::Near);
+        assert_eq!(
+            collected.len(),
+            4,
+            "three queued near + the blocked near entry"
+        );
+        (
+            collected
+                .iter()
+                .map(|view| view.payload)
+                .collect::<Vec<_>>(),
+            collected
+                .iter()
+                .map(|view| view.id.seq)
+                .collect::<BTreeSet<_>>(),
+        )
+    };
+    assert_eq!(
+        collected_payloads,
+        vec![901, 4, 5, 6],
+        "canonically ordered by (due, seq): the blocked due-2 entry first"
+    );
+    assert_eq!(spine.stats().executed, stats_before.executed);
+    assert_eq!(spine.stats().scheduled, stats_before.scheduled);
+    assert_eq!(spine.held_count(), 0, "nothing moved");
+    assert_eq!(spine.held_fingerprint(), held_before);
+    assert_eq!(spine.lane_state_fingerprint(), lanes_before);
+    assert!(conservation(&spine));
+    // The predicate form moves exactly the collected set.
+    assert_eq!(spine.suspend_matching(|view| view.field == Field::Near), 4);
+    assert_eq!(spine.held_count(), 4);
+    let moved: BTreeSet<u64> = spine.held_view().iter().map(|view| view.id.seq).collect();
+    assert_eq!(moved, collected_ids);
+    assert!(conservation(&spine));
+}
+
+#[test]
+fn suspend_ids_is_the_exact_batch_of_the_predicate_form() {
+    // The staged-install step (§5.5.2): suspending the ids a plan
+    // collected is behaviorally identical to the predicate form — the
+    // same held state, the same lane state, the same resumption and
+    // completion.
+    let mut planned = collect_fixture();
+    let mut direct = collect_fixture();
+    let ids: Vec<EventId> = planned
+        .collect_matching(|view| view.field == Field::Near)
+        .iter()
+        .map(|view| view.id)
+        .collect();
+    assert_eq!(planned.suspend_ids(&ids), 4);
+    assert_eq!(direct.suspend_matching(|view| view.field == Field::Near), 4);
+    assert_eq!(planned.held_fingerprint(), direct.held_fingerprint());
+    assert_eq!(
+        planned.lane_state_fingerprint(),
+        direct.lane_state_fingerprint()
+    );
+    assert!(conservation(&planned));
+    assert!(conservation(&direct));
+    assert_eq!(planned.resume_matching(|_| true), 4);
+    assert_eq!(direct.resume_matching(|_| true), 4);
+    assert_eq!(
+        planned.lane_state_fingerprint(),
+        direct.lane_state_fingerprint()
+    );
+    planned.run_to_completion(60);
+    direct.run_to_completion(60);
+    assert_eq!(planned.stats().executed, direct.stats().executed);
+    assert_eq!(planned.engine_fingerprint(), direct.engine_fingerprint());
+}
+
+#[test]
+fn suspend_ids_ignores_absent_targets() {
+    // Id-exact means exactly that: ids not currently queued or blocked
+    // (already held, already executed, never allocated) are not moved
+    // and not counted — the returned count is the staged-commit
+    // discipline's defensive-failure signal, never a silent partial
+    // install.
+    let mut spine = collect_fixture();
+    let held_id = spine
+        .collect_matching(|view| view.payload == 4)
+        .remove(0)
+        .id;
+    assert_eq!(spine.suspend_ids(&[held_id]), 1);
+    spine.run_ticks(10);
+    let Some(executed_id) = spine.ledger().iter().next().map(|record| record.id) else {
+        panic!("the fixture executed work");
+    };
+    let live_id = spine
+        .collect_matching(|view| view.payload == 900)
+        .remove(0)
+        .id;
+    let moved = spine.suspend_ids(&[held_id, executed_id, EventId { seq: 999_999 }, live_id]);
+    assert_eq!(moved, 1, "only the live queued target moves");
+    assert_eq!(spine.held_count(), 2);
+    let held_payloads: BTreeSet<u64> = spine.held_view().iter().map(|view| view.payload).collect();
+    assert_eq!(held_payloads, BTreeSet::from([4, 900]));
+    assert!(conservation(&spine));
+}
