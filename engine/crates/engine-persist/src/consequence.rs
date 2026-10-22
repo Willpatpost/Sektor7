@@ -6,7 +6,13 @@
 //! durable pipeline state: schema `u8`, region `u32`, episode `u64`,
 //! npc `u32`, fixed widths on the wire. No issued durable identity is
 //! ever reused; a retry preserves its original identity; a genuinely
-//! new operation receives a fresh one. The legacy in-memory packed
+//! new operation receives a fresh one. The two-direction legacy
+//! conversion ([`ConsequenceId::pack_stage4`] /
+//! [`ConsequenceId::unpack_stage4`]) proves the mapping against the
+//! actual engine-slice layout with strict bounds: a field exceeding
+//! its legacy bit width is rejected, never wrapped — the unchecked
+//! legacy expression would alias an out-of-range npc into the episode
+//! bits (an identity collision). The legacy in-memory packed
 //! key and its fingerprint domain remain untouched (B4 owns any
 //! migration).
 //!
@@ -57,6 +63,25 @@ pub const AWARD_STATE_SCHEMA: u8 = 1;
 /// (bounded decode: each span is 16 bytes, so the count is also
 /// bounded by the remaining input).
 pub const MAX_COVERAGE_SPANS: u64 = 1 << 16;
+
+/// The Stage 4 legacy packed-key layout, read firsthand from
+/// `engine-slice`'s `consequence_key` (`region.rs`:
+/// `(region << 54) | (episode << 10) | npc`) — never inferred from
+/// design docs or NPC counts: npc occupies bits 0–9, episode bits
+/// 10–53, region bits 54–63. The layout is a bijection between the
+/// full `u64` range and the bounded identity domain below (the
+/// all-bounds identity packs to `u64::MAX`).
+pub const STAGE4_NPC_BITS: u32 = 10;
+/// Episode bits in the legacy layout (bits 10–53).
+pub const STAGE4_EPISODE_BITS: u32 = 44;
+/// Region bits in the legacy layout (bits 54–63).
+pub const STAGE4_REGION_BITS: u32 = 10;
+/// The largest npc the legacy layout can express (bits 0–9).
+pub const STAGE4_MAX_NPC: u32 = (1 << STAGE4_NPC_BITS) - 1;
+/// The largest episode the legacy layout can express (bits 10–53).
+pub const STAGE4_MAX_EPISODE: u64 = (1u64 << STAGE4_EPISODE_BITS) - 1;
+/// The largest region the legacy layout can express (bits 54–63).
+pub const STAGE4_MAX_REGION: u32 = (1 << STAGE4_REGION_BITS) - 1;
 
 /// The structured consequential identity — region, episode, npc.
 /// Ordered by (region, episode, npc) for canonical key-set ordering.
@@ -111,6 +136,39 @@ impl ConsequenceId {
             npc,
         })
     }
+
+    /// Pack into the Stage 4 legacy `u64` capture-key layout (the
+    /// engine-slice `consequence_key` expression — the compatibility
+    /// mapping the architecture's Correction B proves by test).
+    /// Strict bounds, rejection never wrap: a field exceeding its
+    /// legacy bit width would silently alias into a neighboring
+    /// field's bits (npc 1024 ≡ episode 1, npc 0), so it is rejected
+    /// instead — an identity collision is never packed.
+    pub fn pack_stage4(&self) -> Result<u64, PackedKeyError> {
+        if self.npc > STAGE4_MAX_NPC {
+            return Err(PackedKeyError::NpcOverflow);
+        }
+        if self.episode > STAGE4_MAX_EPISODE {
+            return Err(PackedKeyError::EpisodeOverflow);
+        }
+        if self.region > STAGE4_MAX_REGION {
+            return Err(PackedKeyError::RegionOverflow);
+        }
+        Ok((u64::from(self.region) << 54) | (self.episode << 10) | u64::from(self.npc))
+    }
+
+    /// Unpack a Stage 4 legacy `u64` capture key into the structured
+    /// identity. Total: the layout is a bijection onto the bounded
+    /// domain, so every `u64` decodes and this direction cannot
+    /// fail; the bounds discipline lives entirely in
+    /// [`Self::pack_stage4`].
+    pub fn unpack_stage4(packed: u64) -> Self {
+        ConsequenceId {
+            region: (packed >> 54) as u32,
+            episode: (packed >> 10) & STAGE4_MAX_EPISODE,
+            npc: (packed & u64::from(STAGE4_MAX_NPC)) as u32,
+        }
+    }
 }
 
 impl fmt::Display for ConsequenceId {
@@ -122,6 +180,45 @@ impl fmt::Display for ConsequenceId {
         )
     }
 }
+
+/// The identity does not fit the Stage 4 legacy packed-key layout: a
+/// field exceeds its bit width. Rejected, never wrapped — the
+/// unchecked legacy expression would alias the excess into a
+/// neighboring field's bits, colliding distinct identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedKeyError {
+    /// npc exceeds bits 0–9 (would alias into the episode bits).
+    NpcOverflow,
+    /// episode exceeds bits 10–53 (would alias into the region
+    /// bits).
+    EpisodeOverflow,
+    /// region exceeds bits 54–63 (would shift out of the word).
+    RegionOverflow,
+}
+
+impl fmt::Display for PackedKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackedKeyError::NpcOverflow => {
+                write!(f, "npc exceeds the Stage 4 packed-key width (bits 0-9)")
+            }
+            PackedKeyError::EpisodeOverflow => {
+                write!(
+                    f,
+                    "episode exceeds the Stage 4 packed-key width (bits 10-53)"
+                )
+            }
+            PackedKeyError::RegionOverflow => {
+                write!(
+                    f,
+                    "region exceeds the Stage 4 packed-key width (bits 54-63)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PackedKeyError {}
 
 /// A span error — gaps and inversions fail closed, never repaired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1114,5 +1211,129 @@ mod tests {
         state.award_provisional(0);
         assert!(state.durable.is_empty());
         assert!(state.provisional.is_empty());
+    }
+
+    #[test]
+    fn stage4_packing_matches_the_legacy_layout_exactly() {
+        // The legacy expression, read firsthand from engine-slice's
+        // consequence_key (region.rs) — engine-persist cannot depend
+        // on engine-slice (the ratified dependency direction), so the
+        // compatibility proof mirrors the expression and pins the
+        // exact literals it produces.
+        let legacy = |region: u32, episode: u64, npc: u32| {
+            (u64::from(region) << 54) | (episode << 10) | u64::from(npc)
+        };
+        let cases = [
+            (0u32, 0u64, 0u32),
+            (0, 0, 1),
+            (0, 1, 0),
+            (1, 0, 0),
+            (4, 0, 0),
+            (7, 0, 1023),
+            (0, STAGE4_MAX_EPISODE, 0),
+            (STAGE4_MAX_REGION, STAGE4_MAX_EPISODE, STAGE4_MAX_NPC),
+        ];
+        for (region, episode, npc) in cases {
+            let id = ConsequenceId::new(region, episode, npc);
+            assert_eq!(id.pack_stage4().unwrap(), legacy(region, episode, npc));
+        }
+        // Exact literals pin the bit layout independent of any
+        // re-derivation.
+        assert_eq!(ConsequenceId::new(0, 1, 0).pack_stage4().unwrap(), 1 << 10);
+        assert_eq!(ConsequenceId::new(1, 0, 0).pack_stage4().unwrap(), 1 << 54);
+        assert_eq!(
+            ConsequenceId::new(STAGE4_MAX_REGION, STAGE4_MAX_EPISODE, STAGE4_MAX_NPC)
+                .pack_stage4()
+                .unwrap(),
+            u64::MAX,
+            "the all-bounds identity is u64::MAX — the layout is a bijection onto u64"
+        );
+    }
+
+    #[test]
+    fn stage4_packing_round_trips_over_the_full_layout() {
+        // pack∘unpack is the identity on every u64 (the layout is a
+        // bijection); unpack∘pack is the identity on every in-bounds
+        // identity.
+        let patterns = [
+            0u64,
+            1,
+            u64::MAX,
+            0x3FF,
+            0x400,
+            (1u64 << 54) - 1,
+            1u64 << 54,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0x1C00_0000_0000_03FF,
+        ];
+        for packed in patterns {
+            let id = ConsequenceId::unpack_stage4(packed);
+            assert_eq!(id.pack_stage4().unwrap(), packed);
+        }
+        for (region, episode, npc) in [
+            (0u32, 0u64, 0u32),
+            (7, 3, 999),
+            (STAGE4_MAX_REGION, STAGE4_MAX_EPISODE, STAGE4_MAX_NPC),
+        ] {
+            let id = ConsequenceId::new(region, episode, npc);
+            assert_eq!(ConsequenceId::unpack_stage4(id.pack_stage4().unwrap()), id);
+        }
+        // Known field boundaries.
+        assert_eq!(ConsequenceId::unpack_stage4(0), ConsequenceId::new(0, 0, 0));
+        assert_eq!(
+            ConsequenceId::unpack_stage4(1 << 10),
+            ConsequenceId::new(0, 1, 0)
+        );
+        assert_eq!(
+            ConsequenceId::unpack_stage4(1 << 54),
+            ConsequenceId::new(1, 0, 0)
+        );
+        assert_eq!(
+            ConsequenceId::unpack_stage4(u64::MAX),
+            ConsequenceId::new(STAGE4_MAX_REGION, STAGE4_MAX_EPISODE, STAGE4_MAX_NPC)
+        );
+    }
+
+    #[test]
+    fn stage4_packing_rejects_overflow_never_wraps() {
+        // The exact aliasing the strict bounds exist to prevent: the
+        // unchecked legacy expression packs npc=1024 and the distinct
+        // identity (episode=1, npc=0) to the SAME u64. The conversion
+        // rejects the out-of-range field instead of packing a
+        // collision.
+        let unchecked = |region: u32, episode: u64, npc: u32| {
+            (u64::from(region) << 54) | (episode << 10) | u64::from(npc)
+        };
+        assert_eq!(unchecked(0, 0, 1024), unchecked(0, 1, 0));
+        assert_eq!(
+            ConsequenceId::new(0, 0, 1024).pack_stage4(),
+            Err(PackedKeyError::NpcOverflow)
+        );
+        // One past each boundary, and the full-width excesses.
+        assert_eq!(
+            ConsequenceId::new(0, 0, STAGE4_MAX_NPC + 1).pack_stage4(),
+            Err(PackedKeyError::NpcOverflow)
+        );
+        assert_eq!(
+            ConsequenceId::new(0, 0, u32::MAX).pack_stage4(),
+            Err(PackedKeyError::NpcOverflow)
+        );
+        assert_eq!(
+            ConsequenceId::new(0, STAGE4_MAX_EPISODE + 1, 0).pack_stage4(),
+            Err(PackedKeyError::EpisodeOverflow)
+        );
+        assert_eq!(
+            ConsequenceId::new(0, u64::MAX, 0).pack_stage4(),
+            Err(PackedKeyError::EpisodeOverflow)
+        );
+        assert_eq!(
+            ConsequenceId::new(STAGE4_MAX_REGION + 1, 0, 0).pack_stage4(),
+            Err(PackedKeyError::RegionOverflow)
+        );
+        assert_eq!(
+            ConsequenceId::new(u32::MAX, 0, 0).pack_stage4(),
+            Err(PackedKeyError::RegionOverflow)
+        );
     }
 }

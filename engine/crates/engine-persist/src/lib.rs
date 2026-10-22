@@ -53,7 +53,7 @@ pub mod recovery;
 mod tests;
 
 pub use consequence::{
-    AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, SpanError,
+    AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
 };
 pub use encounter::{EncounterError, EncounterJournal};
 pub use envelope::{
