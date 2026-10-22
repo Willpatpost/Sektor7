@@ -93,6 +93,7 @@ use crate::envelope::{
     ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, PartialApplication,
     SourcePosition,
 };
+use crate::hash::Hash;
 use crate::journal::{JournalScan, TransactionId};
 
 /// The verified recovery anchor: the latest confirmed snapshot's
@@ -183,13 +184,14 @@ impl RecoveryAnchor {
 }
 
 /// One chain-confirmed identity's canonical evidence — the exact
-/// occurrence coverage and producing transaction the verified chain
-/// carries (the pipeline's per-key view via
+/// occurrence coverage, producing transaction, and effect commitment
+/// the verified chain carries (the pipeline's per-key view via
 /// [`crate::pipeline::CommitPipeline::confirmed_evidence`], or any
 /// caller with equivalent verified provenance). A bare identity set
 /// is insufficient: the coherence and provenance checks must compare
-/// the canonical entry's coverage and transaction against the
-/// anchor's materialization and the journal's envelopes.
+/// the canonical entry's coverage, transaction, and effect commitment
+/// against the anchor's materialization and the journal's envelopes —
+/// identity-level equality is content-blind by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedEvidence {
     /// The confirmed occurrence coverage (empty for a span-less
@@ -197,6 +199,13 @@ pub struct ConfirmedEvidence {
     pub coverage: Vec<ClassifiedSpan>,
     /// The producing transaction the canonical batch installed.
     pub transaction: TransactionId,
+    /// The producing envelope's effect commitment (the SHA-256 of
+    /// its canonical bytes) — the semantic binding distinguishing
+    /// effect equivalence from identity-level equality: two valid
+    /// payloads sharing the identity, span, classification, and plan
+    /// (and therefore the TransactionId) but feeding different
+    /// signal lanes carry different commitments.
+    pub effect: Hash,
 }
 
 /// Contract B's classification of one transaction against the anchor
@@ -484,7 +493,12 @@ pub fn reconcile(
             // alone.
             let confirmed_evidence = confirmed.get(&envelope.id);
             if let Some(evidence) = confirmed_evidence {
-                if evidence.transaction != transaction.id || evidence.coverage != envelope.sub_spans
+                if evidence.transaction != transaction.id
+                    || evidence.coverage != envelope.sub_spans
+                    || evidence.effect
+                        != envelope
+                            .effect_commitment()
+                            .map_err(RecoveryError::Format)?
                 {
                     return Err(RecoveryError::ConfirmedProvenanceMismatch { id: envelope.id });
                 }
@@ -1124,6 +1138,9 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction: journal.committed[0].id,
+                effect: journal.committed[0].envelopes[0]
+                    .effect_commitment()
+                    .unwrap(),
             },
         );
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
@@ -1166,6 +1183,9 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction: journal.committed[0].id,
+                effect: journal.committed[0].envelopes[0]
+                    .effect_commitment()
+                    .unwrap(),
             },
         );
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
@@ -1204,7 +1224,7 @@ mod tests {
         // historical attempt — the journal itself is absent, so no
         // envelope pairs with it; the empty anchor cannot materialize
         // the coverage either.
-        let transaction = transaction(
+        let committed = transaction(
             1,
             vec![envelope(
                 identity,
@@ -1213,8 +1233,9 @@ mod tests {
                 110,
                 CounterValues::default(),
             )],
-        )
-        .id;
+        );
+        let transaction = committed.id;
+        let effect = committed.envelopes[0].effect_commitment().unwrap();
         let mut confirmed = BTreeMap::new();
         confirmed.insert(
             identity,
@@ -1224,6 +1245,7 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction,
+                effect,
             },
         );
         let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
@@ -1251,7 +1273,7 @@ mod tests {
         })
         .with_identity(identity, unit(SignalLane::Captured, 2), award);
         let journal = scan(vec![]);
-        let transaction = transaction(
+        let committed = transaction(
             1,
             vec![envelope(
                 identity,
@@ -1260,8 +1282,9 @@ mod tests {
                 110,
                 CounterValues::default(),
             )],
-        )
-        .id;
+        );
+        let transaction = committed.id;
+        let effect = committed.envelopes[0].effect_commitment().unwrap();
         let mut confirmed = BTreeMap::new();
         confirmed.insert(
             identity,
@@ -1271,6 +1294,7 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction,
+                effect,
             },
         );
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
@@ -1313,6 +1337,79 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction: journal.committed[0].id,
+                effect: journal.committed[0].envelopes[0]
+                    .effect_commitment()
+                    .unwrap(),
+            },
+        );
+        let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConfirmedProvenanceMismatch { id } if id == identity
+        ));
+    }
+
+    #[test]
+    fn confirmed_with_conflicting_journal_effect_fails_closed() {
+        // The third re-review's finding: `TransactionId` + occurrence
+        // coverage is insufficient to prove effect equivalence — the
+        // same identity, span, classification, and plan admits two
+        // valid uniform lanes (+2 pending vs +2 captured). The
+        // journal envelope's actual EFFECT COMMITMENT and the
+        // confirmed chain's claimed effect must match exactly: a
+        // canonical claim to a different consequential payload is
+        // incompatible evidence, never a recovery source.
+        let identity = id(1);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let journal = scan(vec![transaction(
+            1,
+            vec![envelope(
+                identity,
+                (0, 2),
+                DurabilityClass::DurableEligible,
+                110,
+                CounterValues::default(),
+            )],
+        )]);
+        // The same identity, span, class, tick, and baseline — the
+        // same TransactionId inputs — a different valid uniform
+        // lane: a different effect commitment.
+        let different_effect = ConsequenceEnvelope::capture(
+            identity,
+            vec![ClassifiedSpan {
+                span: OccurrenceSpan::new(0, 2).unwrap(),
+                class: DurabilityClass::DurableEligible,
+            }],
+            SignalLane::Pending,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            SourcePosition {
+                head: None,
+                tick: 110,
+            },
+        )
+        .unwrap();
+        // The canonical entry claims the journal's transaction and
+        // coverage but the OTHER lane's effects.
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction: journal.committed[0].id,
+                effect: different_effect.effect_commitment().unwrap(),
             },
         );
         let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();

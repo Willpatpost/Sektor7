@@ -322,6 +322,14 @@ pub enum WriteReconciliation {
     /// nothing actionable was written; an idempotent retry is safe
     /// (the inert tail, if any, is resolved first).
     NotCommitted,
+    /// A transaction with this identity IS committed — but with a
+    /// DIFFERENT consequential payload. The identity-level
+    /// `TransactionId` matched because identity is content-blind by
+    /// design; the committed effects differ from the attempt, so
+    /// this is never the attempted committed transaction and never a
+    /// matching receipt. Fail closed — never retry as though it were
+    /// the same attempt.
+    ConflictingPayload { id: TransactionId },
 }
 
 /// What the trailing inert region beyond the last valid record is.
@@ -407,6 +415,14 @@ pub enum JournalError {
     UnknownTarget { id: TransactionId },
     /// The cancellation target is already canceled.
     AlreadyCanceled { id: TransactionId },
+    /// A transaction with this identity is already committed with a
+    /// DIFFERENT consequential payload — the identity-level
+    /// `TransactionId` matched (identity is content-blind by design;
+    /// retry-stable identities must not conflate with effect
+    /// equivalence), but the committed effects differ from the
+    /// attempt. Never mistaken for an idempotent duplicate: fail
+    /// closed.
+    ConflictingPayload { id: TransactionId },
 }
 
 impl fmt::Display for JournalError {
@@ -440,6 +456,12 @@ impl fmt::Display for JournalError {
             JournalError::AlreadyCanceled { id } => {
                 write!(f, "cancellation target {id:?} is already canceled")
             }
+            JournalError::ConflictingPayload { id } => write!(
+                f,
+                "transaction {id:?} is already committed with a different \
+                 consequential payload — identity equality is never effect \
+                 equivalence; fail closed"
+            ),
         }
     }
 }
@@ -1287,6 +1309,20 @@ fn derive_transaction_id(
     TransactionId(hash_object(&enc.into_bytes()))
 }
 
+/// The transaction's consequential payload — the canonical bytes of
+/// each envelope, in input order. The identity-level `TransactionId`
+/// is deliberately content-blind (retry-stable identities must not
+/// conflate with effect equivalence), so duplicate recognition and
+/// ambiguous-write reconciliation compare the PAYLOAD: a retry with
+/// a different consequential payload is a conflicting claim under
+/// the same identity, never an already-durable matching attempt.
+fn envelope_payloads(envelopes: &[ConsequenceEnvelope]) -> Result<Vec<Vec<u8>>, SaveError> {
+    envelopes
+        .iter()
+        .map(|envelope| envelope.canonical_bytes())
+        .collect()
+}
+
 // ------------------------------------------------------------- the journal
 
 /// The durable T1 journal. One instance owns the **sidecar lock
@@ -1511,13 +1547,23 @@ impl T1Journal {
         // Idempotent recognition: the journal knows this
         // transaction — the existing committed state returns (a
         // truthful present-moment receipt of an already-durable
-        // transaction, never a fabricated historical one).
+        // transaction, never a fabricated historical one). Identity
+        // equality is NOT effect equivalence: the TransactionId is
+        // content-blind by design, so the committed payload must
+        // match the attempt — a different consequential payload under
+        // the same identity is a conflicting claim, never an
+        // idempotent duplicate.
         if let Some(existing) = self
             .state
             .committed
             .iter()
             .find(|transaction| transaction.id == id)
         {
+            if envelope_payloads(&existing.envelopes).map_err(JournalError::Format)?
+                != envelope_payloads(&input.envelopes).map_err(JournalError::Format)?
+            {
+                return Err(JournalError::ConflictingPayload { id });
+            }
             let receipt = existing.receipt();
             self.acknowledged.insert(id);
             return Ok(receipt);
@@ -1686,6 +1732,17 @@ impl T1Journal {
             .iter()
             .find(|transaction| transaction.id == id)
         {
+            // Identity equality is NOT effect equivalence: the
+            // reread transaction satisfies the ATTEMPT only when its
+            // consequential payload matches — a different payload
+            // under the same identity is never the attempted
+            // committed transaction (never a matching receipt, never
+            // a silent retry).
+            if envelope_payloads(&existing.envelopes).map_err(JournalError::Format)?
+                != envelope_payloads(&attempted.envelopes).map_err(JournalError::Format)?
+            {
+                return Ok(WriteReconciliation::ConflictingPayload { id });
+            }
             return Ok(WriteReconciliation::Committed {
                 receipt: existing.receipt(),
             });
@@ -1988,6 +2045,49 @@ mod tests {
                 episode: index,
             }],
             plan: format!("plan-{index}").into_bytes(),
+        }
+    }
+
+    /// The lane-conflict shape: the same identity, span,
+    /// classification, plan, position, and baseline — the same
+    /// content-blind `TransactionId` inputs — under a different
+    /// valid uniform signal lane (+2 pending vs +2 captured).
+    fn lane_input(lane: SignalLane) -> TransactionInput {
+        let identity = ConsequenceId::new(1, 1, 1);
+        let envelope = ConsequenceEnvelope::capture(
+            identity,
+            vec![ClassifiedSpan {
+                span: OccurrenceSpan::new(0, 2).unwrap(),
+                class: DurabilityClass::DurableEligible,
+            }],
+            lane,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            SourcePosition {
+                head: None,
+                tick: 101,
+            },
+        )
+        .unwrap();
+        TransactionInput {
+            envelopes: vec![envelope],
+            position: SourcePosition {
+                head: None,
+                tick: 101,
+            },
+            classification: DurabilityClass::DurableEligible,
+            dependencies: Vec::new(),
+            frontier: vec![FrontierEntry {
+                region: 1,
+                episode: 1,
+            }],
+            plan: b"plan-lane-conflict".to_vec(),
         }
     }
 
@@ -2537,6 +2637,59 @@ mod tests {
         let syncs = journal.sync_count();
         let recognized = journal.append_transaction(&input).unwrap();
         assert_eq!(recognized.id, receipt.id);
+        assert_eq!(recognized.sequence, receipt.sequence);
+        assert_eq!(fs::metadata(&path).unwrap().len(), file_len);
+        assert_eq!(journal.sync_count(), syncs);
+        assert_eq!(journal.transactions().len(), 1);
+    }
+
+    #[test]
+    fn same_id_different_lane_conflicting_payload_fails_closed() {
+        // The third re-review's finding: the identity-level
+        // `TransactionId` is content-blind — two valid envelopes
+        // with the same identity, span, classification, and plan
+        // share it while their uniform signal lanes differ (+2
+        // pending vs +2 captured). A retry under the same identity
+        // with a DIFFERENT consequential payload is a conflicting
+        // claim, never an idempotent duplicate: it fails closed and
+        // never returns the existing durable receipt.
+        let dir = TestDir::new("lane-conflict");
+        let path = dir.journal();
+        let mut journal = T1Journal::open(&path).unwrap();
+        let receipt = journal
+            .append_transaction(&lane_input(SignalLane::Pending))
+            .unwrap();
+        let id = receipt.id;
+        // The same TransactionId and occurrence coverage, a
+        // different valid lane: a conflicting payload.
+        let error = journal
+            .append_transaction(&lane_input(SignalLane::Captured))
+            .unwrap_err();
+        assert!(
+            matches!(error, JournalError::ConflictingPayload { id: conflict } if conflict == id),
+            "the lane conflict fails closed: {error}"
+        );
+        // Never a matching durable receipt — the original stands,
+        // exactly one frame.
+        assert_eq!(journal.transactions().len(), 1);
+        assert!(journal.is_actionable(id));
+        // Ambiguous-write reconciliation against the conflicting
+        // payload never classifies as the attempted committed
+        // transaction.
+        assert_eq!(
+            journal
+                .reconcile_write(&lane_input(SignalLane::Captured))
+                .unwrap(),
+            WriteReconciliation::ConflictingPayload { id }
+        );
+        // The identical retry remains idempotently recognized — no
+        // second frame, no second fsync.
+        let file_len = fs::metadata(&path).unwrap().len();
+        let syncs = journal.sync_count();
+        let recognized = journal
+            .append_transaction(&lane_input(SignalLane::Pending))
+            .unwrap();
+        assert_eq!(recognized.id, id);
         assert_eq!(recognized.sequence, receipt.sequence);
         assert_eq!(fs::metadata(&path).unwrap().len(), file_len);
         assert_eq!(journal.sync_count(), syncs);

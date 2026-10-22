@@ -86,8 +86,20 @@ use crate::recovery::ConfirmedEvidence;
 
 /// The canonical multi-consequence batch's domain (versioned; the
 /// content object referenced via the revision's `content_refs`).
-pub const CONSEQUENCE_BATCH_DOMAIN: &str = "sektor7/engine-persist/consequence-batch/1";
-pub const CONSEQUENCE_BATCH_SCHEMA: u8 = 1;
+/// **v2 (the third review's effect-equivalence corrective):** each
+/// entry additionally carries the producing envelope's EFFECT
+/// COMMITMENT — the SHA-256 of its canonical bytes — binding the
+/// confirmed consequence to its actual authoritative effects. v1
+/// carried only (identity, transaction, coverage), which cannot
+/// distinguish two valid payloads sharing the identity-level
+/// `TransactionId` and coverage (e.g. +2 pending vs +2 captured
+/// under the same identity, span, classification, and plan). v1
+/// never shipped in an accepted build (the B3 delivery remained on
+/// HOLD), so there is no on-disk compatibility surface: the walk
+/// reads v2 only, and this constant is the documented migration
+/// boundary.
+pub const CONSEQUENCE_BATCH_DOMAIN: &str = "sektor7/engine-persist/consequence-batch/2";
+pub const CONSEQUENCE_BATCH_SCHEMA: u8 = 2;
 
 /// Documented maximum for one batch's entries (bounded decode — each
 /// entry is at least 16 + 40 + 8 bytes, also bounded by the remaining
@@ -98,8 +110,9 @@ pub const MAX_BATCH_SPANS: u64 = 1 << 16;
 
 /// One consequence's entry in the canonical batch — the complete
 /// per-consequence evidence: the identity, the producing transaction,
-/// and the occurrence coverage. Confirmation validates each entry
-/// individually; the aggregate alone is never sufficient.
+/// the occurrence coverage, and the effect commitment. Confirmation
+/// validates each entry individually; the aggregate alone is never
+/// sufficient.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchEntry {
     pub id: ConsequenceId,
@@ -107,6 +120,13 @@ pub struct BatchEntry {
     /// The class-homogeneous occurrence coverage this consequence
     /// commits (mirrors the envelope's sub-spans).
     pub coverage: Vec<ClassifiedSpan>,
+    /// The producing envelope's effect commitment — the SHA-256 of
+    /// its canonical bytes — binding this confirmed consequence to
+    /// its actual authoritative effects (the uniform signal lane,
+    /// the deltas, the classes). The identity-level `TransactionId`
+    /// is deliberately content-blind; THIS is the semantic binding
+    /// that distinguishes effect equivalence from identity equality.
+    pub effect: Hash,
 }
 
 /// The versioned canonical batch content object (requirement A —
@@ -146,6 +166,7 @@ impl ConsequenceBatch {
             enc.write_u64(entry.id.episode);
             enc.write_u32(entry.id.npc);
             enc.write_bytes(entry.transaction.0.as_bytes());
+            enc.write_bytes(entry.effect.as_bytes());
             write_coverage(&mut enc, &entry.coverage)?;
         }
         Ok(enc.into_bytes())
@@ -167,14 +188,14 @@ impl ConsequenceBatch {
         }
         let count = dec.read_count(MAX_BATCH_ENTRIES, SECTION, "entry-count")?;
         // Each entry is at least 16 (identity) + 40 (transaction) +
-        // 8 (coverage count) bytes.
+        // 32 (effect commitment) + 8 (coverage count) bytes.
         let remaining = dec.remaining() as u64;
-        if count > remaining / 64 {
+        if count > remaining / 96 {
             return Err(SaveError::Limit {
                 section: SECTION,
                 kind: "entry-count",
                 value: count,
-                max: remaining / 64,
+                max: remaining / 96,
             });
         }
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(count as usize);
@@ -194,11 +215,15 @@ impl ConsequenceBatch {
                 Hash::from_bytes(transaction_bytes)
                     .ok_or(SaveError::Integrity("consequence-batch/hash-width"))?,
             );
+            let effect_bytes = dec.read_bytes(Hash::WIDTH, SECTION)?;
+            let effect = Hash::from_bytes(effect_bytes)
+                .ok_or(SaveError::Integrity("consequence-batch/hash-width"))?;
             let coverage = read_coverage(&mut dec)?;
             entries.push(BatchEntry {
                 id,
                 transaction,
                 coverage,
+                effect,
             });
         }
         dec.finish()?;
@@ -561,15 +586,25 @@ impl From<JournalError> for PipelineError {
 }
 
 /// One chain-confirmed key's evidence (the suppression authority):
-/// the exact coverage, the producing transaction, and the confirming
-/// revision with its epoch — the full provenance the receipt reports
-/// and the conflict check compares.
+/// the exact coverage, the producing transaction, the effect
+/// commitment binding the confirmed consequence to its actual
+/// authoritative effects, and the confirming revision with its epoch
+/// — the full provenance the receipt reports and the conflict checks
+/// compare.
 struct ConfirmedEntry {
     coverage: Vec<ClassifiedSpan>,
     transaction: TransactionId,
+    effect: Hash,
     revision: Hash,
     epoch: u64,
 }
+
+/// One attempted key's exact-provenance evidence: the occurrence
+/// coverage, the producing transaction, and the envelope's effect
+/// commitment (identity-level equality is content-blind; the
+/// commitment binds the actual authoritative effects — the tuple the
+/// foreign-confirmation and confirmed-recovery equivalence compares).
+type AttemptedKey = (Vec<ClassifiedSpan>, TransactionId, Hash);
 
 /// A retained canonical attempt — the exact revision, the batch's
 /// content identity, and the per-key identities (the batch bytes
@@ -579,8 +614,8 @@ struct PendingAttempt {
     record: RevisionRecord,
     batch_hash: Hash,
     /// The attempted per-key evidence: identity → (coverage,
-    /// producing transaction).
-    keys: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>,
+    /// producing transaction, effect commitment).
+    keys: BTreeMap<ConsequenceId, AttemptedKey>,
 }
 
 /// The commit pipeline over a canonical medium and the durable T1
@@ -711,6 +746,15 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 let reconciled = match self.journal.reconcile_write(&input)? {
                     WriteReconciliation::Committed { receipt } => receipt,
                     WriteReconciliation::NotCommitted => return Err(PipelineError::CaptureAborted),
+                    // A different consequential payload is committed
+                    // under this identity — the attempt is NOT durable
+                    // and can never be: fail closed, never retry as
+                    // though it were the same attempt.
+                    WriteReconciliation::ConflictingPayload { id } => {
+                        return Err(PipelineError::Journal(JournalError::ConflictingPayload {
+                            id,
+                        }));
+                    }
                 };
                 CaptureReceipt {
                     journal: reconciled,
@@ -871,9 +915,9 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     }
 
     /// The chain-confirmed canonical evidence per identity — the
-    /// recovery interface's provenance input (the coverage and
-    /// producing transaction; a bare identity set cannot validate
-    /// journal envelopes against the canonical entries).
+    /// recovery interface's provenance input (the coverage, producing
+    /// transaction, and effect commitment; a bare identity set cannot
+    /// validate journal envelopes against the canonical entries).
     pub fn confirmed_evidence(&self) -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
         self.confirmed
             .iter()
@@ -883,6 +927,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                     ConfirmedEvidence {
                         coverage: entry.coverage.clone(),
                         transaction: entry.transaction,
+                        effect: entry.effect,
                     },
                 )
             })
@@ -913,23 +958,27 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// Collects the actionable, unconfirmed journaled keys — the
     /// batch candidates. A key claimed by two journal transactions is
     /// a conflicting reuse and fails closed.
-    fn collect_pending_keys(
-        &self,
-    ) -> Result<BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>, PipelineError> {
-        let mut keys: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)> =
-            BTreeMap::new();
+    fn collect_pending_keys(&self) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
+        let mut keys: BTreeMap<ConsequenceId, AttemptedKey> = BTreeMap::new();
         for transaction in self.journal.transactions() {
             if !self.journal.is_actionable(transaction.id) {
                 continue;
             }
             for envelope in &transaction.envelopes {
+                let effect = envelope
+                    .effect_commitment()
+                    .map_err(PipelineError::Format)?;
                 if let Some(confirmed) = self.confirmed.get(&envelope.id) {
                     // Exact provenance: the journal envelope must
                     // match the canonical entry — the same producing
-                    // transaction and coverage; a mismatch is a
-                    // conflicting claim, never silently skipped.
+                    // transaction, coverage, and EFFECT COMMITMENT
+                    // (identity-level equality is content-blind; the
+                    // effect commitment binds the actual authoritative
+                    // effects); a mismatch is a conflicting claim,
+                    // never silently skipped.
                     if confirmed.transaction == transaction.id
                         && confirmed.coverage == envelope.sub_spans
+                        && confirmed.effect == effect
                     {
                         continue;
                     }
@@ -938,7 +987,10 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 if keys.contains_key(&envelope.id) {
                     return Err(PipelineError::ConflictingReuse { id: envelope.id });
                 }
-                keys.insert(envelope.id, (envelope.sub_spans.clone(), transaction.id));
+                keys.insert(
+                    envelope.id,
+                    (envelope.sub_spans.clone(), transaction.id, effect),
+                );
             }
         }
         Ok(keys)
@@ -948,17 +1000,21 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// rebase set — identical identities and coverages). A foreign
     /// confirmation satisfies the local attempt only under EXACT
     /// provenance equivalence: the canonical entry must carry the
-    /// attempt's own producing transaction and coverage — a
-    /// mismatched transaction or coverage is a conflicting claim,
-    /// never silently absorbed.
+    /// attempt's own producing transaction, coverage, and EFFECT
+    /// COMMITMENT — a mismatched transaction, coverage, or
+    /// consequential payload is a conflicting claim, never silently
+    /// absorbed.
     fn remaining_keys(
         &self,
-        attempted: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>,
-    ) -> Result<BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>, PipelineError> {
+        attempted: BTreeMap<ConsequenceId, AttemptedKey>,
+    ) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
         let mut remaining = BTreeMap::new();
-        for (id, (coverage, transaction)) in attempted {
+        for (id, (coverage, transaction, effect)) in attempted {
             if let Some(confirmed) = self.confirmed.get(&id) {
-                if confirmed.transaction == transaction && confirmed.coverage == coverage {
+                if confirmed.transaction == transaction
+                    && confirmed.coverage == coverage
+                    && confirmed.effect == effect
+                {
                     // Confirmed by another writer's batch carrying
                     // exactly this attempt — never re-submitted; the
                     // per-key status promotes.
@@ -966,7 +1022,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 }
                 return Err(PipelineError::ConfirmedProvenanceMismatch { id });
             }
-            remaining.insert(id, (coverage, transaction));
+            remaining.insert(id, (coverage, transaction, effect));
         }
         Ok(remaining)
     }
@@ -978,7 +1034,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// double-install unrepresentable.
     fn submit_keys(
         &mut self,
-        keys: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>,
+        keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
     ) -> Result<CommitOutcome, PipelineError> {
         let (attempt, outcome) = self.append_for(keys.clone(), parent)?;
@@ -1055,16 +1111,17 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// stability).
     fn append_for(
         &mut self,
-        keys: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>,
+        keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
     ) -> Result<(Option<PendingAttempt>, AppendOutcome), PipelineError> {
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(keys.len());
         let mut tick: u64 = 0;
-        for (id, (coverage, transaction)) in &keys {
+        for (id, (coverage, transaction, effect)) in &keys {
             entries.push(BatchEntry {
                 id: *id,
                 transaction: *transaction,
                 coverage: coverage.clone(),
+                effect: *effect,
             });
             if let Some(status) = self.journal_transactions_lookup(*transaction) {
                 tick = tick.max(status);
@@ -1117,15 +1174,18 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             });
         }
         let revision = attempt.record.id();
-        for (id, (coverage, transaction)) in &attempt.keys {
+        for (id, (coverage, transaction, effect)) in &attempt.keys {
             let Some(entry) = batch.entries.iter().find(|entry| entry.id == *id) else {
                 return Err(PipelineError::ConfirmationInvalid {
                     detail: "key-missing-from-confirmed-batch",
                 });
             };
-            if entry.coverage != *coverage || entry.transaction != *transaction {
+            if entry.coverage != *coverage
+                || entry.transaction != *transaction
+                || entry.effect != *effect
+            {
                 return Err(PipelineError::ConfirmationInvalid {
-                    detail: "coverage-mismatch-in-confirmed-batch",
+                    detail: "payload-mismatch-in-confirmed-batch",
                 });
             }
             let Some(confirmed) = self.confirmed.get(id) else {
@@ -1267,6 +1327,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                             ConfirmedEntry {
                                 coverage: entry.coverage,
                                 transaction: entry.transaction,
+                                effect: entry.effect,
                                 revision: id,
                                 epoch: record.epoch,
                             },
@@ -1541,6 +1602,7 @@ mod tests {
                 id: ConsequenceId::new(1, 1, 1),
                 transaction,
                 coverage: staged_envelope(1).sub_spans.clone(),
+                effect: staged_envelope(1).effect_commitment().unwrap(),
             }],
         };
         let object = StoredObject::new(real.canonical_bytes().unwrap()).unwrap();
@@ -1556,6 +1618,7 @@ mod tests {
                     class: DurabilityClass::DurableEligible,
                 }],
                 transaction,
+                staged_envelope(1).effect_commitment().unwrap(),
             ),
         );
         let attempt = PendingAttempt {
@@ -1566,18 +1629,26 @@ mod tests {
         assert!(matches!(
             pipeline.confirm(attempt),
             Err(PipelineError::ConfirmationInvalid {
-                detail: "coverage-mismatch-in-confirmed-batch"
+                detail: "payload-mismatch-in-confirmed-batch"
             })
         ));
         // (b) A key the confirmed batch never carried.
         let mut keys = BTreeMap::new();
         keys.insert(
             ConsequenceId::new(1, 1, 1),
-            (staged_envelope(1).sub_spans.clone(), transaction),
+            (
+                staged_envelope(1).sub_spans.clone(),
+                transaction,
+                staged_envelope(1).effect_commitment().unwrap(),
+            ),
         );
         keys.insert(
             ConsequenceId::new(1, 5, 1),
-            (staged_envelope(5).sub_spans.clone(), transaction),
+            (
+                staged_envelope(5).sub_spans.clone(),
+                transaction,
+                staged_envelope(5).effect_commitment().unwrap(),
+            ),
         );
         let batch_hash = object.hash();
         let attempt = PendingAttempt {
@@ -1987,6 +2058,7 @@ mod tests {
                     span: OccurrenceSpan::new(2, 4).unwrap(),
                     class: DurabilityClass::DurableEligible,
                 }],
+                effect: staged_envelope(1).effect_commitment().unwrap(),
             }],
         };
         let batch_bytes = batch.canonical_bytes().unwrap();
@@ -2219,6 +2291,94 @@ mod tests {
     }
 
     #[test]
+    fn foreign_confirmation_with_matching_ids_but_conflicting_effects_fails_closed() {
+        // The third re-review's finding: `TransactionId` + occurrence
+        // coverage is insufficient to prove effect equivalence — the
+        // same identity, span, classification, and plan (the same
+        // content-blind TransactionId inputs) admits two valid
+        // uniform lanes (+2 pending vs +2 captured). A foreign
+        // confirmation carrying the same transaction and coverage
+        // but a DIFFERENT consequential effect does not satisfy the
+        // local attempt: exact effect provenance fails closed.
+        let dir = TestDir::new("foreign-effect-conflict");
+        ensure_founded(&dir);
+        let identity = ConsequenceId::new(1, 1, 1);
+        // Writer A journals the identity with the pending lane —
+        // byte-identical to staged_envelope(1) but for the lane.
+        let journal_a = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer_a =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_a).unwrap();
+        writer_a
+            .stage(
+                ConsequenceEnvelope::capture(
+                    identity,
+                    vec![ClassifiedSpan {
+                        span: OccurrenceSpan::new(0, 2).unwrap(),
+                        class: DurabilityClass::DurableEligible,
+                    }],
+                    SignalLane::Pending,
+                    CounterValues::default(),
+                    SourceBaseline {
+                        counters: CounterValues::default(),
+                        award: AwardCheckpoint {
+                            durable: Coverage::new(),
+                            provisional: Coverage::new(),
+                        },
+                    },
+                    SourcePosition {
+                        head: None,
+                        tick: 101,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let boundary_a = boundary(1);
+        writer_a
+            .capture(
+                boundary_a.position,
+                boundary_a.classification,
+                boundary_a.dependencies,
+                boundary_a.frontier,
+                boundary_a.plan,
+            )
+            .unwrap();
+        // Writer B claims the same identity, span, class, and plan —
+        // the same TransactionId and coverage — under the captured
+        // lane, and confirms it.
+        let journal_b = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let mut writer_b =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_b).unwrap();
+        writer_b.stage(staged_envelope(1)).unwrap();
+        let boundary_b = boundary(1);
+        writer_b
+            .capture(
+                boundary_b.position,
+                boundary_b.classification,
+                boundary_b.dependencies,
+                boundary_b.frontier,
+                boundary_b.plan,
+            )
+            .unwrap();
+        let CommitOutcome::Confirmed(_) = writer_b.commit_canonical().unwrap() else {
+            panic!("expected writer B's confirmation");
+        };
+        drop(writer_b);
+        // Writer A's commit: the stale-path re-walk finds the
+        // identity confirmed under the same transaction and coverage
+        // but a DIFFERENT effect commitment — the local attempt
+        // conflicts with the canonical entry: fail closed.
+        let error = writer_a.commit_canonical().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PipelineError::ConfirmedProvenanceMismatch { id } if *id == identity
+            ),
+            "the conflicting effect fails closed: {error}"
+        );
+    }
+
+    #[test]
     fn nothing_pending_and_unfounded() {
         let dir = TestDir::new("nothing-pending");
         let mut pipeline = fresh_pipeline(&dir);
@@ -2287,11 +2447,13 @@ mod tests {
                             class: DurabilityClass::EncounterProvisional,
                         },
                     ],
+                    effect: Hash::from_bytes(&[11u8; 32]).unwrap(),
                 },
                 BatchEntry {
                     id: ConsequenceId::new(1, 2, 4),
                     transaction: TransactionId(Hash::from_bytes(&[9u8; 32]).unwrap()),
                     coverage: Vec::new(),
+                    effect: Hash::from_bytes(&[13u8; 32]).unwrap(),
                 },
             ],
         };
@@ -2315,6 +2477,7 @@ mod tests {
                         class: DurabilityClass::EncounterProvisional,
                     },
                 ],
+                effect: Hash::from_bytes(&[21u8; 32]).unwrap(),
             }],
         };
         let bytes = partitioned.canonical_bytes().unwrap();

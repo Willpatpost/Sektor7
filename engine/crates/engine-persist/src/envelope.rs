@@ -396,6 +396,22 @@ impl ConsequenceEnvelope {
         self
     }
 
+    /// The cryptographically verifiable semantic commitment binding
+    /// this consequence to its actual authoritative effects: the
+    /// SHA-256 of the envelope's complete canonical bytes (the
+    /// domain-tagged wire form covers the delta — the uniform signal
+    /// lane — the coverage, the classes, the baseline). Retry-stable
+    /// (identical content ⇒ identical commitment) and deliberately
+    /// DISTINCT from the identity-level `TransactionId`, which is
+    /// content-blind by design: two valid envelopes with the same
+    /// identity, span, classification, and plan but different signal
+    /// lanes (+2 pending vs +2 captured) share a TransactionId while
+    /// their effect commitments differ — identity equality is never
+    /// effect equivalence.
+    pub fn effect_commitment(&self) -> Result<Hash, SaveError> {
+        Ok(crate::hash::hash_object(&self.canonical_bytes()?))
+    }
+
     /// The total occurrences covered across all sub-spans (checked —
     /// overflow is an integrity failure).
     pub fn occurrences(&self) -> Result<u64, SaveError> {
