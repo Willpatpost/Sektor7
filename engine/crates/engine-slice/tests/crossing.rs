@@ -5,10 +5,16 @@
 //! entries and captures are EXACTLY the legacy deactivation's — the
 //! shared gathering), and the fail-closed corruption corpus.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use engine_core::{EventClass, LodLevel, PresenceSample, Spine};
-use engine_slice::crossing::DeactivationPlan;
-use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
-use engine_slice::region::RegionConfig;
+use engine_persist::{
+    ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, T1Journal,
+};
+use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
+use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
+use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
 use engine_slice::sim::{SimConfig, SimDriver};
 
 /// A Lod-mode spine with real executed work (no director — the plan
@@ -223,4 +229,271 @@ fn plan_corruption_fails_closed() {
     for cut in bytes.len() - 16..bytes.len() {
         assert!(!accepts(&bytes[..cut]), "cut at {cut} rejected");
     }
+}
+
+// ------------------------------------------- the durable six-phase driver
+
+/// A temporary campaign directory (the B3 test pattern, local to this
+/// suite): a unique child of the system temp dir, removed on drop.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "s7-b4-crossing-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(path)
+    }
+
+    fn store(&self) -> PathBuf {
+        self.0.join("store")
+    }
+
+    fn journal(&self) -> PathBuf {
+        self.0.join("journal.t1")
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn near_region_4() -> PresenceSample {
+    PresenceSample {
+        position: (-100.0, 0.0),
+        velocity: (0.0, 0.0),
+    }
+}
+
+fn far_from_region_4() -> PresenceSample {
+    PresenceSample {
+        position: (100.0, 0.0),
+        velocity: (0.0, 0.0),
+    }
+}
+
+/// The real pair (no SimDriver — the crossing needs the spine and the
+/// director as separate mutable references): the Lod-mode spine plus
+/// the director, driven through the driver's own per-tick sequence.
+fn scenario_pair(ticks: u64, presence: &PresenceSample) -> (Spine<NpcWorld>, RegionDirector) {
+    let config = NpcConfig {
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let mut spine = Spine::with_reservation(NpcWorld::new(config.clone()), 200, 60);
+    install_initial_schedules(&mut spine, &config);
+    let mut director = RegionDirector::new(RegionConfig::default()).unwrap();
+    for _ in 0..ticks {
+        director.apply(&mut spine, std::slice::from_ref(presence));
+        spine.run_tick();
+    }
+    (spine, director)
+}
+
+/// The durable far boundary: every region whose target under the
+/// presence differs routes — Dormant targets through the six-phase
+/// crossing (journal + install), the remaining transitions (the far
+/// side's reactivations and reclassifications) through the legacy
+/// semantics — the same transition set `RegionDirector::apply` would
+/// make.
+fn durable_far_boundary(
+    crossing: &mut SessionCrossing,
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    presence: &PresenceSample,
+) {
+    let now = spine.clock();
+    for region in 0..REGION_COUNT {
+        let current = director.levels()[region];
+        let next = director.target_level(region, std::slice::from_ref(presence));
+        if next == current {
+            continue;
+        }
+        if next == LodLevel::Dormant {
+            crossing.deactivate(spine, director, region, now).unwrap();
+        } else {
+            director.transition_region(spine, region, next, now);
+        }
+    }
+}
+
+#[test]
+fn durable_deactivation_matches_the_legacy_state() {
+    // THE six-phase composition proof: two identical scenario pairs —
+    // one through the legacy director.apply far boundary, one through
+    // the durable crossing (journal + install) — produce EXACTLY the
+    // same authoritative state (the combined Stage 4 fingerprint),
+    // and the journal holds one committed transaction per
+    // deactivation, each carrying its plan blob and capture
+    // envelopes whose identities are exactly the ledger's captured
+    // keys.
+    let far = far_from_region_4();
+    let (mut legacy_spine, mut legacy_director) = scenario_pair(150, &near_region_4());
+    legacy_director.apply(&mut legacy_spine, &[far]);
+
+    let (mut spine, mut director) = scenario_pair(150, &near_region_4());
+    let dir = TestDir::new("equivalence");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "equivalence-campaign")
+        .expect("the crossing opens");
+    durable_far_boundary(&mut crossing, &mut spine, &mut director, &far);
+
+    assert_eq!(
+        stage4_state_fingerprint(&spine, &director),
+        stage4_state_fingerprint(&legacy_spine, &legacy_director),
+        "the durable six-phase boundary produces exactly the legacy state"
+    );
+    // The journal holds the deactivation transactions with the plan
+    // blobs, and the envelope identities are exactly the ledger's
+    // captured keys.
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert!(!scan.committed.is_empty(), "the transitions were journaled");
+    let mut expected_ids = HashSet::new();
+    for (region, state) in director.states().iter().enumerate() {
+        if let Some(checkpoint) = &state.checkpoint {
+            for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
+                expected_ids.insert(ConsequenceId::new(
+                    region as u32,
+                    state.episode,
+                    entry.npc as u32,
+                ));
+            }
+        }
+    }
+    let journal_ids: HashSet<ConsequenceId> = scan
+        .committed
+        .iter()
+        .flat_map(|transaction| transaction.envelopes.iter().map(|envelope| envelope.id))
+        .collect();
+    assert_eq!(journal_ids, expected_ids);
+    for transaction in &scan.committed {
+        assert!(
+            !transaction.plan.is_empty(),
+            "the plan blob is carried whole"
+        );
+    }
+}
+
+#[test]
+fn pre_durable_failure_aborts_intact_and_retries_identically() {
+    // §5.5.1 case 5: a persistence failure after only some capture
+    // writes — the transaction never commits, phase 3/4 fails, the
+    // deactivation ABORTS with a typed error: the pre-transition
+    // state is intact (nothing was mutated — the fingerprint
+    // unchanged, nothing suspended), the partial journal records are
+    // inert, and the retry through a fresh clean journal commits with
+    // identical keys (the episode frontier never advanced) and
+    // produces the legacy state.
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near_region_4());
+    let before = stage4_state_fingerprint(&spine, &director);
+    // The scenario itself holds the far-side regions' obligations
+    // (five regions went dormant at tick 0 under the near-presence);
+    // the abort must leave exactly these, no more.
+    let held_before = spine.held_count();
+    assert_eq!(held_before, 625, "five far regions dormant since tick 0");
+    let dir = TestDir::new("abort");
+    let faulted = T1Journal::open_with(
+        dir.journal(),
+        Some(
+            JournalFaultControl::new()
+                .arm(JournalFaultPoint::CapturesWritten, FaultAction::InjectError),
+        ),
+    )
+    .unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), faulted, "abort-campaign").unwrap();
+    let now = spine.clock();
+    let error = crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap_err();
+    assert!(
+        matches!(error, TransitionError::JournalFailed(_)),
+        "the journal failure is typed: {error:?}"
+    );
+    assert_eq!(
+        stage4_state_fingerprint(&spine, &director),
+        before,
+        "the pre-transition state stands, byte-exactly"
+    );
+    assert_eq!(
+        director.levels()[4],
+        LodLevel::Full,
+        "the region stays live"
+    );
+    assert_eq!(
+        spine.held_count(),
+        held_before,
+        "nothing was suspended by the attempt"
+    );
+    // The retry: drop the faulted session FIRST — the medium's
+    // HEAD.lock and the journal's sidecar lock are session-scoped,
+    // so a same-process second open over the same campaign blocks
+    // until the first holder releases (the B2/B3 lock discipline) —
+    // then a fresh clean journal (the fault fires once; the clean
+    // open sweeps the inert partial records): identical keys, the
+    // legacy state.
+    drop(crossing);
+    let clean = T1Journal::open(dir.journal()).unwrap();
+    let mut retry = SessionCrossing::open(&dir.store(), clean, "abort-campaign").unwrap();
+    durable_far_boundary(&mut retry, &mut spine, &mut director, &far);
+    let (mut legacy_spine, mut legacy_director) = scenario_pair(150, &near_region_4());
+    legacy_director.apply(&mut legacy_spine, &[far]);
+    assert_eq!(
+        stage4_state_fingerprint(&spine, &director),
+        stage4_state_fingerprint(&legacy_spine, &legacy_director),
+        "the retry produces exactly the legacy state"
+    );
+}
+
+#[test]
+fn install_defensive_failure_is_the_halt_signal() {
+    // §5.5.2: the staged-commit discipline's defensive validation —
+    // a plan-vs-live incompatibility detected at phase 5 is the
+    // fail-closed halt signal (a bug, never "continue with the region
+    // unchanged"). The seam: the durability completes, then an
+    // obligation is moved out from under the plan before the install
+    // — the re-validation rejects with the typed halt while the
+    // durable intent stands in the journal.
+    let (mut spine, mut director) = scenario_pair(150, &near_region_4());
+    let dir = TestDir::new("halt");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "halt-campaign").unwrap();
+    let now = spine.clock();
+    let error = crossing
+        .debug_deactivate_around_install(&mut spine, &mut director, 4, now, |spine, _| {
+            // Sabotage: hold one of region 4's obligations between
+            // durability and installation.
+            let class = EventClass::new(4);
+            let Some(victim) = spine
+                .collect_matching(|view| view.class == class)
+                .first()
+                .map(|view| view.id)
+            else {
+                panic!("region 4 has obligations");
+            };
+            spine.suspend_ids(std::slice::from_ref(&victim));
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TransitionError::InstallIncompatible {
+                region: 4,
+                detail: "obligation-moved"
+            }
+        ),
+        "the defensive validation halts: {error:?}"
+    );
+    // The durable intent stands; the install refused — the caller's
+    // correct response is the session halt, which this test models by
+    // simply not continuing.
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(scan.committed.len(), 1, "the intent is durable");
 }

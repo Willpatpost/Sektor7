@@ -11,14 +11,25 @@
 //! frozen fingerprint are mechanically untouched.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use engine_core::wire::MAX_COLLECTION_COUNT;
 use engine_core::{
-    Decoder, Encoder, EventClass, EventId, Field, LodLevel, ObligationView, SaveError, Tick,
+    Decoder, Encoder, EventClass, EventId, Field, LodLevel, ObligationView, SaveError, Spine, Tick,
+};
+
+use engine_persist::{
+    AppendOutcome, AuthorityMode, AwardCheckpoint, CanonicalMedium, CaptureReceipt, ClassifiedSpan,
+    CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
+    FrontierEntry, LocalFileMedium, OccurrenceSpan, PipelineError, RevisionRecord, SignalLane,
+    SourceBaseline, SourcePosition, T1Journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
-use crate::region::{RegionEntry, gather_region_entries, lod_byte, read_flag, read_lod_level};
+use crate::region::{
+    CaptureStatus, RegionCheckpoint, RegionDirector, RegionEntry, gather_region_entries, lod_byte,
+    read_flag, read_lod_level,
+};
 
 /// One collected obligation — the owned form of a collected
 /// [`ObligationView`] (the plan is journalable, so it carries owned
@@ -275,4 +286,291 @@ impl DeactivationPlan {
             captures,
         })
     }
+}
+
+/// The typed transition failure surface (§5.5.1 case 7): pre-durable
+/// failures are retryable soft aborts (nothing was mutated); a
+/// phase-5 defensive-validation failure is a detected
+/// plan-vs-live incompatibility — a bug, not a runtime condition —
+/// whose correct response is the fail-closed session halt (stop
+/// authoritative progression, preserve state, report the evidence),
+/// never "continue with the region unchanged."
+#[derive(Debug)]
+pub enum TransitionError {
+    /// Phases 3–4 (persist/verify): the journal write or its
+    /// verification failed — PRE-durable: the pre-transition state is
+    /// intact (nothing was mutated), the partial journal records are
+    /// inert by construction, and a later boundary may retry with
+    /// identical keys (the episode frontier advances only on durable
+    /// commit).
+    JournalFailed(PipelineError),
+    /// Phase 5 (install): the staged-commit discipline's defensive
+    /// validation failed — the prepared plan does not match the live
+    /// state (an obligation moved, the episode advanced, a ledger key
+    /// already present, a scratch mismatch, or a short suspension
+    /// count). This is the fail-closed halt signal.
+    InstallIncompatible { region: usize, detail: &'static str },
+}
+
+impl From<PipelineError> for TransitionError {
+    fn from(error: PipelineError) -> Self {
+        TransitionError::JournalFailed(error)
+    }
+}
+
+/// The deactivation's capture envelope — the award form (§5.4.1): a
+/// fresh identity's first consequential record, uniform `Captured`
+/// units over the identity's occurrence span `(0, delta]` — the
+/// crossings this boundary claims — with the expected prior and
+/// baseline at the identity's empty base and the boundary's source
+/// position.
+fn capture_envelope(
+    region: usize,
+    episode: u64,
+    npc: usize,
+    delta: u64,
+    now: Tick,
+) -> Result<ConsequenceEnvelope, SaveError> {
+    ConsequenceEnvelope::capture(
+        ConsequenceId::new(region as u32, episode, npc as u32),
+        vec![ClassifiedSpan {
+            span: OccurrenceSpan::new(0, delta)
+                .map_err(|_| SaveError::Integrity("crossing/capture-span"))?,
+            class: DurabilityClass::DurableEligible,
+        }],
+        SignalLane::Captured,
+        CounterValues::default(),
+        SourceBaseline {
+            counters: CounterValues::default(),
+            award: AwardCheckpoint {
+                durable: Coverage::new(),
+                provisional: Coverage::new(),
+            },
+        },
+        SourcePosition {
+            head: None,
+            tick: now.as_u64(),
+        },
+    )
+}
+
+/// The six-phase durable crossing session: the real Stage 4 simulation
+/// bound to a campaign's canonical medium and T1 journal through the
+/// Batch 3 pipeline. One instance owns the pipeline for the session;
+/// the pipeline-free Stage 4 path never constructs one, so its
+/// behavior and every frozen fingerprint are mechanically untouched.
+pub struct SessionCrossing {
+    pipeline: CommitPipeline<LocalFileMedium>,
+}
+
+impl SessionCrossing {
+    /// Opens (or joins) the campaign store: the B2 medium over
+    /// `store_dir` — founded with a standalone authority record on
+    /// first open, so every confirmation carries the honest
+    /// `T3-local (standalone)` label — joined with the caller's
+    /// journal in one pipeline. The caller constructs the journal (a
+    /// plain open, or a fault-injected open for the failure matrix).
+    pub fn open(
+        store_dir: &Path,
+        journal: T1Journal,
+        campaign: &str,
+    ) -> Result<Self, PipelineError> {
+        let mut medium = LocalFileMedium::open(store_dir.to_path_buf())?;
+        if medium.head()?.is_none() {
+            // The founding record is the application's setup act; on a
+            // fresh single-writer session the append must accept —
+            // anything else surfaces typed for investigation.
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
+            match medium.append(&founding, &[], None)? {
+                AppendOutcome::Accepted { .. } => {}
+                _ => return Err(PipelineError::UnfoundedMedium),
+            }
+        }
+        let pipeline = CommitPipeline::open(medium, journal)?;
+        Ok(SessionCrossing { pipeline })
+    }
+
+    /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
+    /// the real simulation state:
+    ///
+    /// 1. **Validate** — the region is live (a Dormant target from a
+    ///    live level; the caller's presence decision).
+    /// 2. **Determine** — the [`DeactivationPlan`] from read-only
+    ///    sources only.
+    /// 3. **Persist T1** — ONE journal transaction: the capture
+    ///    envelopes (one per captured NPC — the award form, uniform
+    ///    `Captured` units) plus the complete plan as the plan blob.
+    /// 4. **Verify** — the receipt exists only after the journal's
+    ///    fsync (the B3 contract); an ambiguous write was reconciled
+    ///    by reread+verify inside the capture.
+    /// 5. **Install** — the staged prepare/install bundle
+    ///    ([`install_deactivation`]) at the same tick boundary.
+    ///
+    /// A pre-durable failure (phases 3–4) is a retryable soft abort —
+    /// the pre-transition state stands. A phase-5 defensive failure is
+    /// the fail-closed halt signal.
+    pub fn deactivate(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        region: usize,
+        now: Tick,
+    ) -> Result<CaptureReceipt, TransitionError> {
+        self.transition(spine, director, region, now, |_, _| {})
+    }
+
+    /// Test-only (the failure matrix's seam): the six phases with the
+    /// caller's gap inserted between durability (phase 4) and the
+    /// install (phase 5) — the injection point for the
+    /// defensive-failure regressions. Engine code never calls this.
+    #[doc(hidden)]
+    pub fn debug_deactivate_around_install(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        region: usize,
+        now: Tick,
+        gap: impl FnOnce(&mut Spine<NpcWorld>, &mut RegionDirector),
+    ) -> Result<CaptureReceipt, TransitionError> {
+        self.transition(spine, director, region, now, gap)
+    }
+
+    /// The shared six-phase driver (the gap is the test seam — a
+    /// no-op in production).
+    fn transition(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        region: usize,
+        now: Tick,
+        gap: impl FnOnce(&mut Spine<NpcWorld>, &mut RegionDirector),
+    ) -> Result<CaptureReceipt, TransitionError> {
+        // Phase 1 — validate.
+        let from = director.levels()[region];
+        if from == LodLevel::Dormant {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "deactivate-of-dormant",
+            });
+        }
+        // Phase 2 — determine (read-only).
+        let class = EventClass::new(region as u16);
+        let episode = director.states()[region].episode + 1;
+        let collected = spine.collect_matching(|view| view.class == class);
+        let plan = DeactivationPlan::prepare(region, from, episode, now, spine.world(), &collected);
+        let plan_bytes = plan.canonical_bytes().map_err(PipelineError::Format)?;
+        // Phase 3 — persist T1: ONE transaction — the capture
+        // envelopes plus the plan blob. The envelopes stage in
+        // ConsequenceId-sorted order (one transaction covers one
+        // region and episode, so npc order IS the identity order —
+        // the journal's canonical discipline: capture records land in
+        // input order and the commit's identity list is written
+        // sorted, validated equal at every scan).
+        let mut captures = plan.captures.clone();
+        captures.sort_by_key(|(npc, _)| *npc);
+        for (npc, delta) in &captures {
+            let envelope = capture_envelope(region, episode, *npc, *delta, now)
+                .map_err(PipelineError::Format)?;
+            self.pipeline.stage(envelope)?;
+        }
+        let receipt = self.pipeline.capture(
+            SourcePosition {
+                head: None,
+                tick: now.as_u64(),
+            },
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: region as u32,
+                episode,
+            }],
+            plan_bytes,
+        )?;
+        // Phase 4 — verify: the receipt is post-fsync by contract.
+        gap(spine, director);
+        // Phase 5 — install (the staged bundle).
+        install_deactivation(spine, director, &plan)?;
+        Ok(receipt)
+    }
+}
+
+/// Phase 5 — the staged prepare/install bundle (§5.5.2): PREPARE
+/// performs every fallible step and precondition re-validation
+/// BEFORE any mutation (nothing is installed if a check fails); then
+/// INSTALL is non-fallible by construction — removals and insertions
+/// of already-validated values — with the one post-mutation check
+/// (the suspension count) being the defensive-failure halt signal.
+fn install_deactivation(
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    plan: &DeactivationPlan,
+) -> Result<(), TransitionError> {
+    let region = plan.region;
+    // PREPARE — every fallible check before any mutation.
+    if director.levels()[region] != plan.from_level {
+        return Err(TransitionError::InstallIncompatible {
+            region,
+            detail: "level-moved",
+        });
+    }
+    if director.states()[region].episode + 1 != plan.episode {
+        return Err(TransitionError::InstallIncompatible {
+            region,
+            detail: "episode-advanced",
+        });
+    }
+    let class = EventClass::new(region as u16);
+    let present: HashSet<u64> = spine
+        .collect_matching(|view| view.class == class)
+        .iter()
+        .map(|view| view.id.seq)
+        .collect();
+    for id in plan.ids() {
+        if !present.contains(&id.seq) {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "obligation-moved",
+            });
+        }
+    }
+    for (npc, _) in &plan.captures {
+        let id = ConsequenceId::new(region as u32, plan.episode, *npc as u32);
+        if !matches!(director.ledger().status(id), CaptureStatus::Unknown) {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "ledger-key-exists",
+            });
+        }
+    }
+    for (npc, delta) in &plan.captures {
+        if spine.world().pending_signals()[*npc] != *delta {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "scratch-moved",
+            });
+        }
+    }
+    // INSTALL — non-fallible by construction (every value
+    // pre-validated; the suspension count is the defensive halt).
+    let ids = plan.ids();
+    let suspended = spine.suspend_ids(&ids);
+    if suspended != ids.len() as u32 {
+        return Err(TransitionError::InstallIncompatible {
+            region,
+            detail: "short-suspension",
+        });
+    }
+    director.install_captures(region, plan.episode, &plan.captures);
+    spine.world_mut().set_region_lod(region, LodLevel::Dormant);
+    spine.world_mut().discard_region_routine(region);
+    director.install_deactivated(
+        region,
+        plan.episode,
+        RegionCheckpoint {
+            dormant_since: plan.tick,
+            from_level: plan.from_level,
+            entries: plan.entries.clone(),
+        },
+    );
+    Ok(())
 }

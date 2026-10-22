@@ -521,6 +521,78 @@ impl RegionDirector {
         &self.ledger
     }
 
+    /// The LOD the controller would transition `region` to under this
+    /// presence (read-only — the decision input the six-phase
+    /// crossing's boundary routing consults; never a mutation).
+    pub fn target_level(&self, region: usize, presence: &[PresenceSample]) -> LodLevel {
+        self.controller.next_lod(
+            self.states[region].level,
+            self.config.centers[region],
+            presence,
+        )
+    }
+
+    /// Transitions one region to `to` — the LEGACY semantics (the same
+    /// routing `apply` performs per region; the caller's presence
+    /// decision). The six-phase crossing routes its Dormant-target
+    /// cases through `SessionCrossing::deactivate` instead; this
+    /// method serves the remaining transitions (reactivation and
+    /// active↔active reclassification) and the pipeline-free path.
+    pub fn transition_region(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        region: usize,
+        to: LodLevel,
+        now: Tick,
+    ) {
+        let from = self.states[region].level;
+        if to == from {
+            return;
+        }
+        self.transition(spine, region, from, to, now);
+    }
+
+    /// The six-phase crossing's phase-5 install step (Batch 4):
+    /// captures the plan's consequences into the ledger — exactly-once
+    /// keyed, the diagnostics parity with the legacy path — called
+    /// only after the staged precondition re-validation.
+    pub(crate) fn install_captures(
+        &mut self,
+        region: usize,
+        episode: u64,
+        captures: &[(usize, u64)],
+    ) {
+        for (npc, delta) in captures {
+            if self
+                .ledger
+                .capture(crossing_id(region, episode, *npc), *delta)
+            {
+                self.diagnostics.captured_deltas += 1;
+            }
+        }
+    }
+
+    /// The six-phase crossing's phase-5 install step (Batch 4): writes
+    /// the deactivated region state from the prepared plan — the same
+    /// state the legacy path writes (level, episode, checkpoint),
+    /// plus the diagnostics parity.
+    pub(crate) fn install_deactivated(
+        &mut self,
+        region: usize,
+        episode: u64,
+        checkpoint: RegionCheckpoint,
+    ) {
+        self.states[region] = RegionState {
+            level: LodLevel::Dormant,
+            episode,
+            checkpoint: Some(checkpoint),
+            last_method: None,
+            reconstructed_activities: 0,
+            last_dormancy_span: 0,
+        };
+        self.diagnostics.deactivations += 1;
+    }
+
     pub fn diagnostics(&self) -> RegionDiagnostics {
         self.diagnostics
     }
