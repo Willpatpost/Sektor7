@@ -21,7 +21,7 @@ use std::time::Instant;
 use engine_core::wire::MAX_COLLECTION_COUNT;
 use engine_core::{
     Decoder, Encoder, EventClass, EventId, EventSpec, Fingerprinter, LodConfig, LodConfigError,
-    LodController, LodLevel, PresenceSample, SaveError, ScheduleError, Spine, Tick,
+    LodController, LodLevel, ObligationView, PresenceSample, SaveError, ScheduleError, Spine, Tick,
 };
 use engine_persist::ConsequenceId;
 
@@ -229,6 +229,65 @@ fn pack_crossing(id: ConsequenceId) -> u64 {
 /// deactivation episode — the Batch 4 crossing's key form.
 fn crossing_id(region: usize, episode: u64, npc: usize) -> ConsequenceId {
     ConsequenceId::new(region as u32, episode, npc as u32)
+}
+
+/// Gathers one region's deactivation checkpoint entries and captured
+/// consequences from its obligation views (Batch 4: extracted from the
+/// legacy deactivation so the six-phase crossing's read-only
+/// preparation builds the SAME plan data — `Spine::collect_matching`
+/// feeds the durable path, `held_view` the legacy path; identical
+/// gathering, identical order). The views are normalized to ascending
+/// `EventId` order — the legacy held iteration's form — so both paths
+/// produce identical checkpoints. Only routine-typed payloads become
+/// checkpoint entries — foreign events stay spine-held without entries
+/// (corrective finding A); the class↔region consistency check (Batch 3
+/// defensive check) keeps a malformed routine-tagged payload whose NPC
+/// belongs to another region out of THIS region's reconstruction data.
+pub(crate) fn gather_region_entries(
+    world: &NpcWorld,
+    region: usize,
+    obligations: &[ObligationView<'_>],
+) -> (Vec<RegionEntry>, Vec<(usize, u64)>) {
+    let mut ordered: Vec<&ObligationView<'_>> = obligations.iter().collect();
+    ordered.sort_by_key(|view| view.id.seq);
+    let mut entries = Vec::with_capacity(ordered.len());
+    let mut captures = Vec::new();
+    for view in ordered {
+        let Some((npc, payload_cursor)) = routine_payload_parts(view.payload) else {
+            continue;
+        };
+        if npc % REGION_COUNT != region {
+            continue;
+        }
+        let pending = world.pending_signals()[npc];
+        // Corrective finding D: capture the CURRENT represented state
+        // from the world — never a stale pending payload. The coherent
+        // anchor is the obligation's own due while the chain is
+        // coherent (payload cursor == world cursor: the state was last
+        // advanced by real execution, which re-bases the chain); once
+        // reconstruction advanced the state past the obligation's
+        // knowledge, the world's tracked represented-through boundary
+        // is the anchor, and a later reconstruction counts only the
+        // unrepresented interval.
+        let world_cursor = world.routine_cursor()[npc];
+        let represented_through = if payload_cursor == world_cursor {
+            view.due
+        } else {
+            world.represented_through()[npc]
+        };
+        entries.push(RegionEntry {
+            npc,
+            event: view.id,
+            represented_through,
+            cursor: world_cursor,
+            position: world.positions()[npc],
+            has_signal: pending > 0,
+        });
+        if pending > 0 {
+            captures.push((npc, pending));
+        }
+    }
+    (entries, captures)
 }
 
 /// One NPC's checkpoint entry — a REFERENCE to the spine-held
@@ -552,62 +611,19 @@ impl RegionDirector {
         let class = EventClass::new(region as u16);
         spine.suspend_matching(|view| view.class == class);
         spine.world_mut().set_region_lod(region, LodLevel::Dormant);
-        // Gather the region's held references first (the spine owns the
-        // obligations); only routine-typed payloads become checkpoint
-        // entries — foreign events stay spine-held without entries.
-        let held: Vec<(EventId, Tick, u64)> = spine
+        // Gather the region's held references (the spine owns the
+        // obligations) through the SHARED gathering — the same
+        // read-only construction the six-phase crossing's preparation
+        // performs from the collected views (Batch 4: identical
+        // entries and captures, identical order — the helper's
+        // ascending-seq normalization is a no-op on the held view).
+        let held: Vec<ObligationView<'_>> = spine
             .held_view()
-            .iter()
+            .into_iter()
             .filter(|view| view.class == class)
-            .map(|view| (view.id, view.due, view.payload))
             .collect();
         let episode = self.states[region].episode + 1;
-        let mut entries = Vec::with_capacity(held.len());
-        let mut captures: Vec<(usize, u64)> = Vec::new();
-        {
-            let world = spine.world();
-            for (event, due, payload) in &held {
-                if let Some((npc, payload_cursor)) = routine_payload_parts(*payload) {
-                    // Class↔region consistency (Batch 3 defensive
-                    // check): a malformed routine-tagged payload whose
-                    // NPC belongs to another region never joins THIS
-                    // region's checkpoint — it cannot corrupt another
-                    // region's reconstruction data.
-                    if npc % REGION_COUNT != region {
-                        continue;
-                    }
-                    let pending = world.pending_signals()[npc];
-                    // Corrective finding D: capture the CURRENT
-                    // represented state from the world — never a stale
-                    // pending payload. The coherent anchor is the
-                    // obligation's own due while the chain is coherent
-                    // (payload cursor == world cursor: the state was
-                    // last advanced by real execution, which re-bases
-                    // the chain); once reconstruction advanced the
-                    // state past the obligation's knowledge, the
-                    // world's tracked represented-through boundary is
-                    // the anchor, and a later reconstruction counts
-                    // only the unrepresented interval.
-                    let world_cursor = world.routine_cursor()[npc];
-                    let represented_through = if payload_cursor == world_cursor {
-                        *due
-                    } else {
-                        world.represented_through()[npc]
-                    };
-                    entries.push(RegionEntry {
-                        npc,
-                        event: *event,
-                        represented_through,
-                        cursor: world_cursor,
-                        position: world.positions()[npc],
-                        has_signal: pending > 0,
-                    });
-                    if pending > 0 {
-                        captures.push((npc, pending));
-                    }
-                }
-            }
-        }
+        let (entries, captures) = gather_region_entries(spine.world(), region, &held);
         // Capture BEFORE discard: every uncommitted consequential signal
         // is captured into the in-memory ledger (keyed per region,
         // episode, and NPC — exactly-once application, explicit
@@ -1054,7 +1070,10 @@ impl RegionDirector {
 }
 
 /// Reads a LOD level discriminant (fail-closed on unknown values).
-fn read_lod_level(dec: &mut Decoder, section: &'static str) -> Result<LodLevel, SaveError> {
+pub(crate) fn read_lod_level(
+    dec: &mut Decoder,
+    section: &'static str,
+) -> Result<LodLevel, SaveError> {
     match dec.read_u8()? {
         0 => Ok(LodLevel::Full),
         1 => Ok(LodLevel::Simplified),
@@ -1079,7 +1098,7 @@ fn read_finite_f64(dec: &mut Decoder) -> Result<f64, SaveError> {
 }
 
 /// Reads a boolean flag (fail-closed on unknown discriminants).
-fn read_flag(dec: &mut Decoder, section: &'static str) -> Result<bool, SaveError> {
+pub(crate) fn read_flag(dec: &mut Decoder, section: &'static str) -> Result<bool, SaveError> {
     match dec.read_u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -1123,7 +1142,7 @@ pub fn stage4_state_fingerprint_hex(spine: &Spine<NpcWorld>, director: &RegionDi
     format!("{:016x}", stage4_state_fingerprint(spine, director))
 }
 
-fn lod_byte(level: LodLevel) -> u8 {
+pub(crate) fn lod_byte(level: LodLevel) -> u8 {
     match level {
         LodLevel::Full => 0,
         LodLevel::Simplified => 1,
