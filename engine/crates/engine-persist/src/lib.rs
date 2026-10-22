@@ -47,6 +47,7 @@ pub mod local;
 pub mod medium;
 pub mod pipeline;
 pub mod record;
+pub mod recovery;
 
 #[cfg(test)]
 mod tests;
@@ -77,3 +78,7 @@ pub use pipeline::{
     ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
+pub use recovery::{
+    AppliedEffect, RecoveredParticipant, RecoveryAnchor, RecoveryError, RecoveryOutcome,
+    RecoveryReport, TransitionClassification, reconcile, reconstruct_episode_frontier,
+};
