@@ -22,19 +22,35 @@ use engine_core::{
     EventClass, EventId, EventSpec, Fingerprinter, LodConfig, LodConfigError, LodController,
     LodLevel, PresenceSample, ScheduleError, Spine, Tick,
 };
+use engine_persist::ConsequenceId;
 
 use crate::npc::{NpcWorld, REGION_COUNT, routine_payload_parts};
 
 /// In-memory capture-before-discard ledger (E-07/I1 in miniature):
 /// keyed captures with pending/applied status and an applied-key ledger
 /// — exactly-once application, duplicate attempts are no-ops. Not
-/// canonical, not durable (Stage 5 boundary).
+/// canonical, not durable (the Stage 5 boundary; the Batch 4 crossing
+/// journals through the engine-persist pipeline separately).
+///
+/// **The structured-key migration (Batch 4, the accepted §5.5 design):
+/// the keys are `ConsequenceId`s in memory** — (region, episode, npc)
+/// structured identities — while the fingerprint's wire form is the
+/// packed Stage 4 encoding: `ConsequenceId::pack_stage4` IS the legacy
+/// `consequence_key` expression (the bijection the engine-persist
+/// boundary trio pinned against this crate's own layout, proven live
+/// by the crossing's compatibility test), and the structured field
+/// order (region, episode, npc) coincides with the packed numeric
+/// order (field-aligned bit packing), so the `capture-ledger/2` domain
+/// keeps byte-identical output — no /3 storage-encoding change is
+/// needed, because the packed form already IS the structured key's
+/// canonical packed form. Historical behavior and every frozen Stage 4
+/// fingerprint are mechanically preserved.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CaptureLedger {
-    /// key -> captured delta (pending until applied).
-    pending: BTreeMap<u64, u64>,
-    /// Applied-key ledger: keys already applied exactly once.
-    applied: BTreeSet<u64>,
+    /// id -> captured delta (pending until applied).
+    pending: BTreeMap<ConsequenceId, u64>,
+    /// Applied-key ledger: ids already applied exactly once.
+    applied: BTreeSet<ConsequenceId>,
 }
 
 /// Status of one capture key.
@@ -64,36 +80,36 @@ pub enum ApplyError {
 }
 
 impl CaptureLedger {
-    /// Captures a keyed delta as pending. Idempotent: a duplicate key is
+    /// Captures a keyed delta as pending. Idempotent: a duplicate id is
     /// a no-op returning `false`.
-    pub fn capture(&mut self, key: u64, delta: u64) -> bool {
-        if self.pending.contains_key(&key) || self.applied.contains(&key) {
+    pub fn capture(&mut self, id: ConsequenceId, delta: u64) -> bool {
+        if self.pending.contains_key(&id) || self.applied.contains(&id) {
             return false;
         }
-        self.pending.insert(key, delta);
+        self.pending.insert(id, delta);
         true
     }
 
     /// Applies a pending capture exactly once. A duplicate attempt is
-    /// `Ok(AlreadyApplied)` (a no-op by contract); an unknown key is an
+    /// `Ok(AlreadyApplied)` (a no-op by contract); an unknown id is an
     /// `Err` — the caller's recovery state references a consequence the
     /// ledger never captured, which must fail coherently rather than
     /// silently promote.
-    pub fn apply(&mut self, key: u64) -> Result<ApplyOutcome, ApplyError> {
-        let Some(delta) = self.pending.remove(&key) else {
-            if self.applied.contains(&key) {
+    pub fn apply(&mut self, id: ConsequenceId) -> Result<ApplyOutcome, ApplyError> {
+        let Some(delta) = self.pending.remove(&id) else {
+            if self.applied.contains(&id) {
                 return Ok(ApplyOutcome::AlreadyApplied);
             }
             return Err(ApplyError::Unknown);
         };
-        self.applied.insert(key);
+        self.applied.insert(id);
         Ok(ApplyOutcome::Applied(delta))
     }
 
-    pub fn status(&self, key: u64) -> CaptureStatus {
-        if let Some(delta) = self.pending.get(&key) {
+    pub fn status(&self, id: ConsequenceId) -> CaptureStatus {
+        if let Some(delta) = self.pending.get(&id) {
             CaptureStatus::Pending(*delta)
-        } else if self.applied.contains(&key) {
+        } else if self.applied.contains(&id) {
             CaptureStatus::Applied
         } else {
             CaptureStatus::Unknown
@@ -116,16 +132,20 @@ impl CaptureLedger {
 
     fn fingerprint(&self, fp: &mut Fingerprinter) {
         // Domain version 2 (Batch 2 corrective): keys moved from
-        // per-episode timestamps to per-NPC consequence deltas.
+        // per-episode timestamps to per-NPC consequence deltas. Batch 4:
+        // the in-memory keys are structured ConsequenceIds; the wire
+        // form is their packed Stage 4 encoding — byte-identical to the
+        // legacy u64 keys (the bijection plus the field-aligned
+        // ordering), so the domain stays /2 with unchanged output.
         fp.write_str("engine-slice/capture-ledger/2");
         fp.write_usize(self.pending.len());
-        for (key, delta) in &self.pending {
-            fp.write_u64(*key);
+        for (id, delta) in &self.pending {
+            fp.write_u64(pack_crossing(*id));
             fp.write_u64(*delta);
         }
         fp.write_usize(self.applied.len());
-        for key in &self.applied {
-            fp.write_u64(*key);
+        for id in &self.applied {
+            fp.write_u64(pack_crossing(*id));
         }
     }
 }
@@ -180,8 +200,32 @@ impl Default for RegionConfig {
 /// deactivation, so every episode's captures are keyed fresh; the
 /// applied-key ledger is the exactly-once guard across retries and
 /// duplicate activation attempts.
+///
+/// Batch 4 (the structured-key migration): the crossing now speaks
+/// `ConsequenceId` — this legacy expression remains as the layout
+/// documentation and the compatibility oracle (the crossing test proves
+/// `ConsequenceId::pack_stage4` equals it for every in-domain triple,
+/// which is what keeps `capture-ledger/2` byte-identical).
 pub fn consequence_key(region: usize, episode: u64, npc: usize) -> u64 {
     ((region as u64) << 54) | (episode << 10) | (npc as u64)
+}
+
+/// The crossing's pack invariant: the director's identities are
+/// constructed from REGION_COUNT/NPC_COUNT-bounded values, so
+/// `pack_stage4` is total on them — the strict bounds (reject, never
+/// wrap) guard the general API against out-of-domain identities, and
+/// the compatibility test pins the bijection against this crate's own
+/// legacy layout.
+fn pack_crossing(id: ConsequenceId) -> u64 {
+    id.pack_stage4().expect(
+        "the crossing's identity domain is packable (region < REGION_COUNT, npc < NPC_COUNT)",
+    )
+}
+
+/// The structured identity for one NPC's consequences in one
+/// deactivation episode — the Batch 4 crossing's key form.
+fn crossing_id(region: usize, episode: u64, npc: usize) -> ConsequenceId {
+    ConsequenceId::new(region as u32, episode, npc as u32)
 }
 
 /// One NPC's checkpoint entry — a REFERENCE to the spine-held
@@ -569,7 +613,7 @@ impl RegionDirector {
         for (npc, delta) in captures {
             if self
                 .ledger
-                .capture(consequence_key(region, episode, npc), delta)
+                .capture(crossing_id(region, episode, npc), delta)
             {
                 self.diagnostics.captured_deltas += 1;
             }
@@ -624,8 +668,7 @@ impl RegionDirector {
         let episode = self.states[region].episode;
         for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
             if matches!(
-                self.ledger
-                    .status(consequence_key(region, episode, entry.npc)),
+                self.ledger.status(crossing_id(region, episode, entry.npc)),
                 CaptureStatus::Unknown
             ) {
                 // The checkpoint claims a consequence the ledger never
@@ -641,10 +684,7 @@ impl RegionDirector {
         // applied-key ledger makes applications idempotent, so a
         // retried activation never double-commits.
         for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
-            match self
-                .ledger
-                .apply(consequence_key(region, episode, entry.npc))
-            {
+            match self.ledger.apply(crossing_id(region, episode, entry.npc)) {
                 Ok(ApplyOutcome::Applied(delta)) => {
                     if delta > 0 {
                         spine.world_mut().apply_captured_signal(entry.npc, delta);

@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use engine_core::{EventClass, EventSpec, Field, LodLevel, Schedule, Tick};
+use engine_persist::ConsequenceId;
 use engine_slice::npc::{
     NPC_COUNT, NpcConfig, POSITION_DISCARDED, REGION_COUNT, REGION_GRID, ROUTINE_CURSOR_DISCARDED,
     routine_payload_parts,
@@ -254,6 +255,13 @@ fn reconstruction_labels_and_adaptive_selection() {
     );
 }
 
+/// The structured identity the crossing's ledger speaks (the Batch 4
+/// migration): the same (region, episode, npc) triples the legacy
+/// `consequence_key` packed, as ConsequenceIds.
+fn crossing_key(region: u32, episode: u64, npc: usize) -> ConsequenceId {
+    ConsequenceId::new(region, episode, npc as u32)
+}
+
 #[test]
 fn capture_ledger_is_exactly_once() {
     // Authorization §9 D / Batch 2 corrective findings A and C:
@@ -263,33 +271,63 @@ fn capture_ledger_is_exactly_once() {
     // coherently, never silently promote); pending is never falsely
     // confirmed as applied.
     let mut ledger = CaptureLedger::default();
-    assert!(ledger.capture(7, 42));
-    assert!(!ledger.capture(7, 99), "duplicate capture is a no-op");
-    assert_eq!(ledger.status(7), CaptureStatus::Pending(42));
+    let key = ConsequenceId::new(0, 0, 7);
+    let unknown = ConsequenceId::new(0, 0, 999);
+    assert!(ledger.capture(key, 42));
+    assert!(!ledger.capture(key, 99), "duplicate capture is a no-op");
+    assert_eq!(ledger.status(key), CaptureStatus::Pending(42));
     assert_eq!(
-        ledger.apply(7),
+        ledger.apply(key),
         Ok(ApplyOutcome::Applied(42)),
         "first application returns the delta"
     );
-    assert_eq!(ledger.status(7), CaptureStatus::Applied);
+    assert_eq!(ledger.status(key), CaptureStatus::Applied);
     assert_eq!(
-        ledger.apply(7),
+        ledger.apply(key),
         Ok(ApplyOutcome::AlreadyApplied),
         "duplicate application is an explicit no-op"
     );
     assert!(
-        !ledger.capture(7, 100),
+        !ledger.capture(key, 100),
         "re-capturing an applied key is a no-op"
     );
     assert_eq!(ledger.pending_count(), 0);
     assert_eq!(ledger.applied_count(), 1);
-    assert_eq!(ledger.status(999), CaptureStatus::Unknown);
+    assert_eq!(ledger.status(unknown), CaptureStatus::Unknown);
     assert_eq!(
-        ledger.apply(999),
+        ledger.apply(unknown),
         Err(ApplyError::Unknown),
         "an unknown key is an explicit application failure"
     );
     assert_eq!(ledger.pending_total(), 0, "nothing pending remains");
+}
+
+#[test]
+fn structured_keys_are_the_stage4_packed_layout() {
+    // The Batch 4 crossing's compatibility pin (the proposal §5.5: the
+    // triple↔packed↔structured mappings proven by compatibility
+    // tests): the structured ConsequenceId's packed Stage 4 form IS
+    // this crate's legacy `consequence_key` expression — the bijection
+    // the engine-persist boundary trio pinned against the mirrored
+    // layout, proven here live against the authoritative source. The
+    // ledger's fingerprint bytes therefore survive the structured-key
+    // migration byte-identically (domain /2, packed keys, the
+    // field-aligned ordering).
+    let mut packed = HashSet::new();
+    for region in [0u32, 1, 4, 7, 1022, 1023] {
+        for npc in [0u32, 1, 999, 1000, 1022, 1023] {
+            for episode in [0u64, 1, 2, 17, 1 << 43, (1 << 44) - 1] {
+                let id = ConsequenceId::new(region, episode, npc);
+                let key = id.pack_stage4().expect("in-domain");
+                assert_eq!(key, consequence_key(region as usize, episode, npc as usize));
+                assert_eq!(ConsequenceId::unpack_stage4(key), id);
+                assert!(
+                    packed.insert(key),
+                    "the packing is injective over the sweep"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -474,11 +512,11 @@ fn capture_before_discard_survives_repeated_cycles() {
         let checkpoint = state.checkpoint.as_ref().expect("checkpoint retained");
         assert_eq!(checkpoint.entries.len(), 125);
         let episode = state.episode;
-        let signal_keys: Vec<u64> = checkpoint
+        let signal_keys: Vec<ConsequenceId> = checkpoint
             .entries
             .iter()
             .filter(|entry| entry.has_signal)
-            .map(|entry| consequence_key(4, episode, entry.npc))
+            .map(|entry| crossing_key(4, episode, entry.npc))
             .collect();
         assert!(!signal_keys.is_empty(), "real consequences were captured");
         let pending_total = director.ledger().pending_total();
@@ -552,8 +590,8 @@ fn capture_before_discard_survives_repeated_cycles() {
             .entries
             .iter()
             .filter(|entry| entry.has_signal)
-            .map(|entry| consequence_key(4, episode, entry.npc))
-            .collect::<Vec<u64>>()
+            .map(|entry| crossing_key(4, episode, entry.npc))
+            .collect::<Vec<ConsequenceId>>()
     };
     assert!(
         !episode2_keys.is_empty(),
@@ -612,11 +650,11 @@ fn activation_failure_preserves_a_coherent_dormant_state() {
         assert_eq!(state.level, LodLevel::Dormant);
         let checkpoint = state.checkpoint.as_ref().expect("checkpoint");
         let episode = state.episode;
-        let signal_keys: Vec<u64> = checkpoint
+        let signal_keys: Vec<ConsequenceId> = checkpoint
             .entries
             .iter()
             .filter(|entry| entry.has_signal)
-            .map(|entry| consequence_key(4, episode, entry.npc))
+            .map(|entry| crossing_key(4, episode, entry.npc))
             .collect();
         assert!(!signal_keys.is_empty(), "real captures exist to apply");
         let expected: u64 = signal_keys
