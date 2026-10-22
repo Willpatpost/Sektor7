@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use engine_core::{EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    CommitOutcome, ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase,
-    T1Journal,
+    AwardState, CommitOutcome, ConsequenceId, CounterValues, DurabilityClass, EncounterJournal,
+    FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase, SignalLane, T1Journal,
 };
 use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
 use engine_slice::npc::{
@@ -714,5 +714,167 @@ fn recovery_from_an_older_anchor_restores_post_snapshot_crossings() {
     assert!(
         spine.world().milestones().iter().any(|m| *m > 0),
         "the fixture crossed milestones after the snapshot"
+    );
+}
+
+// --------------------------------------------------- the demonstrations
+
+#[test]
+fn encounter_rollback_policy_against_real_simulation_state() {
+    // The GO's item 7 — the minimal encounter demonstration against
+    // REAL simulation state: an encounter over a region-4 NPC's live
+    // consequential state (the counters read from the world at the
+    // accrual peak), with the accepted rollback policy — the durable
+    // promotions SURVIVE the failure; the provisional effects roll
+    // back coherently (the eligibility restored — the legitimate
+    // re-attempt re-earns them); the gameplay policy (which effects
+    // are durable) stays outside the machinery.
+    let near = near_region_4();
+    let (spine, _director) = scenario_pair(150, &near);
+    let world = spine.world();
+    let npc = 4;
+    let real_counters = CounterValues {
+        milestones: world.milestones()[npc],
+        pending_signals: world.pending_signals()[npc],
+        captured: 0,
+        credits: world.credits()[npc],
+    };
+    assert!(
+        real_counters.milestones > 0,
+        "the NPC crossed real milestones"
+    );
+    // The encounter: the pending lane (a crossing feeds the pending
+    // lane at execution — the application's boundary choice), over a
+    // demonstration identity in the region's own space.
+    let id = ConsequenceId::new(4, 1000, npc as u32);
+    let mut encounter = EncounterJournal::new(SignalLane::Pending);
+    encounter
+        .begin_participant(id, AwardState::new(), real_counters)
+        .unwrap();
+    // The effects: two occurrences recorded provisional; occurrence
+    // 1 promoted durable mid-encounter (the explicit gameplay
+    // decision — the machinery executes it).
+    assert!(
+        encounter
+            .record_effect(id, 1, DurabilityClass::EncounterProvisional)
+            .unwrap()
+    );
+    assert!(
+        encounter
+            .record_effect(id, 2, DurabilityClass::EncounterProvisional)
+            .unwrap()
+    );
+    assert!(encounter.promote(id, 1).unwrap());
+    let (award, counters) = encounter.participant_state(id).unwrap();
+    assert!(
+        award.durable.covers(1),
+        "the promoted occurrence is durable"
+    );
+    assert!(award.provisional.covers(2), "the other is provisional");
+    assert_eq!(
+        counters.milestones,
+        real_counters.milestones + 2,
+        "both units recorded"
+    );
+    // THE FAILURE: the encounter rolls back — the provisional
+    // discards (the eligibility restored), the durable promotion
+    // SURVIVES with its counter.
+    encounter.rollback().unwrap();
+    let (award, counters) = encounter.participant_state(id).unwrap();
+    assert!(
+        award.durable.covers(1),
+        "the durable promotion survives the failure"
+    );
+    assert!(
+        !award.provisional.covers(2),
+        "the provisional effect rolled back — the eligibility restored"
+    );
+    assert!(
+        !award.provisional.covers(1),
+        "the promoted occurrence never returns to the provisional lane"
+    );
+    assert_eq!(
+        counters.milestones,
+        real_counters.milestones + 1,
+        "the durable unit's counter survives the rollback"
+    );
+    assert_eq!(
+        counters.pending_signals,
+        real_counters.pending_signals + 1,
+        "the durable unit's signal survives in its lane"
+    );
+    assert!(counters.conservation_holds());
+    // The legitimate re-attempt: a fresh encounter from the
+    // rolled-back state — the discarded occurrence is earnable
+    // again, the survived promotion is never re-awarded.
+    let mut survived = AwardState::new();
+    survived.award_durable(1);
+    let mut reattempt = EncounterJournal::new(SignalLane::Pending);
+    reattempt
+        .begin_participant(id, survived, *counters)
+        .unwrap();
+    assert!(
+        reattempt
+            .record_effect(id, 2, DurabilityClass::EncounterProvisional)
+            .unwrap(),
+        "the rolled-back occurrence is earnable again — the reattempt eligibility preserved"
+    );
+    assert!(
+        !reattempt
+            .record_effect(id, 1, DurabilityClass::EncounterProvisional)
+            .unwrap(),
+        "the durable-covered occurrence is never a second award"
+    );
+}
+
+#[test]
+fn irreversible_operations_gate_on_canonical_confirmation() {
+    // The GO's item 8: pending T1 effects are clearly distinct from
+    // confirmed canonical progress — an irreversible operation
+    // dependent on unconfirmed milestones stays GATED until the
+    // canonical confirmation. The durable status surface
+    // (`key_phase`) distinguishes every phase; the gate opens only
+    // on InConfirmedChain (the demo's policy — the engine surfaces
+    // the phase, the gameplay decides).
+    let near = near_region_4();
+    let far = far_from_everything();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("gating");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "gating-campaign").unwrap();
+    let gate = |crossing: &SessionCrossing, id: ConsequenceId| {
+        matches!(crossing.key_phase(id), Some(KeyPhase::InConfirmedChain))
+    };
+    let key = ConsequenceId::new(4, 1, 4);
+    // Before the capture: unknown — gated.
+    assert!(!gate(&crossing, key), "unknown progress never permits");
+    // The durable deactivation: the capture is journaled — T1
+    // pending is NOT confirmed canonical progress. Still gated.
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    assert_eq!(crossing.key_phase(key), Some(KeyPhase::JournaledT1));
+    assert!(
+        !gate(&crossing, key),
+        "pending T1 stays gated — never conflated with confirmation"
+    );
+    // The reactivation: the live application — live effects exist,
+    // the canonical confirmation does not. Still gated.
+    spine.run_tick();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    assert_eq!(
+        crossing.key_phase(key),
+        Some(KeyPhase::AppliedToLivePending)
+    );
+    assert!(
+        !gate(&crossing, key),
+        "live-applied pending stays gated — the pending-vs-confirmed distinction"
+    );
+    // The canonical confirmation: the gate opens.
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the re-drive confirms");
+    };
+    assert_eq!(crossing.key_phase(key), Some(KeyPhase::InConfirmedChain));
+    assert!(
+        gate(&crossing, key),
+        "the canonically confirmed progress permits the irreversible operation"
     );
 }
