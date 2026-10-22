@@ -10,19 +10,21 @@
 //! Stage 4 path never constructs plans, so its behavior and every
 //! frozen fingerprint are mechanically untouched.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use engine_core::wire::MAX_COLLECTION_COUNT;
+use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT};
 use engine_core::{
-    Decoder, Encoder, EventClass, EventId, Field, LodLevel, ObligationView, SaveError, Spine, Tick,
+    Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, Level, LodLevel,
+    ObligationView, SaveError, Schedule, Spine, Tick,
 };
 
 use engine_persist::{
-    AppendOutcome, AuthorityMode, AwardCheckpoint, CanonicalMedium, CaptureReceipt, ClassifiedSpan,
-    CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
-    FrontierEntry, KeyPhase, LocalFileMedium, OccurrenceSpan, PipelineError, RevisionRecord,
-    SignalLane, SourceBaseline, SourcePosition, T1Journal,
+    AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, CaptureReceipt,
+    ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
+    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
+    LocalFileMedium, MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError,
+    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, reconcile,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -310,11 +312,25 @@ pub enum TransitionError {
     /// already present, a scratch mismatch, or a short suspension
     /// count). This is the fail-closed halt signal.
     InstallIncompatible { region: usize, detail: &'static str },
+    /// The chain holds no session snapshot — nothing to recover from
+    /// (a founding-only store, or the snapshots were never
+    /// published).
+    NoSnapshot,
+    /// The B3 reconcile rejected the recovered state (a Contract B
+    /// incompatibility or a coherence failure) — fail closed with the
+    /// evidence.
+    Recovery(RecoveryError),
 }
 
 impl From<PipelineError> for TransitionError {
     fn from(error: PipelineError) -> Self {
         TransitionError::JournalFailed(error)
+    }
+}
+
+impl From<MediumError> for TransitionError {
+    fn from(error: MediumError) -> Self {
+        TransitionError::JournalFailed(PipelineError::Medium(error))
     }
 }
 
@@ -361,6 +377,11 @@ fn capture_envelope(
 /// behavior and every frozen fingerprint are mechanically untouched.
 pub struct SessionCrossing {
     pipeline: CommitPipeline<LocalFileMedium>,
+    /// The campaign store's directory — fresh medium handles for the
+    /// snapshot publications and the recovery's chain walk (the
+    /// HEAD.lock is per-operation, so additional handles serialize
+    /// safely alongside the pipeline's own).
+    store_dir: PathBuf,
 }
 
 impl SessionCrossing {
@@ -387,7 +408,10 @@ impl SessionCrossing {
             }
         }
         let pipeline = CommitPipeline::open(medium, journal)?;
-        Ok(SessionCrossing { pipeline })
+        Ok(SessionCrossing {
+            pipeline,
+            store_dir: store_dir.to_path_buf(),
+        })
     }
 
     /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
@@ -586,6 +610,124 @@ impl SessionCrossing {
         install_deactivation(spine, director, &plan)?;
         Ok(receipt)
     }
+
+    /// Publishes the session snapshot as ONE verified content object
+    /// on the campaign chain (the B2 nine-step append — atomic,
+    /// chain-reachable, content-verified): a regular revision whose
+    /// single content reference is the snapshot object and whose
+    /// idempotency key is the snapshot's content hash. Returns the
+    /// revision's identity.
+    pub fn publish_snapshot(
+        &mut self,
+        spine: &Spine<NpcWorld>,
+        director: &RegionDirector,
+    ) -> Result<Hash, TransitionError> {
+        let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
+        let object = StoredObject::new(bytes)?;
+        let snapshot_hash = object.hash();
+        // A fresh medium handle (the HEAD.lock is per-operation; the
+        // pipeline's own handle is idle between its operations).
+        let mut medium = LocalFileMedium::open(self.store_dir.clone())?;
+        let head = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
+        let parent_epoch = medium.read_record(&head)?.epoch;
+        let record = RevisionRecord::regular(head, parent_epoch, spine.clock().as_u64())
+            .with_idempotency_key(snapshot_hash.as_bytes().to_vec())
+            .with_content_refs(vec![snapshot_hash]);
+        match medium.append(&record, std::slice::from_ref(&object), Some(head))? {
+            AppendOutcome::Accepted { id, .. } => Ok(id),
+            _ => Err(PipelineError::UnfoundedMedium.into()),
+        }
+    }
+
+    /// The canonical re-drive: batches the actionable unconfirmed
+    /// journal keys into a consequence-batch/2 revision on the chain
+    /// (the pending-T1 → confirmed-canonical transition — the gating
+    /// demonstration's other side).
+    pub fn commit_canonical(&mut self) -> Result<CommitOutcome, TransitionError> {
+        Ok(self.pipeline.commit_canonical()?)
+    }
+
+    /// The crash recovery: reconstruct the session from the durable
+    /// state alone — the latest chain snapshot plus the journal — and
+    /// re-open the crossing for the continuation (the pending T1
+    /// re-drive available through [`Self::commit_canonical`]).
+    ///
+    /// The composition (§5.4/§5.5.2):
+    /// 1. **The snapshot** — the latest chain-reachable session
+    ///    snapshot, restored through both codecs' gates.
+    /// 2. **The crossing restore** — the post-snapshot crossings the
+    ///    journal's captures claim (the capture delta minus the
+    ///    snapshot's scratch, per identity), restored exactly as they
+    ///    were at the deactivation (the milestone award AND the
+    ///    scratch), so the staged install's scratch re-validation
+    ///    sees the captured deltas.
+    /// 3. **The plan-based three-case** — each committed deactivation
+    ///    whose plan is not yet installed in the recovered director
+    ///    state (the plan's episode above the region's) installs
+    ///    through the standard phase-5 bundle; already-installed
+    ///    plans skip (the post-state, never a duplicate).
+    /// 4. **The coherence verification** — the B3 reconcile over the
+    ///    recovered anchor: every journal envelope suppressed by the
+    ///    anchor's coverage (the materialization evidence); a
+    ///    reapplied envelope is a double application — the halt.
+    /// 5. **The re-opened crossing** — a fresh pipeline over the same
+    ///    journal (the captured keys seeded from the journal).
+    pub fn recover(
+        store_dir: &Path,
+        journal_path: &Path,
+        campaign: &str,
+    ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
+        // 1. The snapshot.
+        let Some(snapshot_bytes) = latest_snapshot(store_dir)? else {
+            return Err(TransitionError::NoSnapshot);
+        };
+        let (mut spine, mut director) =
+            restore_session(&snapshot_bytes).map_err(PipelineError::Format)?;
+        let scratch_at_snapshot: Vec<u64> = spine.world().pending_signals().to_vec();
+        // 2. The journal scan + the crossing restore.
+        let scan = T1Journal::scan_file(journal_path).map_err(PipelineError::Journal)?;
+        for transaction in &scan.committed {
+            for envelope in &transaction.envelopes {
+                let npc = envelope.id.npc as usize;
+                let restore = envelope
+                    .delta
+                    .milestones
+                    .saturating_sub(scratch_at_snapshot[npc]);
+                if restore > 0 {
+                    spine.world_mut().apply_recovered_crossings(npc, restore);
+                }
+            }
+        }
+        // 3. The plan-based three-case — the pre-state installs
+        //    through the id-exact held reconstruction (the recovered
+        //    spine's chains are the snapshot's; the plan's ids are
+        //    the journaled chains).
+        for transaction in &scan.committed {
+            if transaction.plan.is_empty() {
+                continue;
+            }
+            let plan =
+                DeactivationPlan::restore(&transaction.plan).map_err(PipelineError::Format)?;
+            if plan.episode > director.states()[plan.region].episode {
+                install_recovered_deactivation(&mut spine, &mut director, &plan)?;
+            }
+        }
+        // 4. The coherence verification (the B3 reconcile — the
+        //    anchor's coverage must suppress every journal envelope).
+        let anchor = build_anchor(&spine, &director, &scan);
+        let confirmed = BTreeMap::new();
+        let outcome = reconcile(&anchor, &scan, &confirmed).map_err(TransitionError::Recovery)?;
+        if let Some(effect) = outcome.report.applied.first() {
+            return Err(TransitionError::InstallIncompatible {
+                region: effect.id.region as usize,
+                detail: "recovery-double-application",
+            });
+        }
+        // 5. The re-opened crossing.
+        let journal = T1Journal::open(journal_path).map_err(PipelineError::Journal)?;
+        let crossing = SessionCrossing::open(store_dir, journal, campaign)?;
+        Ok((spine, director, crossing))
+    }
 }
 
 /// Phase 5 — the staged prepare/install bundle (§5.5.2): PREPARE
@@ -667,4 +809,197 @@ fn install_deactivation(
         },
     );
     Ok(())
+}
+
+/// The plan's obligations as spine events (the id-exact
+/// reconstruction's input): each under its OWN identity, with the
+/// due carried as a logical-time schedule (the held entry's queue
+/// priority derives from the due alone; the resumed follow-ups
+/// create their own execution-relative schedules).
+fn plan_events(plan: &DeactivationPlan) -> Vec<Event> {
+    plan.obligations
+        .iter()
+        .map(|obligation| Event {
+            id: obligation.id,
+            class: obligation.class,
+            schedule: Schedule::AtLogicalTime {
+                due: obligation.due,
+            },
+            payload: obligation.payload,
+            field: obligation.field,
+            depends_on: obligation.depends_on.clone(),
+        })
+        .collect()
+}
+
+/// The recovery's phase-5 installer (§5.5.1 case 6 — the id-exact
+/// held reconstruction on the load path): the same staged
+/// precondition re-validation as the live install EXCEPT the
+/// obligation-presence check — the recovered spine's chains are the
+/// SNAPSHOT's, and the plan's ids are the JOURNALED chains (moved by
+/// the post-snapshot executions the crash lost) — so the install
+/// REPLACES the region's stale chains with the plan's obligation data
+/// through [`Spine::reconstruct_held`], never a live suspension.
+fn install_recovered_deactivation(
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    plan: &DeactivationPlan,
+) -> Result<(), TransitionError> {
+    let region = plan.region;
+    // PREPARE — the level, episode, ledger, and scratch checks (the
+    // same standard; the crossing restore made the scratch match the
+    // captured deltas).
+    if director.levels()[region] != plan.from_level {
+        return Err(TransitionError::InstallIncompatible {
+            region,
+            detail: "level-moved",
+        });
+    }
+    if director.states()[region].episode + 1 != plan.episode {
+        return Err(TransitionError::InstallIncompatible {
+            region,
+            detail: "episode-advanced",
+        });
+    }
+    for (npc, _) in &plan.captures {
+        let id = ConsequenceId::new(region as u32, plan.episode, *npc as u32);
+        if !matches!(director.ledger().status(id), CaptureStatus::Unknown) {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "ledger-key-exists",
+            });
+        }
+    }
+    for (npc, delta) in &plan.captures {
+        if spine.world().pending_signals()[*npc] != *delta {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "scratch-moved",
+            });
+        }
+    }
+    // INSTALL — the id-exact held reconstruction (the stale chains
+    // replaced by the plan's), then the same state writes.
+    let class = EventClass::new(region as u16);
+    spine.reconstruct_held(|view| view.class == class, plan_events(plan));
+    director.install_captures(region, plan.episode, &plan.captures);
+    spine.world_mut().set_region_lod(region, LodLevel::Dormant);
+    spine.world_mut().discard_region_routine(region);
+    director.install_deactivated(
+        region,
+        plan.episode,
+        RegionCheckpoint {
+            dormant_since: plan.tick,
+            from_level: plan.from_level,
+            entries: plan.entries.clone(),
+        },
+    );
+    Ok(())
+}
+
+// --------------------------------------------------- the session snapshot
+
+/// The session snapshot's versioned domain: ONE content object
+/// carrying the complete authoritative session — the spine save (with
+/// the world section) plus the director state (the region states, the
+/// checkpoints, and the structured-keyed capture ledger — the
+/// materialization evidence) — published atomically through the B2
+/// medium's nine-step append (the verified snapshot boundary).
+pub const SESSION_SNAPSHOT_DOMAIN: &str = "engine-slice/session-snapshot/1";
+
+/// Encodes the complete session snapshot.
+pub fn save_session(
+    spine: &Spine<NpcWorld>,
+    director: &RegionDirector,
+) -> Result<Vec<u8>, SaveError> {
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_SNAPSHOT_DOMAIN);
+    enc.write_bytes(&spine.save_bytes());
+    let mut director_enc = Encoder::new();
+    director.save(&mut director_enc);
+    enc.write_bytes(&director_enc.into_bytes());
+    Ok(enc.into_bytes())
+}
+
+/// Restores the complete session snapshot (fail-closed through both
+/// codecs' gates; the blob consumed exactly).
+pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector), SaveError> {
+    const SECTION: &str = "session-snapshot";
+    let mut dec = Decoder::new(bytes);
+    dec.read_domain(SESSION_SNAPSHOT_DOMAIN)?;
+    let spine_bytes = dec.read_bytes(MAX_BYTE_LEN, SECTION)?;
+    let director_bytes = dec.read_bytes(MAX_BYTE_LEN, SECTION)?;
+    dec.finish()?;
+    let spine = Spine::<NpcWorld>::restore(spine_bytes, Diagnostics::new(Level::Off))?;
+    let mut director_dec = Decoder::new(director_bytes);
+    let director = RegionDirector::restore(&mut director_dec)?;
+    Ok((spine, director))
+}
+
+/// The latest session snapshot on the chain: walk from HEAD through
+/// the parents, reading each revision's first content object — the
+/// first that restores as a session snapshot wins (the newest). The
+/// founding record carries no content; the walk is bounded by the
+/// chain length.
+fn latest_snapshot(store_dir: &Path) -> Result<Option<Vec<u8>>, MediumError> {
+    let mut medium = LocalFileMedium::open(store_dir.to_path_buf())?;
+    let mut cursor = medium.head()?;
+    while let Some(id) = cursor {
+        let record = medium.read_record(&id)?;
+        let Some(hash) = record.content_refs.first() else {
+            cursor = record.parent;
+            continue;
+        };
+        let bytes = medium.read_object(hash)?;
+        if restore_session(&bytes).is_ok() {
+            return Ok(Some(bytes));
+        }
+        cursor = record.parent;
+    }
+    Ok(None)
+}
+
+/// The recovery anchor from the recovered session state: per journal
+/// identity, the pipeline counters (a pending capture in the Captured
+/// lane, an applied one in Credits) with the coverage `(0, δ]` — the
+/// materialization evidence the four-tier suppression consults.
+fn build_anchor(
+    spine: &Spine<NpcWorld>,
+    director: &RegionDirector,
+    scan: &JournalScan,
+) -> RecoveryAnchor {
+    let mut anchor = RecoveryAnchor::new(SourcePosition {
+        head: None,
+        tick: spine.clock().as_u64(),
+    });
+    for transaction in &scan.committed {
+        for envelope in &transaction.envelopes {
+            let delta = envelope.delta.milestones;
+            let applied = matches!(
+                director.ledger().status(envelope.id),
+                CaptureStatus::Applied
+            );
+            let counters = if applied {
+                CounterValues {
+                    milestones: delta,
+                    pending_signals: 0,
+                    captured: 0,
+                    credits: delta,
+                }
+            } else {
+                CounterValues {
+                    milestones: delta,
+                    pending_signals: 0,
+                    captured: delta,
+                    credits: 0,
+                }
+            };
+            let mut award = AwardState::new();
+            for occurrence in 1..=delta {
+                award.award_durable(occurrence);
+            }
+            anchor = anchor.with_identity(envelope.id, counters, award);
+        }
+    }
+    anchor
 }

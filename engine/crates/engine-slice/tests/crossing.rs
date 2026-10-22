@@ -10,10 +10,13 @@ use std::path::PathBuf;
 
 use engine_core::{EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase, T1Journal,
+    CommitOutcome, ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase,
+    T1Journal,
 };
 use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
-use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
+use engine_slice::npc::{
+    NpcConfig, NpcWorld, POSITION_DISCARDED, REGION_COUNT, install_initial_schedules,
+};
 use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
 use engine_slice::sim::{SimConfig, SimDriver};
 
@@ -571,5 +574,145 @@ fn durable_reactivation_cycle_matches_the_legacy_state() {
     assert!(
         !scan.committed[0].envelopes.is_empty(),
         "the award captures are journaled"
+    );
+}
+
+// ------------------------------------------------- the crash recovery
+
+fn far_from_everything() -> PresenceSample {
+    PresenceSample {
+        position: (2000.0, 2000.0),
+        velocity: (0.0, 0.0),
+    }
+}
+
+#[test]
+fn recovery_reinstalls_the_deactivation_after_a_crash() {
+    // THE W2 window, honestly simulated: the session snapshot
+    // published at the accrual peak; the durable deactivation
+    // (journal + install) completes; then the in-memory state is
+    // LOST — the session reconstructs from the SNAPSHOT alone (the
+    // pre-deactivation state) while the journal retains the durable
+    // intent — and the recovery re-installs the deactivation from
+    // the plan. The recovered region 4 — the deactivation that
+    // carried durable consequences — matches the lost state exactly
+    // (the checkpoint, the ledger, the sentinels, the milestones);
+    // the empty-scratch deactivations of regions 3 and 5 are
+    // presence-re-derivable by design (the recovery leaves them
+    // live; the next boundary re-derives them); the B3 reconcile
+    // verified no double application inside the recovery; and the
+    // re-drive confirms the captures canonically.
+    let near = near_region_4();
+    let far = far_from_everything();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("recovery");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "recovery-campaign").unwrap();
+    // The verified snapshot boundary.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // The durable far boundary: region 4 with captures, regions 3
+    // and 5 empty-scratch.
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    // THE CRASH: the session is dropped (the in-memory crossing
+    // lost; the spine/director pair below represents the lost
+    // state, kept for comparison); the recovery reconstructs from
+    // the snapshot + the journal.
+    drop(crossing);
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "recovery-campaign").unwrap();
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_director.states()[4].checkpoint,
+        director.states()[4].checkpoint,
+        "the plan-installed checkpoint matches the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_total(),
+        director.ledger().pending_total(),
+        "the recovered ledger matches the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the crossings were in the snapshot — the milestones match exactly"
+    );
+    for npc in (4..1000).step_by(8).take(5) {
+        assert_eq!(
+            recovered_spine.world().positions()[npc],
+            POSITION_DISCARDED,
+            "the region-4 sentinels are installed"
+        );
+    }
+    assert_eq!(
+        recovered_director.levels()[3],
+        LodLevel::EventDriven,
+        "the empty-scratch deactivation is presence-re-derivable, never recovered"
+    );
+    // The pending T1 re-drive: the canonical confirmation.
+    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
+        panic!("the re-drive confirms the recovered captures");
+    };
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 1, 4)));
+    assert_eq!(
+        recovered_crossing.key_phase(ConsequenceId::new(4, 1, 4)),
+        Some(KeyPhase::InConfirmedChain),
+        "the recovered capture is canonically confirmed"
+    );
+}
+
+#[test]
+fn recovery_from_an_older_anchor_restores_post_snapshot_crossings() {
+    // The OLDER-anchor recovery (the GO's item): the snapshot at
+    // tick 50 — BEFORE region 4's crossings (the scratch empty) —
+    // the accrual to 150 crosses them, the durable deactivation
+    // captures them, the crash loses the in-memory state; the
+    // recovery restores the post-snapshot crossings (the capture
+    // delta minus the snapshot's scratch — here the full delta)
+    // exactly as they were at the deactivation, then installs the
+    // plan: the recovered milestones INCLUDE the restored crossings
+    // (without the restore they would be short by exactly the
+    // captured count).
+    let near = near_region_4();
+    let far = far_from_everything();
+    let (mut spine, mut director) = scenario_pair(50, &near);
+    let scratch_at_snapshot: u64 = spine.world().pending_signals().iter().sum();
+    assert_eq!(
+        scratch_at_snapshot, 0,
+        "the older snapshot predates the crossings"
+    );
+    let dir = TestDir::new("older");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "older-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // Accrue to 150 — the post-snapshot crossings — then the
+    // durable deactivation.
+    for _ in 0..100 {
+        director.apply(&mut spine, std::slice::from_ref(&near));
+        spine.run_tick();
+    }
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    // THE CRASH + the recovery.
+    drop(crossing);
+    let (recovered_spine, recovered_director, _recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "older-campaign").unwrap();
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_director.states()[4].checkpoint,
+        director.states()[4].checkpoint,
+        "the plan-installed checkpoint matches the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_total(),
+        director.ledger().pending_total(),
+        "the recovered ledger matches the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the post-snapshot crossings are restored — the milestones match the lost state's exactly"
+    );
+    assert!(
+        spine.world().milestones().iter().any(|m| *m > 0),
+        "the fixture crossed milestones after the snapshot"
     );
 }

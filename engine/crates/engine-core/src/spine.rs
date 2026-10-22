@@ -780,6 +780,99 @@ impl<W: World> Spine<W> {
         self.suspend_matching(|view| targets.contains(&view.id.seq))
     }
 
+    /// The recovery's id-exact held reconstruction (the v1.8 §5.5.1
+    /// case 6 load path, never a live-mutation scheduling API):
+    /// REMOVE every queued, blocked, AND held obligation matching
+    /// `matches` — the stale pre-crash chains, superseded by the
+    /// journal's plan data — then INSERT `events` as held under
+    /// their OWN identities (the dormant region's chains exactly as
+    /// the deactivation captured them). The scheduled statistic
+    /// adjusts by the replacement delta so the conservation identity
+    /// holds. Returns the inserted count.
+    pub fn reconstruct_held(
+        &mut self,
+        mut matches: impl FnMut(&ObligationView) -> bool,
+        events: Vec<Event>,
+    ) -> u32 {
+        let mut removed = 0u64;
+        removed += u64::from(Self::drop_from_queue(&mut self.near_queue, &mut matches));
+        removed += u64::from(Self::drop_from_queue(&mut self.far_queue, &mut matches));
+        let blocked_drop: Vec<u64> = self
+            .blocked
+            .values()
+            .filter(|event| matches(&event_view(event, ObligationLocation::Blocked)))
+            .map(|event| event.id.seq)
+            .collect();
+        for seq in blocked_drop {
+            if let Some(event) = self.blocked.remove(&seq) {
+                // The suspend path's discipline: leave the
+                // dependency-release path unaware of the removal.
+                for dep in &event.depends_on {
+                    if !self.executed.contains(&dep.seq)
+                        && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
+                    {
+                        waiters.retain(|&waiter| waiter != seq);
+                        if waiters.is_empty() {
+                            self.waiting_on.remove(&dep.seq);
+                        }
+                    }
+                }
+                removed += 1;
+            }
+        }
+        let held_drop: Vec<u64> = self
+            .held
+            .values()
+            .filter(|pending| matches(&pending.view(ObligationLocation::Held)))
+            .map(|pending| pending.seq)
+            .collect();
+        for seq in held_drop {
+            if let Some(pending) = self.held.remove(&seq) {
+                self.held_index.remove(&(pending.due, pending.seq));
+                removed += 1;
+            }
+        }
+        let mut inserted = 0u32;
+        for event in events {
+            let pending = Pending::new(event);
+            self.held_index.insert((pending.due, pending.seq));
+            self.held.insert(pending.seq, pending);
+            inserted += 1;
+        }
+        // The replacement semantics: the conservation identity holds
+        // with the scheduled statistic adjusted by the delta.
+        self.stats.scheduled = self
+            .stats
+            .scheduled
+            .saturating_sub(removed)
+            .checked_add(u64::from(inserted))
+            .expect("the scheduled count is bounded");
+        inserted
+    }
+
+    /// Drops matching entries from one lane (the reconstruction's
+    /// removal half — the same rebuild-invisibility argument as the
+    /// suspension drain: observable order derives from the canonical
+    /// `(due, seq)` keys).
+    fn drop_from_queue(
+        queue: &mut BinaryHeap<Reverse<Pending>>,
+        matches: &mut impl FnMut(&ObligationView) -> bool,
+    ) -> u32 {
+        let mut dropped = 0u32;
+        let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
+        while let Some(Reverse(pending)) = queue.pop() {
+            if matches(&pending.view(ObligationLocation::Queued)) {
+                dropped += 1;
+            } else {
+                retained.push(Reverse(pending));
+            }
+        }
+        for item in retained {
+            queue.push(item);
+        }
+        dropped
+    }
+
     /// Returns matching held obligations to pending state with their
     /// original `(due, seq)`, lane, schedule, payload, and dependencies
     /// — identity preserved through the entire suspension. An event

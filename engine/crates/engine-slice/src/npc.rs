@@ -376,6 +376,18 @@ impl NpcWorld {
         self.credits[npc] += delta;
     }
 
+    /// The recovery's crossing restore (Batch 4): the post-snapshot
+    /// crossings a durable capture claims — restored as they were at
+    /// the deactivation (the milestone award AND the scratch the
+    /// capture then took), so the staged install's scratch
+    /// re-validation sees exactly the captured deltas and the
+    /// awarded-threshold eligibility keeps the resumed executions
+    /// from re-awarding them.
+    pub(crate) fn apply_recovered_crossings(&mut self, npc: usize, count: u64) {
+        self.milestones[npc] += count;
+        self.pending_signals[npc] += count;
+    }
+
     /// Exact step-by-step replay of a dormant span (reviewer priority
     /// A/C, Batch 2 corrective finding D): recomputes the seeded jitter
     /// chain activity by activity AFTER `from_due` (the coherent
@@ -632,7 +644,18 @@ impl World for NpcWorld {
         // region's deactivation captures it into the ledger and its
         // reactivation commits it exactly once.
         self.steps[npc] += 1;
-        if self.steps[npc].is_multiple_of(MILESTONE_PERIOD) {
+        // The awarded-threshold eligibility (Batch 4): the crossing at
+        // the MILESTONE_PERIOD-th step awards only when its threshold
+        // index exceeds the awarded count — behavior-identical on the
+        // live paths (every 16th step awards exactly one milestone, so
+        // the guard never fires there and every frozen baseline is
+        // preserved) and recovery-correct: a restored world holds
+        // RECOVERED milestones without the matching steps, and the
+        // resumed executions re-approaching an already-awarded
+        // threshold skip the re-award — never a double.
+        if self.steps[npc].is_multiple_of(MILESTONE_PERIOD)
+            && self.steps[npc] / MILESTONE_PERIOD > self.milestones[npc]
+        {
             self.milestones[npc] += 1;
             self.pending_signals[npc] += 1;
         }

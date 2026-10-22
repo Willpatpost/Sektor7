@@ -889,3 +889,56 @@ fn suspend_ids_ignores_absent_targets() {
     assert_eq!(held_payloads, BTreeSet::from([4, 900]));
     assert!(conservation(&spine));
 }
+
+#[test]
+fn reconstruct_held_replaces_the_matching_chains() {
+    // §5.5.1 case 6 — the recovery's id-exact held reconstruction:
+    // the matching queued/blocked/held chains are REPLACED by the
+    // given events under their OWN identities (the stale pre-crash
+    // chains superseded by the journal's plan data); the
+    // conservation identity holds with the scheduled delta; the
+    // inserted obligations resume under those identities and
+    // execute.
+    let mut spine = collect_fixture();
+    // The plan data: two events under FRESH identities, replacing
+    // the fixture's class-0 chains.
+    let events = vec![
+        Event {
+            id: EventId { seq: 9001 },
+            class: EventClass::new(0),
+            schedule: Schedule::AtLogicalTime { due: Tick(7) },
+            payload: 700,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        },
+        Event {
+            id: EventId { seq: 9002 },
+            class: EventClass::new(0),
+            schedule: Schedule::AtLogicalTime { due: Tick(8) },
+            payload: 701,
+            field: Field::Near,
+            depends_on: Vec::new(),
+        },
+    ];
+    let inserted = spine.reconstruct_held(|view| view.class == EventClass::new(0), events);
+    assert_eq!(inserted, 2);
+    assert_eq!(spine.held_count(), 2, "the matching chains replaced");
+    assert_eq!(spine.pending_count(), 0, "the stale queued removed");
+    assert_eq!(spine.blocked_count(), 0, "the stale blocked removed");
+    assert!(
+        conservation(&spine),
+        "the conservation holds with the delta"
+    );
+    let held_seqs: BTreeSet<u64> = spine.held_view().iter().map(|view| view.id.seq).collect();
+    assert_eq!(held_seqs, BTreeSet::from([9001, 9002]));
+    // The inserted obligations resume under their own identities and
+    // execute.
+    assert_eq!(spine.resume_matching(|view| view.payload >= 700), 2);
+    spine.run_to_completion(60);
+    let executed_seqs: BTreeSet<u64> = spine.ledger().iter().map(|record| record.id.seq).collect();
+    assert!(
+        executed_seqs.contains(&9001) && executed_seqs.contains(&9002),
+        "the reconstructed obligations execute under their own identities"
+    );
+    assert!(conservation(&spine));
+}
