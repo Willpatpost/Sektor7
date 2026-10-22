@@ -18,13 +18,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+use engine_core::wire::MAX_COLLECTION_COUNT;
 use engine_core::{
-    EventClass, EventId, EventSpec, Fingerprinter, LodConfig, LodConfigError, LodController,
-    LodLevel, PresenceSample, ScheduleError, Spine, Tick,
+    Decoder, Encoder, EventClass, EventId, EventSpec, Fingerprinter, LodConfig, LodConfigError,
+    LodController, LodLevel, PresenceSample, SaveError, ScheduleError, Spine, Tick,
 };
 use engine_persist::ConsequenceId;
 
-use crate::npc::{NpcWorld, REGION_COUNT, routine_payload_parts};
+use crate::npc::{
+    NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID, routine_payload_parts,
+};
 
 /// In-memory capture-before-discard ledger (E-07/I1 in miniature):
 /// keyed captures with pending/applied status and an applied-key ledger
@@ -830,6 +833,273 @@ impl RegionDirector {
         }
         self.ledger.fingerprint(fp);
     }
+}
+
+impl RegionDirector {
+    /// The director's authoritative-state codec — the session
+    /// snapshot's director section (Batch 4, the second
+    /// authoritative-state codec): the full behavioral configuration
+    /// (re-validated on restore through [`RegionDirector::new`]), the
+    /// per-region states (levels, episode counters, dormancy
+    /// checkpoints with their held-obligation references and captured
+    /// reconstructible state), and the structured-keyed capture ledger
+    /// (in-flight and applied identities, canonical
+    /// `(region, episode, npc)` order). Observational diagnostics and
+    /// latency history are excluded — never fingerprinted, never
+    /// saved. Domain `engine-slice/region-director-save/1`.
+    pub fn save(&self, enc: &mut Encoder) {
+        // The behavioral configuration — transition identity.
+        enc.write_count(REGION_COUNT);
+        for (x, y) in &self.config.centers {
+            enc.write_u64(x.to_bits());
+            enc.write_u64(y.to_bits());
+        }
+        let lod = &self.config.lod;
+        for value in [
+            lod.full_enter,
+            lod.full_exit,
+            lod.simplified_enter,
+            lod.simplified_exit,
+            lod.event_enter,
+            lod.event_exit,
+            lod.lookahead,
+        ] {
+            enc.write_u64(value.to_bits());
+        }
+        enc.write_u64(self.config.adaptive_threshold);
+        // The per-region authoritative states.
+        enc.write_count(REGION_COUNT);
+        for state in &self.states {
+            enc.write_u8(lod_byte(state.level));
+            enc.write_u64(state.episode);
+            enc.write_u8(u8::from(state.checkpoint.is_some()));
+            if let Some(checkpoint) = &state.checkpoint {
+                enc.write_tick(checkpoint.dormant_since);
+                enc.write_u8(lod_byte(checkpoint.from_level));
+                enc.write_count(checkpoint.entries.len());
+                for entry in &checkpoint.entries {
+                    enc.write_u64(entry.npc as u64);
+                    enc.write_u64(entry.event.seq);
+                    enc.write_tick(entry.represented_through);
+                    enc.write_u64(entry.cursor);
+                    enc.write_u8(entry.position.0);
+                    enc.write_u8(entry.position.1);
+                    enc.write_u8(u8::from(entry.has_signal));
+                }
+            }
+            enc.write_u8(match state.last_method {
+                None => 0,
+                Some(ReconstructionMethod::Replay) => 1,
+                Some(ReconstructionMethod::Synthesis) => 2,
+            });
+            enc.write_u64(state.reconstructed_activities);
+            enc.write_u64(state.last_dormancy_span);
+        }
+        // The capture ledger: structured identities, canonical
+        // (region, episode, npc) order (the BTreeMap/BTreeSet
+        // iteration).
+        enc.write_count(self.ledger.pending.len());
+        for (id, delta) in &self.ledger.pending {
+            enc.write_u32(id.region);
+            enc.write_u64(id.episode);
+            enc.write_u32(id.npc);
+            enc.write_u64(*delta);
+        }
+        enc.write_count(self.ledger.applied.len());
+        for id in &self.ledger.applied {
+            enc.write_u32(id.region);
+            enc.write_u64(id.episode);
+            enc.write_u32(id.npc);
+        }
+    }
+
+    /// Restores a director from its section bytes (fail-closed: every
+    /// count bounded before allocation, every discriminant typed, the
+    /// identity and grid bounds enforced, the ledger's canonical
+    /// strict-ascending order required — duplicates and reorders are
+    /// corruption — and the configuration re-validated through
+    /// [`RegionDirector::new`]).
+    pub fn restore(dec: &mut Decoder) -> Result<Self, SaveError> {
+        const SECTION: &str = "region-director-save";
+        let center_count = dec.read_count(REGION_COUNT as u64, SECTION, "center-count")?;
+        if center_count != REGION_COUNT as u64 {
+            return Err(SaveError::Integrity("region-director-save/center-count"));
+        }
+        let mut centers = [(0.0, 0.0); REGION_COUNT];
+        for center in &mut centers {
+            let x = read_finite_f64(dec)?;
+            let y = read_finite_f64(dec)?;
+            *center = (x, y);
+        }
+        let lod = LodConfig {
+            full_enter: read_finite_f64(dec)?,
+            full_exit: read_finite_f64(dec)?,
+            simplified_enter: read_finite_f64(dec)?,
+            simplified_exit: read_finite_f64(dec)?,
+            event_enter: read_finite_f64(dec)?,
+            event_exit: read_finite_f64(dec)?,
+            lookahead: read_finite_f64(dec)?,
+        };
+        let adaptive_threshold = dec.read_u64()?;
+        let config = RegionConfig {
+            centers,
+            lod,
+            adaptive_threshold,
+        };
+        let state_count = dec.read_count(REGION_COUNT as u64, SECTION, "state-count")?;
+        if state_count != REGION_COUNT as u64 {
+            return Err(SaveError::Integrity("region-director-save/state-count"));
+        }
+        let mut states = Vec::with_capacity(REGION_COUNT);
+        for _ in 0..REGION_COUNT {
+            let level = read_lod_level(dec, SECTION)?;
+            let episode = dec.read_u64()?;
+            let checkpoint_present = read_flag(dec, SECTION)?;
+            let checkpoint = if checkpoint_present {
+                let dormant_since = dec.read_tick()?;
+                let from_level = read_lod_level(dec, SECTION)?;
+                let entry_count = dec.read_count(NPC_COUNT as u64, SECTION, "entry-count")?;
+                let mut entries = Vec::with_capacity(entry_count as usize);
+                for _ in 0..entry_count {
+                    let npc = dec.read_u64()?;
+                    if npc >= NPC_COUNT as u64 {
+                        return Err(SaveError::Integrity("region-director-save/npc-bound"));
+                    }
+                    let seq = dec.read_u64()?;
+                    let represented_through = dec.read_tick()?;
+                    let cursor = dec.read_u64()?;
+                    let x = dec.read_u8()?;
+                    let y = dec.read_u8()?;
+                    if (x, y) != POSITION_DISCARDED && (x >= REGION_GRID || y >= REGION_GRID) {
+                        return Err(SaveError::Integrity("region-director-save/position-bounds"));
+                    }
+                    let has_signal = read_flag(dec, SECTION)?;
+                    entries.push(RegionEntry {
+                        npc: npc as usize,
+                        event: EventId { seq },
+                        represented_through,
+                        cursor,
+                        position: (x, y),
+                        has_signal,
+                    });
+                }
+                Some(RegionCheckpoint {
+                    dormant_since,
+                    from_level,
+                    entries,
+                })
+            } else {
+                None
+            };
+            let last_method = match dec.read_u8()? {
+                0 => None,
+                1 => Some(ReconstructionMethod::Replay),
+                2 => Some(ReconstructionMethod::Synthesis),
+                discriminant => {
+                    return Err(SaveError::Enum {
+                        section: SECTION,
+                        discriminant: u64::from(discriminant),
+                    });
+                }
+            };
+            let reconstructed_activities = dec.read_u64()?;
+            let last_dormancy_span = dec.read_u64()?;
+            states.push(RegionState {
+                level,
+                episode,
+                checkpoint,
+                last_method,
+                reconstructed_activities,
+                last_dormancy_span,
+            });
+        }
+        // The capture ledger: pending is bounded by NPC_COUNT (each NPC
+        // holds at most one in-flight capture — its current episode's);
+        // applied grows across episodes, so it takes the general
+        // collection bound. Both require strict-ascending canonical
+        // order (the BTree iteration's form).
+        let pending_count = dec.read_count(NPC_COUNT as u64, SECTION, "pending-count")?;
+        let mut pending = BTreeMap::new();
+        let mut prev: Option<ConsequenceId> = None;
+        for _ in 0..pending_count {
+            let id = read_consequence_id(dec)?;
+            let delta = dec.read_u64()?;
+            if let Some(prior) = prev
+                && id <= prior
+            {
+                return Err(SaveError::Order { section: SECTION });
+            }
+            prev = Some(id);
+            pending.insert(id, delta);
+        }
+        let applied_count = dec.read_count(MAX_COLLECTION_COUNT, SECTION, "applied-count")?;
+        let mut applied = BTreeSet::new();
+        let mut prev: Option<ConsequenceId> = None;
+        for _ in 0..applied_count {
+            let id = read_consequence_id(dec)?;
+            if let Some(prior) = prev
+                && id <= prior
+            {
+                return Err(SaveError::Order { section: SECTION });
+            }
+            prev = Some(id);
+            applied.insert(id);
+        }
+        let mut director = RegionDirector::new(config)
+            .map_err(|_| SaveError::Integrity("region-director-save/lod-config"))?;
+        director.states = states;
+        director.ledger = CaptureLedger { pending, applied };
+        Ok(director)
+    }
+}
+
+/// Reads a LOD level discriminant (fail-closed on unknown values).
+fn read_lod_level(dec: &mut Decoder, section: &'static str) -> Result<LodLevel, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(LodLevel::Full),
+        1 => Ok(LodLevel::Simplified),
+        2 => Ok(LodLevel::EventDriven),
+        3 => Ok(LodLevel::Dormant),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+/// Reads a configuration float — finite only (the decision path
+/// computes distances and thresholds; a NaN or infinite value is
+/// corruption, never a configuration).
+fn read_finite_f64(dec: &mut Decoder) -> Result<f64, SaveError> {
+    let value = f64::from_bits(dec.read_u64()?);
+    if !value.is_finite() {
+        return Err(SaveError::Integrity("region-director-save/finite-f64"));
+    }
+    Ok(value)
+}
+
+/// Reads a boolean flag (fail-closed on unknown discriminants).
+fn read_flag(dec: &mut Decoder, section: &'static str) -> Result<bool, SaveError> {
+    match dec.read_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        discriminant => Err(SaveError::Enum {
+            section,
+            discriminant: u64::from(discriminant),
+        }),
+    }
+}
+
+/// Reads one structured ledger identity, bounds-checked against this
+/// workload's region and NPC counts.
+fn read_consequence_id(dec: &mut Decoder) -> Result<ConsequenceId, SaveError> {
+    let region = dec.read_u32()?;
+    let episode = dec.read_u64()?;
+    let npc = dec.read_u32()?;
+    if region as usize >= REGION_COUNT || npc as usize >= NPC_COUNT {
+        return Err(SaveError::Integrity("region-director-save/identity-bounds"));
+    }
+    Ok(ConsequenceId::new(region, episode, npc))
 }
 
 /// The authoritative Stage 4 combined state fingerprint (domain
