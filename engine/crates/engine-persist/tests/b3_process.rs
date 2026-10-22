@@ -15,7 +15,7 @@
 //! before any publication — nothing durable claims representation, so
 //! recovery re-derives and the re-drive confirms exactly once).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -293,7 +293,7 @@ fn child_w6() {
         tick: 100,
     })
     .with_identity(mover, prior, AwardState::new());
-    let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+    let outcome = reconcile(&anchor, &scan, &BTreeMap::new()).unwrap();
     let participant = outcome.recovered.get(&mover).unwrap();
     let movement = participant
         .movements
@@ -414,7 +414,7 @@ fn reconstruct_confirm_and_verify(dir: &TestDir, expect_applied_marker: bool) {
         head: None,
         tick: 100,
     });
-    let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+    let outcome = reconcile(&anchor, &scan, &BTreeMap::new()).unwrap();
     assert_recovery_invariants(&outcome);
     assert_eq!(
         outcome.recovered.get(&first).unwrap().counters,
@@ -461,7 +461,7 @@ fn reconstruct_confirm_and_verify(dir: &TestDir, expect_applied_marker: bool) {
     // recovered exactly once (never silently discarded on batch
     // identity alone); from the published anchor the chain tier
     // suppresses.
-    let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
+    let confirmed = pipeline.confirmed_evidence();
     let from_old = reconcile(&anchor, &scan, &confirmed).unwrap();
     assert_recovery_invariants(&from_old);
     assert!(from_old.report.applied.is_empty());
@@ -584,7 +584,7 @@ fn crash_after_movement_publication_before_confirmation_w6() {
     .with_identity(mover, published, AwardState::new())
     .with_materialized_movement(mover, [movement]);
     let scan = T1Journal::scan_file(dir.journal()).unwrap();
-    let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+    let outcome = reconcile(&anchor, &scan, &BTreeMap::new()).unwrap();
     assert_recovery_invariants(&outcome);
     assert!(
         outcome.report.applied.is_empty(),

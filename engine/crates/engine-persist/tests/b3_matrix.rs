@@ -34,18 +34,18 @@
 //! — the W4 property). Real child-process deaths at the stack level
 //! live in `tests/b3_process.rs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, ClassifiedSpan,
-    CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterDelta, CounterValues,
-    Coverage, DurabilityClass, EncounterJournal, FaultAction, FaultControl, FaultPoint,
-    FrontierEntry, KeyPhase, LocalFileMedium, OccurrenceSpan, RecoveryAnchor, RecoveryOutcome,
-    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, T1Journal, TransactionDurability,
-    TransactionInput, TransitionClassification, reconcile,
+    CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope, ConsequenceId,
+    CounterDelta, CounterValues, Coverage, DurabilityClass, EncounterJournal, FaultAction,
+    FaultControl, FaultPoint, FrontierEntry, KeyPhase, LocalFileMedium, OccurrenceSpan,
+    RecoveryAnchor, RecoveryOutcome, RevisionRecord, SignalLane, SourceBaseline, SourcePosition,
+    T1Journal, TransactionDurability, TransactionInput, TransitionClassification, reconcile,
 };
 
 // ---------------------------------------------------------------- setup
@@ -298,9 +298,9 @@ fn assert_recovery_invariants(outcome: &RecoveryOutcome) {
     }
 }
 
-/// The empty confirmed set (recovery's tier-1 input).
-fn no_chain() -> BTreeSet<ConsequenceId> {
-    BTreeSet::new()
+/// The empty confirmed evidence (recovery's tier-1 input).
+fn no_chain() -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
+    BTreeMap::new()
 }
 
 // ------------------------------------------- the ten §5.4.1 scenarios
@@ -383,7 +383,7 @@ fn marker_window_eliminated_w4() {
     // that anchor — never silently discarded on batch identity
     // alone); from the PUBLISHED anchor (the recovered state) the
     // chain tier suppresses.
-    let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
+    let confirmed = pipeline.confirmed_evidence();
     let from_old = reconcile(&anchor, &scan, &confirmed).unwrap();
     assert_recovery_invariants(&from_old);
     assert!(from_old.report.applied.is_empty());
@@ -929,7 +929,7 @@ fn multi_crash_reconciliation_then_confirmation() {
         panic!("expected confirmation");
     };
     assert_eq!(confirmation.keys, vec![a, b]);
-    let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
+    let confirmed = pipeline.confirmed_evidence();
     drop(pipeline);
     // Both tiers suppress after publication + confirmation.
     let scan = T1Journal::scan_file(dir.journal()).unwrap();
@@ -1196,8 +1196,8 @@ fn unknown_window_survives_restart_and_resolves_by_the_chain_walk() {
     );
     assert!(pipeline.is_confirmed(id));
     assert_eq!(pipeline.confirmed_coverage(id).unwrap().len(), 1);
-    let confirmed: BTreeSet<ConsequenceId> = pipeline.confirmed_keys().into_iter().collect();
-    assert!(confirmed.contains(&id));
+    let confirmed = pipeline.confirmed_evidence();
+    assert!(confirmed.contains_key(&id));
     drop(pipeline);
     // Recovery against the confirmed set — the canonical-state
     // coherence contract: the installed revision's consequences are

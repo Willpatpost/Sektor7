@@ -79,6 +79,7 @@ pub use pipeline::{
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{
-    AppliedEffect, RecoveredParticipant, RecoveryAnchor, RecoveryError, RecoveryOutcome,
-    RecoveryReport, TransitionClassification, reconcile, reconstruct_episode_frontier,
+    AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
+    RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
+    reconstruct_episode_frontier,
 };

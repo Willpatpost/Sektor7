@@ -182,6 +182,23 @@ impl RecoveryAnchor {
     }
 }
 
+/// One chain-confirmed identity's canonical evidence — the exact
+/// occurrence coverage and producing transaction the verified chain
+/// carries (the pipeline's per-key view via
+/// [`crate::pipeline::CommitPipeline::confirmed_evidence`], or any
+/// caller with equivalent verified provenance). A bare identity set
+/// is insufficient: the coherence and provenance checks must compare
+/// the canonical entry's coverage and transaction against the
+/// anchor's materialization and the journal's envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedEvidence {
+    /// The confirmed occurrence coverage (empty for a span-less
+    /// movement — the transaction is then the evidence).
+    pub coverage: Vec<ClassifiedSpan>,
+    /// The producing transaction the canonical batch installed.
+    pub transaction: TransactionId,
+}
+
 /// Contract B's classification of one transaction against the anchor
 /// (§5.5.2's three cases plus the benign older-anchor path).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +352,14 @@ pub enum RecoveryError {
     ConfirmedUnmaterialized {
         id: ConsequenceId,
     },
+    /// The journal envelope's provenance conflicts with the confirmed
+    /// canonical entry — a different producing transaction or
+    /// occurrence coverage for the same identity. Incompatible
+    /// journal evidence is never a recovery source: fail closed,
+    /// never a guess about which claim is authoritative.
+    ConfirmedProvenanceMismatch {
+        id: ConsequenceId,
+    },
 }
 
 impl fmt::Display for RecoveryError {
@@ -359,6 +384,12 @@ impl fmt::Display for RecoveryError {
                 "the chain-confirmed identity {id} is absent from the loaded \
                  state with no recoverable journal envelope — fail closed, \
                  never silently discarded"
+            ),
+            RecoveryError::ConfirmedProvenanceMismatch { id } => write!(
+                f,
+                "the journal evidence for the chain-confirmed identity {id} \
+                 conflicts with the canonical entry — incompatible \
+                 provenance fails closed"
             ),
         }
     }
@@ -387,13 +418,18 @@ impl From<SaveError> for RecoveryError {
 /// snapshot/revision publication — the W4 property).
 ///
 /// The journal is scanned in sequence order; `confirmed` is the
-/// chain-confirmed identity set (the pipeline's
-/// `confirmed_keys()` — verified canonical inclusion, never the
-/// journal's mere presence).
+/// chain-confirmed canonical evidence per identity (the pipeline's
+/// `confirmed_evidence()` — verified inclusion WITH the exact
+/// coverage and producing transaction, never the journal's mere
+/// presence; a bare identity set cannot validate provenance). A
+/// confirmed identity with no journal envelope is recognized through
+/// its canonical provenance plus exact snapshot materialization —
+/// the historical T1 journal is not required for an
+/// already-represented consequence.
 pub fn reconcile(
     anchor: &RecoveryAnchor,
     journal: &JournalScan,
-    confirmed: &BTreeSet<ConsequenceId>,
+    confirmed: &BTreeMap<ConsequenceId, ConfirmedEvidence>,
 ) -> Result<RecoveryOutcome, RecoveryError> {
     let canceled: BTreeSet<TransactionId> = journal
         .cancellations
@@ -436,15 +472,22 @@ pub fn reconcile(
             };
             // Tier 1 under the canonical-state coherence contract:
             // chain inclusion is a COMMITMENT statement, never a
-            // loaded-state statement. A confirmed identity whose
-            // effects the anchor materializes is fully represented
-            // (W7 — no action); a confirmed identity ABSENT from the
-            // loaded state falls through and is recovered from the
-            // canonical evidence below (the journal envelope under
-            // the chain's commitment) — never silently discarded on
-            // batch identity alone.
-            let confirmed_identity = confirmed.contains(&envelope.id);
-            if confirmed_identity {
+            // loaded-state statement — and the journal envelope must
+            // carry EXACTLY the canonical provenance (the same
+            // producing transaction and occurrence coverage; a
+            // mismatch is incompatible evidence, never a recovery
+            // source). A confirmed identity whose effects the anchor
+            // materializes is fully represented (W7 — no action); a
+            // confirmed identity ABSENT from the loaded state falls
+            // through and is recovered from the canonical evidence
+            // below — never silently discarded on batch identity
+            // alone.
+            let confirmed_evidence = confirmed.get(&envelope.id);
+            if let Some(evidence) = confirmed_evidence {
+                if evidence.transaction != transaction.id || evidence.coverage != envelope.sub_spans
+                {
+                    return Err(RecoveryError::ConfirmedProvenanceMismatch { id: envelope.id });
+                }
                 let materialized = match &application {
                     Some(application) => application.is_empty(),
                     None => participant.movements.contains(&transaction.id),
@@ -511,7 +554,7 @@ pub fn reconcile(
                     applied: Vec::new(),
                     delta,
                 };
-                if confirmed_identity {
+                if confirmed_evidence.is_some() {
                     report.confirmed_recovered.push(effect);
                 } else {
                     report.applied.push(effect);
@@ -543,7 +586,7 @@ pub fn reconcile(
                 applied: application.missing,
                 delta,
             };
-            if confirmed_identity {
+            if confirmed_evidence.is_some() {
                 report.confirmed_recovered.push(effect);
             } else {
                 report.applied.push(effect);
@@ -555,18 +598,41 @@ pub fn reconcile(
                 .push((transaction.id, transaction_classification));
         }
     }
-    // The canonical-state coherence contract's fail-closed edge:
-    // every chain-confirmed identity must be accountable —
-    // materialized in the loaded anchor or recovered from an
-    // actionable journal envelope (the loop above). A confirmed
-    // identity the working state never touched (no envelope in any
-    // actionable transaction — a canceled-only record, an uncommitted
-    // frame, or a journal that never carried it) is an unaccountable
-    // consequence: fail closed, never silently discarded, never
-    // fabricated.
-    for identity in confirmed {
-        if !working.contains_key(identity) {
+    // The canonical-state coherence contract's closing edge: every
+    // chain-confirmed identity must be accountable — recovered from
+    // an actionable journal envelope (the loop above) or MATERIALIZED
+    // in the verified anchor. A confirmed identity with no journal
+    // envelope is recognized through its canonical provenance plus
+    // exact snapshot materialization (the chain-verified coverage
+    // against the anchor's durable lane; for a movement, the anchor's
+    // identity-exact transaction evidence) — the historical T1
+    // journal is NOT required for an already-represented consequence.
+    // A confirmed identity that is neither materialized nor
+    // recoverable is an unaccountable consequence: fail closed,
+    // never silently discarded, never fabricated.
+    for (identity, evidence) in confirmed {
+        if working.contains_key(identity) {
+            continue;
+        }
+        let materialized = if evidence.coverage.is_empty() {
+            anchor
+                .materialized_movements(*identity)
+                .contains(&evidence.transaction)
+        } else {
+            let durable = anchor.durable(*identity);
+            evidence
+                .coverage
+                .iter()
+                .all(|classified| durable.missing_of(&classified.span).is_empty())
+        };
+        if !materialized {
             return Err(RecoveryError::ConfirmedUnmaterialized { id: *identity });
+        }
+        report.chain_suppressed.push(*identity);
+        if evidence.coverage.is_empty() {
+            report
+                .movement_materialized
+                .push((*identity, evidence.transaction));
         }
     }
     Ok(RecoveryOutcome {
@@ -884,7 +950,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(outcome.report.transitions.len(), 1);
         assert_eq!(
             outcome.report.transitions[0].1,
@@ -932,7 +998,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             outcome.report.transitions[0].1,
             TransitionClassification::PartialState
@@ -974,7 +1040,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             outcome.report.applied[0].delta.milestones, 2,
             "occurrences 5 and 7"
@@ -1009,7 +1075,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert!(outcome.report.applied.is_empty());
         assert_eq!(
             outcome.report.transitions[0].1,
@@ -1049,8 +1115,17 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let mut confirmed = BTreeSet::new();
-        confirmed.insert(identity);
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction: journal.committed[0].id,
+            },
+        );
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
         assert_eq!(outcome.report.chain_suppressed, vec![identity]);
         assert!(outcome.report.applied.is_empty());
@@ -1082,8 +1157,17 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let mut confirmed = BTreeSet::new();
-        confirmed.insert(identity);
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction: journal.committed[0].id,
+            },
+        );
         let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
         assert!(outcome.report.chain_suppressed.is_empty());
         assert!(outcome.report.applied.is_empty());
@@ -1116,12 +1200,125 @@ mod tests {
             tick: 100,
         });
         let journal = scan(vec![]);
-        let mut confirmed = BTreeSet::new();
-        confirmed.insert(identity);
+        // The canonical evidence's transaction derives from the
+        // historical attempt — the journal itself is absent, so no
+        // envelope pairs with it; the empty anchor cannot materialize
+        // the coverage either.
+        let transaction = transaction(
+            1,
+            vec![envelope(
+                identity,
+                (0, 2),
+                DurabilityClass::DurableEligible,
+                110,
+                CounterValues::default(),
+            )],
+        )
+        .id;
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction,
+            },
+        );
         let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
         assert!(matches!(
             error,
             RecoveryError::ConfirmedUnmaterialized { id } if id == identity
+        ));
+    }
+
+    #[test]
+    fn confirmed_and_materialized_without_journal_succeeds() {
+        // The re-review's finding: a verified anchor already
+        // containing a confirmed consequence whose historical T1
+        // journal is ABSENT — the canonical provenance plus exact
+        // snapshot materialization recognize it as represented; the
+        // journal is not required for an already-represented
+        // consequence. Success, no replay, no error.
+        let identity = id(1);
+        let mut award = AwardState::new();
+        award.award_durable(1);
+        award.award_durable(2);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        })
+        .with_identity(identity, unit(SignalLane::Captured, 2), award);
+        let journal = scan(vec![]);
+        let transaction = transaction(
+            1,
+            vec![envelope(
+                identity,
+                (0, 2),
+                DurabilityClass::DurableEligible,
+                110,
+                CounterValues::default(),
+            )],
+        )
+        .id;
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction,
+            },
+        );
+        let outcome = reconcile(&anchor, &journal, &confirmed).unwrap();
+        assert_eq!(outcome.report.chain_suppressed, vec![identity]);
+        assert!(outcome.report.applied.is_empty());
+        assert!(outcome.report.confirmed_recovered.is_empty());
+        assert!(outcome.recovered.is_empty());
+    }
+
+    #[test]
+    fn confirmed_with_conflicting_journal_provenance_fails_closed() {
+        // The re-review's finding: the journal envelope's provenance
+        // must match the confirmed canonical entry EXACTLY — a
+        // different producing transaction or occurrence coverage is
+        // incompatible evidence, never a recovery source: fail
+        // closed, never a guess about which claim is authoritative.
+        let identity = id(1);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let journal = scan(vec![transaction(
+            1,
+            vec![envelope(
+                identity,
+                (0, 2),
+                DurabilityClass::DurableEligible,
+                110,
+                CounterValues::default(),
+            )],
+        )]);
+        // The canonical entry claims the same identity under a
+        // DIFFERENT coverage — the journal's envelope conflicts.
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(4, 6).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction: journal.committed[0].id,
+            },
+        );
+        let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConfirmedProvenanceMismatch { id } if id == identity
         ));
     }
 
@@ -1169,7 +1366,7 @@ mod tests {
             tick: 100,
         })
         .with_identity(identity, prior, AwardState::new());
-        let first = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let first = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         let participant = first.recovered.get(&identity).unwrap();
         let published = movement.apply_to(&prior).unwrap();
         assert_eq!(participant.counters, published);
@@ -1185,7 +1382,7 @@ mod tests {
         })
         .with_identity(identity, published, AwardState::new())
         .with_materialized_movement(identity, [transaction]);
-        let second = reconcile(&published_anchor, &journal, &BTreeSet::new()).unwrap();
+        let second = reconcile(&published_anchor, &journal, &BTreeMap::new()).unwrap();
         assert!(second.report.applied.is_empty());
         assert_eq!(
             second.report.movement_materialized,
@@ -1203,7 +1400,7 @@ mod tests {
         );
         // Repeated recovery from the same published anchor derives
         // the identical result (the pure function).
-        let third = reconcile(&published_anchor, &journal, &BTreeSet::new()).unwrap();
+        let third = reconcile(&published_anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(second, third);
     }
 
@@ -1227,7 +1424,7 @@ mod tests {
             head: None,
             tick: 100,
         });
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(outcome.report.canceled.len(), 1);
         assert!(outcome.report.applied.is_empty());
     }
@@ -1266,7 +1463,7 @@ mod tests {
             head: None,
             tick: 100,
         });
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(outcome.report.applied.len(), 2);
         assert_eq!(
             outcome.report.applied[0].delta.milestones, 4,
@@ -1302,9 +1499,9 @@ mod tests {
             head: None,
             tick: 100,
         });
-        let first = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let first = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         for _ in 0..3 {
-            let again = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+            let again = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
             assert_eq!(again, first);
         }
         // The anchor itself is never mutated by the recovery.
@@ -1356,7 +1553,7 @@ mod tests {
             head: None,
             tick: 100,
         });
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             outcome.report.applied[0].delta.milestones, 2,
             "both classes"
@@ -1389,7 +1586,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         let participant = outcome.recovered.get(&identity).unwrap();
         assert!(participant.award.durable.covers(1) && participant.award.durable.covers(2));
         assert!(
@@ -1424,7 +1621,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let error = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap_err();
+        let error = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap_err();
         assert!(matches!(
             error,
             RecoveryError::Incompatible {
@@ -1458,7 +1655,7 @@ mod tests {
                 CounterValues::default(),
             )],
         )]);
-        let error = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap_err();
+        let error = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap_err();
         assert!(matches!(
             error,
             RecoveryError::Incompatible {
@@ -1507,7 +1704,7 @@ mod tests {
             tick: 200,
         })
         .with_identity(identity, transferred, award);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             outcome.report.transitions[0].1,
             TransitionClassification::PostState,
@@ -1531,7 +1728,7 @@ mod tests {
             tick: 200,
         })
         .with_identity(identity, transferred, award);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             outcome.report.transitions[0].1,
             TransitionClassification::PartialState
@@ -1595,7 +1792,7 @@ mod tests {
             tick: 200,
         })
         .with_identity(identity, coincidental, AwardState::new());
-        let first = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        let first = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
         assert_eq!(
             first.report.applied.len(),
             2,
@@ -1617,7 +1814,7 @@ mod tests {
         // function re-derives the identical outcome.
         for _ in 0..3 {
             assert_eq!(
-                reconcile(&anchor, &journal, &BTreeSet::new()).unwrap(),
+                reconcile(&anchor, &journal, &BTreeMap::new()).unwrap(),
                 first
             );
         }
@@ -1720,7 +1917,7 @@ mod tests {
             head: None,
             tick: 100,
         });
-        let outcome = reconcile(&anchor, &scan, &BTreeSet::new()).unwrap();
+        let outcome = reconcile(&anchor, &scan, &BTreeMap::new()).unwrap();
         assert_eq!(outcome.report.applied.len(), 1);
         let participant = outcome.recovered.get(&identity).unwrap();
         assert_eq!(participant.counters, unit(SignalLane::Captured, 2));

@@ -82,6 +82,7 @@ use crate::medium::{
     UnknownReason,
 };
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
+use crate::recovery::ConfirmedEvidence;
 
 /// The canonical multi-consequence batch's domain (versioned; the
 /// content object referenced via the revision's `content_refs`).
@@ -459,6 +460,15 @@ pub enum PipelineError {
         first_revision: Hash,
         second_revision: Hash,
     },
+    /// The local attempt's provenance conflicts with the canonical
+    /// entry claiming the identity — a different producing
+    /// transaction or occurrence coverage. Exact-provenance
+    /// equivalence is required before a foreign confirmation
+    /// satisfies the local attempt; a mismatch fails closed, never
+    /// silently absorbed.
+    ConfirmedProvenanceMismatch {
+        id: ConsequenceId,
+    },
 }
 
 impl fmt::Display for PipelineError {
@@ -516,6 +526,12 @@ impl fmt::Display for PipelineError {
                 "foreign-confirmed keys span distinct confirming revisions \
                  ({first_revision} and {second_revision}, first at {id}) — one \
                  honest receipt cannot report them"
+            ),
+            PipelineError::ConfirmedProvenanceMismatch { id } => write!(
+                f,
+                "the local attempt for consequence identity {id} conflicts with \
+                 the canonical entry claiming it — exact provenance is required, \
+                 a mismatch fails closed"
             ),
         }
     }
@@ -854,6 +870,25 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         self.confirmed.get(&id).map(|entry| entry.transaction)
     }
 
+    /// The chain-confirmed canonical evidence per identity — the
+    /// recovery interface's provenance input (the coverage and
+    /// producing transaction; a bare identity set cannot validate
+    /// journal envelopes against the canonical entries).
+    pub fn confirmed_evidence(&self) -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
+        self.confirmed
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    ConfirmedEvidence {
+                        coverage: entry.coverage.clone(),
+                        transaction: entry.transaction,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// The confirmed key set (the pipeline's session view).
     pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
         self.confirmed.keys().copied().collect()
@@ -888,8 +923,17 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 continue;
             }
             for envelope in &transaction.envelopes {
-                if self.confirmed.contains_key(&envelope.id) {
-                    continue;
+                if let Some(confirmed) = self.confirmed.get(&envelope.id) {
+                    // Exact provenance: the journal envelope must
+                    // match the canonical entry — the same producing
+                    // transaction and coverage; a mismatch is a
+                    // conflicting claim, never silently skipped.
+                    if confirmed.transaction == transaction.id
+                        && confirmed.coverage == envelope.sub_spans
+                    {
+                        continue;
+                    }
+                    return Err(PipelineError::ConfirmedProvenanceMismatch { id: envelope.id });
                 }
                 if keys.contains_key(&envelope.id) {
                     return Err(PipelineError::ConflictingReuse { id: envelope.id });
@@ -901,19 +945,28 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     }
 
     /// The attempted keys still unconfirmed after a re-walk (the
-    /// rebase set — identical identities and coverages).
+    /// rebase set — identical identities and coverages). A foreign
+    /// confirmation satisfies the local attempt only under EXACT
+    /// provenance equivalence: the canonical entry must carry the
+    /// attempt's own producing transaction and coverage — a
+    /// mismatched transaction or coverage is a conflicting claim,
+    /// never silently absorbed.
     fn remaining_keys(
         &self,
         attempted: BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>,
     ) -> Result<BTreeMap<ConsequenceId, (Vec<ClassifiedSpan>, TransactionId)>, PipelineError> {
         let mut remaining = BTreeMap::new();
-        for (id, evidence) in attempted {
-            if self.confirmed.contains_key(&id) {
-                // Confirmed by another writer's batch — never
-                // re-submitted; the per-key status promotes.
-                continue;
+        for (id, (coverage, transaction)) in attempted {
+            if let Some(confirmed) = self.confirmed.get(&id) {
+                if confirmed.transaction == transaction && confirmed.coverage == coverage {
+                    // Confirmed by another writer's batch carrying
+                    // exactly this attempt — never re-submitted; the
+                    // per-key status promotes.
+                    continue;
+                }
+                return Err(PipelineError::ConfirmedProvenanceMismatch { id });
             }
-            remaining.insert(id, evidence);
+            remaining.insert(id, (coverage, transaction));
         }
         Ok(remaining)
     }
@@ -2022,6 +2075,147 @@ mod tests {
         assert_eq!(receipt.revision, confirming);
         assert_eq!(receipt.epoch, confirming_epoch);
         assert_ne!(receipt.revision, unrelated.revision);
+    }
+
+    #[test]
+    fn foreign_confirmation_with_conflicting_coverage_fails_closed() {
+        // The re-review's finding: remaining_keys previously skipped
+        // an attempted identity merely because it existed in the
+        // confirmed map. Competing writers claiming the same identity
+        // under DIFFERENT coverage: the foreign confirmation does not
+        // satisfy the local attempt — exact-provenance equivalence
+        // fails closed, never silently absorbed.
+        let dir = TestDir::new("foreign-coverage-conflict");
+        ensure_founded(&dir);
+        let identity = ConsequenceId::new(1, 1, 1);
+        // Writer A journals the identity with coverage (0, 2].
+        let journal_a = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer_a =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_a).unwrap();
+        writer_a.stage(staged_envelope(1)).unwrap();
+        let boundary_a = boundary(1);
+        writer_a
+            .capture(
+                boundary_a.position,
+                boundary_a.classification,
+                boundary_a.dependencies,
+                boundary_a.frontier,
+                boundary_a.plan,
+            )
+            .unwrap();
+        // Writer B (a separate journal) claims the same identity under
+        // DIFFERENT coverage (2, 4] and confirms it.
+        let journal_b = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let mut writer_b =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_b).unwrap();
+        writer_b
+            .stage(
+                ConsequenceEnvelope::capture(
+                    identity,
+                    vec![ClassifiedSpan {
+                        span: OccurrenceSpan::new(2, 4).unwrap(),
+                        class: DurabilityClass::DurableEligible,
+                    }],
+                    SignalLane::Captured,
+                    CounterValues::default(),
+                    SourceBaseline {
+                        counters: CounterValues::default(),
+                        award: AwardCheckpoint {
+                            durable: Coverage::new(),
+                            provisional: Coverage::new(),
+                        },
+                    },
+                    SourcePosition {
+                        head: None,
+                        tick: 110,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let boundary_b = boundary(1);
+        writer_b
+            .capture(
+                boundary_b.position,
+                boundary_b.classification,
+                boundary_b.dependencies,
+                boundary_b.frontier,
+                boundary_b.plan,
+            )
+            .unwrap();
+        let CommitOutcome::Confirmed(_) = writer_b.commit_canonical().unwrap() else {
+            panic!("expected writer B's confirmation");
+        };
+        drop(writer_b);
+        // Writer A's commit: the stale-path re-walk finds the identity
+        // confirmed under a DIFFERENT coverage — the local attempt
+        // conflicts with the canonical entry: fail closed.
+        let error = writer_a.commit_canonical().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PipelineError::ConfirmedProvenanceMismatch { id } if *id == identity
+            ),
+            "the conflicting coverage fails closed: {error}"
+        );
+    }
+
+    #[test]
+    fn foreign_confirmation_with_conflicting_transaction_fails_closed() {
+        // The same identity and coverage, but a DIFFERENT producing
+        // transaction (a different plan): the canonical entry is not
+        // the local attempt — exact provenance fails closed, never
+        // silently absorbed.
+        let dir = TestDir::new("foreign-transaction-conflict");
+        ensure_founded(&dir);
+        let identity = ConsequenceId::new(1, 1, 1);
+        // Writer A journals the identity under plan-1.
+        let journal_a = T1Journal::open(dir.path().join("journal-a.t1")).unwrap();
+        let mut writer_a =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_a).unwrap();
+        writer_a.stage(staged_envelope(1)).unwrap();
+        let boundary_a = boundary(1);
+        writer_a
+            .capture(
+                boundary_a.position,
+                boundary_a.classification,
+                boundary_a.dependencies,
+                boundary_a.frontier,
+                boundary_a.plan,
+            )
+            .unwrap();
+        // Writer B claims the same identity + the same coverage under
+        // a different plan (a different producing transaction) and
+        // confirms it.
+        let journal_b = T1Journal::open(dir.path().join("journal-b.t1")).unwrap();
+        let mut writer_b =
+            CommitPipeline::open(LocalFileMedium::open(dir.store()).unwrap(), journal_b).unwrap();
+        writer_b.stage(staged_envelope(1)).unwrap();
+        let boundary_b = boundary(2);
+        writer_b
+            .capture(
+                boundary_b.position,
+                boundary_b.classification,
+                boundary_b.dependencies,
+                boundary_b.frontier,
+                boundary_b.plan,
+            )
+            .unwrap();
+        let CommitOutcome::Confirmed(_) = writer_b.commit_canonical().unwrap() else {
+            panic!("expected writer B's confirmation");
+        };
+        drop(writer_b);
+        // Writer A's commit: the producing transaction differs — the
+        // local attempt conflicts with the canonical entry: fail
+        // closed.
+        let error = writer_a.commit_canonical().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PipelineError::ConfirmedProvenanceMismatch { id } if *id == identity
+            ),
+            "the conflicting transaction fails closed: {error}"
+        );
     }
 
     #[test]
