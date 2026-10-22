@@ -21,8 +21,8 @@ use engine_core::{
 use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, CanonicalMedium, CaptureReceipt, ClassifiedSpan,
     CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
-    FrontierEntry, LocalFileMedium, OccurrenceSpan, PipelineError, RevisionRecord, SignalLane,
-    SourceBaseline, SourcePosition, T1Journal,
+    FrontierEntry, KeyPhase, LocalFileMedium, OccurrenceSpan, PipelineError, RevisionRecord,
+    SignalLane, SourceBaseline, SourcePosition, T1Journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -397,9 +397,13 @@ impl SessionCrossing {
     ///    live level; the caller's presence decision).
     /// 2. **Determine** — the [`DeactivationPlan`] from read-only
     ///    sources only.
-    /// 3. **Persist T1** — ONE journal transaction: the capture
-    ///    envelopes (one per captured NPC — the award form, uniform
-    ///    `Captured` units) plus the complete plan as the plan blob.
+    /// 3. **Persist T1** — ONE journal transaction when crossings
+    ///    were captured: the capture envelopes (one per captured NPC
+    ///    — the award form, uniform `Captured` units) plus the
+    ///    complete plan as the plan blob. An empty-scratch
+    ///    deactivation journals nothing (the return is `None`) — the
+    ///    LOD transition is purely re-derivable from the presence, so
+    ///    only the crossings need durable-before-discard protection.
     /// 4. **Verify** — the receipt exists only after the journal's
     ///    fsync (the B3 contract); an ambiguous write was reconciled
     ///    by reread+verify inside the capture.
@@ -408,15 +412,95 @@ impl SessionCrossing {
     ///
     /// A pre-durable failure (phases 3–4) is a retryable soft abort —
     /// the pre-transition state stands. A phase-5 defensive failure is
-    /// the fail-closed halt signal.
+    /// the fail-closed halt signal. The return is the journaled
+    /// transaction's receipt, or `None` when nothing was captured.
     pub fn deactivate(
         &mut self,
         spine: &mut Spine<NpcWorld>,
         director: &mut RegionDirector,
         region: usize,
         now: Tick,
-    ) -> Result<CaptureReceipt, TransitionError> {
+    ) -> Result<Option<CaptureReceipt>, TransitionError> {
         self.transition(spine, director, region, now, |_, _| {})
+    }
+
+    /// The durable reactivation: the captured consequences commit to
+    /// credits as the LIVE APPLICATION of the already-durable
+    /// captures — the B3 per-key lattice's `JournaledT1 →
+    /// AppliedToLivePending` promotion, reported through
+    /// `mark_applied` — followed by the legacy activation's install
+    /// (exactly-once application, labeled reconstruction, resume with
+    /// original identity, reclassify, promote).
+    ///
+    /// Nothing NEW is journaled: the captures are already durable
+    /// (the deactivation's transaction), and the captured→credits
+    /// transfer is re-derivable from the ledger plus this activation
+    /// — the B3 pipeline's per-key model is ONE identity, ONE
+    /// envelope, ONE lifecycle, so a second (movement) envelope under
+    /// the capture's identity would be a conflicting reuse; the
+    /// recovery instead re-drives the pending captures and a later
+    /// activation re-applies them. A coherent activation refusal is
+    /// the LEGACY retry semantics — nothing new was journaled, the
+    /// captures stay pending and actionable in the ledger, the region
+    /// safely dormant — never a durable-intent abandonment.
+    pub fn activate(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        region: usize,
+        to: LodLevel,
+        now: Tick,
+    ) -> Result<(), TransitionError> {
+        // Phase 1 — validate: dormant with a checkpoint, and the
+        // ledger statuses coherent (the legacy phase-0 standard — an
+        // unknown key the checkpoint claims is incoherent recovery
+        // state: the halt, never a silent promotion).
+        if director.levels()[region] != LodLevel::Dormant {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "activate-of-live",
+            });
+        }
+        let state = &director.states()[region];
+        let Some(checkpoint) = &state.checkpoint else {
+            return Err(TransitionError::InstallIncompatible {
+                region,
+                detail: "checkpoint-absent",
+            });
+        };
+        let episode = state.episode;
+        let mut pending: Vec<ConsequenceId> = Vec::new();
+        for entry in checkpoint.entries.iter().filter(|entry| entry.has_signal) {
+            let id = ConsequenceId::new(region as u32, episode, entry.npc as u32);
+            match director.ledger().status(id) {
+                CaptureStatus::Pending(_) => pending.push(id),
+                CaptureStatus::Applied => {}
+                CaptureStatus::Unknown => {
+                    return Err(TransitionError::InstallIncompatible {
+                        region,
+                        detail: "ledger-key-unknown",
+                    });
+                }
+            }
+        }
+        // Phase 5 — install: the legacy activation (validation,
+        // exactly-once application, reconstruction, resume, promote).
+        // A refusal is the legacy coherent retry — the captures stay
+        // pending, the region dormant.
+        if director.transition_region(spine, region, to, now) && !pending.is_empty() {
+            // Report the live application (the per-key promotion —
+            // the pending-vs-confirmed distinction, never conflated
+            // with durability; journaled keys only, after the
+            // application actually happened).
+            self.pipeline.mark_applied(&pending)?;
+        }
+        Ok(())
+    }
+
+    /// The per-key pipeline phase for one identity (the durable
+    /// status surface — the gating demonstration's input).
+    pub fn key_phase(&self, id: ConsequenceId) -> Option<KeyPhase> {
+        self.pipeline.status(id).map(|status| status.phase)
     }
 
     /// Test-only (the failure matrix's seam): the six phases with the
@@ -431,7 +515,7 @@ impl SessionCrossing {
         region: usize,
         now: Tick,
         gap: impl FnOnce(&mut Spine<NpcWorld>, &mut RegionDirector),
-    ) -> Result<CaptureReceipt, TransitionError> {
+    ) -> Result<Option<CaptureReceipt>, TransitionError> {
         self.transition(spine, director, region, now, gap)
     }
 
@@ -444,7 +528,7 @@ impl SessionCrossing {
         region: usize,
         now: Tick,
         gap: impl FnOnce(&mut Spine<NpcWorld>, &mut RegionDirector),
-    ) -> Result<CaptureReceipt, TransitionError> {
+    ) -> Result<Option<CaptureReceipt>, TransitionError> {
         // Phase 1 — validate.
         let from = director.levels()[region];
         if from == LodLevel::Dormant {
@@ -458,34 +542,44 @@ impl SessionCrossing {
         let episode = director.states()[region].episode + 1;
         let collected = spine.collect_matching(|view| view.class == class);
         let plan = DeactivationPlan::prepare(region, from, episode, now, spine.world(), &collected);
-        let plan_bytes = plan.canonical_bytes().map_err(PipelineError::Format)?;
-        // Phase 3 — persist T1: ONE transaction — the capture
-        // envelopes plus the plan blob. The envelopes stage in
-        // ConsequenceId-sorted order (one transaction covers one
-        // region and episode, so npc order IS the identity order —
-        // the journal's canonical discipline: capture records land in
-        // input order and the commit's identity list is written
-        // sorted, validated equal at every scan).
-        let mut captures = plan.captures.clone();
-        captures.sort_by_key(|(npc, _)| *npc);
-        for (npc, delta) in &captures {
-            let envelope = capture_envelope(region, episode, *npc, *delta, now)
-                .map_err(PipelineError::Format)?;
-            self.pipeline.stage(envelope)?;
-        }
-        let receipt = self.pipeline.capture(
-            SourcePosition {
-                head: None,
-                tick: now.as_u64(),
-            },
-            DurabilityClass::DurableEligible,
-            Vec::new(),
-            vec![FrontierEntry {
-                region: region as u32,
-                episode,
-            }],
-            plan_bytes,
-        )?;
+        // Phases 3–4 — persist + verify: ONE journal transaction —
+        // the capture envelopes plus the plan blob — SKIPPED when
+        // nothing was captured: an empty-scratch deactivation has no
+        // non-re-derivable content to protect (the LOD transition is
+        // a pure function of the presence, so a post-crash boundary
+        // re-derives it against the snapshot); only the crossings
+        // are real-execution history the journal must make durable.
+        // The envelopes stage in ConsequenceId-sorted order (one
+        // transaction covers one region and episode, so npc order IS
+        // the identity order — the journal's canonical discipline:
+        // capture records land in input order and the commit's
+        // identity list is written sorted, validated equal at every
+        // scan).
+        let receipt = if plan.captures.is_empty() {
+            None
+        } else {
+            let plan_bytes = plan.canonical_bytes().map_err(PipelineError::Format)?;
+            let mut captures = plan.captures.clone();
+            captures.sort_by_key(|(npc, _)| *npc);
+            for (npc, delta) in &captures {
+                let envelope = capture_envelope(region, episode, *npc, *delta, now)
+                    .map_err(PipelineError::Format)?;
+                self.pipeline.stage(envelope)?;
+            }
+            Some(self.pipeline.capture(
+                SourcePosition {
+                    head: None,
+                    tick: now.as_u64(),
+                },
+                DurabilityClass::DurableEligible,
+                Vec::new(),
+                vec![FrontierEntry {
+                    region: region as u32,
+                    episode,
+                }],
+                plan_bytes,
+            )?)
+        };
         // Phase 4 — verify: the receipt is post-fsync by contract.
         gap(spine, director);
         // Phase 5 — install (the staged bundle).

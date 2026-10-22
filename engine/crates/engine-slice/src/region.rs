@@ -534,22 +534,27 @@ impl RegionDirector {
 
     /// Transitions one region to `to` — the LEGACY semantics (the same
     /// routing `apply` performs per region; the caller's presence
-    /// decision). The six-phase crossing routes its Dormant-target
-    /// cases through `SessionCrossing::deactivate` instead; this
-    /// method serves the remaining transitions (reactivation and
-    /// active↔active reclassification) and the pipeline-free path.
+    /// decision), returning whether the region's level actually
+    /// changed (a coherent activation failure leaves the region
+    /// dormant — false; a no-op target is false). The six-phase
+    /// crossing routes its Dormant-target cases through
+    /// `SessionCrossing::deactivate` and its reactivations through
+    /// `SessionCrossing::activate`; this method serves the remaining
+    /// transitions (active↔active reclassification) and the
+    /// pipeline-free path.
     pub fn transition_region(
         &mut self,
         spine: &mut Spine<NpcWorld>,
         region: usize,
         to: LodLevel,
         now: Tick,
-    ) {
+    ) -> bool {
         let from = self.states[region].level;
         if to == from {
-            return;
+            return false;
         }
         self.transition(spine, region, from, to, now);
+        self.states[region].level != from
     }
 
     /// The six-phase crossing's phase-5 install step (Batch 4):

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use engine_core::{EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, T1Journal,
+    ConsequenceId, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase, T1Journal,
 };
 use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
@@ -297,13 +297,14 @@ fn scenario_pair(ticks: u64, presence: &PresenceSample) -> (Spine<NpcWorld>, Reg
     (spine, director)
 }
 
-/// The durable far boundary: every region whose target under the
-/// presence differs routes — Dormant targets through the six-phase
-/// crossing (journal + install), the remaining transitions (the far
-/// side's reactivations and reclassifications) through the legacy
-/// semantics — the same transition set `RegionDirector::apply` would
-/// make.
-fn durable_far_boundary(
+/// The durable boundary: every region whose target under the presence
+/// differs routes — Dormant targets through the six-phase
+/// deactivation (journal + install), reactivations (Dormant → live)
+/// through the durable activation (the legacy install + the live
+/// application report), and the remaining active↔active
+/// reclassifications through the legacy semantics — the same
+/// transition set `RegionDirector::apply` would make.
+fn durable_boundary(
     crossing: &mut SessionCrossing,
     spine: &mut Spine<NpcWorld>,
     director: &mut RegionDirector,
@@ -317,7 +318,13 @@ fn durable_far_boundary(
             continue;
         }
         if next == LodLevel::Dormant {
-            crossing.deactivate(spine, director, region, now).unwrap();
+            let _journaled = crossing
+                .deactivate(spine, director, region, now)
+                .expect("the deactivation commits");
+        } else if current == LodLevel::Dormant {
+            crossing
+                .activate(spine, director, region, next, now)
+                .expect("the activation installs");
         } else {
             director.transition_region(spine, region, next, now);
         }
@@ -343,7 +350,7 @@ fn durable_deactivation_matches_the_legacy_state() {
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing = SessionCrossing::open(&dir.store(), journal, "equivalence-campaign")
         .expect("the crossing opens");
-    durable_far_boundary(&mut crossing, &mut spine, &mut director, &far);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
 
     assert_eq!(
         stage4_state_fingerprint(&spine, &director),
@@ -442,7 +449,7 @@ fn pre_durable_failure_aborts_intact_and_retries_identically() {
     drop(crossing);
     let clean = T1Journal::open(dir.journal()).unwrap();
     let mut retry = SessionCrossing::open(&dir.store(), clean, "abort-campaign").unwrap();
-    durable_far_boundary(&mut retry, &mut spine, &mut director, &far);
+    durable_boundary(&mut retry, &mut spine, &mut director, &far);
     let (mut legacy_spine, mut legacy_director) = scenario_pair(150, &near_region_4());
     legacy_director.apply(&mut legacy_spine, &[far]);
     assert_eq!(
@@ -496,4 +503,73 @@ fn install_defensive_failure_is_the_halt_signal() {
     // simply not continuing.
     let scan = T1Journal::scan_file(dir.journal()).unwrap();
     assert_eq!(scan.committed.len(), 1, "the intent is durable");
+}
+
+#[test]
+fn durable_reactivation_cycle_matches_the_legacy_state() {
+    // The full durable cycle: accrual → the durable far boundary (the
+    // award captures journaled + installed) → one tick → the durable
+    // near boundary (the legacy activation installed + the live
+    // application reported) — the combined state identical to the
+    // legacy director.apply-driven cycle at every boundary, the
+    // credits applied exactly once on both sides, and the per-key
+    // phase progressing JournaledT1 → AppliedToLivePending (the
+    // activation adds NO journal transactions — the captured→credits
+    // transfer is the live application of the already-durable
+    // captures, re-derivable from the ledger plus the activation).
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut legacy_spine, mut legacy_director) = scenario_pair(150, &near);
+    legacy_director.apply(&mut legacy_spine, &[far]);
+    legacy_spine.run_tick();
+    legacy_director.apply(&mut legacy_spine, &[near]);
+
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("cycle");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "cycle-campaign").unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let sample = ConsequenceId::new(4, 1, 4);
+    assert_eq!(
+        crossing.key_phase(sample),
+        Some(KeyPhase::JournaledT1),
+        "the capture is durable, pending its live application"
+    );
+    spine.run_tick();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+
+    assert_eq!(
+        stage4_state_fingerprint(&spine, &director),
+        stage4_state_fingerprint(&legacy_spine, &legacy_director),
+        "the full durable cycle produces exactly the legacy state"
+    );
+    let credits: u64 = spine.world().credits().iter().sum();
+    assert!(
+        credits > 0,
+        "the reactivations applied the captured consequences"
+    );
+    assert_eq!(
+        credits,
+        legacy_spine.world().credits().iter().sum::<u64>(),
+        "the credits match the legacy cycle exactly"
+    );
+    // The per-key phase progressed through the live application, and
+    // the journal holds ONLY the award captures (one transaction —
+    // the capture-bearing deactivation of region 4; the empty-scratch
+    // deactivations and the activation journal nothing).
+    assert_eq!(
+        crossing.key_phase(sample),
+        Some(KeyPhase::AppliedToLivePending),
+        "the reactivation reported the live application"
+    );
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(
+        scan.committed.len(),
+        1,
+        "only the capture-bearing deactivation journaled"
+    );
+    assert!(
+        !scan.committed[0].envelopes.is_empty(),
+        "the award captures are journaled"
+    );
 }
