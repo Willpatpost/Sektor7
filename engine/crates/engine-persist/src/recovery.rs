@@ -40,15 +40,24 @@
 //! `BenignAbsence` (consequence-recovered, transition not
 //! reconstructed — the encounter-boundary path; B4 owns the actual
 //! reconstruction). The anchor at-or-after the source ⇒ the
-//! comparable-state check: the anchor's counters must be consistent
-//! with what its coverage materializes (at least the envelope's
-//! baseline plus the covered occurrences' units — later legitimate
-//! effects are expected and harmless), and counters claiming the
-//! full post-state while the coverage materializes only part of it
-//! are a contradiction — both directions **fail closed**
-//! ([`RecoveryError::Incompatible`], evidence preserved). A fully
-//! materialized transition (the coverage covers every occurrence)
-//! applies nothing — no duplicate.
+//! comparable-state check. **Individual signal lanes are never
+//! compared** — valid captures transfer pending → captured and
+//! activations transfer captured → credits, so a later, causally
+//! valid anchor may hold less of an individual lane than the
+//! envelope's own units added; the witnesses are the milestone
+//! counter (awards only add, per identity) and the occurrence
+//! coverage (either lane): a coherent anchor holds exactly the
+//! baseline milestones plus the newly-materialized occurrences'
+//! units — fewer milestones than the coverage materializes, or more
+//! milestones than any lane explains, are contradictions: **fail
+//! closed** ([`RecoveryError::Incompatible`], evidence preserved). A
+//! fully materialized transition (the durable coverage covers every
+//! occurrence) applies nothing — no duplicate. **Span-less movements
+//! apply whole-or-not by identity only** — the chain (tier 1) is
+//! their only durable suppression authority; counter equality is
+//! never evidence of an applied identity (unrelated operations can
+//! produce identical values, and two journaled movements with
+//! identical deltas each apply exactly once).
 //!
 //! **Purity and idempotence (the W4 property):** `reconcile` is a
 //! pure function of its inputs — no durable intermediate ever claims
@@ -76,10 +85,10 @@ use std::fmt;
 
 use engine_core::SaveError;
 
-use crate::consequence::{AwardState, ConsequenceId, Coverage};
+use crate::consequence::{AwardState, ConsequenceId, Coverage, OccurrenceSpan};
 use crate::envelope::{
     ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, PartialApplication,
-    SignalLane, SourcePosition,
+    SourcePosition,
 };
 use crate::journal::{JournalScan, TransactionId};
 
@@ -132,6 +141,13 @@ impl RecoveryAnchor {
         self.awards
             .get(&id)
             .map(|award| award.durable.clone())
+            .unwrap_or_default()
+    }
+
+    fn provisional(&self, id: ConsequenceId) -> Coverage {
+        self.awards
+            .get(&id)
+            .map(|award| award.provisional.clone())
             .unwrap_or_default()
     }
 }
@@ -316,7 +332,6 @@ pub fn reconcile(
         .collect();
     let mut working: BTreeMap<ConsequenceId, RecoveredParticipant> = BTreeMap::new();
     let mut report = RecoveryReport::default();
-    let mut spanless_applied: BTreeSet<ConsequenceId> = BTreeSet::new();
 
     for transaction in &journal.committed {
         if canceled.contains(&transaction.id) {
@@ -356,18 +371,14 @@ pub fn reconcile(
                 });
             // A span-less lane movement (an activation commit):
             // identity-governed whole-or-not — the coverage cannot
-            // suppress a movement. The exact post-state recognition
-            // (Contract B, temporally applicable) suppresses the
-            // duplicate; the in-run dedup prevents a second movement
-            // of the same identity within one recovery run.
+            // suppress a movement, and counter equality is never
+            // suppression evidence (unrelated operations can produce
+            // identical values). Each journal transaction is
+            // processed exactly once per run (the journal's own
+            // idempotent recognition prevents duplicate transaction
+            // identities); the chain (tier 1) is the only durable
+            // suppression authority.
             if envelope.sub_spans.is_empty() {
-                if classification == TransitionClassification::PostState {
-                    report.materialized.push((envelope.id, 0));
-                    continue;
-                }
-                if !spanless_applied.insert(envelope.id) {
-                    continue;
-                }
                 let delta = envelope.delta;
                 participant.counters = delta.apply_to(&participant.counters)?;
                 if !participant.counters.conservation_holds() {
@@ -433,6 +444,15 @@ fn classify_transition(
         return Ok(TransitionClassification::BenignAbsence);
     }
     let total = envelope.occurrences()?;
+    if total == 0 {
+        // A span-less lane movement (an activation): identity-governed
+        // whole-or-not — the chain (tier 1) is the only durable
+        // suppression authority. Counter equality is never evidence
+        // of an applied identity: unrelated operations can produce
+        // identical values, and two journaled movements with
+        // identical deltas must each apply exactly once.
+        return Ok(TransitionClassification::PreState);
+    }
     let anchor_durable = anchor.durable(envelope.id);
     let application = envelope.missing_against(&anchor_durable)?;
     let missing: u64 = application
@@ -441,61 +461,68 @@ fn classify_transition(
         .map(|classified| classified.span.hi - classified.span.lo)
         .sum();
     let covered = total - missing;
-    if covered == total {
-        return Ok(TransitionClassification::PostState);
-    }
-    // The comparable-state check: the anchor's counters must be
-    // consistent with what its coverage materializes. The expected
-    // floor is the envelope's baseline plus the covered occurrences'
-    // units (later legitimate effects may exceed it — harmless);
-    // counters behind the floor, or claiming the full post-state
-    // over partial coverage, are contradictions — fail closed.
-    let anchor_counters = anchor.counters(envelope.id);
-    let baseline = envelope.baseline.counters;
-    if total == 0 {
-        // A span-less lane movement (an activation): identity-governed
-        // whole-or-not — the exact post-state recognition suppresses
-        // the duplicate; anything else applies (the counters never
-        // suppress a missing effect).
-        let post = envelope.delta.apply_to(&baseline)?;
-        if anchor_counters == post {
-            return Ok(TransitionClassification::PostState);
-        }
-        return Ok(TransitionClassification::PreState);
-    }
-    let unit = CounterDelta::uniform(
-        envelope.signal_lane()?.unwrap_or(SignalLane::Captured),
-        covered,
-    )?;
-    let expected = unit.apply_to(&baseline)?;
-    if !counters_at_least(&anchor_counters, &expected) {
+    // The comparable-state check. Individual signal lanes are NOT
+    // monotone: valid captures transfer pending → captured and
+    // activations transfer captured → credits, so a later, causally
+    // valid anchor may hold LESS of an individual lane than the
+    // envelope's own units added — no individual lane is ever
+    // compared. The witnesses are the milestone counter (awards only
+    // add, per identity) and the occurrence coverage (per identity,
+    // either lane): a coherent at-or-after anchor holds exactly the
+    // envelope's baseline milestones plus the newly-materialized
+    // occurrences' units — fewer milestones than the coverage
+    // materializes, or more milestones than any lane explains, are
+    // contradictions: fail closed.
+    let anchor_milestones = anchor.counters(envelope.id).milestones;
+    let baseline_milestones = envelope.baseline.counters.milestones;
+    let newly = newly_materialized(anchor, envelope);
+    let explained = baseline_milestones.saturating_add(newly);
+    if anchor_milestones < explained {
         return Ok(TransitionClassification::Incompatible {
-            detail: "counters-behind-materialized-coverage",
+            detail: "milestones-behind-materialized-coverage",
         });
     }
-    let full_unit = CounterDelta::uniform(
-        envelope.signal_lane()?.unwrap_or(SignalLane::Captured),
-        total,
-    )?;
-    let full_post = full_unit.apply_to(&baseline)?;
-    if covered < total && anchor_counters == full_post {
+    if anchor_milestones > explained {
         return Ok(TransitionClassification::Incompatible {
-            detail: "counters-claim-unmaterialized-coverage",
+            detail: "milestones-claim-unmaterialized-coverage",
         });
     }
     Ok(if covered == 0 {
         TransitionClassification::PreState
-    } else {
+    } else if covered < total {
         TransitionClassification::PartialState
+    } else {
+        TransitionClassification::PostState
     })
 }
 
-/// Componentwise ≥ (later legitimate effects only add units).
-fn counters_at_least(value: &CounterValues, floor: &CounterValues) -> bool {
-    value.milestones >= floor.milestones
-        && value.pending_signals >= floor.pending_signals
-        && value.captured >= floor.captured
-        && value.credits >= floor.credits
+/// The occurrences of `span` a single lane covers.
+fn lane_covered_count(lane: &Coverage, span: &OccurrenceSpan) -> u64 {
+    let total = span.hi - span.lo;
+    let missing: u64 = lane
+        .missing_of(span)
+        .iter()
+        .map(|missing| missing.hi - missing.lo)
+        .sum();
+    total - missing
+}
+
+/// The occurrences of the envelope's span materialized since
+/// preparation: covered by the anchor's award lanes (either lane —
+/// the mid-encounter provisional state is legitimate) minus the
+/// baseline's pre-existing coverage (saturating — a rolled-back
+/// provisional restores coherently below the baseline's union).
+fn newly_materialized(anchor: &RecoveryAnchor, envelope: &ConsequenceEnvelope) -> u64 {
+    let mut newly: u64 = 0;
+    for classified in &envelope.sub_spans {
+        let span = classified.span;
+        let anchor_covered = lane_covered_count(&anchor.durable(envelope.id), &span)
+            + lane_covered_count(&anchor.provisional(envelope.id), &span);
+        let baseline_covered = lane_covered_count(&envelope.baseline.award.durable, &span)
+            + lane_covered_count(&envelope.baseline.award.provisional, &span);
+        newly += anchor_covered.saturating_sub(baseline_covered);
+    }
+    newly
 }
 
 /// The total application delta: the durable and provisional parts
@@ -1103,7 +1130,7 @@ mod tests {
         assert!(matches!(
             error,
             RecoveryError::Incompatible {
-                detail: "counters-behind-materialized-coverage",
+                detail: "milestones-behind-materialized-coverage",
                 ..
             }
         ));
@@ -1137,106 +1164,165 @@ mod tests {
         assert!(matches!(
             error,
             RecoveryError::Incompatible {
-                detail: "counters-claim-unmaterialized-coverage",
+                detail: "milestones-claim-unmaterialized-coverage",
                 ..
             }
         ));
     }
 
     #[test]
-    fn later_legitimate_effects_do_not_fail_closed() {
-        // Counters advanced past the expected floor by other
-        // represented consequences are expected and harmless — the
-        // missing occurrences still apply exactly.
+    fn nonmonotonic_transfer_anchor_is_not_incompatible() {
+        // The reviewer's regression: valid captures and activations
+        // transfer values BETWEEN signal lanes, so a later, causally
+        // valid anchor may hold LESS of an individual lane than the
+        // envelope's own units added — the comparable-state check
+        // must never consult an individual lane. The witnesses are
+        // the milestone counter (awards only add, per identity) and
+        // the occurrence coverage; conservation holds through every
+        // transfer.
         let identity = id(1);
-        let mut award = AwardState::new();
-        award.apply_durable_span(OccurrenceSpan::new(3, 4).unwrap());
-        let counters = CounterDelta::uniform(SignalLane::Captured, 9)
-            .unwrap()
-            .apply_to(&CounterValues::default())
-            .unwrap();
-        let anchor = RecoveryAnchor::new(SourcePosition {
-            head: None,
-            tick: 200,
-        })
-        .with_identity(identity, counters, award);
         let journal = scan(vec![transaction(
             1,
             vec![envelope(
                 identity,
-                (3, 7),
+                (0, 4),
                 DurabilityClass::DurableEligible,
                 110,
                 CounterValues::default(),
             )],
         )]);
-        let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
-        assert_eq!(
-            outcome.report.applied[0].delta.milestones, 3,
-            "occurrences 5-7"
-        );
-        let participant = outcome.recovered.get(&identity).unwrap();
-        assert_eq!(
-            participant.counters.milestones, 12,
-            "9 + the 3 recovered units"
-        );
-    }
-
-    #[test]
-    fn span_less_movement_recognizes_the_exact_post_state() {
-        // A span-less activation movement: identity-governed
-        // whole-or-not; the exact post-state recognition (Contract B,
-        // temporally applicable) suppresses the duplicate.
-        let identity = id(1);
-        let movement = CounterDelta {
-            milestones: 0,
-            pending_signals: 0,
-            captured: -5,
-            credits: 5,
+        // The full variant: all four occurrences materialized, then a
+        // legitimate activation transferred 3 captured -> credits —
+        // captured holds 1 (LESS than the envelope's 4 units), the
+        // milestones and the signal mass exact.
+        let mut award = AwardState::new();
+        award.apply_durable_span(OccurrenceSpan::new(0, 4).unwrap());
+        let transferred = CounterValues {
+            milestones: 4,
+            captured: 1,
+            credits: 3,
+            ..CounterValues::default()
         };
-        let baseline = unit(SignalLane::Captured, 5);
-        let post = movement.apply_to(&baseline).unwrap();
-        let envelope = ConsequenceEnvelope::new(identity)
-            .with_delta(movement)
-            .with_expected_prior(baseline)
-            .with_baseline(SourceBaseline {
-                counters: baseline,
-                award: AwardCheckpoint {
-                    durable: Coverage::new(),
-                    provisional: Coverage::new(),
-                },
-            })
-            .with_position(SourcePosition {
-                head: None,
-                tick: 110,
-            });
-        let journal = scan(vec![transaction(1, vec![envelope])]);
-        // The anchor at the exact post-state: no duplicate.
+        assert!(transferred.conservation_holds());
         let anchor = RecoveryAnchor::new(SourcePosition {
             head: None,
             tick: 200,
         })
-        .with_identity(identity, post, AwardState::new());
+        .with_identity(identity, transferred, award);
         let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
-        assert!(outcome.report.applied.is_empty());
         assert_eq!(
             outcome.report.transitions[0].1,
-            TransitionClassification::PostState
+            TransitionClassification::PostState,
+            "a causally valid transferred anchor is never incompatible"
         );
-        // The anchor at the pre-state (the anchor predating the
-        // source is the benign path): the movement applies whole.
+        assert!(outcome.report.applied.is_empty());
+
+        // The partial variant: two occurrences materialized, then the
+        // activation moved BOTH captured units to credits — the
+        // missing occurrences 3-4 still apply exactly.
+        let mut award = AwardState::new();
+        award.apply_durable_span(OccurrenceSpan::new(0, 2).unwrap());
+        let transferred = CounterValues {
+            milestones: 2,
+            credits: 2,
+            ..CounterValues::default()
+        };
+        assert!(transferred.conservation_holds());
         let anchor = RecoveryAnchor::new(SourcePosition {
             head: None,
-            tick: 100,
+            tick: 200,
         })
-        .with_identity(identity, baseline, AwardState::new());
+        .with_identity(identity, transferred, award);
         let outcome = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
-        assert_eq!(outcome.report.applied.len(), 1);
-        let participant = outcome.recovered.get(&identity).unwrap();
         assert_eq!(
-            participant.counters, post,
-            "the whole movement, exactly once"
+            outcome.report.transitions[0].1,
+            TransitionClassification::PartialState
         );
+        assert_eq!(
+            outcome.report.applied[0].delta.milestones, 2,
+            "occurrences 3-4"
+        );
+        let participant = outcome.recovered.get(&identity).unwrap();
+        assert_eq!(participant.counters.milestones, 4);
+        assert!(participant.counters.conservation_holds());
+    }
+
+    #[test]
+    fn movement_exact_once_despite_identical_counter_values() {
+        // The reviewer's regression: the span-less movement's
+        // suppression is IDENTITY-governed (the chain tier and the
+        // in-run set) — counter equality is never evidence of an
+        // applied identity. Two journaled movements with IDENTICAL
+        // deltas (different transactions) against an anchor whose
+        // counters coincidentally equal the first movement's
+        // post-state (unrelated history): both apply, each exactly
+        // once; repeated reconciliation (crashes before the snapshot
+        // publication) derives the identical result — the recovered
+        // state is anchor ⊕ the deltas, never anchor ⊕ deltas ×
+        // runs.
+        let identity = id(1);
+        let movement = CounterDelta {
+            milestones: 0,
+            pending_signals: 0,
+            captured: -2,
+            credits: 2,
+        };
+        let baseline = unit(SignalLane::Captured, 8);
+        let build = || {
+            ConsequenceEnvelope::new(identity)
+                .with_delta(movement)
+                .with_expected_prior(baseline)
+                .with_baseline(SourceBaseline {
+                    counters: baseline,
+                    award: AwardCheckpoint {
+                        durable: Coverage::new(),
+                        provisional: Coverage::new(),
+                    },
+                })
+                .with_position(SourcePosition {
+                    head: None,
+                    tick: 110,
+                })
+        };
+        let journal = scan(vec![
+            transaction(1, vec![build()]),
+            transaction(2, vec![build()]),
+        ]);
+        // The anchor's counters coincide with the first movement's
+        // exact post-state — from unrelated history (the movements
+        // never applied: chain-unconfirmed, nothing suppressed).
+        let coincidental = movement.apply_to(&baseline).unwrap();
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 200,
+        })
+        .with_identity(identity, coincidental, AwardState::new());
+        let first = reconcile(&anchor, &journal, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            first.report.applied.len(),
+            2,
+            "both movements apply — neither suppressed by the other's counter effect"
+        );
+        let participant = first.recovered.get(&identity).unwrap();
+        assert_eq!(
+            participant.counters,
+            CounterValues {
+                milestones: 8,
+                captured: 2,
+                credits: 6,
+                ..CounterValues::default()
+            },
+            "exactly two deltas from the coincidental anchor"
+        );
+        assert!(participant.counters.conservation_holds());
+        // Repeated crashes before the snapshot publication: the pure
+        // function re-derives the identical outcome.
+        for _ in 0..3 {
+            assert_eq!(
+                reconcile(&anchor, &journal, &BTreeSet::new()).unwrap(),
+                first
+            );
+        }
     }
 
     // ------------------------------------------------------------- frontier
