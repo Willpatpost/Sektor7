@@ -90,8 +90,8 @@ use engine_core::SaveError;
 
 use crate::consequence::{AwardState, ConsequenceId, Coverage, OccurrenceSpan};
 use crate::envelope::{
-    ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, PartialApplication,
-    SourcePosition,
+    ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, DurabilityClass,
+    PartialApplication, SignalLane, SourcePosition,
 };
 use crate::hash::Hash;
 use crate::journal::{JournalScan, TransactionId};
@@ -369,6 +369,17 @@ pub enum RecoveryError {
     ConfirmedProvenanceMismatch {
         id: ConsequenceId,
     },
+    /// Distinct actionable journal transactions claim the same
+    /// occurrences of one identity with divergent authoritative
+    /// effects — a different durability class or uniform signal lane
+    /// for the same occurrence. The working coverage's
+    /// occurrence-exact suppression is not semantic agreement: a
+    /// conflicting claim is never silently deduplicated — fail
+    /// closed with the evidence preserved, never a guess about
+    /// which transaction is authoritative.
+    ConflictingJournalEffects {
+        id: ConsequenceId,
+    },
 }
 
 impl fmt::Display for RecoveryError {
@@ -400,6 +411,12 @@ impl fmt::Display for RecoveryError {
                  conflicts with the canonical entry — incompatible \
                  provenance fails closed"
             ),
+            RecoveryError::ConflictingJournalEffects { id } => write!(
+                f,
+                "distinct journal transactions claim the occurrences of {id:?} \
+                 with divergent authoritative effects — fail closed, never \
+                 silently deduplicated"
+            ),
         }
     }
 }
@@ -419,6 +436,25 @@ impl From<SaveError> for RecoveryError {
     }
 }
 
+/// One in-run applied unit — the per-occurrence semantic
+/// contribution (occurrence span, durability class, uniform signal
+/// lane) one journal envelope's application actually made, with its
+/// producing transaction. The tier-4 semantic record: occurrences a
+/// later actionable envelope re-claims are compared against it
+/// BEFORE the working coverage suppresses the replay — the earlier
+/// and later transactions must AGREE about the re-claimed
+/// occurrences' authoritative effects (a divergent class or signal
+/// lane is [`RecoveryError::ConflictingJournalEffects`], never a
+/// silent deduplication); a same-unit re-claim stays exactly-once
+/// (the legitimate duplicate intent). In-run state only — it dies
+/// with the process and re-derives identically on restart.
+struct AppliedUnit {
+    span: OccurrenceSpan,
+    class: DurabilityClass,
+    lane: SignalLane,
+    transaction: TransactionId,
+}
+
 /// The (anchor, journal, confirmed-chain) reconciliation — Contract A
 /// unconditional, Contract B classified, the four-tier suppression
 /// exact. **A pure function**: repeated calls derive identical
@@ -434,7 +470,13 @@ impl From<SaveError> for RecoveryError {
 /// confirmed identity with no journal envelope is recognized through
 /// its canonical provenance plus exact snapshot materialization —
 /// the historical T1 journal is not required for an
-/// already-represented consequence.
+/// already-represented consequence. Distinct actionable
+/// transactions re-claiming the SAME occurrences must AGREE about
+/// those occurrences' authoritative effects — the durability class
+/// and uniform signal lane, compared per-unit before the working
+/// coverage suppresses the replay: a divergent claim fails closed
+/// ([`RecoveryError::ConflictingJournalEffects`]), a same-unit
+/// re-claim stays exactly-once.
 pub fn reconcile(
     anchor: &RecoveryAnchor,
     journal: &JournalScan,
@@ -447,6 +489,10 @@ pub fn reconcile(
         .collect();
     let mut working: BTreeMap<ConsequenceId, RecoveredParticipant> = BTreeMap::new();
     let mut report = RecoveryReport::default();
+    // The tier-4 semantic record — per identity, the units this run
+    // has actually applied (span, class, lane, producing
+    // transaction). In-run only; dies with the process.
+    let mut applied_units: BTreeMap<ConsequenceId, Vec<AppliedUnit>> = BTreeMap::new();
 
     for transaction in &journal.committed {
         if canceled.contains(&transaction.id) {
@@ -576,6 +622,42 @@ pub fn reconcile(
                 continue;
             }
             let application = application.expect("span-bearing envelopes computed it above");
+            // The tier-4 semantic gate (the fourth re-review's
+            // finding): the working coverage's suppression is
+            // occurrence-exact but never semantically blind — a
+            // later actionable envelope re-claiming occurrences an
+            // earlier DIFFERENT journal transaction applied is
+            // compared per-unit BEFORE the coverage suppresses the
+            // replay. The two transactions must AGREE about the
+            // re-claimed occurrences' authoritative effects (the
+            // durability class and the uniform signal lane): a
+            // divergent claim (+2 pending vs +2 captured for the
+            // same occurrences) is a conflict — fail closed with
+            // typed evidence, never silently deduplicated; a
+            // same-unit re-claim (the legitimate duplicate intent —
+            // partial overlaps and holes included) stays
+            // exactly-once.
+            let lane = envelope
+                .signal_lane()
+                .map_err(RecoveryError::Format)?
+                .ok_or(SaveError::Integrity("envelope/uniform-unit-violation"))
+                .map_err(RecoveryError::Format)?;
+            for unit in applied_units.get(&envelope.id).into_iter().flatten() {
+                if unit.transaction == transaction.id {
+                    // One identity is one envelope per journal
+                    // transaction (the append-side identity-set
+                    // validation); a same-transaction re-claim is
+                    // the same intent, never a conflict.
+                    continue;
+                }
+                for classified in &envelope.sub_spans {
+                    let lo = unit.span.lo.max(classified.span.lo);
+                    let hi = unit.span.hi.min(classified.span.hi);
+                    if lo < hi && (unit.class != classified.class || unit.lane != lane) {
+                        return Err(RecoveryError::ConflictingJournalEffects { id: envelope.id });
+                    }
+                }
+            }
             if application.missing.is_empty() {
                 report
                     .materialized
@@ -590,6 +672,15 @@ pub fn reconcile(
                 // lane — cross-lane coherence preserved.
                 participant.award.durable.insert_span(classified.span);
                 participant.award.provisional.remove_span(&classified.span);
+                applied_units
+                    .entry(envelope.id)
+                    .or_default()
+                    .push(AppliedUnit {
+                        span: classified.span,
+                        class: classified.class,
+                        lane,
+                        transaction: transaction.id,
+                    });
             }
             if !participant.counters.conservation_holds() {
                 return Err(RecoveryError::ConservationViolation { id: envelope.id });
@@ -1576,6 +1667,175 @@ mod tests {
     }
 
     #[test]
+    fn same_unit_reclaim_across_transactions_stays_exactly_once() {
+        // The compatible mirror of the conflict case: two distinct
+        // transactions re-claiming the SAME occurrences under the
+        // SAME unit (class + lane) — the later claim is the same
+        // authoritative effect, a legitimate duplicate intent:
+        // suppressed exactly-once, never a conflict.
+        let identity = id(1);
+        let journal = scan(vec![
+            transaction(
+                1,
+                vec![envelope(
+                    identity,
+                    (0, 2),
+                    DurabilityClass::DurableEligible,
+                    110,
+                    CounterValues::default(),
+                )],
+            ),
+            transaction(
+                2,
+                vec![envelope(
+                    identity,
+                    (0, 2),
+                    DurabilityClass::DurableEligible,
+                    120,
+                    CounterValues::default(),
+                )],
+            ),
+        ]);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let outcome = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap();
+        assert_eq!(outcome.report.applied.len(), 1, "the first applies");
+        assert_eq!(
+            outcome.report.materialized,
+            vec![(identity, 2)],
+            "the same-unit re-claim reports materialized, exactly-once"
+        );
+        let participant = outcome.recovered.get(&identity).unwrap();
+        assert_eq!(participant.counters, unit(SignalLane::Captured, 2));
+        assert!(participant.counters.conservation_holds());
+    }
+
+    #[test]
+    fn divergent_partial_overlap_fails_closed() {
+        // The conflict check is per-occurrence, not whole-envelope:
+        // a PARTIAL overlap under divergent lanes still conflicts on
+        // the shared occurrences — the earlier transaction's claim
+        // stands for them; the later's divergent claim is never
+        // absorbed by the coverage suppression.
+        let identity = id(1);
+        let pending = ConsequenceEnvelope::capture(
+            identity,
+            vec![ClassifiedSpan {
+                span: OccurrenceSpan::new(0, 2).unwrap(),
+                class: DurabilityClass::DurableEligible,
+            }],
+            SignalLane::Pending,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            SourcePosition {
+                head: None,
+                tick: 110,
+            },
+        )
+        .unwrap();
+        let journal = scan(vec![
+            transaction(1, vec![pending]),
+            transaction(
+                2,
+                vec![envelope(
+                    identity,
+                    (0, 4),
+                    DurabilityClass::DurableEligible,
+                    120,
+                    CounterValues::default(),
+                )],
+            ),
+        ]);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let error = reconcile(&anchor, &journal, &BTreeMap::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConflictingJournalEffects { id } if id == identity
+        ));
+    }
+
+    #[test]
+    fn confirmed_provenance_gates_divergent_journal_claims() {
+        // The composition with confirmed provenance: when one of the
+        // two divergent transactions IS the canonically confirmed
+        // one, the exact-provenance gate fires first — every journal
+        // envelope of a confirmed identity is validated against the
+        // canonical evidence, so the divergent second transaction
+        // fails closed as incompatible provenance. The tier-4
+        // semantic gate composes behind the confirmed gate, never
+        // preempts it.
+        let identity = id(1);
+        let pending = ConsequenceEnvelope::capture(
+            identity,
+            vec![ClassifiedSpan {
+                span: OccurrenceSpan::new(0, 2).unwrap(),
+                class: DurabilityClass::DurableEligible,
+            }],
+            SignalLane::Pending,
+            CounterValues::default(),
+            SourceBaseline {
+                counters: CounterValues::default(),
+                award: AwardCheckpoint {
+                    durable: Coverage::new(),
+                    provisional: Coverage::new(),
+                },
+            },
+            SourcePosition {
+                head: None,
+                tick: 120,
+            },
+        )
+        .unwrap();
+        let journal = scan(vec![
+            transaction(
+                1,
+                vec![envelope(
+                    identity,
+                    (0, 2),
+                    DurabilityClass::DurableEligible,
+                    110,
+                    CounterValues::default(),
+                )],
+            ),
+            transaction(2, vec![pending]),
+        ]);
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let mut confirmed = BTreeMap::new();
+        confirmed.insert(
+            identity,
+            ConfirmedEvidence {
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction: journal.committed[0].id,
+                effect: journal.committed[0].envelopes[0]
+                    .effect_commitment()
+                    .unwrap(),
+            },
+        );
+        let error = reconcile(&anchor, &journal, &confirmed).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConfirmedProvenanceMismatch { id } if id == identity
+        ));
+    }
+
+    #[test]
     fn repeated_recovery_before_publication_is_idempotent() {
         // The W4/multi-crash property: reconcile is a pure function —
         // repeated calls (simulating crashes before the snapshot
@@ -2023,5 +2283,110 @@ mod tests {
             reconstruct_episode_frontier(1, &anchor, &scan, &BTreeSet::new()).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn divergent_journal_effects_across_transactions_fail_closed() {
+        // The fourth re-review's reproduction, on a REAL journal: two
+        // distinct durably-committed transactions (distinct plans —
+        // distinct TransactionIds) claiming the SAME identity and
+        // span under DIFFERENT valid uniform lanes (+2 milestones/
+        // +2 pending vs +2 milestones/+2 captured), neither
+        // canonically confirmed, recovered from an older empty
+        // anchor. The tier-4 dedup previously suppressed the second
+        // claim silently — its missing set was empty, a successful
+        // recovery despite conflicting authoritative effects; the
+        // re-claimed occurrences are now compared per-unit BEFORE
+        // the suppression: the divergent lane fails closed with
+        // typed evidence.
+        let dir = TestDir::new("divergent-lanes");
+        let identity = id(1);
+        {
+            let mut journal = crate::journal::T1Journal::open(dir.journal()).unwrap();
+            let pending = ConsequenceEnvelope::capture(
+                identity,
+                vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                SignalLane::Pending,
+                CounterValues::default(),
+                SourceBaseline {
+                    counters: CounterValues::default(),
+                    award: AwardCheckpoint {
+                        durable: Coverage::new(),
+                        provisional: Coverage::new(),
+                    },
+                },
+                SourcePosition {
+                    head: None,
+                    tick: 110,
+                },
+            )
+            .unwrap();
+            journal
+                .append_transaction(&crate::journal::TransactionInput {
+                    envelopes: vec![pending],
+                    position: SourcePosition {
+                        head: None,
+                        tick: 110,
+                    },
+                    classification: DurabilityClass::DurableEligible,
+                    dependencies: Vec::new(),
+                    frontier: vec![FrontierEntry {
+                        region: 1,
+                        episode: 1,
+                    }],
+                    plan: b"plan-pending".to_vec(),
+                })
+                .unwrap();
+            let captured = ConsequenceEnvelope::capture(
+                identity,
+                vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                SignalLane::Captured,
+                CounterValues::default(),
+                SourceBaseline {
+                    counters: CounterValues::default(),
+                    award: AwardCheckpoint {
+                        durable: Coverage::new(),
+                        provisional: Coverage::new(),
+                    },
+                },
+                SourcePosition {
+                    head: None,
+                    tick: 120,
+                },
+            )
+            .unwrap();
+            journal
+                .append_transaction(&crate::journal::TransactionInput {
+                    envelopes: vec![captured],
+                    position: SourcePosition {
+                        head: None,
+                        tick: 120,
+                    },
+                    classification: DurabilityClass::DurableEligible,
+                    dependencies: Vec::new(),
+                    frontier: vec![FrontierEntry {
+                        region: 1,
+                        episode: 1,
+                    }],
+                    plan: b"plan-captured".to_vec(),
+                })
+                .unwrap();
+        }
+        let scan = crate::journal::T1Journal::scan_file(dir.journal()).unwrap();
+        let anchor = RecoveryAnchor::new(SourcePosition {
+            head: None,
+            tick: 100,
+        });
+        let error = reconcile(&anchor, &scan, &BTreeMap::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            RecoveryError::ConflictingJournalEffects { id } if id == identity
+        ));
     }
 }
