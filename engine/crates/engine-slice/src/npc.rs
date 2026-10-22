@@ -11,8 +11,8 @@
 //! streaming, or LOD in Stage 3.
 
 use engine_core::{
-    Event, EventClass, EventSpec, ExecCtx, Field, Fingerprinter, LodLevel, Schedule, Spine, Tick,
-    World,
+    Decoder, Encoder, Event, EventClass, EventSpec, ExecCtx, Field, Fingerprinter, LodLevel,
+    SaveError, SaveWorld, Schedule, Spine, Tick, World,
 };
 
 /// Eight logical region identifiers (Stage 3 metadata for later stages).
@@ -675,5 +675,173 @@ impl World for NpcWorld {
         for step in &self.steps {
             fp.write_u64(*step);
         }
+    }
+}
+
+impl SaveWorld for NpcWorld {
+    const SAVE_DOMAIN: &'static str = "engine-slice/npc-world-save/1";
+
+    fn save(&self, enc: &mut Encoder) {
+        // The workload configuration first — behavioral identity: a
+        // restored world must chain, jitter, and reconstruct exactly
+        // as the saved one would, so every value execution consults
+        // is on the wire (the Batch 4 authoritative-state codec; the
+        // frozen `npc-world/1` fingerprint domain is untouched and
+        // never sees this section).
+        enc.write_u64(self.config.seed);
+        let mut near_mask = 0u64;
+        for (index, near) in self.config.near_regions.iter().enumerate() {
+            if *near {
+                near_mask |= 1 << index;
+            }
+        }
+        enc.write_u64(near_mask);
+        enc.write_u64(self.config.activity_period);
+        enc.write_u64(self.config.simplify_factor);
+        enc.write_u64(self.config.commitment_window);
+        enc.write_u8(u8::from(self.config.region_lods_enabled));
+        // The authoritative per-NPC state: dense arrays indexed by the
+        // stable identity set — ONE count governs every array (the
+        // identity set is fixed; a different count is an incompatible
+        // workload, rejected at restore, never a resized restore).
+        enc.write_count(NPC_COUNT);
+        for step in &self.steps {
+            enc.write_u64(*step);
+        }
+        for cursor in &self.routine_cursor {
+            enc.write_u64(*cursor);
+        }
+        for position in &self.positions {
+            enc.write_u8(position.0);
+            enc.write_u8(position.1);
+        }
+        for boundary in &self.represented_through {
+            enc.write_tick(*boundary);
+        }
+        for milestone in &self.milestones {
+            enc.write_u64(*milestone);
+        }
+        for signal in &self.pending_signals {
+            enc.write_u64(*signal);
+        }
+        for credit in &self.credits {
+            enc.write_u64(*credit);
+        }
+        for lod in &self.region_lods {
+            enc.write_u8(match lod {
+                LodLevel::Full => 0,
+                LodLevel::Simplified => 1,
+                LodLevel::EventDriven => 2,
+                LodLevel::Dormant => 3,
+            });
+        }
+    }
+
+    fn restore(dec: &mut Decoder) -> Result<Self, SaveError> {
+        const SECTION: &str = "npc-world-save";
+        let seed = dec.read_u64()?;
+        let near_mask = dec.read_u64()?;
+        let activity_period = dec.read_u64()?;
+        let simplify_factor = dec.read_u64()?;
+        let commitment_window = dec.read_u64()?;
+        let region_lods_enabled = match dec.read_u8()? {
+            0 => false,
+            1 => true,
+            discriminant => {
+                return Err(SaveError::Enum {
+                    section: SECTION,
+                    discriminant: u64::from(discriminant),
+                });
+            }
+        };
+        // The fixed identity set: the count is bounded by the
+        // documented workload size and the remaining bytes before any
+        // allocation trusts it, and must equal NPC_COUNT exactly — a
+        // different identity set is an incompatible workload, never a
+        // silently resized restore.
+        let npc_count = dec.read_count(NPC_COUNT as u64, SECTION, "npc-count")?;
+        if npc_count != NPC_COUNT as u64 {
+            return Err(SaveError::Integrity("npc-world-save/npc-count"));
+        }
+        let mut steps = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            steps.push(dec.read_u64()?);
+        }
+        let mut routine_cursor = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            routine_cursor.push(dec.read_u64()?);
+        }
+        // Grid positions carry the dormant-discard sentinel
+        // (`POSITION_DISCARDED` — the reconstructible representation is
+        // GONE, not merely flagged); every other position must lie on
+        // the region-local grid (the bounds invariant).
+        let mut positions = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            let x = dec.read_u8()?;
+            let y = dec.read_u8()?;
+            if (x, y) != POSITION_DISCARDED && (x >= REGION_GRID || y >= REGION_GRID) {
+                return Err(SaveError::Integrity("npc-world-save/position-bounds"));
+            }
+            positions.push((x, y));
+        }
+        let mut represented_through = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            represented_through.push(dec.read_tick()?);
+        }
+        let mut milestones = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            milestones.push(dec.read_u64()?);
+        }
+        let mut pending_signals = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            pending_signals.push(dec.read_u64()?);
+        }
+        let mut credits = Vec::with_capacity(NPC_COUNT);
+        for _ in 0..NPC_COUNT {
+            credits.push(dec.read_u64()?);
+        }
+        let mut region_lods = [LodLevel::Full; REGION_COUNT];
+        for lod in &mut region_lods {
+            *lod = match dec.read_u8()? {
+                0 => LodLevel::Full,
+                1 => LodLevel::Simplified,
+                2 => LodLevel::EventDriven,
+                3 => LodLevel::Dormant,
+                discriminant => {
+                    return Err(SaveError::Enum {
+                        section: SECTION,
+                        discriminant: u64::from(discriminant),
+                    });
+                }
+            };
+        }
+        // The near-region mask is a REGION_COUNT-bit mask — set bits
+        // above it are not this workload's configuration.
+        if near_mask >> REGION_COUNT != 0 {
+            return Err(SaveError::Integrity("npc-world-save/near-mask"));
+        }
+        let mut near_regions = [false; REGION_COUNT];
+        for (index, near) in near_regions.iter_mut().enumerate() {
+            *near = near_mask & (1 << index) != 0;
+        }
+        let config = NpcConfig {
+            seed,
+            near_regions,
+            activity_period,
+            simplify_factor,
+            commitment_window,
+            region_lods_enabled,
+        };
+        Ok(NpcWorld {
+            config,
+            steps,
+            routine_cursor,
+            positions,
+            represented_through,
+            milestones,
+            pending_signals,
+            credits,
+            region_lods,
+        })
     }
 }
