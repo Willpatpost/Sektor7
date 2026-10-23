@@ -8,10 +8,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use engine_core::{EventClass, LodLevel, PresenceSample, Spine};
+use engine_core::{Encoder, EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    AwardState, CommitOutcome, ConsequenceId, CounterValues, DurabilityClass, EncounterJournal,
-    FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase, SignalLane, T1Journal,
+    AwardCheckpoint, AwardState, CancellationReason, CanonicalMedium, ClassifiedSpan,
+    CommitOutcome, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
+    EncounterJournal, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase,
+    LocalFileMedium, OccurrenceSpan, RecoveryError, RevisionRecord, SignalLane, SourceBaseline,
+    SourcePosition, StoredObject, T1Journal, TransactionInput,
 };
 use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
 use engine_slice::npc::{
@@ -877,4 +880,414 @@ fn irreversible_operations_gate_on_canonical_confirmation() {
         gate(&crossing, key),
         "the canonically confirmed progress permits the irreversible operation"
     );
+}
+
+// -------------------------- the Batch 4 review-corrective regressions
+
+/// The double-apply reproduction (the review's first corrective): a
+/// snapshot published BETWEEN two deactivation episodes — after
+/// episode 1's capture and reactivation, before episode 2. Episode
+/// 1's crossings are ALREADY materialized in the snapshot (its
+/// ledger carries them applied, its credits hold them); the journal
+/// holds both episodes' claims. The recovery must derive its
+/// materialization evidence from the SNAPSHOT — episode 1 is
+/// pre-snapshot by the director's own episode counter, so its
+/// claimed crossings are NEVER re-applied — and restore only
+/// episode 2's post-snapshot crossings.
+#[test]
+fn recovery_does_not_reapply_presnapshot_episode_crossings() {
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("no-reapply");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "no-reapply-campaign").unwrap();
+    // Episode 1: the durable far boundary (region 4's captures
+    // journaled), then the durable reactivation (the captures applied
+    // to credits — the ledger's applied lane).
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    assert!(
+        director.ledger().applied_count() > 0,
+        "episode 1's captures are applied in the ledger"
+    );
+    assert!(
+        spine.world().credits().iter().sum::<u64>() > 0,
+        "the credits hold episode 1's effects"
+    );
+    // THE SNAPSHOT between the episodes: episode 1 is INSIDE it (the
+    // director's episode counter, the applied ledger, the credits);
+    // episode 2 happens after it.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // Episode 2: further accrual, then the second durable far
+    // boundary.
+    for _ in 0..150 {
+        director.apply(&mut spine, std::slice::from_ref(&near));
+        spine.run_tick();
+    }
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    // THE CRASH + the recovery from the mid-session snapshot.
+    drop(crossing);
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "no-reapply-campaign")
+            .expect("the recovery succeeds without re-applying episode 1");
+    // Episode 2 installed; episode 1 never re-applied.
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_director.states()[4].checkpoint,
+        director.states()[4].checkpoint,
+        "episode 2's plan-installed checkpoint matches the lost state's exactly"
+    );
+    // THE no-double-apply proof: the recovered milestones are the
+    // snapshot's plus exactly episode 2's post-snapshot crossings —
+    // episode 1's already-materialized crossings are never applied
+    // again.
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the milestones match the lost state's exactly — no re-application"
+    );
+    assert_eq!(
+        recovered_spine.world().credits(),
+        spine.world().credits(),
+        "the credits are the snapshot's — episode 1's application is inside it"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_total(),
+        director.ledger().pending_total(),
+        "only episode 2's captures are pending"
+    );
+    assert_eq!(
+        recovered_director.ledger().applied_count(),
+        director.ledger().applied_count(),
+        "episode 1's applied identities stand from the snapshot"
+    );
+    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
+        panic!("the re-drive confirms the recovered captures");
+    };
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
+}
+
+/// The multi-episode interleave (the same corrective's other half):
+/// ONE snapshot before BOTH episodes. The recovery must interleave
+/// per transaction — episode 1's restore (the claimed delta minus the
+/// snapshot's scratch), its install (capturing and zeroing the
+/// scratch), then episode 2's restore (the FULL delta — the prior
+/// install rebased the scratch exactly as the live capture did) and
+/// its install. Per-envelope arithmetic against the snapshot's stale
+/// scratch without the interleave under-restores the second episode
+/// and fails its install's scratch re-validation.
+#[test]
+fn recovery_restores_both_episodes_from_an_older_snapshot() {
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("two-episodes");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open(&dir.store(), journal, "two-episodes-campaign").unwrap();
+    // THE older snapshot: before both episodes.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // Episode 1: accrual beyond the snapshot, the durable far
+    // boundary, and the durable reactivation.
+    for _ in 0..80 {
+        director.apply(&mut spine, std::slice::from_ref(&near));
+        spine.run_tick();
+    }
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    // Episode 2: accrual, then the second durable far boundary —
+    // the accrual long enough for the threshold crossings to recur
+    // (under the spine's budget a Full region executes ~0.15
+    // activities per NPC per tick, so a MILESTONE_PERIOD crossing
+    // needs ~a hundred ticks; a short accrual would make episode 2's
+    // deactivation empty-scratch — unjournaled,
+    // presence-re-derivable — and the multi-episode interleave
+    // would never be exercised).
+    for _ in 0..160 {
+        director.apply(&mut spine, std::slice::from_ref(&near));
+        spine.run_tick();
+    }
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    // THE CRASH + the recovery from the pre-episode snapshot.
+    drop(crossing);
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign")
+            .expect("the interleaved recovery succeeds");
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_director.states()[4].checkpoint,
+        director.states()[4].checkpoint,
+        "episode 2's checkpoint matches the lost state's exactly"
+    );
+    // The milestones: the snapshot's plus BOTH episodes'
+    // post-snapshot crossings — exactly the lost state's.
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the milestones match the lost state's exactly across both episodes"
+    );
+    // The durable lanes: episode 1's captures are APPLIED (the
+    // derived reactivation replayed the lost session's application —
+    // the credits match the lost state's exactly), episode 2's are
+    // pending.
+    assert_eq!(
+        recovered_director.ledger().pending_total(),
+        director.ledger().pending_total(),
+        "episode 2's captures are pending — matching the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_director.ledger().applied_count(),
+        director.ledger().applied_count(),
+        "episode 1's applied identities match the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_spine.world().credits(),
+        spine.world().credits(),
+        "the credits match the lost state's exactly — the derived reactivation applied them"
+    );
+    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
+        panic!("the re-drive confirms both episodes' recovered captures");
+    };
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 1, 4)));
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
+}
+
+/// The cancellation integration (the review's second corrective): a
+/// durably CANCELED deactivation transaction is never replayed — its
+/// plan never installs, its captures never restore, its keys never
+/// re-drive. The region stays exactly as the verified snapshot left
+/// it.
+#[test]
+fn recovery_skips_canceled_deactivation_transactions() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let milestones_at_snapshot = spine.world().milestones().to_vec();
+    let dir = TestDir::new("canceled");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "canceled-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // The durable deactivation — then the durable CANCELLATION of its
+    // transaction (the journal's own record; the crossing is dropped
+    // first — the journal's sidecar lock is session-scoped).
+    let now = spine.clock();
+    let receipt = crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .expect("the deactivation commits")
+        .expect("the scenario captured consequences");
+    drop(crossing);
+    let mut journal = T1Journal::open(dir.journal()).unwrap();
+    journal
+        .append_cancellation(
+            receipt.journal.id,
+            CancellationReason::ApplicationPolicy,
+            b"corrective-test-cancellation",
+        )
+        .expect("the cancellation is recorded");
+    drop(journal);
+    // THE recovery: the canceled plan must not install.
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "canceled-campaign")
+            .expect("the recovery succeeds over the canceled intent");
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Full,
+        "the canceled deactivation never installs — the snapshot's level stands"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_count(),
+        0,
+        "the canceled captures never enter the ledger"
+    );
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        milestones_at_snapshot,
+        "the canceled crossings never restore — the snapshot's state stands"
+    );
+    assert!(matches!(
+        recovered_crossing.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// The canonical-confirmation integration (the review's second
+/// corrective, the other half): the recovery feeds the RE-OPENED
+/// pipeline's real chain-walk confirmation evidence into the B3
+/// reconcile — a canonically confirmed capture recovers as confirmed
+/// (the exact-provenance check passes: the journal envelope IS the
+/// canonical evidence's transaction and coverage), the key phase
+/// surfaces InConfirmedChain, and the re-drive has nothing pending
+/// (chain-confirmed keys are never re-batched).
+#[test]
+fn recovery_composes_canonical_confirmation_evidence() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("confirmed");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "confirmed-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm canonically before the crash");
+    };
+    drop(crossing);
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "confirmed-campaign")
+            .expect("the recovery composes the confirmation evidence");
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the crossings were in the snapshot — the milestones match exactly"
+    );
+    assert_eq!(
+        recovered_crossing.key_phase(ConsequenceId::new(4, 1, 4)),
+        Some(KeyPhase::InConfirmedChain),
+        "the recovered capture's phase is canonically confirmed"
+    );
+    assert!(matches!(
+        recovered_crossing.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// The confirmation-evidence discriminator: a DIVERGENT journal claim
+/// against a canonically confirmed identity — the same identity, a
+/// different transaction with a different occurrence span — must
+/// fail the recovery CLOSED through the confirmed-provenance gate
+/// (the journal envelope does not carry the canonical evidence's
+/// exact transaction and coverage), never a silent suppression by
+/// session-side coverage.
+#[test]
+fn recovery_fails_closed_on_divergent_claims_against_confirmation() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("divergent");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "divergent-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm canonically");
+    };
+    drop(crossing);
+    // The divergent claim: the same identity under a DIFFERENT
+    // transaction — a span one occurrence beyond the confirmed
+    // coverage (a different effect commitment; the journal accepts a
+    // distinct transaction identity — the exact scenario the
+    // confirmed-provenance gate exists for).
+    let original = T1Journal::scan_file(dir.journal())
+        .unwrap()
+        .committed
+        .iter()
+        .flat_map(|transaction| transaction.envelopes.iter())
+        .find(|envelope| envelope.id == ConsequenceId::new(4, 1, 4))
+        .expect("the original claim is journaled")
+        .delta
+        .milestones;
+    let mut journal = T1Journal::open(dir.journal()).unwrap();
+    let envelope = ConsequenceEnvelope::capture(
+        ConsequenceId::new(4, 1, 4),
+        vec![ClassifiedSpan {
+            span: OccurrenceSpan::new(0, original + 1).unwrap(),
+            class: DurabilityClass::DurableEligible,
+        }],
+        SignalLane::Captured,
+        CounterValues::default(),
+        SourceBaseline {
+            counters: CounterValues::default(),
+            award: AwardCheckpoint {
+                durable: Coverage::new(),
+                provisional: Coverage::new(),
+            },
+        },
+        SourcePosition {
+            head: None,
+            tick: now.as_u64(),
+        },
+    )
+    .unwrap();
+    journal
+        .append_transaction(&TransactionInput {
+            envelopes: vec![envelope],
+            position: SourcePosition {
+                head: None,
+                tick: now.as_u64(),
+            },
+            classification: DurabilityClass::DurableEligible,
+            dependencies: Vec::new(),
+            frontier: Vec::new(),
+            plan: Vec::new(),
+        })
+        .expect("the divergent claim is journaled");
+    drop(journal);
+    // THE recovery: fail closed through the confirmed-provenance gate.
+    let error = match SessionCrossing::recover(&dir.store(), &dir.journal(), "divergent-campaign") {
+        Err(error) => error,
+        Ok(_) => panic!("the divergent claim fails the recovery closed"),
+    };
+    assert!(matches!(
+        error,
+        TransitionError::Recovery(RecoveryError::ConfirmedProvenanceMismatch { .. })
+    ));
+}
+
+/// The invalid-newest-snapshot fail-closed (the review's third
+/// corrective): a recognizable-but-invalid session object on TOP of
+/// a valid snapshot — the newest authoritative session state is
+/// corrupt, and the recovery must fail CLOSED, never silently fall
+/// back to the older snapshot (which would resurrect stale
+/// authoritative state). The future-version case too: a
+/// session-snapshot/2 object is recognizable (the domain family) and
+/// equally fails closed.
+#[test]
+fn recovery_fails_closed_on_invalid_newest_snapshot() {
+    let near = near_region_4();
+    let (spine, director) = scenario_pair(150, &near);
+    let dir = TestDir::new("corrupt-snapshot");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "corrupt-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    drop(crossing);
+    // A recognizable-but-invalid session object appended on top: the
+    // domain tag is genuine, the bodies are garbage.
+    let append_corrupt = |domain: &str| {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mut enc = Encoder::new();
+        enc.write_str(domain);
+        enc.write_bytes(b"not-a-spine-save");
+        enc.write_bytes(b"not-a-director-save");
+        let object = StoredObject::new(enc.into_bytes()).unwrap();
+        let record = RevisionRecord::regular(head, epoch, 999)
+            .with_idempotency_key(object.hash().as_bytes().to_vec())
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&record, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+    };
+    append_corrupt("engine-slice/session-snapshot/1");
+    let error = match SessionCrossing::recover(&dir.store(), &dir.journal(), "corrupt-campaign") {
+        Err(error) => error,
+        Ok(_) => panic!("the invalid newest snapshot fails the recovery closed"),
+    };
+    assert!(matches!(error, TransitionError::CorruptSnapshot(_)));
+    // The future-version case: a session-snapshot/2 object is still
+    // recognizable (the domain family) — this build fails closed
+    // rather than silently using the older snapshot.
+    append_corrupt("engine-slice/session-snapshot/2");
+    let error = match SessionCrossing::recover(&dir.store(), &dir.journal(), "corrupt-campaign") {
+        Err(error) => error,
+        Ok(_) => panic!("the future-version snapshot also fails closed"),
+    };
+    assert!(matches!(error, TransitionError::CorruptSnapshot(_)));
 }

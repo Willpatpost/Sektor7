@@ -10,8 +10,9 @@
 //! Stage 4 path never constructs plans, so its behavior and every
 //! frozen fingerprint are mechanically untouched.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT};
 use engine_core::{
@@ -316,6 +317,12 @@ pub enum TransitionError {
     /// (a founding-only store, or the snapshots were never
     /// published).
     NoSnapshot,
+    /// The NEWEST chain-reachable session snapshot is recognizable
+    /// but invalid — a session-domain object that fails its restore
+    /// gates. This is corruption of the newest authoritative session
+    /// state: fail closed, never a silent fallback to an older
+    /// snapshot (which would resurrect stale authoritative state).
+    CorruptSnapshot(&'static str),
     /// The B3 reconcile rejected the recovered state (a Contract B
     /// incompatibility or a coherence failure) — fail closed with the
     /// evidence.
@@ -654,22 +661,41 @@ impl SessionCrossing {
     ///
     /// The composition (§5.4/§5.5.2):
     /// 1. **The snapshot** — the latest chain-reachable session
-    ///    snapshot, restored through both codecs' gates.
-    /// 2. **The crossing restore** — the post-snapshot crossings the
-    ///    journal's captures claim (the capture delta minus the
-    ///    snapshot's scratch, per identity), restored exactly as they
-    ///    were at the deactivation (the milestone award AND the
-    ///    scratch), so the staged install's scratch re-validation
-    ///    sees the captured deltas.
-    /// 3. **The plan-based three-case** — each committed deactivation
-    ///    whose plan is not yet installed in the recovered director
-    ///    state (the plan's episode above the region's) installs
-    ///    through the standard phase-5 bundle; already-installed
-    ///    plans skip (the post-state, never a duplicate).
-    /// 4. **The coherence verification** — the B3 reconcile over the
-    ///    recovered anchor: every journal envelope suppressed by the
-    ///    anchor's coverage (the materialization evidence); a
-    ///    reapplied envelope is a double application — the halt.
+    ///    snapshot, restored through both codecs' gates. A
+    ///    recognizable-but-invalid NEWEST session object fails closed
+    ///    (corruption of the newest authoritative state — never a
+    ///    silent fallback to an older snapshot, which would resurrect
+    ///    stale state).
+    /// 2. **The journal scan + the actionability filter** — a durably
+    ///    CANCELED transaction is never replayed: its plan never
+    ///    installs, its captures never restore.
+    /// 3. **The interleaved crossing restore + plan install** — per
+    ///    ACTIONABLE transaction in journal-sequence order, only the
+    ///    deactivations that POSTDATE the snapshot (the plan's episode
+    ///    above the SNAPSHOT's director episode — the snapshot-origin
+    ///    discriminator, never a journal-constructed counter): the
+    ///    claimed crossings the snapshot had NOT already materialized
+    ///    (the claimed delta minus the snapshot's scratch for each
+    ///    NPC's first post-snapshot capture, the full delta after —
+    ///    the prior install's capture zeroed the scratch exactly as
+    ///    the live sequence did) restore into the world, then the plan
+    ///    installs through the standard phase-5 bundle; an IMPLICIT
+    ///    reactivation between episodes is derived from the next
+    ///    plan's own from-level (the durable evidence the region was
+    ///    live) and replayed through the real activation path — the
+    ///    legacy install plus the live application of the prior
+    ///    episode's captures, nothing new journaled. A PRE-snapshot
+    ///    deactivation is already materialized in the snapshot's
+    ///    ledger and world — never re-applied.
+    /// 4. **The coherence verification** — the B3 reconcile with the
+    ///    REAL canonical-chain confirmation evidence (the re-opened
+    ///    pipeline's chain walk, never an empty map) over the anchor
+    ///    built from the RECOVERED SESSION STATE (the ledger's own
+    ///    captured amounts; the applied claims admitted only under the
+    ///    per-NPC credits conservation): every actionable journal
+    ///    envelope suppressed by the session's materialization or the
+    ///    canonical evidence — anything else is a claim the verified
+    ///    state cannot account for, the halt.
     /// 5. **The re-opened crossing** — a fresh pipeline over the same
     ///    journal (the captured keys seeded from the journal).
     pub fn recover(
@@ -677,56 +703,120 @@ impl SessionCrossing {
         journal_path: &Path,
         campaign: &str,
     ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
-        // 1. The snapshot.
-        let Some(snapshot_bytes) = latest_snapshot(store_dir)? else {
+        // 1. The snapshot — fail closed on a recognizable-but-invalid
+        //    newest session object (corruption of the newest
+        //    authoritative state is never walked past).
+        let Some((mut spine, mut director)) = latest_snapshot(store_dir)? else {
             return Err(TransitionError::NoSnapshot);
         };
-        let (mut spine, mut director) =
-            restore_session(&snapshot_bytes).map_err(PipelineError::Format)?;
+        // The snapshot-origin materialization evidence, captured
+        // BEFORE any recovery application mutates the world: the
+        // verified scratch the first post-snapshot capture consumed.
         let scratch_at_snapshot: Vec<u64> = spine.world().pending_signals().to_vec();
-        // 2. The journal scan + the crossing restore.
+        // 2. The journal scan + the actionability filter: a durably
+        //    canceled transaction is never replayed.
         let scan = T1Journal::scan_file(journal_path).map_err(PipelineError::Journal)?;
+        let canceled: HashSet<engine_persist::TransactionId> =
+            scan.cancellations.iter().map(|c| c.target).collect();
+        // 3. The interleaved crossing restore + plan install — the
+        //    actionable, post-snapshot deactivations in
+        //    journal-sequence order, over the re-opened crossing.
+        //    `restored` tracks each NPC's first post-snapshot claim:
+        //    the first subtracts the snapshot's scratch (the
+        //    crossings the snapshot already materialized are NEVER
+        //    re-applied), every later one claims against zero — the
+        //    prior install's capture zeroed the scratch exactly as
+        //    the live sequence did.
+        let journal = T1Journal::open(journal_path).map_err(PipelineError::Journal)?;
+        let mut crossing = SessionCrossing::open(store_dir, journal, campaign)?;
+        let mut restored = vec![false; NPC_COUNT];
         for transaction in &scan.committed {
-            for envelope in &transaction.envelopes {
-                let npc = envelope.id.npc as usize;
-                let restore = envelope
-                    .delta
-                    .milestones
-                    .saturating_sub(scratch_at_snapshot[npc]);
-                if restore > 0 {
-                    spine.world_mut().apply_recovered_crossings(npc, restore);
-                }
+            if canceled.contains(&transaction.id) {
+                continue;
             }
-        }
-        // 3. The plan-based three-case — the pre-state installs
-        //    through the id-exact held reconstruction (the recovered
-        //    spine's chains are the snapshot's; the plan's ids are
-        //    the journaled chains).
-        for transaction in &scan.committed {
             if transaction.plan.is_empty() {
+                // A foreign (plan-less) claim: the application recovery
+                // cannot reconstruct its world effects — the anchor
+                // below surfaces it as unaccounted (the halt), never a
+                // silent partial restore.
                 continue;
             }
             let plan =
                 DeactivationPlan::restore(&transaction.plan).map_err(PipelineError::Format)?;
-            if plan.episode > director.states()[plan.region].episode {
-                install_recovered_deactivation(&mut spine, &mut director, &plan)?;
+            if plan.episode <= director.states()[plan.region].episode {
+                // A pre-snapshot deactivation: already materialized in
+                // the snapshot's ledger and world — never re-applied.
+                continue;
             }
+            // The implicit reactivation between episodes, DERIVED from
+            // this plan's own from-level (the durable evidence the
+            // region was live at its deactivation): a prior episode's
+            // install left the region dormant, so the reactivation —
+            // the legacy activation install plus the live application
+            // of the prior episode's captures — is part of the honest
+            // reconstruction, replayed through the real activation
+            // path at the plan's own tick (nothing new journaled; the
+            // application is exactly the one the lost session
+            // performed).
+            if director.levels()[plan.region] == LodLevel::Dormant
+                && plan.from_level != LodLevel::Dormant
+            {
+                crossing.activate(
+                    &mut spine,
+                    &mut director,
+                    plan.region,
+                    plan.from_level,
+                    plan.tick,
+                )?;
+            }
+            for envelope in &transaction.envelopes {
+                let npc = envelope.id.npc as usize;
+                let base = if restored[npc] {
+                    0
+                } else {
+                    scratch_at_snapshot[npc]
+                };
+                let missing = envelope.delta.milestones.saturating_sub(base);
+                if missing > 0 {
+                    spine.world_mut().apply_recovered_crossings(npc, missing);
+                }
+                restored[npc] = true;
+            }
+            install_recovered_deactivation(&mut spine, &mut director, &plan)?;
         }
-        // 4. The coherence verification (the B3 reconcile — the
-        //    anchor's coverage must suppress every journal envelope).
-        let anchor = build_anchor(&spine, &director, &scan);
-        let confirmed = BTreeMap::new();
+        // 4. The coherence verification — the REAL canonical-chain
+        //    confirmation evidence from the re-opened pipeline (never
+        //    an empty map), and the anchor built from the RECOVERED
+        //    session state (never from the journal's claims).
+        let confirmed = crossing.pipeline.confirmed_evidence();
+        let anchor = build_anchor(&spine, &director, &scan)?;
         let outcome = reconcile(&anchor, &scan, &confirmed).map_err(TransitionError::Recovery)?;
         if let Some(effect) = outcome.report.applied.first() {
             return Err(TransitionError::InstallIncompatible {
                 region: effect.id.region as usize,
-                detail: "recovery-double-application",
+                detail: "recovery-unaccounted-claim",
             });
         }
-        // 5. The re-opened crossing.
-        let journal = T1Journal::open(journal_path).map_err(PipelineError::Journal)?;
-        let crossing = SessionCrossing::open(store_dir, journal, campaign)?;
+        // 5. The recovered session, with the re-opened crossing.
         Ok((spine, director, crossing))
+    }
+}
+
+/// Test-only (the genuine mid-install crash seam): when armed, the
+/// live install hard-exits BETWEEN the spine suspension and the
+/// ledger capture — some install mutations applied, the rest never
+/// run — the exact §5.5.2 mid-install termination window the
+/// process-kill regression drives from a real child process (exit 7;
+/// the pre-install gap's convention is 6). Engine code never arms
+/// this; the static is process-local, so only the child that armed
+/// it dies.
+#[doc(hidden)]
+pub static ARM_MID_INSTALL_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The mid-install seam's exit point (see [`ARM_MID_INSTALL_EXIT`]).
+fn mid_install_seam() {
+    if ARM_MID_INSTALL_EXIT.load(Ordering::Relaxed) {
+        std::process::exit(7);
     }
 }
 
@@ -796,6 +886,12 @@ fn install_deactivation(
             detail: "short-suspension",
         });
     }
+    // The genuine mid-install crash seam (test-only — see
+    // [`ARM_MID_INSTALL_EXIT`]): the spine IS suspended, the ledger
+    // NOT yet captured — a process death here leaves the journal's
+    // durable intent standing and a partially-installed in-memory
+    // state that dies with the process.
+    mid_install_seam();
     director.install_captures(region, plan.episode, &plan.captures);
     spine.world_mut().set_region_lod(region, LodLevel::Dormant);
     spine.world_mut().discard_region_routine(region);
@@ -937,11 +1033,17 @@ pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector)
 }
 
 /// The latest session snapshot on the chain: walk from HEAD through
-/// the parents, reading each revision's first content object — the
-/// first that restores as a session snapshot wins (the newest). The
-/// founding record carries no content; the walk is bounded by the
-/// chain length.
-fn latest_snapshot(store_dir: &Path) -> Result<Option<Vec<u8>>, MediumError> {
+/// the parents, reading each revision's first content object. The
+/// FIRST object recognizable as a session snapshot (the
+/// domain-family tag) is the NEWEST authoritative session state: it
+/// must restore — a recognizable-but-invalid newest session object
+/// fails CLOSED (corruption of the newest authoritative state is
+/// never walked past to an older snapshot, which would resurrect
+/// stale authoritative state). The founding record carries no
+/// content; the walk is bounded by the chain length.
+fn latest_snapshot(
+    store_dir: &Path,
+) -> Result<Option<(Spine<NpcWorld>, RegionDirector)>, TransitionError> {
     let mut medium = LocalFileMedium::open(store_dir.to_path_buf())?;
     let mut cursor = medium.head()?;
     while let Some(id) = cursor {
@@ -951,55 +1053,101 @@ fn latest_snapshot(store_dir: &Path) -> Result<Option<Vec<u8>>, MediumError> {
             continue;
         };
         let bytes = medium.read_object(hash)?;
-        if restore_session(&bytes).is_ok() {
-            return Ok(Some(bytes));
+        if is_session_object(&bytes) {
+            return restore_session(&bytes)
+                .map(Some)
+                .map_err(|_| TransitionError::CorruptSnapshot("newest-snapshot-restore-failed"));
         }
         cursor = record.parent;
     }
     Ok(None)
 }
 
-/// The recovery anchor from the recovered session state: per journal
-/// identity, the pipeline counters (a pending capture in the Captured
-/// lane, an applied one in Credits) with the coverage `(0, δ]` — the
-/// materialization evidence the four-tier suppression consults.
+/// Whether a content object is recognizable as a session snapshot:
+/// the object's first wire field (the u64-length-prefixed domain
+/// string) carries the session-snapshot domain FAMILY — any version.
+/// Recognition peeks the tag only, never committing to the body: a
+/// future version's snapshot is still recognizable, so this build
+/// fails closed on its restore rather than silently using older
+/// state.
+fn is_session_object(bytes: &[u8]) -> bool {
+    const FAMILY: &[u8] = b"engine-slice/session-snapshot";
+    if bytes.len() < 8 {
+        return false;
+    }
+    let tag_len =
+        u64::from_le_bytes(bytes[0..8].try_into().expect("the slice is 8 bytes")) as usize;
+    tag_len >= FAMILY.len() && 8 + tag_len <= bytes.len() && &bytes[8..8 + FAMILY.len()] == FAMILY
+}
+
+/// The recovery anchor from the RECOVERED SESSION STATE — never
+/// constructed from the journal's claims. Per journal identity: a
+/// pending capture's OWN amount (the ledger's verified
+/// materialization — the coverage the four-tier suppression
+/// consults); an applied identity's claim is admitted only under the
+/// per-NPC credits conservation (the world's credits — the snapshot's
+/// verified materialization — must equal the sum of the applied
+/// claims exactly; a divergence is a claim the verified state
+/// contradicts — the fail-closed halt). An identity the recovered
+/// ledger does not know is ABSENT from the anchor: the reconcile
+/// surfaces its claim as unaccounted (the halt), never a silently
+/// fabricated coverage.
 fn build_anchor(
     spine: &Spine<NpcWorld>,
     director: &RegionDirector,
     scan: &JournalScan,
-) -> RecoveryAnchor {
+) -> Result<RecoveryAnchor, TransitionError> {
     let mut anchor = RecoveryAnchor::new(SourcePosition {
         head: None,
         tick: spine.clock().as_u64(),
     });
+    let mut applied_claims = vec![0u64; NPC_COUNT];
     for transaction in &scan.committed {
         for envelope in &transaction.envelopes {
-            let delta = envelope.delta.milestones;
-            let applied = matches!(
-                director.ledger().status(envelope.id),
-                CaptureStatus::Applied
-            );
-            let counters = if applied {
-                CounterValues {
-                    milestones: delta,
-                    pending_signals: 0,
-                    captured: 0,
-                    credits: delta,
+            match director.ledger().status(envelope.id) {
+                CaptureStatus::Pending(amount) => {
+                    let counters = CounterValues {
+                        milestones: amount,
+                        pending_signals: 0,
+                        captured: amount,
+                        credits: 0,
+                    };
+                    let mut award = AwardState::new();
+                    for occurrence in 1..=amount {
+                        award.award_durable(occurrence);
+                    }
+                    anchor = anchor.with_identity(envelope.id, counters, award);
                 }
-            } else {
-                CounterValues {
-                    milestones: delta,
-                    pending_signals: 0,
-                    captured: delta,
-                    credits: 0,
+                CaptureStatus::Applied => {
+                    // The verified status says this capture was applied;
+                    // the amount is admitted under the conservation check
+                    // below (the world's credits are the snapshot-origin
+                    // materialization).
+                    let delta = envelope.delta.milestones;
+                    applied_claims[envelope.id.npc as usize] += delta;
+                    let counters = CounterValues {
+                        milestones: delta,
+                        pending_signals: 0,
+                        captured: 0,
+                        credits: delta,
+                    };
+                    let mut award = AwardState::new();
+                    for occurrence in 1..=delta {
+                        award.award_durable(occurrence);
+                    }
+                    anchor = anchor.with_identity(envelope.id, counters, award);
                 }
-            };
-            let mut award = AwardState::new();
-            for occurrence in 1..=delta {
-                award.award_durable(occurrence);
+                CaptureStatus::Unknown => {}
             }
-            anchor = anchor.with_identity(envelope.id, counters, award);
         }
     }
-    anchor
+    for (npc, claims) in applied_claims.iter().enumerate() {
+        if *claims != spine.world().credits()[npc] {
+            return Err(TransitionError::InstallIncompatible {
+                region: npc % REGION_COUNT,
+                detail: "applied-claims-conservation",
+            });
+        }
+    }
+    Ok(anchor)
 }
