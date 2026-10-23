@@ -232,6 +232,12 @@ pub enum ObligationLocation {
 pub struct ObligationView<'a> {
     pub id: EventId,
     pub due: Tick,
+    /// The obligation's FULL schedule form (Batch 5's lifecycle
+    /// corrective: the collected obligation's exact semantics —
+    /// logical-time or execution-relative — must survive the plan's
+    /// owned form, so a recovered chain resumes with its original
+    /// anchoring, never a flattened due).
+    pub schedule: Schedule,
     pub class: EventClass,
     pub payload: u64,
     pub field: Field,
@@ -267,6 +273,7 @@ impl Pending {
         ObligationView {
             id: self.event.id,
             due: self.due,
+            schedule: self.event.schedule,
             class: self.event.class,
             payload: self.event.payload,
             field: self.event.field,
@@ -1499,6 +1506,7 @@ fn event_view(event: &Event, location: ObligationLocation) -> ObligationView<'_>
     ObligationView {
         id: event.id,
         due: event.schedule.due(),
+        schedule: event.schedule,
         class: event.class,
         payload: event.payload,
         field: event.field,

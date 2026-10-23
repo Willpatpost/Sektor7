@@ -42,6 +42,13 @@ use crate::region::{
 pub struct PlanObligation {
     pub id: EventId,
     pub due: Tick,
+    /// The obligation's FULL schedule form — carried verbatim (Batch
+    /// 5's lifecycle corrective: a recovered chain resumes with its
+    /// original anchoring semantics — logical-time or
+    /// execution-relative — never a flattened due; the execution
+    /// ledger's schedule-kind record and the follow-up anchoring stay
+    /// identical to the never-crashed path).
+    pub schedule: Schedule,
     pub class: EventClass,
     pub payload: u64,
     pub field: Field,
@@ -82,8 +89,17 @@ pub struct DeactivationPlan {
 }
 
 impl DeactivationPlan {
-    /// The plan blob's versioned domain.
-    pub const DOMAIN: &'static str = "engine-slice/deactivation-plan/1";
+    /// The plan blob's versioned domain. Schema v2 (Batch 5's
+    /// lifecycle corrective): each obligation carries its FULL
+    /// schedule form — v1's flattened due reconstructed every
+    /// obligation as `AtLogicalTime`, so a recovered chain resumed
+    /// with wrong anchoring semantics (the execution ledger's
+    /// schedule-kind record and the follow-up anchoring diverged from
+    /// the never-crashed path). v1 appeared only within B4-review
+    /// test campaigns — no durable artifact carries one — so the walk
+    /// reads v2 only; the version bump is the explicit migration
+    /// boundary.
+    pub const DOMAIN: &'static str = "engine-slice/deactivation-plan/2";
 
     /// Builds the plan from read-only sources (phases 1–2): the
     /// collected obligations — the caller passes
@@ -104,6 +120,7 @@ impl DeactivationPlan {
             .map(|view| PlanObligation {
                 id: view.id,
                 due: view.due,
+                schedule: view.schedule,
                 class: view.class,
                 payload: view.payload,
                 field: view.field,
@@ -144,6 +161,17 @@ impl DeactivationPlan {
         for obligation in &self.obligations {
             enc.write_u64(obligation.id.seq);
             enc.write_tick(obligation.due);
+            match obligation.schedule {
+                Schedule::AtLogicalTime { due } => {
+                    enc.write_u8(0);
+                    enc.write_tick(due);
+                }
+                Schedule::ExecutionRelative { origin, delay } => {
+                    enc.write_u8(1);
+                    enc.write_tick(origin);
+                    enc.write_u64(delay);
+                }
+            }
             enc.write_u32(u32::from(obligation.class.0));
             enc.write_u64(obligation.payload);
             enc.write_u8(match obligation.field {
@@ -199,6 +227,24 @@ impl DeactivationPlan {
                 return Err(SaveError::Order { section: SECTION });
             }
             prev = Some((due, seq));
+            let schedule = match dec.read_u8()? {
+                0 => Schedule::AtLogicalTime {
+                    due: dec.read_tick()?,
+                },
+                1 => Schedule::ExecutionRelative {
+                    origin: dec.read_tick()?,
+                    delay: dec.read_u64()?,
+                },
+                discriminant => {
+                    return Err(SaveError::Enum {
+                        section: SECTION,
+                        discriminant: u64::from(discriminant),
+                    });
+                }
+            };
+            if schedule.due() != due {
+                return Err(SaveError::Integrity("deactivation-plan/schedule-due"));
+            }
             let class_raw = dec.read_u32()?;
             let Ok(class_value) = u16::try_from(class_raw) else {
                 return Err(SaveError::Enum {
@@ -227,6 +273,7 @@ impl DeactivationPlan {
             obligations.push(PlanObligation {
                 id: EventId { seq },
                 due,
+                schedule,
                 class: EventClass(class_value),
                 payload,
                 field,
@@ -961,9 +1008,7 @@ fn plan_events(plan: &DeactivationPlan) -> Vec<Event> {
         .map(|obligation| Event {
             id: obligation.id,
             class: obligation.class,
-            schedule: Schedule::AtLogicalTime {
-                due: obligation.due,
-            },
+            schedule: obligation.schedule,
             payload: obligation.payload,
             field: obligation.field,
             depends_on: obligation.depends_on.clone(),
