@@ -37,6 +37,13 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--benchmark-persistence") {
+        // Stage 5 Batch 5: the persistence performance benchmark (the
+        // GO's fourth item) — pod results, NOT physical-rig evidence.
+        engine_slice::benchmark::run();
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "--sim") {
