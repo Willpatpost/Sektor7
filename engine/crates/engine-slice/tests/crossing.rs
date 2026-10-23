@@ -1121,6 +1121,7 @@ fn recovery_skips_canceled_deactivation_transactions() {
 #[test]
 fn recovery_composes_canonical_confirmation_evidence() {
     let near = near_region_4();
+    let far = far_from_region_4();
     let (mut spine, mut director) = scenario_pair(150, &near);
     let dir = TestDir::new("confirmed");
     let journal = T1Journal::open(dir.journal()).unwrap();
@@ -1135,7 +1136,7 @@ fn recovery_composes_canonical_confirmation_evidence() {
         panic!("the captures confirm canonically before the crash");
     };
     drop(crossing);
-    let (recovered_spine, recovered_director, mut recovered_crossing) =
+    let (mut recovered_spine, mut recovered_director, mut recovered_crossing) =
         SessionCrossing::recover(&dir.store(), &dir.journal(), "confirmed-campaign")
             .expect("the recovery composes the confirmation evidence");
     assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
@@ -1153,6 +1154,60 @@ fn recovery_composes_canonical_confirmation_evidence() {
         recovered_crossing.commit_canonical().unwrap(),
         CommitOutcome::NothingPending
     ));
+    // THE CONTINUATION (the third review corrective's frontier
+    // proof): the recovered session's next legitimate transitions
+    // derive FRESH identities — the reactivation applies the
+    // recovered captures to credits (the legitimate lifecycle), the
+    // accrual crosses fresh milestones, and the next deactivation
+    // captures under episode 2: no previously issued canonical
+    // identity is reused (the frontier is monotonic), no pending
+    // reward is stranded, the authoritative state remains coherent.
+    durable_boundary(
+        &mut recovered_crossing,
+        &mut recovered_spine,
+        &mut recovered_director,
+        &near,
+    );
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Full,
+        "the reactivation installs over the recovered checkpoint"
+    );
+    assert!(
+        recovered_spine.world().credits().iter().sum::<u64>() > 0,
+        "the recovered pending rewards applied to credits — nothing stranded"
+    );
+    for _ in 0..160 {
+        recovered_director.apply(&mut recovered_spine, std::slice::from_ref(&near));
+        recovered_spine.run_tick();
+    }
+    durable_boundary(
+        &mut recovered_crossing,
+        &mut recovered_spine,
+        &mut recovered_director,
+        &far,
+    );
+    assert_eq!(
+        recovered_director.states()[4].episode,
+        2,
+        "the next deactivation derives episode 2 — the frontier advanced monotonically"
+    );
+    assert!(
+        matches!(
+            recovered_director
+                .ledger()
+                .status(ConsequenceId::new(4, 2, 4)),
+            CaptureStatus::Pending(_)
+        ),
+        "the fresh capture sits under the fresh episode-2 identity"
+    );
+    assert_eq!(
+        recovered_director
+            .ledger()
+            .status(ConsequenceId::new(4, 1, 4)),
+        CaptureStatus::Applied,
+        "the confirmed episode-1 identity stands applied — no collision, no reissue"
+    );
 }
 
 /// The confirmation-evidence discriminator: a DIVERGENT journal claim
@@ -1450,18 +1505,21 @@ fn recovery_fails_closed_on_confirmed_unmaterialized_without_evidence() {
 }
 
 /// The confirmed effect OUTSIDE the supported application plan path
-/// (the review's first corrective): a canonically confirmed,
-/// actionable PLAN-LESS consequence — the application's recovery
-/// skips the plan (there is none), the B3 reconcile reconstructs the
-/// missing effect from the canonical evidence (confirmed_recovered),
-/// and the application MUST materialize it into the returned world —
-/// never a successful recovery that silently discards a known
-/// confirmed effect.
+/// (the third review corrective): a canonically confirmed, actionable
+/// PLAN-LESS consequence has NO legitimate application lifecycle — no
+/// deactivation plan, no checkpoint, no activation path, and its
+/// foreign episode choice sits outside the director's frontier
+/// arithmetic (the next ordinary deactivation would derive the same
+/// episode and collide with the already-confirmed identity — the
+/// pipeline's ConflictingReuse — stranding the session with a pending
+/// reward no activation can reach). The application REJECTS the
+/// unsupported plan-less form explicitly: the recovery fails CLOSED
+/// — never a successful materialization whose continuation is
+/// incoherent, and never a fabricated checkpoint or activation.
 #[test]
-fn recovery_materializes_confirmed_effects_outside_the_plan_path() {
+fn recovery_fails_closed_on_planless_confirmed_effects() {
     let near = near_region_4();
     let (spine, director) = scenario_pair(150, &near);
-    let milestones_at_snapshot = spine.world().milestones().to_vec();
     let dir = TestDir::new("plan-less");
     // The plan-less claim, staged and confirmed through the raw
     // pipeline. The campaign is FOUNDED through a crossing first (the
@@ -1524,28 +1582,20 @@ fn recovery_materializes_confirmed_effects_outside_the_plan_path() {
     crossing.publish_snapshot(&spine, &director).unwrap();
     drop(crossing);
     // THE recovery: the plan-less claim is confirmed + unmaterialized
-    // — the B3 reports it confirmed_recovered and the application
-    // materializes it.
-    let (recovered_spine, recovered_director, recovered_crossing) =
-        SessionCrossing::recover(&dir.store(), &dir.journal(), "plan-less-campaign")
-            .expect("the confirmed effect outside the plan path is materialized, never discarded");
-    let mut milestones = milestones_at_snapshot;
-    milestones[4] += 2;
-    assert_eq!(
-        recovered_spine.world().milestones(),
-        milestones,
-        "the confirmed effect's milestone awards land in the world"
-    );
-    assert_eq!(
-        recovered_director
-            .ledger()
-            .status(ConsequenceId::new(4, 1, 4)),
-        CaptureStatus::Pending(2),
-        "the confirmed effect's captured signal lands in the ledger"
-    );
-    assert_eq!(
-        recovered_crossing.key_phase(ConsequenceId::new(4, 1, 4)),
-        Some(KeyPhase::InConfirmedChain),
-        "the materialized capture is canonically confirmed"
-    );
+    // — the B3 reports it confirmed_recovered, and the application
+    // REJECTS the unsupported form explicitly (fail closed — the
+    // session is never stranded with a pending reward no activation
+    // can reach and an identity the next deactivation would collide
+    // with).
+    let error = match SessionCrossing::recover(&dir.store(), &dir.journal(), "plan-less-campaign") {
+        Err(error) => error,
+        Ok(_) => panic!("the unsupported plan-less confirmed effect fails the recovery closed"),
+    };
+    assert!(matches!(
+        error,
+        TransitionError::InstallIncompatible {
+            detail: "confirmed-recovered-planless-unsupported",
+            ..
+        }
+    ));
 }

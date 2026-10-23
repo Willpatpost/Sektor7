@@ -817,37 +817,28 @@ impl SessionCrossing {
         }
         // The confirmed-recovered effects (the B3 coherence
         // contract's distinctly-reported exactly-once reconstruction
-        // from the canonical evidence): the application MUST
-        // materialize them into the returned authoritative state —
-        // never a successful recovery that silently discards known
-        // confirmed effects. The supported materialization form is
-        // the application's own uniform award (+1 milestone, +1
-        // signal into the CAPTURED lane per occurrence — the
-        // crossing's capture form): the milestone awards land in the
-        // world and the captured signal in the ledger. Any other
-        // form is outside the application's supported path — fail
-        // closed, never a guess.
-        for effect in &outcome.report.confirmed_recovered {
-            let delta = &effect.delta;
-            if delta.pending_signals != 0
-                || delta.credits != 0
-                || delta.captured < 0
-                || delta.captured as u64 != delta.milestones
-            {
-                return Err(TransitionError::InstallIncompatible {
-                    region: effect.id.region as usize,
-                    detail: "confirmed-recovered-unsupported-form",
-                });
-            }
-            let npc = effect.id.npc as usize;
-            spine
-                .world_mut()
-                .apply_confirmed_recovered(npc, delta.milestones);
-            director.install_captures(
-                effect.id.region as usize,
-                effect.id.episode,
-                &[(npc, delta.milestones)],
-            );
+        // from the canonical evidence): in this application they are
+        // exactly the PLAN-LESS foreign claims — confirmed
+        // consequences with no deactivation plan, no checkpoint, no
+        // activation path, and a foreign episode choice outside the
+        // director's own frontier arithmetic. The crossing's
+        // coherent continuation REQUIRES the monotonic
+        // episode/identity frontier (the next ordinary deactivation
+        // derives its identities from the director's episode
+        // counter), so a restored plan-less capture under such an
+        // identity would collide with the next derived identity
+        // (the pipeline's ConflictingReuse) and strand the session
+        // with a pending reward no activation can reach.
+        // Materializing it would require exactly the fabrication the
+        // recovery never does — an invented checkpoint, activation,
+        // or source execution — so the application REJECTS the
+        // unsupported plan-less form explicitly: fail closed, never
+        // a successful recovery whose continuation is incoherent.
+        if let Some(effect) = outcome.report.confirmed_recovered.first() {
+            return Err(TransitionError::InstallIncompatible {
+                region: effect.id.region as usize,
+                detail: "confirmed-recovered-planless-unsupported",
+            });
         }
         // 5. The recovered session, with the re-opened crossing.
         Ok((spine, director, crossing))
