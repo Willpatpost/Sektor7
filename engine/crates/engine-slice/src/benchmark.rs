@@ -25,8 +25,10 @@
 //!   reconcile, and the re-opened crossing).
 //! - **Chain cold-open validation** (the B2 founding→HEAD walk at
 //!   growing chain lengths).
-//! - **Storage growth** (the save bytes, the journal bytes per first
-//!   transaction, the store bytes per publication).
+//! - **Storage growth** (the journal bytes per first transaction, the
+//!   store bytes per publication, and the GROWTH SWEEP across
+//!   increasing campaign durations — the lifetime-growing execution
+//!   ledger/indexes/snapshot vs the bounded active obligations).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -248,9 +250,52 @@ pub fn run() {
     }
     report("session recovery (recover)", &mut recovery);
 
+    // 6. The storage-growth sweep (the review corrective): the spine's
+    //    execution LEDGER (one record per execution, serialized in
+    //    full fidelity), the KNOWN/EXECUTED indexes (one entry per
+    //    scheduled/executed identity — in-memory, rebuilt from
+    //    next_seq + unfinished on load), and therefore the SERIALIZED
+    //    SNAPSHOT all grow with LIFETIME execution history — the
+    //    150-tick baseline cannot establish long-campaign boundedness.
+    //    Measured across increasing campaign durations: the executed
+    //    count (the ledger's record count), the scheduled count (the
+    //    known index's size), the serialized spine save, the session
+    //    snapshot, and the codec time — deriving the per-execution
+    //    growth rate and the per-record codec cost.
+    println!("storage-growth sweep (the LIFETIME history vs the bounded active state):");
+    let mut sweep_first: Option<(u64, usize, u64)> = None; // (executed, spine_len, ticks)
+    let mut sweep_last: (u64, usize, u64) = (0, 0, 0);
+    for ticks in [150u64, 600, 1200, 2400, 4800] {
+        let (spine, director) = scenario_pair(ticks, &near);
+        let stats = spine.stats();
+        let spine_len = spine.save_bytes().len();
+        let session_len = save_session(&spine, &director).unwrap().len();
+        let start = Instant::now();
+        let _ = save_session(&spine, &director).unwrap();
+        let ser = start.elapsed();
+        println!(
+            "  {ticks} ticks: executed {} / scheduled {} (the known index) / the spine save {spine_len} B / the session snapshot {session_len} B / the codec {:.3} ms",
+            stats.executed,
+            stats.scheduled,
+            ser.as_secs_f64() * 1e3
+        );
+        if sweep_first.is_none() {
+            sweep_first = Some((stats.executed, spine_len, ticks));
+        }
+        sweep_last = (stats.executed, spine_len, ticks);
+    }
+    if let Some((first_exec, first_len, _)) = sweep_first {
+        let per_execution =
+            (sweep_last.1 as f64 - first_len as f64) / (sweep_last.0 as f64 - first_exec as f64);
+        println!(
+            "  derived: ~{per_execution:.1} B per execution (the ledger's serialized share — the dominant lifetime growth); ~{:.0} executions per tick in this fixture",
+            sweep_last.0 as f64 / sweep_last.2 as f64
+        );
+    }
+
     // The storage summary.
     println!(
-        "storage: the session snapshot object {save_len} B; the journal {journal_min}-{journal_max} B for the first capture-bearing transaction on a fresh campaign"
+        "storage: the session snapshot object {save_len} B AT 150 TICKS (lifetime-growing — see the sweep above); the journal {journal_min}-{journal_max} B for the first capture-bearing transaction on a fresh campaign"
     );
 
     // The frame budgets (the interpretation with the full methodology
