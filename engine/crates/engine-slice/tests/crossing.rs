@@ -11,16 +11,16 @@ use std::path::PathBuf;
 use engine_core::{Encoder, EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
     AwardCheckpoint, AwardState, CancellationReason, CanonicalMedium, ClassifiedSpan,
-    CommitOutcome, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
-    EncounterJournal, FaultAction, JournalFaultControl, JournalFaultPoint, KeyPhase,
-    LocalFileMedium, OccurrenceSpan, RecoveryError, RevisionRecord, SignalLane, SourceBaseline,
-    SourcePosition, StoredObject, T1Journal, TransactionInput,
+    CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage,
+    DurabilityClass, EncounterJournal, FaultAction, FrontierEntry, JournalFaultControl,
+    JournalFaultPoint, KeyPhase, LocalFileMedium, OccurrenceSpan, RecoveryError, RevisionRecord,
+    SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TransactionInput,
 };
 use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
 use engine_slice::npc::{
     NpcConfig, NpcWorld, POSITION_DISCARDED, REGION_COUNT, install_initial_schedules,
 };
-use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
+use engine_slice::region::{CaptureStatus, RegionConfig, RegionDirector, stage4_state_fingerprint};
 use engine_slice::sim::{SimConfig, SimDriver};
 
 /// A Lod-mode spine with real executed work (no director — the plan
@@ -1290,4 +1290,262 @@ fn recovery_fails_closed_on_invalid_newest_snapshot() {
         Ok(_) => panic!("the future-version snapshot also fails closed"),
     };
     assert!(matches!(error, TransitionError::CorruptSnapshot(_)));
+}
+
+// ----------------- the second review-corrective regressions
+
+/// The accepted B3 coherence case at the application level (the
+/// review's second corrective): a canonically confirmed consequence
+/// ALREADY materialized in the verified snapshot (the pending
+/// capture in its ledger) with the historical T1 journal GONE — the
+/// recovery succeeds with no duplicate and no false failure: the
+/// chain and the snapshot carry the truth, the journal is not
+/// required.
+#[test]
+fn recovery_recognizes_confirmed_pending_without_journal() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let milestones_at_snapshot = spine.world().milestones().to_vec();
+    let dir = TestDir::new("no-journal-pending");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "no-journal-campaign").unwrap();
+    // The durable deactivation, canonically confirmed, THEN the
+    // snapshot (the ledger holds the pending captures; the world
+    // holds the deactivation's state).
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm canonically");
+    };
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let pending_count = director.ledger().pending_count();
+    assert!(
+        pending_count > 0,
+        "the snapshot's ledger holds the pending captures"
+    );
+    // THE historical T1 journal is GONE (the accepted case: confirmed
+    // + materialized needs no journal).
+    drop(crossing);
+    std::fs::remove_file(dir.journal()).unwrap();
+    // THE recovery: no duplicate, no false failure.
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "no-journal-campaign")
+            .expect("the confirmed + materialized state recovers without the journal");
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Dormant,
+        "the snapshot's deactivation state stands"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_count(),
+        pending_count,
+        "the pending captures stand from the snapshot — no duplicate"
+    );
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        milestones_at_snapshot,
+        "the milestones stand from the snapshot — no duplicate award"
+    );
+    assert!(
+        matches!(
+            recovered_crossing.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        ),
+        "nothing re-batches — the confirmation is already on the chain"
+    );
+}
+
+/// The same accepted case on the APPLIED lane: confirmed + applied
+/// (the credits) + the journal gone — the recovery succeeds with the
+/// credits and the applied ledger intact (the per-identity applied
+/// AMOUNTS — the persisted v3 evidence — are the materialization
+/// proof; never inferred from aggregate counters).
+#[test]
+fn recovery_recognizes_confirmed_applied_without_journal() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("no-journal-applied");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "no-journal-campaign").unwrap();
+    // Episode 1: the durable deactivation, the durable reactivation
+    // (the captures applied to credits), the canonical confirmation,
+    // then the snapshot.
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm canonically");
+    };
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let applied_count = director.ledger().applied_count();
+    let credits_at_snapshot = spine.world().credits().to_vec();
+    assert!(
+        applied_count > 0,
+        "the snapshot's ledger holds the applied captures"
+    );
+    assert!(
+        credits_at_snapshot.iter().sum::<u64>() > 0,
+        "the snapshot's world holds the applied credits"
+    );
+    drop(crossing);
+    std::fs::remove_file(dir.journal()).unwrap();
+    let (recovered_spine, recovered_director, _recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "no-journal-campaign")
+            .expect("the confirmed + applied state recovers without the journal");
+    assert_eq!(
+        recovered_director.ledger().applied_count(),
+        applied_count,
+        "the applied identities stand from the snapshot — no duplicate"
+    );
+    assert_eq!(
+        recovered_spine.world().credits(),
+        credits_at_snapshot,
+        "the credits stand from the snapshot — no duplicate application"
+    );
+}
+
+/// The mirror case: confirmed + NOT materialized in the snapshot +
+/// no journal (the recovery evidence insufficient) — the fail-closed
+/// halt (the B3 ConfirmedUnmaterialized), never a silent discard and
+/// never a fabricated state.
+#[test]
+fn recovery_fails_closed_on_confirmed_unmaterialized_without_evidence() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("unmaterialized");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open(&dir.store(), journal, "unmaterialized-campaign").unwrap();
+    // The snapshot BEFORE the deactivation (the ledger empty — the
+    // confirmed captures are NOT materialized in it).
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    let CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm canonically");
+    };
+    drop(crossing);
+    std::fs::remove_file(dir.journal()).unwrap();
+    // THE recovery: the confirmed captures are unmaterialized in the
+    // snapshot and the journal (their only recovery evidence) is
+    // gone — fail closed.
+    let error =
+        match SessionCrossing::recover(&dir.store(), &dir.journal(), "unmaterialized-campaign") {
+            Err(error) => error,
+            Ok(_) => panic!("the unmaterialized confirmed captures fail the recovery closed"),
+        };
+    assert!(matches!(
+        error,
+        TransitionError::Recovery(RecoveryError::ConfirmedUnmaterialized { .. })
+    ));
+}
+
+/// The confirmed effect OUTSIDE the supported application plan path
+/// (the review's first corrective): a canonically confirmed,
+/// actionable PLAN-LESS consequence — the application's recovery
+/// skips the plan (there is none), the B3 reconcile reconstructs the
+/// missing effect from the canonical evidence (confirmed_recovered),
+/// and the application MUST materialize it into the returned world —
+/// never a successful recovery that silently discards a known
+/// confirmed effect.
+#[test]
+fn recovery_materializes_confirmed_effects_outside_the_plan_path() {
+    let near = near_region_4();
+    let (spine, director) = scenario_pair(150, &near);
+    let milestones_at_snapshot = spine.world().milestones().to_vec();
+    let dir = TestDir::new("plan-less");
+    // The plan-less claim, staged and confirmed through the raw
+    // pipeline. The campaign is FOUNDED through a crossing first (the
+    // raw pipeline's canonical commit needs the founded chain; the
+    // journal's sidecar lock is session-scoped — each holder is
+    // dropped before the next opens).
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let founding_crossing =
+        SessionCrossing::open(&dir.store(), journal, "plan-less-campaign").unwrap();
+    drop(founding_crossing);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let medium = LocalFileMedium::open(dir.store()).unwrap();
+    let mut pipeline = CommitPipeline::open(medium, journal).unwrap();
+    let envelope = ConsequenceEnvelope::capture(
+        ConsequenceId::new(4, 1, 4),
+        vec![ClassifiedSpan {
+            span: OccurrenceSpan::new(0, 2).unwrap(),
+            class: DurabilityClass::DurableEligible,
+        }],
+        SignalLane::Captured,
+        CounterValues::default(),
+        SourceBaseline {
+            counters: CounterValues::default(),
+            award: AwardCheckpoint {
+                durable: Coverage::new(),
+                provisional: Coverage::new(),
+            },
+        },
+        SourcePosition {
+            head: None,
+            tick: 150,
+        },
+    )
+    .unwrap();
+    pipeline.stage(envelope).unwrap();
+    pipeline
+        .capture(
+            SourcePosition {
+                head: None,
+                tick: 150,
+            },
+            DurabilityClass::DurableEligible,
+            Vec::new(),
+            vec![FrontierEntry {
+                region: 4,
+                episode: 1,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+    let CommitOutcome::Confirmed(_) = pipeline.commit_canonical().unwrap() else {
+        panic!("the plan-less claim confirms canonically");
+    };
+    drop(pipeline);
+    // The snapshot AFTER the confirmation, from a world that never
+    // materialized the claim (the crossing re-opens over the same
+    // campaign — the journal's lock was released by the drop).
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "plan-less-campaign").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    drop(crossing);
+    // THE recovery: the plan-less claim is confirmed + unmaterialized
+    // — the B3 reports it confirmed_recovered and the application
+    // materializes it.
+    let (recovered_spine, recovered_director, recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "plan-less-campaign")
+            .expect("the confirmed effect outside the plan path is materialized, never discarded");
+    let mut milestones = milestones_at_snapshot;
+    milestones[4] += 2;
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        milestones,
+        "the confirmed effect's milestone awards land in the world"
+    );
+    assert_eq!(
+        recovered_director
+            .ledger()
+            .status(ConsequenceId::new(4, 1, 4)),
+        CaptureStatus::Pending(2),
+        "the confirmed effect's captured signal lands in the ledger"
+    );
+    assert_eq!(
+        recovered_crossing.key_phase(ConsequenceId::new(4, 1, 4)),
+        Some(KeyPhase::InConfirmedChain),
+        "the materialized capture is canonically confirmed"
+    );
 }

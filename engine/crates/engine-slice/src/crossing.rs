@@ -25,7 +25,8 @@ use engine_persist::{
     ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
     CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
     LocalFileMedium, MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError,
-    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, reconcile,
+    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
+    reconcile,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -714,8 +715,25 @@ impl SessionCrossing {
         // verified scratch the first post-snapshot capture consumed.
         let scratch_at_snapshot: Vec<u64> = spine.world().pending_signals().to_vec();
         // 2. The journal scan + the actionability filter: a durably
-        //    canceled transaction is never replayed.
-        let scan = T1Journal::scan_file(journal_path).map_err(PipelineError::Journal)?;
+        //    canceled transaction is never replayed. A journal file
+        //    that no longer exists (the historical T1 intents dropped
+        //    after canonical confirmation — the accepted B3 coherence
+        //    case: a confirmed consequence materialized in a verified
+        //    snapshot needs no historical T1) is an EMPTY scan: the
+        //    chain and the snapshot carry the truth.
+        let scan = match T1Journal::scan_file(journal_path) {
+            Ok(scan) => scan,
+            Err(engine_persist::JournalError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                JournalScan {
+                    committed: Vec::new(),
+                    cancellations: Vec::new(),
+                    tail: TailState::Clean,
+                }
+            }
+            Err(error) => return Err(PipelineError::Journal(error).into()),
+        };
         let canceled: HashSet<engine_persist::TransactionId> =
             scan.cancellations.iter().map(|c| c.target).collect();
         // 3. The interleaved crossing restore + plan install — the
@@ -786,16 +804,50 @@ impl SessionCrossing {
         }
         // 4. The coherence verification — the REAL canonical-chain
         //    confirmation evidence from the re-opened pipeline (never
-        //    an empty map), and the anchor built from the RECOVERED
-        //    session state (never from the journal's claims).
+        //    an empty map), and the anchor built from the LEDGER's
+        //    own per-identity state (journal-independent).
         let confirmed = crossing.pipeline.confirmed_evidence();
-        let anchor = build_anchor(&spine, &director, &scan)?;
+        let anchor = build_anchor(&spine, &director)?;
         let outcome = reconcile(&anchor, &scan, &confirmed).map_err(TransitionError::Recovery)?;
         if let Some(effect) = outcome.report.applied.first() {
             return Err(TransitionError::InstallIncompatible {
                 region: effect.id.region as usize,
                 detail: "recovery-unaccounted-claim",
             });
+        }
+        // The confirmed-recovered effects (the B3 coherence
+        // contract's distinctly-reported exactly-once reconstruction
+        // from the canonical evidence): the application MUST
+        // materialize them into the returned authoritative state —
+        // never a successful recovery that silently discards known
+        // confirmed effects. The supported materialization form is
+        // the application's own uniform award (+1 milestone, +1
+        // signal into the CAPTURED lane per occurrence — the
+        // crossing's capture form): the milestone awards land in the
+        // world and the captured signal in the ledger. Any other
+        // form is outside the application's supported path — fail
+        // closed, never a guess.
+        for effect in &outcome.report.confirmed_recovered {
+            let delta = &effect.delta;
+            if delta.pending_signals != 0
+                || delta.credits != 0
+                || delta.captured < 0
+                || delta.captured as u64 != delta.milestones
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: effect.id.region as usize,
+                    detail: "confirmed-recovered-unsupported-form",
+                });
+            }
+            let npc = effect.id.npc as usize;
+            spine
+                .world_mut()
+                .apply_confirmed_recovered(npc, delta.milestones);
+            director.install_captures(
+                effect.id.region as usize,
+                effect.id.episode,
+                &[(npc, delta.milestones)],
+            );
         }
         // 5. The recovered session, with the re-opened crossing.
         Ok((spine, director, crossing))
@@ -1080,72 +1132,63 @@ fn is_session_object(bytes: &[u8]) -> bool {
     tag_len >= FAMILY.len() && 8 + tag_len <= bytes.len() && &bytes[8..8 + FAMILY.len()] == FAMILY
 }
 
-/// The recovery anchor from the RECOVERED SESSION STATE — never
-/// constructed from the journal's claims. Per journal identity: a
-/// pending capture's OWN amount (the ledger's verified
-/// materialization — the coverage the four-tier suppression
-/// consults); an applied identity's claim is admitted only under the
-/// per-NPC credits conservation (the world's credits — the snapshot's
-/// verified materialization — must equal the sum of the applied
-/// claims exactly; a divergence is a claim the verified state
-/// contradicts — the fail-closed halt). An identity the recovered
-/// ledger does not know is ABSENT from the anchor: the reconcile
-/// surfaces its claim as unaccounted (the halt), never a silently
-/// fabricated coverage.
+/// The recovery anchor from the LEDGER's own per-identity state —
+/// the snapshot's verified materialization evidence,
+/// journal-independent (the accepted B3 coherence case: a confirmed
+/// consequence already materialized in a verified snapshot requires
+/// NO historical T1 journal). A pending capture's own amount is the
+/// coverage; an applied identity's own amount — the persisted v3
+/// per-identity evidence, never inferred from aggregate counters —
+/// is the credits-lane coverage. The coherence check: the world's
+/// credits must equal the sum of the ledger's applied amounts per
+/// NPC (both session-origin — the snapshot's internal coherence; a
+/// divergence is the fail-closed halt).
 fn build_anchor(
     spine: &Spine<NpcWorld>,
     director: &RegionDirector,
-    scan: &JournalScan,
 ) -> Result<RecoveryAnchor, TransitionError> {
     let mut anchor = RecoveryAnchor::new(SourcePosition {
         head: None,
         tick: spine.clock().as_u64(),
     });
-    let mut applied_claims = vec![0u64; NPC_COUNT];
-    for transaction in &scan.committed {
-        for envelope in &transaction.envelopes {
-            match director.ledger().status(envelope.id) {
-                CaptureStatus::Pending(amount) => {
-                    let counters = CounterValues {
-                        milestones: amount,
-                        pending_signals: 0,
-                        captured: amount,
-                        credits: 0,
-                    };
-                    let mut award = AwardState::new();
-                    for occurrence in 1..=amount {
-                        award.award_durable(occurrence);
-                    }
-                    anchor = anchor.with_identity(envelope.id, counters, award);
-                }
-                CaptureStatus::Applied => {
-                    // The verified status says this capture was applied;
-                    // the amount is admitted under the conservation check
-                    // below (the world's credits are the snapshot-origin
-                    // materialization).
-                    let delta = envelope.delta.milestones;
-                    applied_claims[envelope.id.npc as usize] += delta;
-                    let counters = CounterValues {
-                        milestones: delta,
-                        pending_signals: 0,
-                        captured: 0,
-                        credits: delta,
-                    };
-                    let mut award = AwardState::new();
-                    for occurrence in 1..=delta {
-                        award.award_durable(occurrence);
-                    }
-                    anchor = anchor.with_identity(envelope.id, counters, award);
-                }
-                CaptureStatus::Unknown => {}
-            }
+    for (id, amount) in director.ledger().pending_entries() {
+        let counters = CounterValues {
+            milestones: amount,
+            pending_signals: 0,
+            captured: amount,
+            credits: 0,
+        };
+        let mut award = AwardState::new();
+        for occurrence in 1..=amount {
+            award.award_durable(occurrence);
         }
+        anchor = anchor.with_identity(id, counters, award);
     }
-    for (npc, claims) in applied_claims.iter().enumerate() {
-        if *claims != spine.world().credits()[npc] {
+    for (id, amount) in director.ledger().applied_entries() {
+        let counters = CounterValues {
+            milestones: amount,
+            pending_signals: 0,
+            captured: 0,
+            credits: amount,
+        };
+        let mut award = AwardState::new();
+        for occurrence in 1..=amount {
+            award.award_durable(occurrence);
+        }
+        anchor = anchor.with_identity(id, counters, award);
+    }
+    // The coherence: the world's credits == the sum of the ledger's
+    // applied amounts per NPC — both session-origin (the snapshot's
+    // internal coherence; a divergence is the halt).
+    let mut applied_amounts = vec![0u64; NPC_COUNT];
+    for (id, amount) in director.ledger().applied_entries() {
+        applied_amounts[id.npc as usize] += amount;
+    }
+    for (npc, amounts) in applied_amounts.iter().enumerate() {
+        if *amounts != spine.world().credits()[npc] {
             return Err(TransitionError::InstallIncompatible {
                 region: npc % REGION_COUNT,
-                detail: "applied-claims-conservation",
+                detail: "applied-amounts-conservation",
             });
         }
     }

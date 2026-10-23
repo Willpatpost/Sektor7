@@ -388,6 +388,16 @@ impl NpcWorld {
         self.pending_signals[npc] += count;
     }
 
+    /// The recovery's confirmed-recovered materialization (Batch 4's
+    /// second review corrective): a canonically confirmed consequence
+    /// reconstructed from the canonical evidence — its milestone
+    /// awards land in the world. The captured signal's lane lives in
+    /// the ledger (the capture form means the signal was never
+    /// pending in this world — the scratch is NOT touched).
+    pub(crate) fn apply_confirmed_recovered(&mut self, npc: usize, count: u64) {
+        self.milestones[npc] += count;
+    }
+
     /// Exact step-by-step replay of a dormant span (reviewer priority
     /// A/C, Batch 2 corrective finding D): recomputes the seeded jitter
     /// chain activity by activity AFTER `from_due` (the coherent

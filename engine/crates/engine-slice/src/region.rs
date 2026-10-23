@@ -15,7 +15,7 @@
 //! across process crashes, NOT disk-persisted. The production Commit
 //! Pipeline and file-backed persistence arrive in Stage 5.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use engine_core::wire::MAX_COLLECTION_COUNT;
@@ -52,8 +52,13 @@ use crate::npc::{
 pub struct CaptureLedger {
     /// id -> captured delta (pending until applied).
     pending: BTreeMap<ConsequenceId, u64>,
-    /// Applied-key ledger: ids already applied exactly once.
-    applied: BTreeSet<ConsequenceId>,
+    /// id -> applied amount: the exactly-once applied-key ledger,
+    /// carrying the per-identity amount as the exact materialization
+    /// evidence (Batch 4's second review corrective: the applied
+    /// lane's amount must survive verified snapshot publication
+    /// independently of the historical T1 journal — never inferred
+    /// from aggregate counters).
+    applied: BTreeMap<ConsequenceId, u64>,
 }
 
 /// Status of one capture key.
@@ -86,7 +91,7 @@ impl CaptureLedger {
     /// Captures a keyed delta as pending. Idempotent: a duplicate id is
     /// a no-op returning `false`.
     pub fn capture(&mut self, id: ConsequenceId, delta: u64) -> bool {
-        if self.pending.contains_key(&id) || self.applied.contains(&id) {
+        if self.pending.contains_key(&id) || self.applied.contains_key(&id) {
             return false;
         }
         self.pending.insert(id, delta);
@@ -100,19 +105,19 @@ impl CaptureLedger {
     /// silently promote.
     pub fn apply(&mut self, id: ConsequenceId) -> Result<ApplyOutcome, ApplyError> {
         let Some(delta) = self.pending.remove(&id) else {
-            if self.applied.contains(&id) {
+            if self.applied.contains_key(&id) {
                 return Ok(ApplyOutcome::AlreadyApplied);
             }
             return Err(ApplyError::Unknown);
         };
-        self.applied.insert(id);
+        self.applied.insert(id, delta);
         Ok(ApplyOutcome::Applied(delta))
     }
 
     pub fn status(&self, id: ConsequenceId) -> CaptureStatus {
         if let Some(delta) = self.pending.get(&id) {
             CaptureStatus::Pending(*delta)
-        } else if self.applied.contains(&id) {
+        } else if self.applied.contains_key(&id) {
             CaptureStatus::Applied
         } else {
             CaptureStatus::Unknown
@@ -125,6 +130,17 @@ impl CaptureLedger {
 
     pub fn applied_count(&self) -> usize {
         self.applied.len()
+    }
+
+    /// The pending lane's per-identity entries (canonical order).
+    pub(crate) fn pending_entries(&self) -> impl Iterator<Item = (ConsequenceId, u64)> + '_ {
+        self.pending.iter().map(|(id, delta)| (*id, *delta))
+    }
+
+    /// The applied lane's per-identity entries with their amounts
+    /// (canonical order) — the exact materialization evidence.
+    pub(crate) fn applied_entries(&self) -> impl Iterator<Item = (ConsequenceId, u64)> + '_ {
+        self.applied.iter().map(|(id, amount)| (*id, *amount))
     }
 
     /// Sum of unapplied captured deltas — the consequence-conservation
@@ -146,8 +162,13 @@ impl CaptureLedger {
             fp.write_u64(pack_crossing(*id));
             fp.write_u64(*delta);
         }
+        // The applied lane's ids only: the per-identity amounts are
+        // deliberately excluded from the frozen /2 fingerprint (the
+        // accepted pins stay byte-identical); the amounts' exact
+        // evidence lives in the persisted section's in-band v3
+        // schema (the save path below).
         fp.write_usize(self.applied.len());
-        for id in &self.applied {
+        for id in self.applied.keys() {
             fp.write_u64(pack_crossing(*id));
         }
     }
@@ -989,8 +1010,14 @@ impl RegionDirector {
             enc.write_u64(state.last_dormancy_span);
         }
         // The capture ledger: structured identities, canonical
-        // (region, episode, npc) order (the BTreeMap/BTreeSet
-        // iteration).
+        // (region, episode, npc) order (the BTreeMap iteration). The
+        // section's schema version is explicit in-band: v3 adds the
+        // per-identity APPLIED amounts — the exact materialization
+        // evidence that survives verified snapshot publication
+        // independently of the historical T1 journal (the second
+        // review corrective; v2's ids-only applied form never
+        // shipped in an accepted build, so the walk reads v3 only).
+        enc.write_u8(3);
         enc.write_count(self.ledger.pending.len());
         for (id, delta) in &self.ledger.pending {
             enc.write_u32(id.region);
@@ -999,10 +1026,11 @@ impl RegionDirector {
             enc.write_u64(*delta);
         }
         enc.write_count(self.ledger.applied.len());
-        for id in &self.ledger.applied {
+        for (id, amount) in &self.ledger.applied {
             enc.write_u32(id.region);
             enc.write_u64(id.episode);
             enc.write_u32(id.npc);
+            enc.write_u64(*amount);
         }
     }
 
@@ -1110,7 +1138,19 @@ impl RegionDirector {
         // holds at most one in-flight capture — its current episode's);
         // applied grows across episodes, so it takes the general
         // collection bound. Both require strict-ascending canonical
-        // order (the BTree iteration's form).
+        // order (the BTree iteration's form). The section's in-band
+        // schema version: v3 carries the per-identity applied amounts
+        // (v2's ids-only form never shipped in an accepted build —
+        // both versions named here, the walk reads v3 only).
+        match dec.read_u8()? {
+            3 => {}
+            discriminant => {
+                return Err(SaveError::Enum {
+                    section: SECTION,
+                    discriminant: u64::from(discriminant),
+                });
+            }
+        }
         let pending_count = dec.read_count(NPC_COUNT as u64, SECTION, "pending-count")?;
         let mut pending = BTreeMap::new();
         let mut prev: Option<ConsequenceId> = None;
@@ -1126,17 +1166,18 @@ impl RegionDirector {
             pending.insert(id, delta);
         }
         let applied_count = dec.read_count(MAX_COLLECTION_COUNT, SECTION, "applied-count")?;
-        let mut applied = BTreeSet::new();
+        let mut applied = BTreeMap::new();
         let mut prev: Option<ConsequenceId> = None;
         for _ in 0..applied_count {
             let id = read_consequence_id(dec)?;
+            let amount = dec.read_u64()?;
             if let Some(prior) = prev
                 && id <= prior
             {
                 return Err(SaveError::Order { section: SECTION });
             }
             prev = Some(id);
-            applied.insert(id);
+            applied.insert(id, amount);
         }
         let mut director = RegionDirector::new(config)
             .map_err(|_| SaveError::Integrity("region-director-save/lod-config"))?;
