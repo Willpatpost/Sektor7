@@ -116,4 +116,4 @@
 
 No production source changes, new dependencies, save-format migrations, provider implementation, compaction, deletion/reclamation, or async implementation in this phase; `stage5`/`main`/`macos-port` untouched; the frozen baseline `047faf9`; the deps discipline (engine-core + sha2; SQLite would be an `engine-persist`-level addition behind D-PP-1's approval); every frozen fingerprint mechanically preserved (the medium and the save-domain extension sit beneath the fingerprinted layers or beside them on `Full` instances); the ratified v1.8 contracts (the outcome semantics, the two-contract recovery, the four-tier suppression, P0-1..P0-6) never re-opened — only built upon.
 
-**Every entry OPEN. No implementation GO is granted. Stopping for independent architecture PASS/HOLD review.**
+**All ten decisions RATIFIED by the owner 2026-10-23 (D-PP-1/2/3/4/5/6/7/8 APPROVED; D-PP-4a/4b REJECTED — the recommended defaults adopted). No implementation GO is granted: the next gate is a separately scoped PP-B1 implementation authorization — every batch requiring its own owner authorization, full acceptance evidence, and independent PASS before progression.**
