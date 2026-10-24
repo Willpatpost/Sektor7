@@ -48,7 +48,12 @@ pub trait World {
 /// Handler context: what an executing event may observe and enqueue.
 pub struct ExecCtx<'a> {
     executed_tick: Tick,
-    executed: &'a BTreeSet<u64>,
+    /// The complement-of-unfinished executed-membership view: the
+    /// unfinished-id index plus the allocation frontier. Identical
+    /// semantics to the replaced per-identity executed set (the E3
+    /// selection — see [`Spine::is_executed`]).
+    unfinished: &'a BTreeSet<u64>,
+    next_seq: u64,
     /// Lane of the currently executing event: handler follow-ups inherit
     /// their cause's lane (Stage 3 decision — chained work stays in its
     /// lane; an explicit override API is deferred until a use case
@@ -64,7 +69,7 @@ impl<'a> ExecCtx<'a> {
     }
 
     pub fn is_executed(&self, id: EventId) -> bool {
-        self.executed.contains(&id.seq)
+        id.seq < self.next_seq && !self.unfinished.contains(&id.seq)
     }
 
     /// Schedules an execution-relative follow-up: due = executed_tick +
@@ -305,10 +310,19 @@ pub struct Spine<W: World> {
     blocked: BTreeMap<u64, Event>,
     /// dependency seq -> dependent seqs currently registered on it.
     waiting_on: BTreeMap<u64, Vec<u64>>,
-    /// Every seq ever scheduled (pending or executed).
-    known: BTreeSet<u64>,
-    /// Every seq already executed.
-    executed: BTreeSet<u64>,
+    /// The unfinished-id index — every identity currently holding an
+    /// obligation (queued, blocked, or held). Under the ratified
+    /// dense-allocation invariant (`known == [0, next_seq)` exactly,
+    /// allocation is cancellation-free) executed-membership is the
+    /// COMPLEMENT: a seq is executed iff `seq < next_seq` and not in
+    /// this index. The index is bounded by live work, never by
+    /// lifetime executions — the v1.8 §5.6 erratum E3 selection,
+    /// which replaces the per-identity `known`/`executed` membership
+    /// sets (one entry per ever-allocated id — lifetime-growing)
+    /// with a bounds check plus this index. Representation-internal
+    /// and fingerprint-invisible: no Stage 0–4 domain hashed either
+    /// set, so every historical pin is mechanically preserved.
+    unfinished: BTreeSet<u64>,
     ledger: Vec<ExecutionRecord>,
     /// Incrementally maintained maximum intended-due among executed
     /// events — updated at the single ledger-append site, so
@@ -379,8 +393,7 @@ impl<W: World> Spine<W> {
             far_queue: BinaryHeap::new(),
             blocked: BTreeMap::new(),
             waiting_on: BTreeMap::new(),
-            known: BTreeSet::new(),
-            executed: BTreeSet::new(),
+            unfinished: BTreeSet::new(),
             ledger: Vec::new(),
             max_executed_index: None,
             world,
@@ -494,7 +507,17 @@ impl<W: World> Spine<W> {
     }
 
     pub fn is_executed(&self, id: EventId) -> bool {
-        self.executed.contains(&id.seq)
+        self.is_executed_seq(id.seq)
+    }
+
+    /// Executed-membership by seq — the complement of unfinished
+    /// under the dense-allocation invariant: an allocated identity is
+    /// exactly one of Executed/Queued/Blocked/Held at every stable
+    /// boundary, so `seq < next_seq ∧ seq ∉ unfinished` is executed
+    /// (the E3 representation; identical semantics to the replaced
+    /// per-identity set).
+    fn is_executed_seq(&self, seq: u64) -> bool {
+        seq < self.next_seq && !self.unfinished.contains(&seq)
     }
 
     /// Maximum intended-due tick among executed events — a raw progress
@@ -574,11 +597,9 @@ impl<W: World> Spine<W> {
     /// or already-executed events; unknown ids are rejected immediately
     /// (which also makes dependency cycles structurally impossible).
     pub fn schedule(&mut self, spec: EventSpec) -> Result<EventId, ScheduleError> {
-        if let Some(unknown) = spec
-            .depends_on
-            .iter()
-            .find(|id| !self.known.contains(&id.seq))
-        {
+        // Dense allocation issues exactly `[0, next_seq)`, so `known`
+        // is the frontier bounds check (the E3 representation).
+        if let Some(unknown) = spec.depends_on.iter().find(|id| id.seq >= self.next_seq) {
             return Err(ScheduleError::UnknownDependency(*unknown));
         }
         let seq = self.next_seq;
@@ -612,7 +633,7 @@ impl<W: World> Spine<W> {
                 event.depends_on.len()
             ),
         );
-        self.known.insert(seq);
+        self.unfinished.insert(seq);
         match event.field {
             Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
             Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
@@ -630,11 +651,8 @@ impl<W: World> Spine<W> {
     /// identity holds unchanged). Dependency validation and late-
     /// arrival accounting are identical to [`Self::schedule`].
     pub fn schedule_held(&mut self, spec: EventSpec) -> Result<EventId, ScheduleError> {
-        if let Some(unknown) = spec
-            .depends_on
-            .iter()
-            .find(|id| !self.known.contains(&id.seq))
-        {
+        // The dense-allocation bounds check (the E3 representation).
+        if let Some(unknown) = spec.depends_on.iter().find(|id| id.seq >= self.next_seq) {
             return Err(ScheduleError::UnknownDependency(*unknown));
         }
         let seq = self.next_seq;
@@ -659,7 +677,7 @@ impl<W: World> Spine<W> {
                 ),
             );
         }
-        self.known.insert(seq);
+        self.unfinished.insert(seq);
         self.held_index.insert((pending.due, pending.seq));
         self.held.insert(pending.seq, pending);
         self.stats.scheduled += 1;
@@ -753,7 +771,7 @@ impl<W: World> Spine<W> {
                 // Leave the dependency-release path hold-unaware: drop
                 // this event's registrations on its unexecuted deps.
                 for dep in &event.depends_on {
-                    if !self.executed.contains(&dep.seq)
+                    if !self.is_executed_seq(dep.seq)
                         && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
                     {
                         waiters.retain(|&waiter| waiter != seq);
@@ -802,8 +820,16 @@ impl<W: World> Spine<W> {
         events: Vec<Event>,
     ) -> u32 {
         let mut removed = 0u64;
-        removed += u64::from(Self::drop_from_queue(&mut self.near_queue, &mut matches));
-        removed += u64::from(Self::drop_from_queue(&mut self.far_queue, &mut matches));
+        removed += u64::from(Self::drop_from_queue(
+            &mut self.near_queue,
+            &mut self.unfinished,
+            &mut matches,
+        ));
+        removed += u64::from(Self::drop_from_queue(
+            &mut self.far_queue,
+            &mut self.unfinished,
+            &mut matches,
+        ));
         let blocked_drop: Vec<u64> = self
             .blocked
             .values()
@@ -815,7 +841,7 @@ impl<W: World> Spine<W> {
                 // The suspend path's discipline: leave the
                 // dependency-release path unaware of the removal.
                 for dep in &event.depends_on {
-                    if !self.executed.contains(&dep.seq)
+                    if !self.is_executed_seq(dep.seq)
                         && let Some(waiters) = self.waiting_on.get_mut(&dep.seq)
                     {
                         waiters.retain(|&waiter| waiter != seq);
@@ -824,6 +850,7 @@ impl<W: World> Spine<W> {
                         }
                     }
                 }
+                self.unfinished.remove(&seq);
                 removed += 1;
             }
         }
@@ -836,6 +863,7 @@ impl<W: World> Spine<W> {
         for seq in held_drop {
             if let Some(pending) = self.held.remove(&seq) {
                 self.held_index.remove(&(pending.due, pending.seq));
+                self.unfinished.remove(&seq);
                 removed += 1;
             }
         }
@@ -843,6 +871,7 @@ impl<W: World> Spine<W> {
         for event in events {
             let pending = Pending::new(event);
             self.held_index.insert((pending.due, pending.seq));
+            self.unfinished.insert(pending.seq);
             self.held.insert(pending.seq, pending);
             inserted += 1;
         }
@@ -860,15 +889,19 @@ impl<W: World> Spine<W> {
     /// Drops matching entries from one lane (the reconstruction's
     /// removal half — the same rebuild-invisibility argument as the
     /// suspension drain: observable order derives from the canonical
-    /// `(due, seq)` keys).
+    /// `(due, seq)` keys). A dropped obligation leaves the unfinished
+    /// index — it is neither queued nor held anymore, and the
+    /// reconstruction's replacement insertions re-enter it.
     fn drop_from_queue(
         queue: &mut BinaryHeap<Reverse<Pending>>,
+        unfinished: &mut BTreeSet<u64>,
         matches: &mut impl FnMut(&ObligationView) -> bool,
     ) -> u32 {
         let mut dropped = 0u32;
         let mut retained: Vec<Reverse<Pending>> = Vec::with_capacity(queue.len());
         while let Some(Reverse(pending)) = queue.pop() {
             if matches(&pending.view(ObligationLocation::Queued)) {
+                unfinished.remove(&pending.seq);
                 dropped += 1;
             } else {
                 retained.push(Reverse(pending));
@@ -1398,7 +1431,12 @@ impl<W: World> Spine<W> {
             Some(max) if max >= due => max,
             _ => due,
         });
-        self.executed.insert(event.id.seq);
+        // The event leaves the unfinished index BEFORE the handler
+        // runs, so follow-ups may declare dependencies on the event
+        // currently executing (the complement representation's form
+        // of the old executed-set insert — same sequencing, same
+        // semantics).
+        self.unfinished.remove(&event.id.seq);
         self.stats.executed += 1;
         if executed_tick > due {
             self.stats.late_executions += 1;
@@ -1415,10 +1453,12 @@ impl<W: World> Spine<W> {
         }
 
         let follow_ups = {
-            let executed = &self.executed;
+            let unfinished = &self.unfinished;
+            let next_seq = self.next_seq;
             let mut ctx = ExecCtx {
                 executed_tick,
-                executed,
+                unfinished,
+                next_seq,
                 field: event.field,
                 follow_ups: Vec::new(),
             };
@@ -1451,7 +1491,7 @@ impl<W: World> Spine<W> {
             .depends_on
             .iter()
             .copied()
-            .filter(|id| !self.executed.contains(&id.seq))
+            .filter(|id| !self.is_executed_seq(id.seq))
             .collect()
     }
 
@@ -1793,12 +1833,13 @@ impl<W: SaveWorld> Spine<W> {
 
         // ---- derived-state reconstruction -----------------------------
 
-        // `known` is the dense allocation range; `executed` is the
-        // complement of unfinished — both exact by the gates above.
-        let known: BTreeSet<u64> = (0..next_seq).collect();
-        let executed: BTreeSet<u64> = (0..next_seq)
-            .filter(|seq| !unfinished.contains(seq))
-            .collect();
+        // `known` is the dense allocation range (a bounds check);
+        // `executed` is the complement of unfinished — both exact by
+        // the gates above, so the unfinished index the gates built IS
+        // the live membership structure (the E3 representation: no
+        // per-identity sets are materialized, so a restored spine's
+        // memory scales with live work, never with lifetime
+        // executions).
 
         let mut spine = Spine {
             clock,
@@ -1807,8 +1848,7 @@ impl<W: SaveWorld> Spine<W> {
             far_queue: BinaryHeap::new(),
             blocked: BTreeMap::new(),
             waiting_on: BTreeMap::new(),
-            known,
-            executed,
+            unfinished,
             ledger,
             max_executed_index: None,
             world,
