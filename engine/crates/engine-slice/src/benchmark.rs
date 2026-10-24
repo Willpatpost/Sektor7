@@ -33,10 +33,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine_core::{PresenceSample, Spine};
+use engine_core::{HistoryKind, PresenceSample, Spine};
 use engine_persist::{CommitOutcome, LocalFileMedium, SqliteMedium, T1Journal};
 
-use crate::crossing::{SessionCrossing, save_session};
+use crate::crossing::{SessionCrossing, restore_session, save_session};
 use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use crate::region::{RegionConfig, RegionDirector};
 use crate::store::StoreLocation;
@@ -407,6 +407,197 @@ pub fn run() {
             sweep_last.0 as f64 / sweep_last.2 as f64
         );
     }
+
+    // 7. THE PP-B2 COMPACTION MEASUREMENTS (spine-history/2 + the
+    //    consequence-lane extension): the compaction cost, the
+    //    compacted serialization/deserialization, the publication and
+    //    the recovery over compacted pairs, the window sensitivity,
+    //    and the full-vs-compacted growth sweep — the bounded-history
+    //    claim measured against the design's §7.3 projections (pod
+    //    results, NOT authoritative physical-rig evidence; the
+    //    Windows rig's release-mode evidence remains the owner's).
+    println!(
+        "PP-B2 compaction (spine-history/2 — pod results, NOT authoritative physical-rig evidence):"
+    );
+    // 7a. The compaction cost — fresh scenarios, each compacted once
+    //     (the operation mutates the history, so every sample is a
+    //     fresh 150-tick history).
+    let mut compaction = Vec::new();
+    for _ in 0..10 {
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = campaign_dir("compact-cost");
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.join("store"), journal, "benchmark-compaction").unwrap();
+        let start = Instant::now();
+        crossing
+            .compact_session(&mut spine, &mut director, 100)
+            .unwrap();
+        compaction.push(start.elapsed());
+        drop(crossing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    report(
+        "session compaction (compact_session, the 150-tick history)",
+        &mut compaction,
+    );
+
+    // 7b. The compacted codec at 150 ticks — the compacted form's
+    //     serialization and deserialization, with the full form's
+    //     deserialization beside it (the full serialization is
+    //     section 1 above).
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let full_session_len = save_session(&spine, &director).unwrap().len();
+    let dir = campaign_dir("compact-codec");
+    let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+    let mut crossing =
+        SessionCrossing::open(&dir.join("store"), journal, "benchmark-compaction").unwrap();
+    crossing
+        .compact_session(&mut spine, &mut director, 100)
+        .unwrap();
+    let mut compacted_serialization = Vec::new();
+    let mut compacted_bytes = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        compacted_bytes = save_session(&spine, &director).unwrap();
+        compacted_serialization.push(start.elapsed());
+    }
+    let compacted_session_len = compacted_bytes.len();
+    let mut compacted_deserialization = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        let _ = restore_session(&compacted_bytes).unwrap();
+        compacted_deserialization.push(start.elapsed());
+    }
+    report(
+        "compacted serialization (save_session, no I/O)",
+        &mut compacted_serialization,
+    );
+    report(
+        "compacted deserialization (restore_session)",
+        &mut compacted_deserialization,
+    );
+    let (full_spine, full_director) = scenario_pair(150, &near);
+    let full_bytes = save_session(&full_spine, &full_director).unwrap();
+    let mut full_deserialization = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        let _ = restore_session(&full_bytes).unwrap();
+        full_deserialization.push(start.elapsed());
+    }
+    report(
+        "full deserialization (restore_session)",
+        &mut full_deserialization,
+    );
+    println!(
+        "  the session snapshot at 150 ticks: full {full_session_len} B vs compacted {compacted_session_len} B (retain 100 records)"
+    );
+
+    // 7c. The publication and the recovery over the compacted form.
+    //     The publication samples ride the codec campaign above; the
+    //     recovery uses its OWN campaign in exactly the section-5
+    //     shape (one publication plus one durable transaction — the
+    //     same chain length), so the comparison against the full-path
+    //     recovery isolates the compacted snapshot's effect.
+    let mut compacted_publication = Vec::new();
+    for _ in 0..10 {
+        director.apply(&mut spine, std::slice::from_ref(&near));
+        spine.run_tick();
+        let start = Instant::now();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        compacted_publication.push(start.elapsed());
+    }
+    report(
+        "compacted snapshot publication (the B2 append incl. fsync)",
+        &mut compacted_publication,
+    );
+    drop(crossing);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = campaign_dir("compact-recovery");
+    let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+    let mut crossing =
+        SessionCrossing::open(&dir.join("store"), journal, "benchmark-compaction").unwrap();
+    crossing
+        .compact_session(&mut spine, &mut director, 100)
+        .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the scenario captured consequences");
+    drop(crossing);
+    let mut compacted_recovery = Vec::new();
+    for _ in 0..10 {
+        let start = Instant::now();
+        let (_spine, _director, _crossing) = SessionCrossing::recover(
+            &dir.join("store"),
+            &dir.join("journal.t1"),
+            "benchmark-compaction",
+        )
+        .unwrap();
+        compacted_recovery.push(start.elapsed());
+    }
+    report(
+        "session recovery from the compacted pair (recover)",
+        &mut compacted_recovery,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 7d. The full-vs-compacted growth sweep (one scenario per
+    //     duration: the full session measured first, then the SAME
+    //     history compacted) and the window sensitivity at the
+    //     longest duration — the bounded steady state against the
+    //     design's §7.3 projection.
+    println!("compaction growth sweep (the full lifetime growth vs the compacted steady state):");
+    for ticks in [150u64, 600, 1200, 2400, 4800] {
+        let (mut sweep_spine, mut sweep_director) = scenario_pair(ticks, &near);
+        let full_len = save_session(&sweep_spine, &sweep_director).unwrap().len();
+        let cdir = campaign_dir("sweep-compact");
+        let cjournal = T1Journal::open(cdir.join("journal.t1")).unwrap();
+        let mut ccrossing =
+            SessionCrossing::open(&cdir.join("store"), cjournal, "benchmark-compaction").unwrap();
+        let start = Instant::now();
+        let compact_report = ccrossing
+            .compact_session(&mut sweep_spine, &mut sweep_director, 100)
+            .unwrap();
+        let compaction_ms = start.elapsed().as_secs_f64() * 1e3;
+        let compacted_len = save_session(&sweep_spine, &sweep_director).unwrap().len();
+        let summarized = match compact_report.history {
+            HistoryKind::Compacted {
+                summarized_records, ..
+            } => summarized_records,
+            HistoryKind::Full => 0,
+        };
+        println!(
+            "  {ticks} ticks: full {full_len} B vs compacted {compacted_len} B (retain 100) / the compaction {compaction_ms:.3} ms / summarized {summarized} records"
+        );
+        drop(ccrossing);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+    println!(
+        "window sensitivity (the 4800-tick history, the compacted snapshot by retained window):"
+    );
+    for retain in [0u64, 100, 1000, 5000] {
+        let (mut sweep_spine, mut sweep_director) = scenario_pair(4800, &near);
+        let cdir = campaign_dir("window");
+        let cjournal = T1Journal::open(cdir.join("journal.t1")).unwrap();
+        let mut ccrossing =
+            SessionCrossing::open(&cdir.join("store"), cjournal, "benchmark-compaction").unwrap();
+        let start = Instant::now();
+        ccrossing
+            .compact_session(&mut sweep_spine, &mut sweep_director, retain)
+            .unwrap();
+        let compaction_ms = start.elapsed().as_secs_f64() * 1e3;
+        let compacted_len = save_session(&sweep_spine, &sweep_director).unwrap().len();
+        println!("  retain {retain}: {compacted_len} B / the compaction {compaction_ms:.3} ms");
+        drop(ccrossing);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+    println!(
+        "  design §7.3 projection: the compacted steady state ≈250-400 KB (the active-state scale + the retained window) — compare the measured compacted sizes above"
+    );
 
     // The storage summary.
     println!(
