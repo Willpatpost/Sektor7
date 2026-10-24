@@ -52,6 +52,8 @@ pub mod sqlite;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod sqlite_tests;
 
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
@@ -77,6 +79,9 @@ pub use medium::{
 pub use pipeline::{
     BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
     ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
+};
+pub use sqlite::{
+    SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{
