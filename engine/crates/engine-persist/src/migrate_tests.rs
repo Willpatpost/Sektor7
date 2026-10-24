@@ -81,11 +81,9 @@ fn legacy_store(root: &Path, campaign: &str, regulars: u64) -> LocalFileMedium {
     let mut medium = LocalFileMedium::open(root).unwrap();
     let founding = founding_record(campaign);
     let mut head = append_accepted(&mut medium, &founding, &[object(0)], None);
-    let mut epoch = 0u64;
-    for index in 1..=regulars {
-        let record = regular_record(head, epoch, index);
+    for (epoch, index) in (1..=regulars).enumerate() {
+        let record = regular_record(head, epoch as u64, index);
         head = append_accepted(&mut medium, &record, &[object(index)], Some(head));
-        epoch += 1;
     }
     medium
 }
@@ -123,8 +121,14 @@ fn happy_path_migrates_seals_and_archives() {
     assert!(!report.resumed);
     let archive = report.archived_to.as_ref().unwrap();
     assert!(archive.is_dir());
-    assert!(!legacy_root.exists(), "the legacy root moved out of the way");
-    assert!(archive.join("MIGRATED").is_file(), "the seal traveled with it");
+    assert!(
+        !legacy_root.exists(),
+        "the legacy root moved out of the way"
+    );
+    assert!(
+        archive.join("MIGRATED").is_file(),
+        "the seal traveled with it"
+    );
     // The seal's admission: a new binary refuses the archived store.
     assert!(matches!(
         LocalFileMedium::open(archive),
@@ -156,18 +160,19 @@ fn interrupted_copy_resumes_from_the_target_head() {
     let mut target = SqliteMedium::open(&target_db).unwrap();
     let founding = founding_record("resume-campaign");
     let mut head = append_accepted(&mut target, &founding, &[object(0)], None);
-    let mut epoch = 0u64;
-    for index in 1..=2u64 {
-        let record = regular_record(head, epoch, index);
+    for (epoch, index) in (1..=2u64).enumerate() {
+        let record = regular_record(head, epoch as u64, index);
         head = append_accepted(&mut target, &record, &[object(index)], Some(head));
-        epoch += 1;
     }
     drop(target);
     // THE RESUME: the migration detects the partial target by its
     // head, appends only the missing records, and completes the
     // cutover.
     let report = migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap();
-    assert_eq!(report.copied, 2, "only the two un-copied records are appended");
+    assert_eq!(
+        report.copied, 2,
+        "only the two un-copied records are appended"
+    );
     assert!(!report.resumed);
     assert_eq!(report.target_summary, expected);
     assert!(!legacy_root.exists());
@@ -210,8 +215,7 @@ fn post_seal_interruption_completes_activation_and_archive() {
     assert_eq!(copied.appended, 4);
     // The migration ran through the full cutover and died before the
     // archive: sealed, activated, still in place.
-    migrate::cutover_seal_activate(&legacy_root, &copied.target_summary.head, &mut target)
-        .unwrap();
+    migrate::cutover_seal_activate(&legacy_root, &copied.target_summary.head, &mut target).unwrap();
     drop(legacy);
     drop(target);
     assert!(legacy_root.join("MIGRATED").is_file());
@@ -279,8 +283,9 @@ fn source_moved_between_copy_and_cutover_fails_closed() {
     append_accepted(&mut foreign, &record, &[object(9)], Some(expected.head));
     drop(foreign);
     // THE CUTOVER: the raw recheck under the held lock refuses.
-    let refusal = migrate::cutover_seal_activate(&legacy_root, &copied.target_summary.head, &mut target)
-        .unwrap_err();
+    let refusal =
+        migrate::cutover_seal_activate(&legacy_root, &copied.target_summary.head, &mut target)
+            .unwrap_err();
     assert!(matches!(refusal, MigrationError::Diverged { .. }));
     // Fail-closed: no tombstone (the source is still a live store),
     // the target intact at the copied state.
@@ -306,8 +311,7 @@ fn foreign_target_chain_is_refused() {
     append_accepted(&mut target, &founding_b, &[object(0)], None);
     drop(target);
     // Never merged: the target's head is not on the source chain.
-    let refusal =
-        migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap_err();
+    let refusal = migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap_err();
     assert!(matches!(refusal, MigrationError::Diverged { .. }));
     let mut target = SqliteMedium::open(&target_db).unwrap();
     assert_eq!(
@@ -316,7 +320,10 @@ fn foreign_target_chain_is_refused() {
         "the foreign target holds only its own founding"
     );
     assert_eq!(target.validate().unwrap().campaign_id, "campaign-b");
-    assert!(!legacy_root.join("MIGRATED").is_file(), "the source unsealed");
+    assert!(
+        !legacy_root.join("MIGRATED").is_file(),
+        "the source unsealed"
+    );
     let _ = expected;
 }
 
@@ -396,11 +403,9 @@ fn restored_older_source_is_refused_never_merged() {
     // The campaign grows to 5 records, then migrates.
     let mut legacy = LocalFileMedium::open(&legacy_root).unwrap();
     let mut head = expected.head;
-    let mut epoch = expected.height;
-    for index in 4..=5u64 {
+    for (epoch, index) in (expected.height..).zip(4..=5u64) {
         let record = regular_record(head, epoch, index);
         head = append_accepted(&mut legacy, &record, &[object(index)], Some(head));
-        epoch += 1;
     }
     let grown = legacy.validate().unwrap();
     drop(legacy);

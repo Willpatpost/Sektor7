@@ -29,11 +29,11 @@ use engine_persist::{
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
-use crate::store::{SessionStore, StoreLocation};
 use crate::region::{
     CaptureStatus, RegionCheckpoint, RegionDirector, RegionEntry, gather_region_entries, lod_byte,
     read_flag, read_lod_level,
 };
+use crate::store::{SessionStore, StoreLocation};
 
 /// One collected obligation — the owned form of a collected
 /// [`ObligationView`] (the plan is journalable, so it carries owned
@@ -454,7 +454,11 @@ impl SessionCrossing {
         journal: T1Journal,
         campaign: &str,
     ) -> Result<Self, PipelineError> {
-        Self::open_at(&StoreLocation::Directory(store_dir.to_path_buf()), journal, campaign)
+        Self::open_at(
+            &StoreLocation::Directory(store_dir.to_path_buf()),
+            journal,
+            campaign,
+        )
     }
 
     /// The provider-aware constructor (PP-B1's integration seam): the

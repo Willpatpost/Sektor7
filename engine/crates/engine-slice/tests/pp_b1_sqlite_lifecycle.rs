@@ -282,10 +282,7 @@ fn pp_b1_sqlite_crash_after_confirmation_restarts_coherently() {
         twin_final_engine,
         "the SQLite crash-restart continuation converges to the twin's engine state"
     );
-    assert_eq!(
-        spine.world().milestones(),
-        twin_spine.world().milestones()
-    );
+    assert_eq!(spine.world().milestones(), twin_spine.world().milestones());
     assert_eq!(spine.world().credits(), twin_spine.world().credits());
     assert_eq!(
         director.ledger().pending_total(),
@@ -324,7 +321,7 @@ fn pp_b1_sqlite_repeated_recovery_is_idempotent() {
     crossing.publish_snapshot(&spine, &director).unwrap();
     drop(crossing);
     // THE FIRST RECOVERY.
-    let (mut spine_a, mut director_a, mut crossing_a) =
+    let (spine_a, director_a, mut crossing_a) =
         SessionCrossing::recover_at(&dir.location(), &dir.journal(), "recovery-campaign")
             .expect("the first recovery succeeds");
     let fingerprint_a = stage4_state_fingerprint(&spine_a, &director_a);

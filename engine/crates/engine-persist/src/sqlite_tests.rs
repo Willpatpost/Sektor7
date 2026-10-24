@@ -90,7 +90,8 @@ fn pp_b1_concurrent_writers_same_parent_one_accepts_one_stale() {
     let object_a = sample_object(b"a-payload");
     let a_record =
         RevisionRecord::regular(founding.id(), 0, 11).with_content_refs(vec![object_a.hash()]);
-    a.append(&a_record, &[object_a], Some(founding.id())).unwrap();
+    a.append(&a_record, &[object_a], Some(founding.id()))
+        .unwrap();
 
     let object_b = sample_object(b"b-payload");
     let b_record =
@@ -153,7 +154,9 @@ fn pp_b1_busy_timeout_is_typed_contention_never_stale_never_unknown() {
     let object = sample_object(b"busy-payload");
     let record =
         RevisionRecord::regular(founding.id(), 0, 21).with_content_refs(vec![object.hash()]);
-    let accepted = subject.append(&record, &[object], Some(founding.id())).unwrap();
+    let accepted = subject
+        .append(&record, &[object], Some(founding.id()))
+        .unwrap();
     assert!(matches!(accepted, AppendOutcome::Accepted { .. }));
     drop(foreign);
     cleanup_db(&path);
@@ -166,12 +169,12 @@ fn pp_b1_duplicate_idempotency_key_fails_closed() {
     let founding = founding("dup-key");
     medium.append(&founding, &[], None).unwrap();
 
-    let first = RevisionRecord::regular(founding.id(), 0, 30)
-        .with_idempotency_key(b"shared-key".to_vec());
+    let first =
+        RevisionRecord::regular(founding.id(), 0, 30).with_idempotency_key(b"shared-key".to_vec());
     medium.append(&first, &[], Some(founding.id())).unwrap();
 
-    let second = RevisionRecord::regular(first.id(), 1, 31)
-        .with_idempotency_key(b"shared-key".to_vec());
+    let second =
+        RevisionRecord::regular(first.id(), 1, 31).with_idempotency_key(b"shared-key".to_vec());
     let result = medium.append(&second, &[], Some(first.id()));
     assert!(
         matches!(
@@ -220,10 +223,12 @@ fn pp_b1_mid_transaction_injection_rolls_back_typed() {
         let founding = founding("mid-tx");
         medium.append(&founding, &[], None).unwrap();
     }
-    let fault = SqliteFaultControl::new()
-        .arm(SqliteFaultPoint::MidObjectInserts, SqliteFaultAction::InjectError);
-    let mut medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault))
-        .unwrap();
+    let fault = SqliteFaultControl::new().arm(
+        SqliteFaultPoint::MidObjectInserts,
+        SqliteFaultAction::InjectError,
+    );
+    let mut medium =
+        SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault)).unwrap();
     let founding = founding("mid-tx");
     let object = sample_object(b"mid-tx-payload");
     let record =
@@ -255,10 +260,13 @@ fn pp_b1_rollback_uncertainty_is_unknown_and_reconciles_not_installed() {
     // the rollback cannot be completed, so the disposition is
     // genuinely unknown.
     let fault = SqliteFaultControl::new()
-        .arm(SqliteFaultPoint::MidObjectInserts, SqliteFaultAction::InjectError)
+        .arm(
+            SqliteFaultPoint::MidObjectInserts,
+            SqliteFaultAction::InjectError,
+        )
         .arm(SqliteFaultPoint::AtRollback, SqliteFaultAction::InjectError);
-    let mut medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault))
-        .unwrap();
+    let mut medium =
+        SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault)).unwrap();
     let founding = founding("rollback-unknown");
     let object = sample_object(b"rollback-payload");
     let record =
@@ -292,10 +300,12 @@ fn pp_b1_commit_failure_is_unknown_and_reconciles_not_installed() {
         let founding = founding("commit-unknown");
         medium.append(&founding, &[], None).unwrap();
     }
-    let fault = SqliteFaultControl::new()
-        .arm(SqliteFaultPoint::CommitFailure, SqliteFaultAction::InjectError);
-    let mut medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault))
-        .unwrap();
+    let fault = SqliteFaultControl::new().arm(
+        SqliteFaultPoint::CommitFailure,
+        SqliteFaultAction::InjectError,
+    );
+    let mut medium =
+        SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault)).unwrap();
     let founding = founding("commit-unknown");
     let object = sample_object(b"commit-fail-payload");
     let record =
@@ -330,10 +340,12 @@ fn pp_b1_post_commit_unknown_reconciles_installed() {
     // The commit SUCCEEDS, then the acknowledgment is lost (the
     // post-commit window): the caller sees Unknown; the durable state
     // is installed — the reconcile establishes it from the chain.
-    let fault = SqliteFaultControl::new()
-        .arm(SqliteFaultPoint::AfterCommit, SqliteFaultAction::InjectError);
-    let mut medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault))
-        .unwrap();
+    let fault = SqliteFaultControl::new().arm(
+        SqliteFaultPoint::AfterCommit,
+        SqliteFaultAction::InjectError,
+    );
+    let mut medium =
+        SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), Some(fault)).unwrap();
     let founding = founding("after-commit");
     let object = sample_object(b"post-commit-payload");
     let record =
@@ -366,7 +378,9 @@ fn pp_b1_trusted_cursor_appends_do_zero_walk_work() {
     let object = sample_object(b"cursor-payload");
     let record =
         RevisionRecord::regular(founding.id(), 0, 90).with_content_refs(vec![object.hash()]);
-    medium.append(&record, &[object], Some(founding.id())).unwrap();
+    medium
+        .append(&record, &[object], Some(founding.id()))
+        .unwrap();
     assert_eq!(medium.walk_stats().last_append_walked, 0);
     // A fresh medium's session open walks the full chain once.
     let reopened = SqliteMedium::open(&path).unwrap();
@@ -388,7 +402,7 @@ fn pp_b1_corrupt_referenced_object_row_fails_closed() {
         let record =
             RevisionRecord::regular(founding.id(), 0, 100).with_content_refs(vec![object.hash()]);
         medium
-            .append(&record, &[object.clone()], Some(founding.id()))
+            .append(&record, std::slice::from_ref(&object), Some(founding.id()))
             .unwrap();
     }
     // Tamper the stored bytes under the content identity (a direct
@@ -444,7 +458,7 @@ fn pp_b1_unverifiable_chain_never_falsely_confirms() {
         let record =
             RevisionRecord::regular(founding.id(), 0, 110).with_content_refs(vec![object.hash()]);
         medium
-            .append(&record, &[object.clone()], Some(founding.id()))
+            .append(&record, std::slice::from_ref(&object), Some(founding.id()))
             .unwrap();
         record
     };
@@ -481,7 +495,9 @@ fn pp_b1_reconcile_installed_for_head_and_ancestors() {
     let object = sample_object(b"reconcile-payload");
     let middle =
         RevisionRecord::regular(founding.id(), 0, 120).with_content_refs(vec![object.hash()]);
-    medium.append(&middle, &[object], Some(founding.id())).unwrap();
+    medium
+        .append(&middle, &[object], Some(founding.id()))
+        .unwrap();
     let top = RevisionRecord::regular(middle.id(), 1, 121);
     medium.append(&top, &[], Some(middle.id())).unwrap();
 
@@ -499,7 +515,9 @@ fn pp_b1_reconcile_installed_for_head_and_ancestors() {
     let absent = Hash::from_bytes(&[7u8; 32]).unwrap();
     assert_eq!(
         medium.reconcile_unknown(&absent).unwrap(),
-        Reconciliation::NotInstalled { head: Some(top.id()) }
+        Reconciliation::NotInstalled {
+            head: Some(top.id())
+        }
     );
     cleanup_db(&path);
 }
@@ -518,7 +536,9 @@ fn pp_b1_wal_recovery_on_reopen_after_connection_drop() {
         medium.append(&founding, &[], None).unwrap();
         let record =
             RevisionRecord::regular(founding.id(), 0, 130).with_content_refs(vec![object.hash()]);
-        medium.append(&record, &[object], Some(founding.id())).unwrap();
+        medium
+            .append(&record, &[object], Some(founding.id()))
+            .unwrap();
         record
     };
     let mut reopened = SqliteMedium::open(&path).unwrap();
@@ -538,7 +558,9 @@ fn pp_b1_checkpoint_truncate_succeeds_and_validation_survives() {
     let object = sample_object(b"checkpoint-payload");
     let record =
         RevisionRecord::regular(founding.id(), 0, 140).with_content_refs(vec![object.hash()]);
-    medium.append(&record, &[object], Some(founding.id())).unwrap();
+    medium
+        .append(&record, &[object], Some(founding.id()))
+        .unwrap();
     medium.checkpoint_truncate().unwrap();
     // The chain validates identically after the checkpoint.
     assert_eq!(medium.validate().unwrap().records, 2);
@@ -571,8 +593,12 @@ fn pp_b1_parity_chain_summary_and_reads_match_local_medium() {
         let record = RevisionRecord::regular(parent, step, 1_000 + step)
             .with_idempotency_key(format!("parity-key-{step}").into_bytes())
             .with_content_refs(vec![object.hash()]);
-        file_medium.append(&record, &[object.clone()], Some(parent)).unwrap();
-        sqlite_medium.append(&record, &[object.clone()], Some(parent)).unwrap();
+        file_medium
+            .append(&record, std::slice::from_ref(&object), Some(parent))
+            .unwrap();
+        sqlite_medium
+            .append(&record, std::slice::from_ref(&object), Some(parent))
+            .unwrap();
         objects.push(object);
         parent = record.id();
     }
@@ -580,11 +606,17 @@ fn pp_b1_parity_chain_summary_and_reads_match_local_medium() {
     // both walks).
     let dep_source = RevisionRecord::regular(parent, 5, 2_000);
     file_medium.append(&dep_source, &[], Some(parent)).unwrap();
-    sqlite_medium.append(&dep_source, &[], Some(parent)).unwrap();
-    let dependent = RevisionRecord::regular(dep_source.id(), 6, 2_001)
-        .with_depends_on(vec![dep_source.id()]);
-    file_medium.append(&dependent, &[], Some(dep_source.id())).unwrap();
-    sqlite_medium.append(&dependent, &[], Some(dep_source.id())).unwrap();
+    sqlite_medium
+        .append(&dep_source, &[], Some(parent))
+        .unwrap();
+    let dependent =
+        RevisionRecord::regular(dep_source.id(), 6, 2_001).with_depends_on(vec![dep_source.id()]);
+    file_medium
+        .append(&dependent, &[], Some(dep_source.id()))
+        .unwrap();
+    sqlite_medium
+        .append(&dependent, &[], Some(dep_source.id()))
+        .unwrap();
 
     // The ChainSummary parity: identical head, height, founding,
     // authority, campaign, record count, and content-object count.
@@ -635,12 +667,8 @@ fn pp_b1_child_append_body() {
         medium.append(&founding, &[], None).unwrap();
     }
     let control = SqliteFaultControl::new().arm(point, SqliteFaultAction::Abort);
-    let mut medium = SqliteMedium::open_with(
-        &db,
-        &SqliteMediumConfig::default(),
-        Some(control),
-    )
-    .unwrap();
+    let mut medium =
+        SqliteMedium::open_with(&db, &SqliteMediumConfig::default(), Some(control)).unwrap();
     let founding = founding("child-crash");
     let object = sample_object(b"child-crash-payload");
     let record =

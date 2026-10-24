@@ -52,11 +52,11 @@ pub mod recovery;
 pub mod sqlite;
 
 #[cfg(test)]
-mod tests;
+mod migrate_tests;
 #[cfg(test)]
 mod sqlite_tests;
 #[cfg(test)]
-mod migrate_tests;
+mod tests;
 
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
@@ -80,19 +80,19 @@ pub use medium::{
     SyncTier, UnknownReason,
 };
 pub use migrate::{
-    archive_legacy, copy_legacy_chain, cutover_seal_activate, migrate_local_to_sqlite, CopiedChain,
-    MigrationError, MigrationReport,
+    CopiedChain, MigrationError, MigrationReport, archive_legacy, copy_legacy_chain,
+    cutover_seal_activate, migrate_local_to_sqlite,
 };
 pub use pipeline::{
     BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
     ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
-};
-pub use sqlite::{
-    SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
+};
+pub use sqlite::{
+    SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };

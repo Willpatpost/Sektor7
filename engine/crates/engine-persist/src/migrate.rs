@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use engine_core::{Decoder, Encoder};
 
 use crate::hash::Hash;
-use crate::local::{read_head_at, LocalFileMedium, HEAD_LOCK, MIGRATED_MARKER};
+use crate::local::{HEAD_LOCK, LocalFileMedium, MIGRATED_MARKER, read_head_at};
 use crate::medium::{AppendOutcome, CanonicalMedium, ChainSummary, MediumError, StoredObject};
 use crate::record::RevisionRecord;
 use crate::sqlite::SqliteMedium;
@@ -210,9 +210,7 @@ fn check_layout(
             && (p == l || p.starts_with(&l))
         {
             return Err(MigrationError::Layout {
-                detail: format!(
-                    "{what} resolves inside the legacy store directory (a symlink)"
-                ),
+                detail: format!("{what} resolves inside the legacy store directory (a symlink)"),
             });
         }
     }
@@ -423,13 +421,7 @@ pub fn cutover_seal_activate(
 pub fn archive_legacy(legacy_root: &Path) -> Result<PathBuf, MigrationError> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| {
-            io_err(
-                "clock",
-                legacy_root,
-                std::io::Error::other(e),
-            )
-        })?
+        .map_err(|e| io_err("clock", legacy_root, std::io::Error::other(e)))?
         .as_nanos();
     let mut candidate = archive_path(legacy_root, stamp, 0);
     let mut n = 0u32;
@@ -462,11 +454,10 @@ fn find_archive(legacy_root: &Path) -> Result<Option<PathBuf>, MigrationError> {
         None => return Ok(None),
     };
     let parent = legacy_root.parent().unwrap_or_else(|| Path::new("."));
-    let entries = fs::read_dir(parent)
-        .map_err(|e| io_err("read the campaign directory", parent, e))?;
+    let entries =
+        fs::read_dir(parent).map_err(|e| io_err("read the campaign directory", parent, e))?;
     for entry in entries {
-        let entry =
-            entry.map_err(|e| io_err("read the campaign directory", parent, e))?;
+        let entry = entry.map_err(|e| io_err("read the campaign directory", parent, e))?;
         if entry.file_name().to_string_lossy().starts_with(&prefix) {
             return Ok(Some(entry.path()));
         }

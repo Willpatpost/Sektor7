@@ -59,12 +59,12 @@ impl SessionStore {
     /// location's shape — never inferred from content, never silent).
     pub fn open(location: &StoreLocation) -> Result<Self, MediumError> {
         match location {
-            StoreLocation::Directory(root) => Ok(SessionStore::Local(LocalFileMedium::open(
-                root.clone(),
-            )?)),
-            StoreLocation::Database(path) => Ok(SessionStore::Sqlite(SqliteMedium::open(
-                path.clone(),
-            )?)),
+            StoreLocation::Directory(root) => {
+                Ok(SessionStore::Local(LocalFileMedium::open(root.clone())?))
+            }
+            StoreLocation::Database(path) => {
+                Ok(SessionStore::Sqlite(SqliteMedium::open(path.clone())?))
+            }
         }
     }
 
@@ -72,12 +72,8 @@ impl SessionStore {
     /// publications and the recovery re-open reuse it).
     pub fn location(&self) -> StoreLocation {
         match self {
-            SessionStore::Local(medium) => StoreLocation::Directory(PathBuf::from(
-                medium.root(),
-            )),
-            SessionStore::Sqlite(medium) => {
-                StoreLocation::Database(medium.db_path().to_path_buf())
-            }
+            SessionStore::Local(medium) => StoreLocation::Directory(PathBuf::from(medium.root())),
+            SessionStore::Sqlite(medium) => StoreLocation::Database(medium.db_path().to_path_buf()),
         }
     }
 
@@ -113,10 +109,7 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
-    fn read_record(
-        &mut self,
-        id: &engine_persist::Hash,
-    ) -> Result<RevisionRecord, MediumError> {
+    fn read_record(&mut self, id: &engine_persist::Hash) -> Result<RevisionRecord, MediumError> {
         match self {
             SessionStore::Local(medium) => medium.read_record(id),
             SessionStore::Sqlite(medium) => medium.read_record(id),
