@@ -10,9 +10,12 @@
 
 use std::path::PathBuf;
 
-use engine_core::{LodLevel, PresenceSample, Spine};
-use engine_persist::{CanonicalMedium, CommitOutcome, ConsequenceId, SqliteMedium, T1Journal};
-use engine_slice::backup::{BackupError, backup_campaign, verify_backup};
+use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
+use engine_persist::{
+    AppendOutcome, CanonicalMedium, CommitOutcome, ConsequenceId, Hash, MediumError,
+    RevisionRecord, SqliteMedium, StoredObject, T1Journal,
+};
+use engine_slice::backup::{BACKUP_MANIFEST_DOMAIN, BackupError, backup_campaign, verify_backup};
 use engine_slice::crossing::SessionCrossing;
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
@@ -381,4 +384,176 @@ fn mixed_time_pairs_are_refused() {
         verify_backup(&mixed),
         Err(BackupError::Incoherent { .. })
     ));
+}
+
+#[test]
+fn live_session_holding_the_journal_refuses_the_backup() {
+    // THE REVIEW CORRECTIVE (Finding 3), the journal half of the
+    // boundary: a live session (a held T1 journal — every crossing
+    // holds its sidecar lock for its lifetime) must not silently
+    // produce an allegedly coherent backup: the boundary's
+    // try-acquisition refuses, and nothing is captured.
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("live-session");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&StoreLocation::Database(dir.db()), journal, "live-campaign")
+            .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    crossing.checkpoint().unwrap();
+    drop(crossing);
+    // THE LIVE SESSION: an open T1Journal on the campaign journal —
+    // exactly what every live crossing holds — takes the sidecar
+    // lock for its lifetime.
+    let live = T1Journal::open(dir.journal()).unwrap();
+    let refusal = backup_campaign(&dir.db(), &dir.journal(), &dir.output()).unwrap_err();
+    assert!(matches!(refusal, BackupError::Quiescence { .. }));
+    assert!(
+        !dir.output().exists(),
+        "nothing was captured — the boundary refused before any capture work"
+    );
+    drop(live);
+    // With the session gone, the same backup succeeds.
+    backup_campaign(&dir.db(), &dir.journal(), &dir.output())
+        .expect("the quiescent backup succeeds after the session closes");
+}
+
+#[test]
+fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
+    // THE REVIEW CORRECTIVE (Finding 3), the canonical-write half of
+    // the boundary: a writer outside the journal discipline (a raw
+    // medium append — exactly what the head-stability verification
+    // targets) during the capture must refuse the set — never a
+    // silent "coherent" backup of a moving campaign.
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("racing-writer");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "racing-campaign",
+    )
+    .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    // Enough distinct publications that the capture window (the
+    // checkpoint + VACUUM INTO) is real.
+    for _ in 0..4 {
+        run(&mut spine, &mut director, &near, 1);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+    }
+    crossing.checkpoint().unwrap();
+    drop(crossing);
+    // THE CONCURRENT WRITER: a thread appending content-bearing
+    // revisions to the source database continuously (no journal —
+    // out-of-discipline by construction) while the backup captures.
+    let db_path = dir.db();
+    let (start_head, start_epoch) = {
+        let mut probe = SqliteMedium::open_read_only(&db_path).unwrap();
+        let summary = probe.validate().unwrap();
+        (summary.head, summary.height)
+    };
+    let writer = std::thread::spawn(move || {
+        let mut medium = SqliteMedium::open(db_path).unwrap();
+        let mut head = start_head;
+        for (epoch, index) in (start_epoch..).zip(0..80u64) {
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/engine-slice/backup-race/1");
+            enc.write_bytes(&index.to_le_bytes());
+            let object = StoredObject::new(enc.into_bytes()).unwrap();
+            let record = RevisionRecord::regular(head, epoch, 10_000 + index)
+                .with_idempotency_key(format!("race-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            let AppendOutcome::Accepted { id, .. } = medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap()
+            else {
+                panic!("the race append must be accepted");
+            };
+            head = id;
+        }
+    });
+    let result = backup_campaign(&dir.db(), &dir.journal(), &dir.output());
+    writer.join().unwrap();
+    let refusal = result.expect_err("the concurrent writer never yields a usable backup");
+    assert!(
+        matches!(
+            refusal,
+            BackupError::Quiescence { .. } | BackupError::Medium(MediumError::Contention { .. })
+        ),
+        "the refusal is the boundary at work: {refusal:?}"
+    );
+}
+
+#[test]
+fn hand_crafted_manifests_and_wrong_bindings_are_refused() {
+    // THE REVIEW CORRECTIVE (Finding 3), the completed §6.2 bindings:
+    // a manifest without the v2 fields is refused by the version
+    // check, and a v2 manifest whose last-committed binding does not
+    // match the actual journal is refused by the re-scan.
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("hand-crafted");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "binding-campaign",
+    )
+    .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // A durable boundary — the journal carries committed
+    // transactions (a non-trivial last-committed binding).
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output()).unwrap();
+    let journal_len = std::fs::metadata(dir.output().join("journal.t1"))
+        .unwrap()
+        .len();
+    // (a) A v1-shaped manifest (no boundary evidence, no journal
+    // bindings): the version check refuses it.
+    let set = dir.0.join("set-v1-manifest");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    let mut enc = Encoder::new();
+    enc.write_str(BACKUP_MANIFEST_DOMAIN);
+    enc.write_u32(1);
+    enc.write_bytes(report.summary.head.as_bytes());
+    enc.write_bytes(report.journal_sha256.as_bytes());
+    std::fs::write(set.join("MANIFEST"), enc.into_bytes()).unwrap();
+    assert!(matches!(
+        verify_backup(&set),
+        Err(BackupError::ManifestCorrupt { .. })
+    ));
+    // (b) A v2 manifest with a WRONG last-committed binding — the
+    // journal re-scan refuses it.
+    let set = dir.0.join("set-wrong-tx");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    let wrong_tx = Hash::from_bytes(&[7u8; 32]).unwrap();
+    let mut enc = Encoder::new();
+    enc.write_str(BACKUP_MANIFEST_DOMAIN);
+    enc.write_u32(2);
+    enc.write_bytes(report.summary.head.as_bytes());
+    enc.write_bytes(report.journal_sha256.as_bytes());
+    enc.write_u64(report.summary.records);
+    enc.write_str("binding-campaign");
+    enc.write_bytes(wrong_tx.as_bytes());
+    enc.write_u64(journal_len);
+    enc.write_u32(1);
+    enc.write_u32(1);
+    enc.write_u32(1);
+    std::fs::write(set.join("MANIFEST"), enc.into_bytes()).unwrap();
+    assert!(matches!(
+        verify_backup(&set),
+        Err(BackupError::Incoherent { .. })
+    ));
+    // The REAL set still verifies on its own.
+    assert!(verify_backup(&dir.output()).is_ok());
 }
