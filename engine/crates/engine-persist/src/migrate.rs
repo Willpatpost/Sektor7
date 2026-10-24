@@ -534,9 +534,54 @@ pub fn migrate_local_to_sqlite(
                 ),
             });
         }
-        target
-            .mark_migrated_from(&sealed_head)
-            .map_err(MigrationError::Medium)?;
+        // THE LEGACY RECHECK (the review corrective — Finding 2): the
+        // tombstone binds the sealed head, but a pre-tombstone binary
+        // may have ignored it and advanced the source after the seal.
+        // Before the resume archives the source as a completed
+        // migration, recheck the ACTUAL legacy HEAD under the same
+        // held-lock coordination as the cutover — a changed source
+        // fails closed (never auto-merged, never archived as a
+        // success; the divergence is the operator's decision). The
+        // lock is released before the archive rename (Windows cannot
+        // rename a directory containing a locked file) — the residual
+        // unlock-to-rename window is the documented older-binary
+        // limitation: new binaries refuse the tombstone, and the
+        // ratified caveat (no mechanically guaranteed cross-medium
+        // transfer under every adversarial timing) stands.
+        let lock_path = legacy_root.join(HEAD_LOCK);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| io_err("open HEAD.lock", &lock_path, e))?;
+        lock_file
+            .lock()
+            .map_err(|e| io_err("lock HEAD.lock", &lock_path, e))?;
+        let rechecked = read_head_at(legacy_root).map_err(MigrationError::Medium)?;
+        let activation = (|| {
+            if rechecked != Some(sealed_head) {
+                let observed = rechecked
+                    .map(|hash| hash.to_string())
+                    .unwrap_or_else(|| "unfounded".to_owned());
+                return Err(MigrationError::Diverged {
+                    detail: format!(
+                        "the sealed source moved after the seal (expected \
+                         {sealed_head}, observed {observed}) — an older binary may \
+                         have ignored the tombstone; the divergence requires the \
+                         operator's decision and the source is NOT archived"
+                    ),
+                });
+            }
+            target
+                .mark_migrated_from(&sealed_head)
+                .map_err(MigrationError::Medium)?;
+            Ok(())
+        })();
+        let _ = lock_file.unlock();
+        drop(lock_file);
+        activation?;
         drop(target);
         let archived_to = archive_legacy(legacy_root)?;
         return Ok(MigrationReport {

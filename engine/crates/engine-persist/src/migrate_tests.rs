@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use engine_core::Encoder;
 
-use crate::local::LocalFileMedium;
+use crate::local::{HEAD_DOMAIN, HEAD_VERSION, LocalFileMedium, OBJECTS_DIR};
 use crate::medium::{AppendOutcome, CanonicalMedium, MediumError, StoredObject};
 use crate::migrate::{self, MigrationError};
 use crate::record::{AuthorityMode, RevisionRecord};
@@ -579,5 +579,74 @@ fn activation_without_pending_refuses() {
             op: "mark_migrated_from",
             ..
         }
+    ));
+}
+
+#[test]
+fn older_binary_advances_sealed_source_refuses_resume() {
+    // THE REVIEW CORRECTIVE (Finding 2): a pre-tombstone binary may
+    // ignore the MIGRATED seal and append to the source after the
+    // seal — the post-seal resume must recheck the ACTUAL legacy HEAD
+    // under the lock and refuse to archive a diverged source.
+    let dir = TestDir::new("older-binary");
+    let legacy_root = dir.0.join("store");
+    let target_db = dir.0.join("store.db");
+    let journal = dir.0.join("journal.t1");
+    let mut legacy = legacy_store(&legacy_root, "older-binary-campaign", 3);
+    let expected = legacy.validate().unwrap();
+    drop(legacy);
+    // THE SEALED/UNACTIVATED state: the copy complete, the tombstone
+    // written (encoded independently — the wire format pinned), the
+    // activation not yet.
+    let mut legacy = LocalFileMedium::open(&legacy_root).unwrap();
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
+    let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
+    drop(legacy);
+    drop(target);
+    let mut enc = Encoder::new();
+    enc.write_str(migrate::MIGRATED_DOMAIN);
+    enc.write_u32(1);
+    enc.write_bytes(copied.target_summary.head.as_bytes());
+    std::fs::write(legacy_root.join("MIGRATED"), enc.into_bytes()).unwrap();
+    // THE OLDER BINARY: a pre-tombstone binary ignores the seal and
+    // appends — written directly at the file level (the new-binary
+    // open refuses the tombstone by design; the old binary predates
+    // it): the record object, its content object, and the HEAD
+    // pointer moved to the new revision.
+    let record = regular_record(expected.head, expected.height, 9);
+    let record_bytes = record.canonical_bytes();
+    let record_id = record.id();
+    let content = object(9);
+    std::fs::write(
+        legacy_root.join(OBJECTS_DIR).join(record_id.hex()),
+        record_bytes,
+    )
+    .unwrap();
+    std::fs::write(
+        legacy_root.join(OBJECTS_DIR).join(content.hash().hex()),
+        content.bytes(),
+    )
+    .unwrap();
+    let mut head = Encoder::new();
+    head.write_str(HEAD_DOMAIN);
+    head.write_u32(HEAD_VERSION);
+    head.write_bytes(record_id.as_bytes());
+    std::fs::write(legacy_root.join("HEAD"), head.into_bytes()).unwrap();
+    // THE RESUME: the target matches the sealed head, but the SOURCE
+    // has moved — the held-lock recheck refuses; the diverged source
+    // is NOT archived as a completed migration.
+    let refusal = migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap_err();
+    assert!(matches!(refusal, MigrationError::Diverged { .. }));
+    assert!(legacy_root.exists(), "the diverged source is NOT archived");
+    assert!(legacy_root.join("MIGRATED").is_file(), "the seal stands");
+    assert!(
+        find_no_archive(&dir.0, "store"),
+        "no archive sibling exists"
+    );
+    // The target stands intact at the sealed state — unactivated
+    // (the pending lifecycle), awaiting the operator's decision.
+    assert!(matches!(
+        SqliteMedium::open(&target_db),
+        Err(MediumError::MigrationPending { .. })
     ));
 }
