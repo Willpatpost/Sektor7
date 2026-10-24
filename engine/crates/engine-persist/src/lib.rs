@@ -45,10 +45,16 @@ pub mod hash;
 pub mod journal;
 pub mod local;
 pub mod medium;
+pub mod migrate;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
+pub mod sqlite;
 
+#[cfg(test)]
+mod migrate_tests;
+#[cfg(test)]
+mod sqlite_tests;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +79,10 @@ pub use medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
 };
+pub use migrate::{
+    CopiedChain, MigrationError, MigrationReport, archive_legacy, copy_legacy_chain,
+    cutover_seal_activate, migrate_local_to_sqlite,
+};
 pub use pipeline::{
     BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
     ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
@@ -82,4 +92,7 @@ pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
+};
+pub use sqlite::{
+    SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };

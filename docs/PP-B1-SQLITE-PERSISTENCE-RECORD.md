@@ -1,0 +1,138 @@
+# PP-B1 — The SQLite Production Persistence Implementation Record
+
+> **Status:** the PP-B1 implementation **COMPLETE** at the branch head, **PENDING the independent PP-B1 PASS/HOLD review** — the owner-ratified D-PP-1..8 architecture implemented under the PP-B1 GO (the SQLite canonical medium, the real integration, the offline migration, the verified backups, the testing/docs — ONLY; PP-B2/B3/B4/Stage 6 not begun). The design documents remain binding **by commit** on `production-persistence-design` (never merged); this record cites them, never replaces them.
+>
+> **Verification summary:** **520 tests + 1 intentionally ignored, 0 failed** (the 479+1 Stage 5 Batch 5 baseline, every one still green, plus PP-B1's 41: the SQLite unit tests and 19-test matrix in `engine-persist`, the 3 lifecycle arcs + 1 migration acceptance + 4 backup tests in `engine-slice`). `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --workspace` green. **Every historical fingerprint byte-identical, double-run**: selftest `engine=6504123a47cab66f` / `state=937bd3b6f56f07e0`; save `save-len=1209` / `save-fnv=c6c1b46c7d21843b`; ticks-300 `executed 45717` + `engine-lanes=5591d3eb05643e78` / `state-lanes=9d90cb3bbd45b032`; presence stationary/walk/tour `stage4=da1b2d1a7e5cd49e` / `1df391ad488848bf` / `495ab27b37549e93` — the medium is beneath every fingerprinted layer, and nothing moved. The three-platform CI evidence at the head is in §9. The physical-rig release measurements remain the owner's (§12).
+
+## 1. The scope, the branch, the commit chain
+
+Delivered on `production-persistence-b1` from the exact frozen baseline `047faf9` (the Stage 5 Batch 5 CLOSED-PASS closure), **no merges, no protected-branch modifications**:
+
+- **6500430** — the `SqliteMedium` production canonical medium (the §3.1 schema, the §3.2 append contract, the connection discipline, the fault seam; rusqlite 0.40.2 `bundled` — the only new dependency).
+- **b83e70e** — the 19-test comprehensive matrix (the §3.2 outcomes, contention, uncertainty, corruption fail-closed, reconciliation, the LocalFileMedium parity, the two real-process child kills).
+- **3f6ce2c** — the provider-selection integration seam (`StoreLocation` / `SessionStore` in `engine-slice`) + the accepted B5 lifecycle arcs over SQLite.
+- **258cd68** — the §6.1 operator-controlled offline migration (the 8-step protocol, the mandatory layout check, the seal admission, the 10-test matrix).
+- **e2a7bbf** — the §6.1 end-to-end acceptance (a real legacy campaign migrating and recovering through the SQLite provider to the twin exactly) + the fmt/clippy normalization.
+- **42d42b8** — the §6.2 quiescent, recovery-verified backup tool (the capture, the manifest-last binding, the isolated-scratch B4 verification, the 4-test matrix).
+
+## 2. The SqliteMedium — what was implemented
+
+**`engine-persist/src/sqlite.rs`** (~1650 lines), the owner-ratified D-PP-1:
+
+- **The §3.1 schema:** `meta (key PRIMARY KEY, value BLOB)`, `objects (hash PRIMARY KEY, bytes BLOB)`, `records (id PRIMARY KEY, parent, parent_epoch, epoch, tick, kind, idem, record_bytes)` + the **partial unique index** `records_idem_unique ON records(idem) WHERE idem IS NOT NULL` (the chain-wide idempotency-key uniqueness, D-PP-4b's rejection preserved) + the parent/epoch indexes.
+- **The connection discipline:** WAL **set-and-verified** and `synchronous=FULL` **set as a pure setter then verified by reading the configuration back** (=2) — never assumed granted (the pure-setter lesson: `PRAGMA synchronous=FULL` returns no row; `journal_mode=WAL` does); the busy timeout; the cold founding→HEAD walk at open establishing the trusted cursor; the founding authority meta row (`[32B founding][1B mode][campaign-id]`) written once at founding and cross-checked at every open (a contradiction is fail-closed `CorruptHead`).
+- **The §3.2 append contract:** `BEGIN IMMEDIATE` with the **typed `MediumError::Contention`** on BUSY expiry — never a stale parent (no comparison ran), never an uncertain commit (no work began); the **in-transaction committed head read** as the sole basis for `RejectedStaleParent`; the cursor coherence checks (kind/epoch/parent with checked arithmetic, the idem duplicate, the dependency ancestry); **insert-once verify-on-retry** for objects and records (an existing row is accepted only if its bytes hash to the identity; a mismatch is fail-closed evidence — `ReferencedObjectCorrupt` when cursor-reachable, `HashMismatch` otherwise; never rewritten in place); the idem-unique violation mapped to `duplicate-idempotency-key`; the head `UPDATE` (exactly one row); **COMMIT as the linearization** — `Accepted` only after it; a commit failure is `Unknown{CommitUncertain}`, a failed rollback is `Unknown{RollbackUncertain}` (never a guessed outcome).
+- **`reconcile_unknown`:** the fresh committed read + the full cold walk — `Installed` only when the candidate is HEAD or in the fully validated ancestor chain; `NotInstalled` when absent from a validated chain; `Unverifiable` when the chain cannot be validated.
+- **The trusted cursor:** O(1) per append to the verified head, the bounded suffix walk on divergence (the boundary-epoch check + the deferred ancestry), sound invalidation, fail-closed on non-descendant histories — mirroring `LocalFileMedium`'s cost model.
+- **The audit mode** (`open_read_only`): the WAL snapshot walk, never blocking a writer; appends refused with the typed error.
+- **`checkpoint_truncate`:** the ratified `TRUNCATE` boundary (the graceful lifecycle close, the backup capture); busy ≠ 0 → typed `Contention`.
+- **The test seam:** `SqliteFaultControl` — `{MidObjectInserts, ObjectsInserted, CommitFailure, AtRollback, AfterCommit} × {Abort, InjectError}`.
+
+## 3. The fault-injection and crash matrix (19 tests, all green)
+
+- **The §3.2 outcome table:** concurrent writers with the same expected parent (one accepts, the loser `RejectedStaleParent` from the in-transaction committed read); the BUSY timeout as **typed contention** (a foreign `BEGIN IMMEDIATE` holder + the 150 ms timeout → `Contention`; the same append succeeds after the release — contention is not corruption); duplicate idempotency keys fail closed; the content-set mismatch fails before any transaction work.
+- **The uncertainty windows:** the mid-transaction injection rolls back cleanly; the double injection (the failure + the failed rollback) → `Unknown{RollbackUncertain}` → reconciled `NotInstalled` from the authoritative state; the commit failure → `Unknown{CommitUncertain}` → `NotInstalled`; **the post-commit lost acknowledgment** → `Unknown{CommitUncertain}` over a succeeded commit → reconciled `Installed` (the honest post-crash-window resolution).
+- **The corruption fail-closed cases:** a tampered `objects` row under a referenced identity → `ReferencedObjectCorrupt` at the session open (writable and read-only); a malformed `meta` head row → `CorruptHead`; an unverifiable chain never falsely confirms — the fail-closed open IS the answer.
+- **The reconciliation contract:** `Installed` for the head and every strictly-older ancestor of the validated chain; `NotInstalled` for a never-appended candidate.
+- **The real-process crash matrix** (the child harness re-executing the test binary with the armed fault environment — a genuine `SIGKILL`, not a simulated failure): the kill **before the commit** (Abort at `ObjectsInserted`) → the parent's reopen runs SQLite's own WAL recovery → the durable head is the prior revision, the candidate reconciles `NotInstalled`; the kill **after the successful commit** (Abort at `AfterCommit`) → the reopen replays the committed frames → the durable head IS the new revision, the chain validates — **the post-commit crash never loses an acknowledged revision**.
+
+## 4. The parity — LocalFileMedium as the oracle
+
+The identical logical campaign (a founding + object-bearing regulars with idempotency keys + a dependency pair) in both mediums → the **complete `ChainSummary` equality** (head, height, founding, authority, campaign, records, content objects), identical canonical reads (`read_record`/`read_object`), and the honest tier distinction (the platform file tier vs `TransactionalWalFull` — never conflated). `LocalFileMedium` is otherwise **untouched** (the reference implementation and comparison oracle; its only addition is the migration's `MIGRATED` admission in §6).
+
+## 5. The provider seam — the real integration
+
+**`engine-slice/src/store.rs`:** the explicit `StoreLocation{Directory(PathBuf), Database(PathBuf)}` and `SessionStore{Local, Sqlite}` implementing `CanonicalMedium` by direct delegation — the **real B3 `CommitPipeline` and the B4/B5 crossing lifecycle run over either provider unchanged** (the pipeline is generic over `M: CanonicalMedium`; the choice is made once, at the location, never silently: the existing directory constructors keep the file-medium behavior byte-identical; the SQLite provider is engaged only through the explicit `Database` form; a database at a fresh path is unfounded until the founding append — never a silent empty store where recovery was expected).
+
+**`SessionCrossing`** (all additive): `open_at`/`recover_at`/`latest_snapshot_at` (the provider-aware constructors and recovery — the identical composition: the snapshot walk, the journal scan, the interleaved restore, the reconcile, the re-opened crossing); `checkpoint()` (the ratified TRUNCATE boundary for SQLite, a no-op for the file medium — typed failures never swallowed).
+
+**The lifecycle arcs over SQLite (3 tests, all green):** the graceful-close-and-restart twin match (the complete arc, the close WITH the TRUNCATE checkpoint, the restart, the continuation with the canonical confirmation — ending EXACTLY at the never-persisted twin's combined Stage 4 fingerprint, milestones, credits); the crash-after-confirmation restart (the recovery re-installs the confirmed plan, the confirmation suppresses the replay, the continuation converges to the twin's engine fingerprint and both ledger lanes); the repeated-recovery idempotence. The **T1 journal remains the separate file medium (D-PP-2)** — the chain lives in the database, the journal beside it. The existing engine-slice suites run **unchanged and green through the seam** (crossing 22, b4_process 2, b5_lifecycle 3, npc_lod 7, npc_save 4, frame_timing 4, lib 4).
+
+## 6. The offline migration (§6.1)
+
+**`engine-persist/src/migrate.rs`** — `migrate_local_to_sqlite(legacy_root, target_db, journal_path)`, the operator-controlled, never-automatic conversion between sessions:
+
+- **The mandatory directory-layout safety check first:** the DB and the journal must not live inside the legacy store directory nor inside the archive's name family, and must be distinct paths (lexical-absolute + component containment + the canonicalized symlink re-check) — a violation refuses before anything is touched.
+- **The 8-step protocol:** validate the legacy cold (read-only); the **suffix-copy resume** (the target's current head detects an interrupted copy; only the missing records are appended, oldest-first, each with its own parent as the expected parent — never restarted, never a foreign merge: a target head not on the source chain is `Diverged`); the **ChainSummary parity**; the cutover under the held `HEAD.lock` (the raw cursor-free recheck — a source that moved between the copy and the cutover fails closed); the **seal first** (the `MIGRATED` tombstone, create-new, the `migrated/1` domain wire binding the sealed head); the **activation** (`SqliteMedium::mark_migrated_from` — the reserved provenance row, write-once, idempotent on the identical binding) only over the verified seal; the lock released before the archive; the **archive rename** (`<name>.migrated-<nanos>/` beside the source, after the handles drop — Windows cannot rename a directory containing an open file).
+- **The seal's admission:** `LocalFileMedium::open` refuses a `MIGRATED`-carried directory with the new typed `MediumError::Sealed` — new binaries refuse; **binaries predating the tombstone cannot be made to honor it** (the ratified documented operational limitation — keep them away from the archive, or rely on its non-standard path).
+- **The report** carries the operator's verified checklist — the gameplay eligibility is the operator's own verification (D-PP-6), never the tool's claim.
+- **The matrix (10 tests):** the happy path (the parity end-to-end, the campaign identity carried, the archived store refused); the interrupted copy resume; the completed re-run (clean); the post-seal interruption (the activation idempotent + the archive completed); the seal-without-activation crash (resumed and activated); the source-moved divergence refusal (the raw recheck, both sides intact); the foreign target chain refusal; the three unsafe layouts; the unfounded source; the restored-older-source refusal (never merged).
+- **The end-to-end acceptance (engine-slice, 1 test):** a real campaign lives its complete durable lifecycle on the legacy file medium, the operator migrates, and the **same campaign recovers through `recover_at(Database)` — the migrated chain plus the UNTOUCHED journal** — continuing to the never-persisted twin exactly.
+- **The durability caveat (D-PP-6, verbatim):** no mechanically guaranteed Windows power-loss-safe **cross-medium** migration is claimed; the migration is offline and operator-controlled; the source seal and the target activation are ordered, but a power event between them leaves a sealed source and an unactivated (still-complete, still-resumable) target — the resume completes it.
+
+## 7. The quiescent, recovery-verified backup (§6.2)
+
+**`engine-slice/src/backup.rs`** — `backup_campaign(db, journal, output)` and `verify_backup(dir)`:
+
+- **The caller's quiescence contract** (documented): the tool runs between sessions with no canonical write, journal write, or rotation in flight across the capture; it fails closed on everything it can verify.
+- **The capture** (`SqliteMedium::backup_into`): the TRUNCATE checkpoint folds the quiescent WAL into the main file, then **`VACUUM INTO`** emits the complete self-contained snapshot — with the **persistent journal mode restored on the capture** (`VACUUM INTO` emits a rollback-journal database; the read-only audit open verifies WAL and never sets it — set, then verified by reading it back).
+- **The manifest written LAST, atomically** (tmp + fsync + rename): the canonical head, the journal's SHA-256, the record count, the campaign id — its presence is what marks the set complete; a set without it is `Incomplete` (the interrupted-copy case), an undecodable one is `ManifestCorrupt`, and a set whose files do not match it is `Incoherent` (a tampered file or a mixed-time pairing).
+- **Usable only after verification:** `verify_backup` re-validates the captured chain read-only, re-hashes the journal, and then **restores the pair into an isolated scratch directory and runs the real B4 recovery** (`SessionCrossing::recover_at`) — the same machinery a restart uses. A failure is a typed `Verification` refusal; `Ok` means usable.
+- **Never a quiet overwrite:** an existing output directory is refused; the verification writes only into its ephemeral scratch; the source receives no write except the ratified checkpoint.
+- **The matrix (4 tests):** the quiescent happy path (the re-verification idempotent, the source intact and recoverable, the existing output refused); **the confirmed-but-unmaterialized crash state** (the journal replayed exactly in the scratch — region 4 dormant, episode 1, the captures pending, the milestones exact — and the **exact-once re-drive over the restored pair confirms** with the region-4 capture key: the backup pair is not merely recoverable but confirmable); the refusal matrix (incomplete/corrupt/tampered/torn); the mixed-time pairs (the journal-hash and head bindings both refuse).
+- **Online (concurrent-writer) backup is DEFERRED** per the ratified §6.2 scope — offline-only.
+
+## 8. The local verification evidence
+
+- `cargo fmt --all -- --check` — **green**.
+- `cargo clippy --workspace --all-targets -- -D warnings` — **green**.
+- `cargo build --workspace` — **green**.
+- `cargo test --workspace` — **520 passed + 1 intentionally ignored, 0 failed** (the 479+1 baseline + 41: `engine-persist` 240 lib incl. the 19-test matrix and the 10-test migration matrix, plus the integration suites; `engine-slice` + the 3 lifecycle + 1 migration + 4 backup tests).
+- **Every frozen fingerprint, double-run, byte-identical and pin-matched:** selftest, save-selftest, ticks-300 (`executed 45717` + both lane fingerprints), presence stationary/walk/tour (+ `held`).
+- **The persistence benchmark smoke on the pod** (dev-profile cloud numbers, explicitly non-authoritative — D-PP-7): the full report and the storage-growth sweep green, matching the B5-recorded magnitudes (150→4800 ticks: 3,442→108,984 executed; ~31.0 B per execution; the codec 0.088→1.477 ms; the confirmation median ~2.5 ms; the recovery median ~6.4 ms — **the file-medium paths; the SQLite-path release-mode numbers are the rig's to take, §12**).
+
+## 9. The CI evidence (the three platforms, verified firsthand job-level)
+
+The push triggers exclude `production-persistence-b1` (engine-ci's push filter is `[main, stage5, macos-port]`), so the evidence was obtained through **draft PR #1** (`production-persistence-b1` → `stage5`, opened strictly as the review/CI vehicle — **never to be merged**; the `pull_request` trigger has no branch restriction):
+
+- **Run 40114873363** (`engine-ci`, pull_request, at the delivery head `42d42b8`): https://github.com/Willpatpost/Sektor7/actions/runs/40114873363 — **completed green 2026-10-24, every job verified firsthand job-level**:
+  - `ubuntu-latest` — **✓ in 3m33s** (job 120933981218): fmt, clippy `-D warnings`, build, the workspace tests (39 suite results, all `ok` — verified in the job log firsthand), every fingerprint double-run pin, the Vulkan offscreen render smokes including the validation-layer and swapchain-recreation paths.
+  - `windows-latest` — **✓ in 2m31s** (job 120933981124): the same CPU gates — fmt, clippy, build, the workspace tests, the fingerprint double-runs with the historical pins.
+  - `macos-15 ARM64` — **✓ in 3m53s** (job 120933980991): the CPU gates, the SDL one-test-per-process discipline, the pinned per-scenario `stage4` fingerprints, the explicit `aarch64-apple-darwin` host gate.
+
+The run carries only benign annotations (the `actions/checkout@v4` Node-20 deprecation notice, a macOS queue-capacity note, an ubuntu-26 migration heads-up) — no failures, no skipped gates. The push triggers exclude this branch, which is why the evidence rides the draft PR; **the PR is the vehicle only — never merged** (its disposition awaits the independent review and the owner's decision).
+
+## 10. The dependency and build impact
+
+- **`rusqlite 0.40.2` with the `bundled` feature is the ONLY new dependency** — at the `engine-persist` level (`engine-core` stays zero-dependency; no other crate gained a dependency; `engine/Cargo.lock` updated). The bundled feature compiles the SQLite C amalgamation through the `cc` crate at build time: **a C toolchain (cc/clang/gcc or MSVC) is now required to build `engine-persist`** — already true of the workspace's SDL vendoring, so no new environment class; verified on the pod (Linux) and by CI (Ubuntu, Windows MSVC, macOS ARM64).
+- The vendored SQLite version is the one shipped in rusqlite 0.40.2's amalgamation (the `sqlite3_libversion` reported at open in the audit log); the engine never attempts `.recover` or any destructive repair (D-PP-1's fail-closed rule).
+- `LocalFileMedium` and the T1 journal are untouched in behavior (the parity + the unchanged suites + the frozen fingerprints prove it); `engine-slice`'s public surface gained `backup`, `store`, and the provider-aware crossing constructors — all additive.
+
+## 11. The tier claims and their exact limits
+
+- **`SyncTier::TransactionalWalFull`** — what `Accepted` establishes over the SQLite provider: every committed transaction's WAL frames are fsynced before the commit acknowledges, per SQLite's documented WAL semantics under the **verified** `synchronous=FULL` configuration. The process-kill tests (the real child deaths) establish the **process-crash** behavior on the development pod; the broader tier (OS crash, power loss) **rests on the documented engine semantics and SQLite's stated hardware/filesystem synchronization assumptions — never on tests runnable on development hardware** (the same honesty as the B2 record's Windows analysis, now with the engine's own documented contract behind it).
+- **No cross-medium power-loss-safe migration is claimed** (D-PP-6); **the Windows custom-file-medium `ProcessCrashOnly` honesty is preserved** where that provider is still selected; the production provider selection remains the owner's (the rig evidence in §12 completes the Windows side).
+
+## 12. The physical Windows release-rig instructions (PENDING THE OWNER'S EXECUTION)
+
+The reproducible plan for the owner's machine (the RTX 5070 Ti rig, the Stage 4 acceptance environment), with the expected outputs and the PASS/HOLD criteria. **Nothing below has been executed by the implementer; no rig measurement is claimed.**
+
+1. `git fetch && git checkout production-persistence-b1` (the delivery head — the SHA in §14).
+2. `cd engine && cargo test --workspace` — **expect: 520 passed, 0 failed, 1 intentionally ignored** (any failure = HOLD; this runs every PP-B1 matrix on native Windows — the SQLite child kills, the migration, the backup, the lifecycle arcs).
+3. `cargo run -q -p engine-slice -- --fingerprint-selftest` twice — **expect: `engine=6504123a47cab66f` / `state=937bd3b6f56f07e0` both runs**.
+4. `cargo run -q -p engine-slice -- --save-selftest` twice — **expect: `save-len=1209` / `save-fnv=c6c1b46c7d21843b` both runs**.
+5. `cargo run -q -p engine-slice -- --sim --ticks 300 --cadence 60` — **expect: `executed 45717` + `engine-lanes=5591d3eb05643e78` / `state-lanes=9d90cb3bbd45b032`**.
+6. `cargo run -q -p engine-slice -- --sim --presence stationary` / `walk` / `tour` — **expect: `stage4=da1b2d1a7e5cd49e` / `1df391ad488848bf` / `495ab27b37549e93`**.
+7. `cargo test -p engine-slice --test pp_b1_sqlite_lifecycle --test pp_b1_migration --test pp_b1_backup --test b4_process --test b5_lifecycle -- --nocapture` — **expect: 3 + 1 + 4 + 2 + 3 passed** (the PP-B1 arcs and the real process-kill matrices on native Windows, named).
+8. `cargo test --release -p engine-persist` — **expect: 240 passed** (the SQLite medium and its matrices in release mode — correctness; no timing asserted).
+9. `cargo run -q -p engine-slice --release -- --benchmark-persistence` — **expect: the full report without error; RECORD the distributions and the sweep** (the authoritative native-NTFS numbers — the pod's overlayfs numbers in §8 are explicitly non-authoritative). **Known limit, stated honestly:** this harness measures the **file-medium** persistence paths (the B5 harness, unchanged by PP-B1); **a SQLite-path release-mode benchmark harness does not exist in this batch** — the SQLite append/commit/recovery latencies on the rig are an identified follow-up measurement (a harness extension needing its own review), not a claim made here.
+10. The operator walkthrough (optional but recommended before any real campaign migrates): a scratch campaign through `SessionCrossing::open` (the directory form), the graceful close, `migrate_local_to_sqlite`, the restart through the `Database` form, and one `backup_campaign` + `verify_backup` — the §6/§7 matrices are the machine-performed versions of exactly this.
+
+**PASS = every command green with the pinned outputs. HOLD = any failure, any fingerprint divergence, or any panic.** The rig evidence remains pending until the owner executes and supplies it; the automated evidence (§1–§9 + the CI matrix) stands independently.
+
+## 13. The uncertainties, limitations, and owner-only steps
+
+- **The rig measurements (D-PP-7) are outstanding** — §12's plan, never claimed executed.
+- **The gameplay eligibility of any migrated campaign is the operator's own verification** (D-PP-6): the migration report's checklist, never the tool's claim.
+- **The older-binary migration limitation** (D-PP-6, documented in §6): pre-tombstone binaries can still open an archived legacy store; keep them away from it.
+- **The SQLite-path release-mode performance is unmeasured** (§12 item 9's known limit) — the harness extension is a follow-up, not a PP-B1 claim.
+- **Online (concurrent-writer) backup is deferred** (§6.2's ratified scope); the async publication, compaction/retention, and the SK/MK checkpointing remain PP-B2/B3 (NOT AUTHORIZED, not begun).
+- **The draft PR #1 must never be merged** without the independent PP-B1 PASS/HOLD review and the owner's explicit disposition; `stage5`, `main`, `macos-port`, and `production-persistence-design` are untouched by this batch.
+- **The provisional D-PP-4 thresholds remain provisional** — no retention, no reclamation, no rotation was implemented (PP-B3's scope).
+
+## 14. The delivery handoff
+
+- **The branch:** `production-persistence-b1` (pushed, tracking `origin/production-persistence-b1`), from the frozen `047faf9`.
+- **The commit chain:** `6500430` (the SqliteMedium) → `b83e70e` (the 19-test matrix) → `3f6ce2c` (the seam + the lifecycle) → `258cd68` (the migration) → `e2a7bbf` (the end-to-end acceptance) → `42d42b8` (the backup) → **the record commit (this document, the HEAD)**.
+- **The changed files:** `engine/crates/engine-persist/Cargo.toml` + `engine/Cargo.lock` (rusqlite); `engine/crates/engine-persist/src/{lib,medium,local,sqlite,sqlite_tests,migrate,migrate_tests}.rs`; `engine/crates/engine-slice/src/{lib,store,crossing,backup}.rs`; `engine/crates/engine-slice/tests/{pp_b1_sqlite_lifecycle,pp_b1_migration,pp_b1_backup}.rs`; `docs/PP-B1-SQLITE-PERSISTENCE-RECORD.md` (this record).
+- **The STOP:** this record completes the PP-B1 GO's deliverables. The batch now stands for **independent PP-B1 PASS/HOLD review**. PP-B2 is not begun.

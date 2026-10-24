@@ -11,7 +11,7 @@
 //! frozen fingerprint are mechanically untouched.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT};
@@ -24,9 +24,8 @@ use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, CaptureReceipt,
     ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
     CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
-    LocalFileMedium, MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError,
-    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
-    reconcile,
+    MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError, RevisionRecord,
+    SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState, reconcile,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -34,6 +33,7 @@ use crate::region::{
     CaptureStatus, RegionCheckpoint, RegionDirector, RegionEntry, gather_region_entries, lod_byte,
     read_flag, read_lod_level,
 };
+use crate::store::{SessionStore, StoreLocation};
 
 /// One collected obligation — the owned form of a collected
 /// [`ObligationView`] (the plan is journalable, so it carries owned
@@ -431,27 +431,49 @@ fn capture_envelope(
 /// the pipeline-free Stage 4 path never constructs one, so its
 /// behavior and every frozen fingerprint are mechanically untouched.
 pub struct SessionCrossing {
-    pipeline: CommitPipeline<LocalFileMedium>,
-    /// The campaign store's directory — fresh medium handles for the
-    /// snapshot publications and the recovery's chain walk (the
-    /// HEAD.lock is per-operation, so additional handles serialize
-    /// safely alongside the pipeline's own).
-    store_dir: PathBuf,
+    pipeline: CommitPipeline<SessionStore>,
+    /// The campaign's canonical store location — fresh medium handles
+    /// for the snapshot publications and the recovery's chain walk
+    /// (each provider's own coordination is per-operation, so
+    /// additional handles serialize safely alongside the pipeline's
+    /// own).
+    store: StoreLocation,
 }
 
 impl SessionCrossing {
-    /// Opens (or joins) the campaign store: the B2 medium over
+    /// Opens (or joins) the campaign store: the file medium over
     /// `store_dir` — founded with a standalone authority record on
     /// first open, so every confirmation carries the honest
     /// `T3-local (standalone)` label — joined with the caller's
     /// journal in one pipeline. The caller constructs the journal (a
     /// plain open, or a fault-injected open for the failure matrix).
+    /// The existing directory-based constructor — behaviorally
+    /// identical to the accepted implementation.
     pub fn open(
         store_dir: &Path,
         journal: T1Journal,
         campaign: &str,
     ) -> Result<Self, PipelineError> {
-        let mut medium = LocalFileMedium::open(store_dir.to_path_buf())?;
+        Self::open_at(
+            &StoreLocation::Directory(store_dir.to_path_buf()),
+            journal,
+            campaign,
+        )
+    }
+
+    /// The provider-aware constructor (PP-B1's integration seam): the
+    /// same founding-and-joining semantics over the explicit store
+    /// location — the legacy file root or the SQLite campaign
+    /// database. **No silent selection ever occurs**: a database at a
+    /// fresh path is unfounded until the founding append runs (the
+    /// same first-open semantics as the file medium); an existing
+    /// campaign at the location is joined, never re-founded.
+    pub fn open_at(
+        location: &StoreLocation,
+        journal: T1Journal,
+        campaign: &str,
+    ) -> Result<Self, PipelineError> {
+        let mut medium = SessionStore::open(location)?;
         if medium.head()?.is_none() {
             // The founding record is the application's setup act; on a
             // fresh single-writer session the append must accept —
@@ -465,8 +487,16 @@ impl SessionCrossing {
         let pipeline = CommitPipeline::open(medium, journal)?;
         Ok(SessionCrossing {
             pipeline,
-            store_dir: store_dir.to_path_buf(),
+            store: location.clone(),
         })
+    }
+
+    /// The graceful lifecycle boundary (PP-B1): the ratified `TRUNCATE`
+    /// checkpoint for the SQLite provider — a no-op for the file
+    /// medium (its every publication already fsyncs through the
+    /// nine-step contract). Typed failures, never swallowed.
+    pub fn checkpoint(&mut self) -> Result<(), MediumError> {
+        SessionStore::open(&self.store)?.checkpoint()
     }
 
     /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
@@ -680,9 +710,10 @@ impl SessionCrossing {
         let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
         let object = StoredObject::new(bytes)?;
         let snapshot_hash = object.hash();
-        // A fresh medium handle (the HEAD.lock is per-operation; the
-        // pipeline's own handle is idle between its operations).
-        let mut medium = LocalFileMedium::open(self.store_dir.clone())?;
+        // A fresh medium handle (each provider's coordination is
+        // per-operation; the pipeline's own handle is idle between its
+        // operations).
+        let mut medium = SessionStore::open(&self.store)?;
         let head = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
         let parent_epoch = medium.read_record(&head)?.epoch;
         let record = RevisionRecord::regular(head, parent_epoch, spine.clock().as_u64())
@@ -751,10 +782,25 @@ impl SessionCrossing {
         journal_path: &Path,
         campaign: &str,
     ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
+        Self::recover_at(
+            &StoreLocation::Directory(store_dir.to_path_buf()),
+            journal_path,
+            campaign,
+        )
+    }
+
+    /// The provider-aware recovery (PP-B1): the same reconstruction
+    /// over the explicit store location — the same composition, the
+    /// same contracts, the same fail-closed behavior.
+    pub fn recover_at(
+        location: &StoreLocation,
+        journal_path: &Path,
+        campaign: &str,
+    ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
         // 1. The snapshot — fail closed on a recognizable-but-invalid
         //    newest session object (corruption of the newest
         //    authoritative state is never walked past).
-        let Some((mut spine, mut director)) = latest_snapshot(store_dir)? else {
+        let Some((mut spine, mut director)) = latest_snapshot_at(location)? else {
             return Err(TransitionError::NoSnapshot);
         };
         // The snapshot-origin materialization evidence, captured
@@ -793,7 +839,7 @@ impl SessionCrossing {
         //    prior install's capture zeroed the scratch exactly as
         //    the live sequence did.
         let journal = T1Journal::open(journal_path).map_err(PipelineError::Journal)?;
-        let mut crossing = SessionCrossing::open(store_dir, journal, campaign)?;
+        let mut crossing = SessionCrossing::open_at(location, journal, campaign)?;
         let mut restored = vec![false; NPC_COUNT];
         for transaction in &scan.committed {
             if canceled.contains(&transaction.id) {
@@ -1129,10 +1175,10 @@ pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector)
 /// never walked past to an older snapshot, which would resurrect
 /// stale authoritative state). The founding record carries no
 /// content; the walk is bounded by the chain length.
-fn latest_snapshot(
-    store_dir: &Path,
+fn latest_snapshot_at(
+    location: &StoreLocation,
 ) -> Result<Option<(Spine<NpcWorld>, RegionDirector)>, TransitionError> {
-    let mut medium = LocalFileMedium::open(store_dir.to_path_buf())?;
+    let mut medium = SessionStore::open(location)?;
     let mut cursor = medium.head()?;
     while let Some(id) = cursor {
         let record = medium.read_record(&id)?;
