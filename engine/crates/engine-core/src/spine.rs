@@ -25,9 +25,11 @@ use crate::event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 use crate::fingerprint::Fingerprinter;
+use crate::sha256::{Sha256, digest};
 use crate::wire::{
-    Decoder, Encoder, MAX_BYTE_LEN, MAX_COLLECTION_COUNT, SAVE_DOMAIN, SAVE_FORMAT_VERSION,
-    SPINE_DOMAIN, SaveError, SaveWorld,
+    Decoder, Encoder, MAX_BYTE_LEN, MAX_COLLECTION_COUNT, MAX_TAG_LEN, SAVE_DOMAIN, SAVE_DOMAIN_V2,
+    SAVE_FORMAT_VERSION, SAVE_FORMAT_VERSION_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN, SaveError,
+    SaveWorld,
 };
 
 /// Game-side event handler. Implemented by the application, never by the
@@ -157,6 +159,53 @@ pub enum ScheduleError {
     /// events, this rule also makes dependency cycles structurally
     /// impossible (review correction 2).
     UnknownDependency(EventId),
+}
+
+/// The spine's execution-history representation (PP-B2, the ratified
+/// v1.8 §5.6.1 `HistoryKind`). `Full` retains every
+/// [`ExecutionRecord`]; `Compacted` replaced the first
+/// `summarized_records` records with the authenticated SHA-256 prefix
+/// summary — a derivation witness that authenticates *what was
+/// discarded*, never a reconstruction of it — and retains the tail
+/// verbatim. The Spine's logical state (scheduling, conservation,
+/// watermarks, every fingerprint on `Full` instances) is identical
+/// under both representations; only per-record history retention
+/// differs. Discarded records are never reconstructible: the
+/// full-history APIs surface their unavailability loudly, and the
+/// safe accessors ([`Spine::ledger_retained`],
+/// [`Spine::try_ledger_full`], the `try_*` fingerprint variants)
+/// report it without crashing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryKind {
+    Full,
+    Compacted {
+        /// Records below the compaction cut, summarized into the
+        /// prefix summary (cumulative across repeated compactions).
+        summarized_records: u64,
+        /// The retained tail's record count (always the live ledger
+        /// length).
+        retained_records: u64,
+        /// The authenticated SHA-256 prefix-summary chain over the
+        /// summarized records' canonical bytes, seeded from the
+        /// spine-history domain tag and chained across repeated
+        /// compactions.
+        prefix_summary: [u8; 32],
+    },
+}
+
+/// Typed refusals of the explicit compaction operation
+/// ([`Spine::compact`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionError {
+    /// The requested retained window covers the whole ledger —
+    /// nothing would be summarized, and a compaction that summarizes
+    /// nothing is not a compaction (the `spine-history/2` form
+    /// requires `summarized_records >= 1`, keeping the full and
+    /// compacted forms honestly disjoint).
+    NothingToSummarize { ledger_len: u64, retain: u64 },
+    /// The requested retained window exceeds the ledger length — the
+    /// explicit operation takes an exact window, never a clamped one.
+    RetainExceedsLedger { ledger_len: u64, retain: u64 },
 }
 
 /// Spine counters. All fields are logical state and fingerprinted.
@@ -300,6 +349,15 @@ impl PartialOrd for Pending {
     }
 }
 
+/// The stored compacted-history state (see [`HistoryKind`]): the
+/// cumulative summarized-record count and the authenticated prefix
+/// summary. The retained-record count is always the live ledger
+/// length, so it is derived, never stored.
+struct CompactedHistory {
+    summarized_records: u64,
+    prefix_summary: [u8; 32],
+}
+
 /// The event spine.
 pub struct Spine<W: World> {
     clock: Tick,
@@ -324,6 +382,12 @@ pub struct Spine<W: World> {
     /// set, so every historical pin is mechanically preserved.
     unfinished: BTreeSet<u64>,
     ledger: Vec<ExecutionRecord>,
+    /// The compacted-history state; `None` is `HistoryKind::Full`.
+    /// The retained-record count is always the live ledger length
+    /// (execution appends to the tail), so only the cumulative
+    /// summarized count and the authenticated prefix summary are
+    /// stored.
+    compacted: Option<CompactedHistory>,
     /// Incrementally maintained maximum intended-due among executed
     /// events — updated at the single ledger-append site, so
     /// `max_executed_due()` is O(1) instead of a scan over the
@@ -395,6 +459,7 @@ impl<W: World> Spine<W> {
             waiting_on: BTreeMap::new(),
             unfinished: BTreeSet::new(),
             ledger: Vec::new(),
+            compacted: None,
             max_executed_index: None,
             world,
             budget,
@@ -464,8 +529,63 @@ impl<W: World> Spine<W> {
         &mut self.diag
     }
 
+    /// The full execution history — **full-history API** (the v1.8
+    /// §5.6.1 contract): keeps its exact historical meaning on every
+    /// instance and never silently returns a retained tail. On a
+    /// compacted instance the full history is not retained, so
+    /// calling this is a documented contract violation surfaced
+    /// LOUDLY — a panic naming the safe accessors — never a silently
+    /// misleading value. Production code uses [`Self::history_kind`],
+    /// [`Self::ledger_retained`], or [`Self::try_ledger_full`].
     pub fn ledger(&self) -> &[ExecutionRecord] {
+        self.require_full_history("ledger()", "ledger_retained() / try_ledger_full()");
         &self.ledger
+    }
+
+    /// The spine's execution-history representation (the capability
+    /// check every history-touching call site should consult first).
+    pub fn history_kind(&self) -> HistoryKind {
+        match &self.compacted {
+            None => HistoryKind::Full,
+            Some(compacted) => HistoryKind::Compacted {
+                summarized_records: compacted.summarized_records,
+                retained_records: self.ledger.len() as u64,
+                prefix_summary: compacted.prefix_summary,
+            },
+        }
+    }
+
+    /// The retained execution records — the full ledger on a `Full`
+    /// instance, the verbatim tail on a `Compacted` one (the
+    /// explicitly named safe accessor; identical to [`Self::ledger`]
+    /// on `Full`).
+    pub fn ledger_retained(&self) -> &[ExecutionRecord] {
+        &self.ledger
+    }
+
+    /// The safe full-history request: `Some` on `Full`, `None` on
+    /// `Compacted` — reports unavailability, never crashes, never
+    /// fabricates.
+    pub fn try_ledger_full(&self) -> Option<&[ExecutionRecord]> {
+        if self.compacted.is_some() {
+            None
+        } else {
+            Some(&self.ledger)
+        }
+    }
+
+    /// The loud full-history guard (the fail-visible contract — see
+    /// [`Self::ledger`]).
+    fn require_full_history(&self, api: &'static str, remedy: &'static str) {
+        if self.compacted.is_some() {
+            panic!(
+                "{api} requires the full execution history, which this compacted spine does \
+                 not retain (history_kind() is Compacted) — use {remedy}, or the try_* \
+                 fingerprint variants for the fingerprint domains; calling a full-history \
+                 API on a compacted instance is a documented contract violation surfaced \
+                 loudly, never a silently misleading value"
+            );
+        }
     }
 
     /// Events waiting in either lane (due or not yet due).
@@ -1147,12 +1267,75 @@ impl<W: World> Spine<W> {
         used
     }
 
+    // ------------------------------------------------------------ compaction
+
+    /// The explicit, versioned history compaction (PP-B2 — the
+    /// ratified v1.8 §5.6 / D-PP-3): summarizes the first
+    /// `ledger.len() - retain` execution records into the
+    /// authenticated SHA-256 prefix summary and retains the last
+    /// `retain` records verbatim. The logical state — scheduling,
+    /// conservation, watermarks, every active structure — is
+    /// untouched; only per-record history retention changes, and the
+    /// spine's subsequent saves take the `spine-history/2` form.
+    ///
+    /// **THE AUTHENTICATED PREFIX SUMMARY**: a running SHA-256 chain
+    /// over the discarded records' canonical wire bytes — the first
+    /// compaction seeds from the spine-history domain tag, a repeated
+    /// compaction chains from the prior summary, so successive
+    /// compactions authenticate end-to-end and two independent
+    /// compactions of the same history produce identical summaries.
+    /// The summary is a derivation witness: it authenticates *what*
+    /// was discarded; it never reconstructs it.
+    ///
+    /// **THE ELIGIBILITY DISCIPLINE**: this method is the spine-side
+    /// mechanism — any prefix cut of a live ledger is structurally
+    /// valid (the retained tail satisfies every load gate). The
+    /// ratified eligibility conditions (which identities' consequence
+    /// lane state may be summarized — the B4 extension) are the
+    /// application compaction driver's to verify before calling this;
+    /// compaction is an explicit operation, never a silent default.
+    pub fn compact(&mut self, retain: u64) -> Result<HistoryKind, CompactionError> {
+        let ledger_len = self.ledger.len() as u64;
+        if retain > ledger_len {
+            return Err(CompactionError::RetainExceedsLedger { ledger_len, retain });
+        }
+        let cut = ledger_len - retain;
+        if cut == 0 {
+            return Err(CompactionError::NothingToSummarize { ledger_len, retain });
+        }
+        let mut chain = match &self.compacted {
+            Some(prior) => prior.prefix_summary,
+            None => digest(SPINE_HISTORY_DOMAIN.as_bytes()),
+        };
+        for record in &self.ledger[..cut as usize] {
+            let mut hasher = Sha256::new();
+            hasher.update(&chain);
+            hasher.update(&record_wire_bytes(record));
+            chain = hasher.finish();
+        }
+        let tail = self.ledger.split_off(cut as usize);
+        self.ledger = tail;
+        let summarized_records = match &self.compacted {
+            Some(prior) => prior.summarized_records + cut,
+            None => cut,
+        };
+        self.compacted = Some(CompactedHistory {
+            summarized_records,
+            prefix_summary: chain,
+        });
+        Ok(self.history_kind())
+    }
+
     // ------------------------------------------------------- fingerprints
 
     /// Fingerprint of engine-logical state (clock, budget, stats, pending
     /// queue, blocked set, ledger). Excludes diagnostics (observational)
-    /// and the world — see [`Self::state_fingerprint`].
+    /// and the world — see [`Self::state_fingerprint`]. **Full-history
+    /// API**: hashes the execution ledger, so a compacted instance —
+    /// which does not retain it — surfaces the call loudly (see
+    /// [`Self::ledger`]); the safe path is [`Self::try_engine_fingerprint`].
     pub fn engine_fingerprint(&self) -> u64 {
+        self.require_full_history("engine_fingerprint()", "try_engine_fingerprint()");
         let mut fp = Fingerprinter::new();
         // Schema v2: length-prefixed strings in Fingerprinter::write_str
         // (independent audit 2026-10-19, item 4).
@@ -1212,8 +1395,11 @@ impl<W: World> Spine<W> {
     }
 
     /// Fingerprint of engine state plus world state — the full logical
-    /// state, in the E-07…E-10 double-run tradition.
+    /// state, in the E-07…E-10 double-run tradition. **Full-history
+    /// API** (composes [`Self::engine_fingerprint`]): the safe path on
+    /// a compacted instance is [`Self::try_state_fingerprint`].
     pub fn state_fingerprint(&self) -> u64 {
+        self.require_full_history("state_fingerprint()", "try_state_fingerprint()");
         let mut fp = Fingerprinter::new();
         fp.write_str("engine-core/state/2");
         fp.write_u64(self.engine_fingerprint());
@@ -1241,6 +1427,7 @@ impl<W: World> Spine<W> {
     /// wall-clock time, rendering cadence, and unordered iteration never
     /// reach it.
     pub fn lane_fingerprint(&self) -> u64 {
+        self.require_full_history("lane_fingerprint()", "try_lane_fingerprint()");
         let mut fp = Fingerprinter::new();
         fp.write_str("engine-core/spine-lanes/1");
         fp.write_tick(self.clock);
@@ -1302,8 +1489,11 @@ impl<W: World> Spine<W> {
 
     /// Stage 3 lane-aware state fingerprint (domain
     /// "engine-core/state-lanes/1"): the lane fingerprint plus world
-    /// state.
+    /// state. **Full-history API** (composes
+    /// [`Self::lane_fingerprint`]): the safe path on a compacted
+    /// instance is [`Self::try_lane_state_fingerprint`].
     pub fn lane_state_fingerprint(&self) -> u64 {
+        self.require_full_history("lane_state_fingerprint()", "try_lane_state_fingerprint()");
         let mut fp = Fingerprinter::new();
         fp.write_str("engine-core/state-lanes/1");
         fp.write_u64(self.lane_fingerprint());
@@ -1344,6 +1534,180 @@ impl<W: World> Spine<W> {
 
     pub fn held_fingerprint_hex(&self) -> String {
         format!("{:016x}", self.held_fingerprint())
+    }
+
+    // --------------------------------------------- history-safe variants
+
+    /// The safe engine-fingerprint path: `Some` on `Full` (identical
+    /// to [`Self::engine_fingerprint`]), `None` on `Compacted` —
+    /// reports unavailability, never crashes, never fabricates (the
+    /// v1.8 §5.6.1 `try_*` contract).
+    pub fn try_engine_fingerprint(&self) -> Option<u64> {
+        if self.compacted.is_some() {
+            None
+        } else {
+            Some(self.engine_fingerprint())
+        }
+    }
+
+    /// The safe lane-fingerprint path (see
+    /// [`Self::try_engine_fingerprint`]).
+    pub fn try_lane_fingerprint(&self) -> Option<u64> {
+        if self.compacted.is_some() {
+            None
+        } else {
+            Some(self.lane_fingerprint())
+        }
+    }
+
+    /// The safe state-fingerprint path (see
+    /// [`Self::try_engine_fingerprint`]).
+    pub fn try_state_fingerprint(&self) -> Option<u64> {
+        if self.compacted.is_some() {
+            None
+        } else {
+            Some(self.state_fingerprint())
+        }
+    }
+
+    /// The safe lane-state-fingerprint path (see
+    /// [`Self::try_engine_fingerprint`]).
+    pub fn try_lane_state_fingerprint(&self) -> Option<u64> {
+        if self.compacted.is_some() {
+            None
+        } else {
+            Some(self.lane_state_fingerprint())
+        }
+    }
+
+    // -------------------------------------------------- compacted domains
+
+    /// The compacted-history fingerprint (domain
+    /// "engine-core/spine-compacted/1" — the ratified v1.8 §5.6.1
+    /// domain): the domain tag, clock, `next_seq`, budget,
+    /// near-reserve, every Stats counter, both lane queues (canonical
+    /// `(due, seq)` order, the lane-aware entry encoding), blocked,
+    /// held, the prefix-summary bytes, `summarized_records`,
+    /// `retained_records`, the retained tail records (the lane-aware
+    /// record encoding), and a SHA-256 digest of the unfinished-id
+    /// index. **Comparison semantics**: two compacted instances agree
+    /// iff the hashed content agrees — the same logical state AND the
+    /// same compaction cut; an uncompacted instance and its compacted
+    /// image never compare through this domain (their equivalence is
+    /// behavioral, established by the twin-continuation protocol).
+    /// **Compacted-domain API**: requires the compacted representation
+    /// — a `Full` instance surfaces the call loudly (the symmetric
+    /// fail-visible discipline).
+    pub fn compacted_fingerprint(&self) -> u64 {
+        self.require_compacted("compacted_fingerprint()");
+        let Some(compacted) = &self.compacted else {
+            unreachable!("require_compacted enforced the variant")
+        };
+        let mut fp = Fingerprinter::new();
+        fp.write_str("engine-core/spine-compacted/1");
+        fp.write_tick(self.clock);
+        fp.write_u64(self.next_seq);
+        fp.write_u32(self.budget);
+        fp.write_u32(self.near_reserve);
+        fp.write_u64(self.stats.scheduled);
+        fp.write_u64(self.stats.executed);
+        fp.write_u64(self.stats.late_arrivals);
+        fp.write_u64(self.stats.late_executions);
+        fp.write_u64(self.stats.blocked_transitions);
+        fp.write_u64(self.stats.invalid_dropped);
+        fp.write_u64(self.stats.budget_exhausted_ticks);
+        for (queue, field) in [
+            (&self.near_queue, Field::Near),
+            (&self.far_queue, Field::Far),
+        ] {
+            let mut lane: Vec<&Pending> = queue.iter().map(|item| &item.0).collect();
+            lane.sort_by_key(|pending| (pending.due, pending.seq));
+            fp.write_usize(lane.len());
+            for pending in lane {
+                fp.write_u64(pending.seq);
+                fp.write_u8(field_byte(field));
+                fp.write_u32(u32::from(pending.event.class.0));
+                fp.write_u64(pending.event.payload);
+                fingerprint_schedule(&mut fp, &pending.event.schedule);
+                fingerprint_deps(&mut fp, &pending.event);
+            }
+        }
+        fp.write_usize(self.blocked.len());
+        for (seq, event) in &self.blocked {
+            fp.write_u64(*seq);
+            fp.write_u8(field_byte(event.field));
+            fp.write_u32(u32::from(event.class.0));
+            fp.write_u64(event.payload);
+            fingerprint_schedule(&mut fp, &event.schedule);
+            fingerprint_deps(&mut fp, event);
+        }
+        fp.write_usize(self.held.len());
+        for pending in self.held.values() {
+            fp.write_u64(pending.seq);
+            fp.write_u8(field_byte(pending.event.field));
+            fp.write_u32(u32::from(pending.event.class.0));
+            fp.write_u64(pending.event.payload);
+            fingerprint_schedule(&mut fp, &pending.event.schedule);
+            fingerprint_deps(&mut fp, &pending.event);
+        }
+        fp.write_bytes(&compacted.prefix_summary);
+        fp.write_u64(compacted.summarized_records);
+        fp.write_usize(self.ledger.len());
+        for record in &self.ledger {
+            fp.write_u64(record.id.seq);
+            fp.write_u8(field_byte(record.field));
+            fp.write_u32(u32::from(record.class.0));
+            fp.write_tick(record.intended_due);
+            fp.write_tick(record.executed_tick);
+            fp.write_u8(match record.schedule_kind {
+                ScheduleKind::AtLogicalTime => 0,
+                ScheduleKind::ExecutionRelative => 1,
+            });
+            fp.write_u8(u8::from(record.late));
+        }
+        // The unfinished-id digest — SHA-256 over the ascending ids
+        // (the complement representation's authoritative membership
+        // index, hashed per the v1.8 §5.6.1 domain definition).
+        let mut hasher = Sha256::new();
+        for seq in &self.unfinished {
+            hasher.update(&seq.to_le_bytes());
+        }
+        fp.write_bytes(&hasher.finish());
+        fp.finish()
+    }
+
+    /// The compacted-history state fingerprint (domain
+    /// "engine-core/state-compacted/1"): the compacted fingerprint
+    /// plus world state.
+    pub fn compacted_state_fingerprint(&self) -> u64 {
+        self.require_compacted("compacted_state_fingerprint()");
+        let mut fp = Fingerprinter::new();
+        fp.write_str("engine-core/state-compacted/1");
+        fp.write_u64(self.compacted_fingerprint());
+        self.world.fingerprint(&mut fp);
+        fp.finish()
+    }
+
+    pub fn compacted_fingerprint_hex(&self) -> String {
+        format!("{:016x}", self.compacted_fingerprint())
+    }
+
+    pub fn compacted_state_fingerprint_hex(&self) -> String {
+        format!("{:016x}", self.compacted_state_fingerprint())
+    }
+
+    /// The loud compacted-domain guard (the symmetric discipline — a
+    /// `Full` instance has no compaction cut to compare through).
+    fn require_compacted(&self, api: &'static str) {
+        if self.compacted.is_none() {
+            panic!(
+                "{api} compares through the compacted-history domains, which require the \
+                 spine-history/2 representation (history_kind() is Full) — compact first via \
+                 Spine::compact, or compare Full instances through the existing fingerprint \
+                 domains; this call is a documented contract violation surfaced loudly, \
+                 never a silently misleading value"
+            );
+        }
     }
 
     // ------------------------------------------------------------ internals
@@ -1620,11 +1984,21 @@ const DEP_BYTES: u64 = 8;
 impl<W: SaveWorld> Spine<W> {
     /// Encodes the complete save — header, spine section, world
     /// section — into `enc`, so a save can nest inside larger canonical
-    /// streams (the revision objects of later batches).
+    /// streams (the revision objects of later batches). The outer
+    /// domain and version select the representation: `sektor7/save/1`
+    /// (the full-fidelity reference) for a `Full` history,
+    /// `sektor7/save/2` (`spine-history/2`) for a compacted one — the
+    /// forms reject one another at load, never silently reinterpreted.
     pub fn save(&self, enc: &mut Encoder) {
-        enc.write_str(SAVE_DOMAIN);
-        enc.write_u32(SAVE_FORMAT_VERSION);
-        self.save_spine_section(enc);
+        if let Some(compacted) = &self.compacted {
+            enc.write_str(SAVE_DOMAIN_V2);
+            enc.write_u32(SAVE_FORMAT_VERSION_V2);
+            self.save_spine_history_section(enc, compacted);
+        } else {
+            enc.write_str(SAVE_DOMAIN);
+            enc.write_u32(SAVE_FORMAT_VERSION);
+            self.save_spine_section(enc);
+        }
         let mut world_enc = Encoder::new();
         self.world.save(&mut world_enc);
         enc.write_str(W::SAVE_DOMAIN);
@@ -1640,6 +2014,11 @@ impl<W: SaveWorld> Spine<W> {
 
     /// Restores a spine from complete save bytes (fail-closed).
     ///
+    /// The outer domain tag selects the representation —
+    /// `sektor7/save/1` (full fidelity) or `sektor7/save/2`
+    /// (`spine-history/2`) — and the forms reject one another by
+    /// domain and version, never silently reinterpreted.
+    ///
     /// Every §5.2 integrity gate is enforced with a typed
     /// [`SaveError`]: domain/schema match; the dense-allocation identity
     /// (`scheduled == next_seq`); conservation (`scheduled == executed +
@@ -1647,8 +2026,14 @@ impl<W: SaveWorld> Spine<W> {
     /// next_seq - unfinished`); the ledger-count identity; identity
     /// uniqueness and frontier bounds; clock coherence; dependency
     /// resolvability against `[0, next_seq)`; coherent blocked state.
-    /// Corrupted input is rejected, never repaired — no best-effort
-    /// reconstruction of unverified history.
+    /// The `spine-history/2` form adds the ratified compacted gates:
+    /// the count identity (`summarized + retained == executed`); a
+    /// non-empty summary; the retained tail's disjointness, clock
+    /// coherence, and order; the late-count bound; and the carried
+    /// `max_executed_index`'s coherence (present, at-or-above the
+    /// tail's maximum, at-or-below the clock). Corrupted input is
+    /// rejected, never repaired — no best-effort reconstruction of
+    /// unverified history.
     ///
     /// The clock is initialized from the verified save — the one
     /// sanctioned deviation from tick-zero construction, meaningful only
@@ -1656,15 +2041,39 @@ impl<W: SaveWorld> Spine<W> {
     /// rather than time-traveled).
     pub fn restore(bytes: &[u8], diag: Diagnostics) -> Result<Spine<W>, SaveError> {
         let mut dec = Decoder::new(bytes);
-        dec.read_domain(SAVE_DOMAIN)?;
+        // The representation dispatch: the outer domain tag selects
+        // full fidelity or the compacted form; each form's version and
+        // spine-section domain are then checked exactly.
+        let compacted_form = {
+            let observed = dec.read_str(MAX_TAG_LEN, "domain-tag")?;
+            match observed {
+                SAVE_DOMAIN => false,
+                SAVE_DOMAIN_V2 => true,
+                other => {
+                    return Err(SaveError::Domain {
+                        expected: SAVE_DOMAIN,
+                        observed: other.to_owned(),
+                    });
+                }
+            }
+        };
+        let supported = if compacted_form {
+            SAVE_FORMAT_VERSION_V2
+        } else {
+            SAVE_FORMAT_VERSION
+        };
         let version = dec.read_u32()?;
-        if version != SAVE_FORMAT_VERSION {
+        if version != supported {
             return Err(SaveError::Version {
                 observed: version,
-                supported: SAVE_FORMAT_VERSION,
+                supported,
             });
         }
-        dec.read_domain(SPINE_DOMAIN)?;
+        if compacted_form {
+            dec.read_domain(SPINE_HISTORY_DOMAIN)?;
+        } else {
+            dec.read_domain(SPINE_DOMAIN)?;
+        }
         let clock = dec.read_tick()?;
         let next_seq = dec.read_u64()?;
         let budget = dec.read_u32()?;
@@ -1693,7 +2102,40 @@ impl<W: SaveWorld> Spine<W> {
         let far = read_lane(&mut dec, "spine-save/far", Field::Far)?;
         let blocked = read_seq_section(&mut dec, "spine-save/blocked")?;
         let held = read_seq_section(&mut dec, "spine-save/held")?;
-        let ledger = read_ledger(&mut dec)?;
+        // The history payload: the full ledger, or the compacted
+        // form's fields — the carried derived max, the authenticated
+        // prefix summary, the cumulative summarized count, and the
+        // retained tail in the full form's per-record encoding.
+        let payload = if compacted_form {
+            let max_executed_index = match dec.read_u8()? {
+                0 => None,
+                1 => Some(dec.read_tick()?),
+                discriminant => {
+                    return Err(SaveError::Enum {
+                        section: "spine-history/max-present",
+                        discriminant: u64::from(discriminant),
+                    });
+                }
+            };
+            let summary_bytes = dec.read_bytes(32, "spine-history/summary")?;
+            if summary_bytes.len() != 32 {
+                return Err(SaveError::Integrity("spine-history/summary-length"));
+            }
+            let mut prefix_summary = [0u8; 32];
+            prefix_summary.copy_from_slice(summary_bytes);
+            let summarized_records = dec.read_u64()?;
+            let tail = read_ledger_section(&mut dec, "spine-history/tail")?;
+            HistoryPayload::Compacted {
+                max_executed_index,
+                prefix_summary,
+                summarized_records,
+                tail,
+            }
+        } else {
+            HistoryPayload::Full {
+                ledger: read_ledger_section(&mut dec, "spine-save/ledger")?,
+            }
+        };
 
         // ---- integrity gates -----------------------------------------
 
@@ -1764,51 +2206,84 @@ impl<W: SaveWorld> Spine<W> {
             return Err(SaveError::Integrity("spine-save/conservation"));
         }
 
-        // The execution ledger: full-fidelity count, unique and disjoint
-        // from unfinished work, clock-coherent per record and
-        // chronologically nondecreasing (live execution appends within
-        // nondecreasing campaign ticks — one clock advance per tick,
-        // every execution of that tick at it — so a regressing
-        // `executed_tick` is not a live state), with the encoded
-        // lateness flag agreeing with its derivation.
-        if stats.executed != ledger.len() as u64 {
-            return Err(SaveError::Integrity("spine-save/ledger-count"));
-        }
-        let mut prev_executed_tick: Option<u64> = None;
-        for record in &ledger {
-            let seq = record.id.seq;
-            if seq >= next_seq {
-                return Err(SaveError::Integrity("spine-save/frontier"));
+        // The history payload's own gates. The per-record checks are
+        // shared between the forms — frontier bounds, disjointness
+        // from unfinished work, per-record clock coherence with the
+        // encoded lateness flag, and chronological order — applied to
+        // whichever records the form retains.
+        let (ledger, compacted, max_carried) = match payload {
+            HistoryPayload::Full { ledger } => {
+                if stats.executed != ledger.len() as u64 {
+                    return Err(SaveError::Integrity("spine-save/ledger-count"));
+                }
+                check_record_section(&ledger, &unfinished, next_seq, clock)?;
+                // The authoritative ledger reconciles the statistic
+                // exactly: the live spine increments
+                // `late_executions` precisely when it appends a
+                // record carrying the lateness flag, so the two
+                // counts can never legitimately disagree.
+                if stats.late_executions != count_late(&ledger) {
+                    return Err(SaveError::Integrity("spine-save/late-execution-count"));
+                }
+                (ledger, None, None)
             }
-            if unfinished.contains(&seq) {
-                return Err(SaveError::Integrity(
-                    "spine-save/ledger-overlaps-unfinished",
-                ));
+            HistoryPayload::Compacted {
+                max_executed_index,
+                prefix_summary,
+                summarized_records,
+                tail,
+            } => {
+                // An explicit compaction summarizes at least one
+                // record — the full and compacted forms stay honestly
+                // disjoint.
+                if summarized_records == 0 {
+                    return Err(SaveError::Integrity("spine-history/empty-summary"));
+                }
+                // The compacted count identity.
+                let retained =
+                    u64::try_from(tail.len()).expect("counts are bounded by the input length");
+                let counted =
+                    summarized_records
+                        .checked_add(retained)
+                        .ok_or(SaveError::Overflow {
+                            section: "spine-history/count-identity",
+                        })?;
+                if counted != stats.executed {
+                    return Err(SaveError::Integrity("spine-history/count-identity"));
+                }
+                check_record_section(&tail, &unfinished, next_seq, clock)?;
+                // The late-count bound (equality is the full form's
+                // gate — the summarized records may include late
+                // ones, so the retained tail's late count is a lower
+                // bound on the statistic).
+                if stats.late_executions < count_late(&tail) {
+                    return Err(SaveError::Integrity("spine-history/late-count-bound"));
+                }
+                // The carried max: required (a compacted history
+                // executed at least one record), at-or-above the
+                // retained tail's maximum intended due, at-or-below
+                // the clock.
+                let Some(max) = max_executed_index else {
+                    return Err(SaveError::Integrity("spine-history/max-required"));
+                };
+                if let Some(tail_max) = tail.iter().map(|record| record.intended_due).max()
+                    && tail_max > max
+                {
+                    return Err(SaveError::Integrity("spine-history/max-below-tail"));
+                }
+                if max > clock {
+                    return Err(SaveError::Integrity("spine-history/max-clock-coherence"));
+                }
+                (
+                    tail,
+                    Some(CompactedHistory {
+                        summarized_records,
+                        prefix_summary,
+                    }),
+                    max_executed_index,
+                )
             }
-            if record.intended_due > record.executed_tick
-                || record.executed_tick > clock
-                || record.late != (record.executed_tick > record.intended_due)
-            {
-                return Err(SaveError::Integrity("spine-save/clock-coherence"));
-            }
-            if let Some(prior) = prev_executed_tick
-                && record.executed_tick.as_u64() < prior
-            {
-                return Err(SaveError::Integrity("spine-save/ledger-order"));
-            }
-            prev_executed_tick = Some(record.executed_tick.as_u64());
-        }
-
-        // The authoritative ledger reconciles the statistic exactly: the
-        // live spine increments `late_executions` precisely when it
-        // appends a record carrying the lateness flag, so the two counts
-        // can never legitimately disagree.
-        let late_records = ledger.iter().filter(|record| record.late).count();
-        let late_records =
-            u64::try_from(late_records).expect("counts are bounded by the input length");
-        if stats.late_executions != late_records {
-            return Err(SaveError::Integrity("spine-save/late-execution-count"));
-        }
+        };
 
         // Counter bounds, each structurally implied by live behavior:
         // late executions are counted per executed event, late arrivals
@@ -1850,6 +2325,7 @@ impl<W: SaveWorld> Spine<W> {
             waiting_on: BTreeMap::new(),
             unfinished,
             ledger,
+            compacted,
             max_executed_index: None,
             world,
             budget,
@@ -1904,10 +2380,16 @@ impl<W: SaveWorld> Spine<W> {
             spine.held.insert(pending.seq, pending);
         }
 
-        // The derived max-intended-due index, recomputed from the
-        // canonical ledger — value-identical to the incrementally
-        // maintained index by construction.
-        spine.max_executed_index = spine.ledger.iter().map(|record| record.intended_due).max();
+        // The derived max-intended-due index: recomputed from the
+        // canonical ledger on the full path (value-identical to the
+        // incrementally maintained index by construction); carried
+        // from the compacted save on the spine-history/2 path (the
+        // pre-cut records are summarized — the writer-computed value,
+        // gated above against the retained tail and the clock).
+        spine.max_executed_index = match max_carried {
+            Some(carried) => Some(carried),
+            None => spine.ledger.iter().map(|record| record.intended_due).max(),
+        };
 
         Ok(spine)
     }
@@ -1943,6 +2425,56 @@ impl<W: SaveWorld> Spine<W> {
         for pending in self.held.values() {
             write_event_entry(enc, &pending.event);
         }
+        enc.write_count(self.ledger.len());
+        for record in &self.ledger {
+            write_record_entry(enc, record);
+        }
+    }
+
+    /// The compacted spine section (`spine-history/2`): the
+    /// authoritative active state in the full section's exact encoding
+    /// (clock through held), then the compacted-history fields — the
+    /// CARRIED derived max (the pre-cut records are summarized, so the
+    /// load cannot derive it from the tail alone), the authenticated
+    /// prefix summary, the cumulative summarized count, and the
+    /// retained tail in the full form's per-record encoding.
+    fn save_spine_history_section(&self, enc: &mut Encoder, compacted: &CompactedHistory) {
+        enc.write_str(SPINE_HISTORY_DOMAIN);
+        enc.write_tick(self.clock);
+        enc.write_u64(self.next_seq);
+        enc.write_u32(self.budget);
+        enc.write_u32(self.near_reserve);
+        enc.write_u64(self.stats.scheduled);
+        enc.write_u64(self.stats.executed);
+        enc.write_u64(self.stats.late_arrivals);
+        enc.write_u64(self.stats.late_executions);
+        enc.write_u64(self.stats.blocked_transitions);
+        enc.write_u64(self.stats.invalid_dropped);
+        enc.write_u64(self.stats.budget_exhausted_ticks);
+        for queue in [&self.near_queue, &self.far_queue] {
+            // Canonical `(due, seq)` order — heap layout is
+            // rebuild-dependent and never observable.
+            let mut lane: Vec<&Pending> = queue.iter().map(|item| &item.0).collect();
+            lane.sort_by_key(|pending| (pending.due, pending.seq));
+            enc.write_count(lane.len());
+            for pending in lane {
+                write_event_entry(enc, &pending.event);
+            }
+        }
+        enc.write_count(self.blocked.len());
+        for event in self.blocked.values() {
+            write_event_entry(enc, event);
+        }
+        enc.write_count(self.held.len());
+        for pending in self.held.values() {
+            write_event_entry(enc, &pending.event);
+        }
+        enc.write_u8(u8::from(self.max_executed_index.is_some()));
+        if let Some(max) = self.max_executed_index {
+            enc.write_tick(max);
+        }
+        enc.write_bytes(&compacted.prefix_summary);
+        enc.write_u64(compacted.summarized_records);
         enc.write_count(self.ledger.len());
         for record in &self.ledger {
             write_record_entry(enc, record);
@@ -2150,14 +2682,17 @@ fn read_seq_section(dec: &mut Decoder, section: &'static str) -> Result<Vec<Even
     Ok(events)
 }
 
-/// Reads the ledger section: the authoritative execution order (append
+/// Reads a ledger-form section (the full ledger, or the compacted
+/// form's retained tail): the authoritative execution order (append
 /// order), with unique identities.
-fn read_ledger(dec: &mut Decoder) -> Result<Vec<ExecutionRecord>, SaveError> {
-    const SECTION: &str = "spine-save/ledger";
-    let count = dec.read_count(MAX_COLLECTION_COUNT, SECTION, "entry-count")?;
+fn read_ledger_section(
+    dec: &mut Decoder,
+    section: &'static str,
+) -> Result<Vec<ExecutionRecord>, SaveError> {
+    let count = dec.read_count(MAX_COLLECTION_COUNT, section, "entry-count")?;
     if count > dec.remaining() as u64 / RECORD_BYTES {
         return Err(SaveError::Limit {
-            section: SECTION,
+            section,
             kind: "entry-count",
             value: count,
             max: dec.remaining() as u64 / RECORD_BYTES,
@@ -2169,21 +2704,18 @@ fn read_ledger(dec: &mut Decoder) -> Result<Vec<ExecutionRecord>, SaveError> {
         let seq = dec.read_u64()?;
         let wide_class = dec.read_u32()?;
         let class = u16::try_from(wide_class).map_err(|_| SaveError::Limit {
-            section: SECTION,
+            section,
             kind: "class",
             value: u64::from(wide_class),
             max: u64::from(u16::MAX),
         })?;
-        let field = read_field(dec, SECTION)?;
+        let field = read_field(dec, section)?;
         let intended_due = dec.read_tick()?;
         let executed_tick = dec.read_tick()?;
-        let schedule_kind = read_schedule_kind(dec, SECTION)?;
-        let late = read_late(dec, SECTION)?;
+        let schedule_kind = read_schedule_kind(dec, section)?;
+        let late = read_late(dec, section)?;
         if !seen.insert(seq) {
-            return Err(SaveError::Duplicate {
-                section: SECTION,
-                seq,
-            });
+            return Err(SaveError::Duplicate { section, seq });
         }
         records.push(ExecutionRecord {
             id: EventId { seq },
@@ -2196,4 +2728,106 @@ fn read_ledger(dec: &mut Decoder) -> Result<Vec<ExecutionRecord>, SaveError> {
         });
     }
     Ok(records)
+}
+
+/// The history payload [`Spine::restore`] read: the full ledger, or
+/// the compacted form's fields.
+enum HistoryPayload {
+    Full {
+        ledger: Vec<ExecutionRecord>,
+    },
+    Compacted {
+        max_executed_index: Option<Tick>,
+        prefix_summary: [u8; 32],
+        summarized_records: u64,
+        tail: Vec<ExecutionRecord>,
+    },
+}
+
+/// The per-record ledger checks shared by both history forms:
+/// frontier bounds, disjointness from unfinished work, per-record
+/// clock coherence with the encoded lateness flag, and chronological
+/// order (live execution appends within nondecreasing campaign ticks
+/// — one clock advance per tick, every execution of that tick at it —
+/// so a regressing `executed_tick` is not a live state).
+fn check_record_section(
+    records: &[ExecutionRecord],
+    unfinished: &BTreeSet<u64>,
+    next_seq: u64,
+    clock: Tick,
+) -> Result<(), SaveError> {
+    let mut prev_executed_tick: Option<u64> = None;
+    for record in records {
+        let seq = record.id.seq;
+        if seq >= next_seq {
+            return Err(SaveError::Integrity("spine-save/frontier"));
+        }
+        if unfinished.contains(&seq) {
+            return Err(SaveError::Integrity(
+                "spine-save/ledger-overlaps-unfinished",
+            ));
+        }
+        if record.intended_due > record.executed_tick
+            || record.executed_tick > clock
+            || record.late != (record.executed_tick > record.intended_due)
+        {
+            return Err(SaveError::Integrity("spine-save/clock-coherence"));
+        }
+        if let Some(prior) = prev_executed_tick
+            && record.executed_tick.as_u64() < prior
+        {
+            return Err(SaveError::Integrity("spine-save/ledger-order"));
+        }
+        prev_executed_tick = Some(record.executed_tick.as_u64());
+    }
+    Ok(())
+}
+
+fn count_late(records: &[ExecutionRecord]) -> u64 {
+    u64::try_from(records.iter().filter(|record| record.late).count())
+        .expect("counts are bounded by the input length")
+}
+
+/// The fixed-width canonical record bytes — the exact 31 bytes
+/// [`write_record_entry`] emits (pinned equal by test) — hashed into
+/// the authenticated prefix-summary chain. Fixed-width by
+/// construction: seq 8 + class 4 + field 1 + intended due 8 +
+/// executed tick 8 + schedule kind 1 + late flag 1.
+fn record_wire_bytes(record: &ExecutionRecord) -> [u8; 31] {
+    let mut bytes = [0u8; 31];
+    bytes[0..8].copy_from_slice(&record.id.seq.to_le_bytes());
+    bytes[8..12].copy_from_slice(&u32::from(record.class.0).to_le_bytes());
+    bytes[12] = field_byte(record.field);
+    bytes[13..21].copy_from_slice(&record.intended_due.as_u64().to_le_bytes());
+    bytes[21..29].copy_from_slice(&record.executed_tick.as_u64().to_le_bytes());
+    bytes[29] = match record.schedule_kind {
+        ScheduleKind::AtLogicalTime => 0,
+        ScheduleKind::ExecutionRelative => 1,
+    };
+    bytes[30] = u8::from(record.late);
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefix-summary chain's per-record bytes are the save
+    /// encoding's per-record bytes — pinned exactly, so the summary
+    /// hashes what the wire format specifies.
+    #[test]
+    fn record_wire_bytes_matches_the_save_encoding() {
+        let record = ExecutionRecord {
+            id: EventId { seq: 42 },
+            class: EventClass::new(7),
+            field: Field::Far,
+            intended_due: Tick(5),
+            executed_tick: Tick(9),
+            schedule_kind: ScheduleKind::ExecutionRelative,
+            late: true,
+        };
+        let mut enc = Encoder::new();
+        write_record_entry(&mut enc, &record);
+        assert_eq!(enc.into_bytes(), record_wire_bytes(&record));
+    }
 }

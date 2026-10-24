@@ -33,6 +33,23 @@ pub const SAVE_FORMAT_VERSION: u32 = 1;
 /// §sections): the outermost schema identity of the byte stream.
 pub const SAVE_DOMAIN: &str = "sektor7/save/1";
 
+/// The COMPACTED save format version (PP-B2 `spine-history/2`): a
+/// spine whose execution history below the compaction cut is replaced
+/// by the authenticated SHA-256 prefix summary. The full (`/1`) and
+/// compacted (`/2`) forms reject one another by domain and version —
+/// never silently reinterpreted.
+pub const SAVE_FORMAT_VERSION_V2: u32 = 2;
+
+/// Domain tag of a complete COMPACTED save's header section: the
+/// outermost schema identity of the `spine-history/2` byte stream.
+pub const SAVE_DOMAIN_V2: &str = "sektor7/save/2";
+
+/// Domain tag of the compacted spine section (the `spine-history/2`
+/// form: the authoritative active state in the full section's exact
+/// encoding, then the carried derived max, the authenticated prefix
+/// summary, the summarized count, and the retained tail).
+pub const SPINE_HISTORY_DOMAIN: &str = "engine-core/spine-history/2";
+
 /// Domain tag of the spine section (wire-format spec §sections).
 pub const SPINE_DOMAIN: &str = "engine-core/spine-save/1";
 

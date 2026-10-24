@@ -48,6 +48,8 @@ pub mod lod;
 pub mod spine;
 pub mod wire;
 
+mod sha256;
+
 pub use clock::Tick;
 pub use diag::{Diagnostics, Level, Record};
 pub use event::{
@@ -56,7 +58,7 @@ pub use event::{
 pub use fingerprint::Fingerprinter;
 pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
 pub use spine::{
-    ExecCtx, LaneReport, LaneTotals, ObligationLocation, ObligationView, ScheduleError, Spine,
-    Stats, SuspensionStats, World,
+    CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
+    ObligationView, ScheduleError, Spine, Stats, SuspensionStats, World,
 };
 pub use wire::{Decoder, Encoder, SaveError, SaveWorld};
