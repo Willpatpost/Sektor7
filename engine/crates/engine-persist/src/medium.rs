@@ -32,6 +32,18 @@ pub enum SyncTier {
     /// scenario of §5.3.3 is possible and undetectable by chain
     /// validation. Development / process-crash qualification only.
     ProcessCrashOnly,
+    /// The verified SQLite transactional configuration (PP-B1,
+    /// D-PP-1): WAL with `synchronous=FULL`, both **confirmed by
+    /// querying the actual configuration at open** — every committed
+    /// transaction's WAL frames are fsynced before the commit
+    /// acknowledges, the documented acknowledged-transaction
+    /// persistence contract across process crash, OS crash, and power
+    /// loss per SQLite's documented WAL semantics (the
+    /// hardware/filesystem synchronization assumptions stated in the
+    /// PP-B1 record). Process-kill tests establish the process-crash
+    /// behavior only; the broader tier rests on the documented engine
+    /// semantics, never on tests runnable on development hardware.
+    TransactionalWalFull,
 }
 
 /// Why an append outcome is uncertain. The outcome is `Unknown` —
@@ -48,6 +60,14 @@ pub enum UnknownReason {
     HeadPublishFailed,
     /// Failure in post-rename metadata synchronization.
     PostPublishSyncFailed,
+    /// A SQLite transaction's `COMMIT` could not be completed — the
+    /// transaction's final disposition (installed or not) cannot be
+    /// established from the returned error; reconcile under a fresh
+    /// committed read (PP-B1).
+    CommitUncertain,
+    /// A failed SQLite transaction's `ROLLBACK` could not be
+    /// completed — the disposition is genuinely unknown (PP-B1).
+    RollbackUncertain,
 }
 
 /// The result of a conditional append (§5.3.1's exact semantics).
@@ -124,6 +144,25 @@ pub enum MediumError {
     /// A persisted object failed strict decoding (the Batch 1 typed
     /// error carried through).
     Format(SaveError),
+    /// Writer contention persisted past the configured busy timeout —
+    /// the SQLite write lock was unavailable (PP-B1). **Never evidence
+    /// of a stale parent** (no parent comparison occurred — no
+    /// transaction work began) and **never an uncertain commit** (the
+    /// failure precedes the transaction's first write).
+    Contention {
+        /// What was contended and where.
+        detail: String,
+    },
+    /// A SQLite database-level failure (corruption, unreadable
+    /// storage, an API-level error) — fail-closed, never automatically
+    /// repaired (PP-B1). The `detail` carries the engine's message;
+    /// the engine never attempts `.recover` or any destructive repair.
+    Sqlite {
+        /// The operation that failed.
+        op: &'static str,
+        /// The database engine's message.
+        detail: String,
+    },
 }
 
 impl fmt::Display for MediumError {
@@ -152,6 +191,12 @@ impl fmt::Display for MediumError {
                 "chain-referenced object {hash} fails its hash — fail closed, evidence preserved"
             ),
             MediumError::Format(error) => write!(f, "persisted object failed decoding: {error}"),
+            MediumError::Contention { detail } => {
+                write!(f, "storage write contention: {detail}")
+            }
+            MediumError::Sqlite { op, detail } => {
+                write!(f, "sqlite operation {op} failed: {detail}")
+            }
         }
     }
 }

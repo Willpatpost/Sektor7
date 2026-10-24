@@ -48,6 +48,7 @@ pub mod medium;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
+pub mod sqlite;
 
 #[cfg(test)]
 mod tests;

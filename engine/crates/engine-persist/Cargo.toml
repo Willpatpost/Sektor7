@@ -6,6 +6,7 @@ description = "Sektor7 original engine — Stage 5 B2: content-addressed revisio
 
 [dependencies]
 engine-core = { path = "../engine-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11"
 
 [lints]
