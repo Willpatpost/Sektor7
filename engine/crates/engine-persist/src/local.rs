@@ -224,6 +224,12 @@ impl LocalFileMedium {
         self.walks
     }
 
+    /// The store root path (the PP-B1 provider seam's location
+    /// reporting — diagnostics and the fresh-handle reuse).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The campaign identity established by the session open (or a
     /// later validated append) — founding id, authority mode, and
     /// campaign id, available without re-walking. `None` before the
