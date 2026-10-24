@@ -508,10 +508,12 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
 
 #[test]
 fn hand_crafted_manifests_and_wrong_bindings_are_refused() {
-    // THE REVIEW CORRECTIVE (Finding 3), the completed §6.2 bindings:
-    // a manifest without the v2 fields is refused by the version
-    // check, and a v2 manifest whose last-committed binding does not
-    // match the actual journal is refused by the re-scan.
+    // THE REVIEW CORRECTIVES (Finding 3 + the final contract
+    // completion): a manifest of an older wire version (v1 or the
+    // corrective-era v2) is refused by the version check — never
+    // silently reinterpreted — and a v3 manifest whose last-committed
+    // binding does not match the actual journal is refused by the
+    // re-scan.
     let near = near_region_4();
     let far = far_from_region_4();
     let (mut spine, mut director) = scenario_pair(150, &near);
@@ -549,7 +551,24 @@ fn hand_crafted_manifests_and_wrong_bindings_are_refused() {
         verify_backup(&set),
         Err(BackupError::ManifestCorrupt { .. })
     ));
-    // (b) A v2 manifest with a WRONG last-committed binding — the
+    // (a2) A v2-SHAPED manifest (the corrective-era field set): the
+    // version check refuses it — a v2 manifest is never silently
+    // reinterpreted as v3 (the final review's requirement).
+    let set = dir.0.join("set-v2-manifest");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    let mut enc = Encoder::new();
+    enc.write_str(BACKUP_MANIFEST_DOMAIN);
+    enc.write_u32(2);
+    enc.write_bytes(report.summary.head.as_bytes());
+    enc.write_bytes(report.journal_sha256.as_bytes());
+    std::fs::write(set.join("MANIFEST"), enc.into_bytes()).unwrap();
+    assert!(matches!(
+        verify_backup(&set),
+        Err(BackupError::ManifestCorrupt { .. })
+    ));
+    // (b) A v3 manifest with a WRONG last-committed binding — the
     // journal re-scan refuses it.
     let set = dir.0.join("set-wrong-tx");
     std::fs::create_dir(&set).unwrap();
@@ -558,13 +577,15 @@ fn hand_crafted_manifests_and_wrong_bindings_are_refused() {
     let wrong_tx = Hash::from_bytes(&[7u8; 32]).unwrap();
     let mut enc = Encoder::new();
     enc.write_str(BACKUP_MANIFEST_DOMAIN);
-    enc.write_u32(2);
+    enc.write_u32(3);
     enc.write_bytes(report.summary.head.as_bytes());
     enc.write_bytes(report.journal_sha256.as_bytes());
     enc.write_u64(report.summary.records);
     enc.write_str("binding-campaign");
     enc.write_bytes(wrong_tx.as_bytes());
     enc.write_u64(journal_len);
+    enc.write_str("/the/source/journal.t1");
+    enc.write_u64(1);
     enc.write_u32(1);
     enc.write_u32(1);
     enc.write_u32(1);
@@ -575,4 +596,100 @@ fn hand_crafted_manifests_and_wrong_bindings_are_refused() {
     ));
     // The REAL set still verifies on its own.
     assert!(verify_backup(&dir.output()).is_ok());
+}
+
+#[test]
+fn manifest_v3_contract_fields_portability_and_bounds() {
+    // THE FINAL REVIEW'S CONTRACT COMPLETION: the v3 manifest carries
+    // the source-journal identity (PROVENANCE — the journal actually
+    // selected and locked; never a restoration requirement: a moved
+    // set verifies and restores anywhere) and the capture timestamp
+    // (OBSERVATIONAL — never ordering or durability evidence), with
+    // presence and bounds enforced at the decode.
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("v3-contract");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&StoreLocation::Database(dir.db()), journal, "v3-campaign")
+            .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    crossing.checkpoint().unwrap();
+    drop(crossing);
+    let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output()).unwrap();
+    let journal_len = std::fs::metadata(dir.output().join("journal.t1"))
+        .unwrap()
+        .len();
+    // The real set's manifest is a v3 (the decode requires the new
+    // fields — the round-trip proof) and verifies, including its
+    // isolated-scratch restoration.
+    assert!(verify_backup(&dir.output()).is_ok());
+    // The hand-encoded v3 helper: the correct bindings plus the
+    // caller-chosen source-journal identity and capture timestamp.
+    let encode_v3 = |source_journal: &str, captured_at: u64| {
+        let last_tx = T1Journal::scan_file(dir.output().join("journal.t1"))
+            .unwrap()
+            .committed
+            .last()
+            .map(|transaction| transaction.id.0)
+            .unwrap_or_else(|| Hash::from_bytes(&[0u8; 32]).unwrap());
+        let mut enc = Encoder::new();
+        enc.write_str(BACKUP_MANIFEST_DOMAIN);
+        enc.write_u32(3);
+        enc.write_bytes(report.summary.head.as_bytes());
+        enc.write_bytes(report.journal_sha256.as_bytes());
+        enc.write_u64(report.summary.records);
+        enc.write_str("v3-campaign");
+        enc.write_bytes(last_tx.as_bytes());
+        enc.write_u64(journal_len);
+        enc.write_str(source_journal);
+        enc.write_u64(captured_at);
+        enc.write_u32(1);
+        enc.write_u32(1);
+        enc.write_u32(1);
+        enc.into_bytes()
+    };
+    // PORTABILITY: a manifest naming a DIFFERENT source journal (the
+    // set moved between machines) still verifies — the identity is
+    // provenance, never a restoration requirement — including the
+    // full scratch restoration inside verify_backup.
+    let set = dir.0.join("set-moved");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    std::fs::write(
+        set.join("MANIFEST"),
+        encode_v3(
+            "/another/machine/campaign/journal.t1",
+            1_700_000_000_000_000_000,
+        ),
+    )
+    .unwrap();
+    assert!(
+        verify_backup(&set).is_ok(),
+        "the moved set verifies and restores — the source-journal identity is provenance"
+    );
+    // PRESENCE: an EMPTY source-journal identity is refused.
+    let set = dir.0.join("set-empty-identity");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    std::fs::write(set.join("MANIFEST"), encode_v3("", 1)).unwrap();
+    assert!(matches!(
+        verify_backup(&set),
+        Err(BackupError::ManifestCorrupt { .. })
+    ));
+    // BOUNDS: an over-long source-journal identity is refused (the
+    // wire bound).
+    let set = dir.0.join("set-overlong-identity");
+    std::fs::create_dir(&set).unwrap();
+    std::fs::copy(dir.output().join("store.db"), set.join("store.db")).unwrap();
+    std::fs::copy(dir.output().join("journal.t1"), set.join("journal.t1")).unwrap();
+    let overlong = "j".repeat(5000);
+    std::fs::write(set.join("MANIFEST"), encode_v3(&overlong, 1)).unwrap();
+    assert!(matches!(
+        verify_backup(&set),
+        Err(BackupError::ManifestCorrupt { .. })
+    ));
 }

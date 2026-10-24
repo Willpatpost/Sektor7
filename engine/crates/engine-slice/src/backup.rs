@@ -60,7 +60,11 @@ use crate::store::StoreLocation;
 
 /// The manifest's wire domain (versioned, self-describing).
 pub const BACKUP_MANIFEST_DOMAIN: &str = "sektor7/engine-slice/backup-manifest/1";
-const BACKUP_MANIFEST_VERSION: u32 = 2;
+/// The manifest's wire version. **v3** (the final review's contract
+/// completion) adds the source-journal identity and the capture
+/// timestamp to the v2 binding set; a version-2 manifest is REFUSED
+/// by the version check — never silently reinterpreted.
+const BACKUP_MANIFEST_VERSION: u32 = 3;
 const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_TMP: &str = "MANIFEST.tmp";
 const BACKUP_DB: &str = "store.db";
@@ -68,6 +72,8 @@ const BACKUP_JOURNAL: &str = "journal.t1";
 /// The campaign-id wire bound (generous; the founding record's own
 /// campaign ids are far shorter).
 const MAX_CAMPAIGN_ID: u64 = 1024;
+/// The source-journal identity's wire bound (a path; generous).
+const MAX_SOURCE_JOURNAL: u64 = 4096;
 /// The none-sentinel for the last-committed-transaction binding (a
 /// journal with no committed transactions): no real content hashes
 /// to the zero digest.
@@ -221,6 +227,22 @@ struct Manifest {
     campaign_id: String,
     last_committed_tx: Hash,
     journal_bytes: u64,
+    /// The journal actually selected and locked for the capture —
+    /// PROVENANCE ONLY (the active journal's identity at capture;
+    /// under a future rotation protocol, the post-rotation journal
+    /// actually locked): the verification and the scratch
+    /// restoration never require the original path — the set is
+    /// portable; the field exists so an operator can identify which
+    /// journal file a set was captured from.
+    source_journal: String,
+    /// The capture timestamp (Unix-epoch nanoseconds) — OBSERVATIONAL
+    /// METADATA ONLY: when the capturing machine's clock claimed the
+    /// capture ran. NEVER authoritative ordering evidence (the chain
+    /// head, the journal bindings, and the record counts order the
+    /// set) and NEVER durability evidence (the commits and fsyncs
+    /// establish durability); a restored or moved set keeps its
+    /// original timestamp unchanged.
+    captured_at_nanos: u64,
     checkpointed: bool,
     journal_locked: bool,
     head_stable: bool,
@@ -236,6 +258,8 @@ fn manifest_bytes(manifest: &Manifest) -> Vec<u8> {
     enc.write_str(&manifest.campaign_id);
     enc.write_bytes(manifest.last_committed_tx.as_bytes());
     enc.write_u64(manifest.journal_bytes);
+    enc.write_str(&manifest.source_journal);
+    enc.write_u64(manifest.captured_at_nanos);
     enc.write_u32(manifest.checkpointed as u32);
     enc.write_u32(manifest.journal_locked as u32);
     enc.write_u32(manifest.head_stable as u32);
@@ -272,6 +296,23 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, BackupError> {
     )
     .ok_or_else(|| corrupt("last-committed width".to_owned()))?;
     let journal_bytes = dec.read_u64().map_err(|e| corrupt(e.to_string()))?;
+    // The source-journal identity (the final review's contract): the
+    // provenance of the journal actually locked for the capture —
+    // present and bounded, never a restoration requirement.
+    let source_journal = dec
+        .read_str(MAX_SOURCE_JOURNAL, "backup-source-journal")
+        .map_err(|e| corrupt(e.to_string()))?
+        .to_owned();
+    if source_journal.is_empty() {
+        return Err(corrupt(
+            "the source-journal identity is absent — the manifest must \
+             name the journal actually locked for the capture"
+                .to_owned(),
+        ));
+    }
+    // The capture timestamp (observational — never ordering or
+    // durability evidence; any value decodes).
+    let captured_at_nanos = dec.read_u64().map_err(|e| corrupt(e.to_string()))?;
     let checkpointed = dec.read_u32().map_err(|e| corrupt(e.to_string()))? != 0;
     let journal_locked = dec.read_u32().map_err(|e| corrupt(e.to_string()))? != 0;
     let head_stable = dec.read_u32().map_err(|e| corrupt(e.to_string()))? != 0;
@@ -283,6 +324,8 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, BackupError> {
         campaign_id,
         last_committed_tx,
         journal_bytes,
+        source_journal,
+        captured_at_nanos,
         checkpointed,
         journal_locked,
         head_stable,
@@ -405,7 +448,14 @@ pub fn backup_campaign(
     // the set complete — carrying the complete ratified §6.2
     // bindings: the head, the journal hash, the records, the campaign
     // id, the last committed transaction, the journal length, the
-    // checkpoint state, and the boundary evidence.
+    // SOURCE-JOURNAL IDENTITY (the journal actually selected and
+    // locked — provenance, never a restoration requirement), the
+    // CAPTURE TIMESTAMP (observational, never ordering or durability
+    // evidence), the checkpoint state, and the boundary evidence.
+    let captured_at_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| io_err("clock", journal_path, std::io::Error::other(e)))?
+        .as_nanos() as u64;
     let manifest = Manifest {
         head: summary.head,
         journal_sha256,
@@ -413,6 +463,8 @@ pub fn backup_campaign(
         campaign_id: summary.campaign_id.clone(),
         last_committed_tx: scan_last_committed(&backup_journal)?,
         journal_bytes: journal_bytes.len() as u64,
+        source_journal: journal_path.to_string_lossy().to_string(),
+        captured_at_nanos,
         checkpointed: true,
         journal_locked: true,
         head_stable: true,
