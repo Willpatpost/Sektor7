@@ -173,6 +173,19 @@ pub enum MediumError {
         /// The refusing store's context.
         detail: String,
     },
+    /// The SQLite database carries a `migration-pending` meta row
+    /// (the §6.1 offline migration's target lifecycle — the PP-B1
+    /// review corrective): it is a partially- or fully-copied
+    /// migration target whose source-side seal and activation have
+    /// not both completed. It is NOT a live campaign — the normal
+    /// constructors refuse it; only the migration itself
+    /// (`SqliteMedium::open_migration_target`) may proceed, and the
+    /// activation (`mark_migrated_from`) transitions it to a live
+    /// campaign transactionally.
+    MigrationPending {
+        /// The refusing database's context.
+        detail: String,
+    },
 }
 
 impl fmt::Display for MediumError {
@@ -209,6 +222,12 @@ impl fmt::Display for MediumError {
             }
             MediumError::Sealed { detail } => {
                 write!(f, "the store is sealed as migrated: {detail}")
+            }
+            MediumError::MigrationPending { detail } => {
+                write!(
+                    f,
+                    "the database is an unactivated migration target: {detail}"
+                )
             }
         }
     }

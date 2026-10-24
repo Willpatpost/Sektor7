@@ -8,7 +8,12 @@
 //! never merged; an unsafe directory layout is refused before
 //! anything is touched; a restored older source is never merged),
 //! and the seal's admission (new binaries refuse the archived
-//! store).
+//! store) — plus the review corrective's migration-target lifecycle
+//! (a pending target refuses the normal opens across the partial,
+//! copy-complete, and sealed-unactivated states until the
+//! transactional activation; standalone and activated databases
+//! refuse the migration mode; the activation refuses a target
+//! without the pending marker).
 
 use std::path::{Path, PathBuf};
 
@@ -156,8 +161,11 @@ fn interrupted_copy_resumes_from_the_target_head() {
     let expected = legacy.validate().unwrap();
     drop(legacy);
     // THE INTERRUPTED COPY: only the founding plus the first two
-    // regulars made it into the target before the process died.
-    let mut target = SqliteMedium::open(&target_db).unwrap();
+    // regulars made it into the target before the process died —
+    // the target opened in MIGRATION MODE (the lifecycle's pending
+    // marker written before the first append, so the partial state
+    // can never be mistaken for a standalone campaign).
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
     let founding = founding_record("resume-campaign");
     let mut head = append_accepted(&mut target, &founding, &[object(0)], None);
     for (epoch, index) in (1..=2u64).enumerate() {
@@ -210,7 +218,7 @@ fn post_seal_interruption_completes_activation_and_archive() {
     let journal = dir.0.join("journal.t1");
     let mut legacy = legacy_store(&legacy_root, "post-seal-campaign", 3);
     let expected = legacy.validate().unwrap();
-    let mut target = SqliteMedium::open(&target_db).unwrap();
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
     let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
     assert_eq!(copied.appended, 4);
     // The migration ran through the full cutover and died before the
@@ -242,10 +250,17 @@ fn seal_without_activation_resumes_and_activates() {
     let journal = dir.0.join("journal.t1");
     let mut legacy = legacy_store(&legacy_root, "seal-only-campaign", 3);
     let expected = legacy.validate().unwrap();
-    let mut target = SqliteMedium::open(&target_db).unwrap();
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
     let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
     drop(legacy);
     drop(target);
+    // THE SEALED/UNACTIVATED state: even with the tombstone on the
+    // source, the unactivated target still refuses the normal opens
+    // (the pending lifecycle — gameplay cannot proceed on it).
+    assert!(matches!(
+        SqliteMedium::open(&target_db),
+        Err(MediumError::MigrationPending { .. })
+    ));
     // THE CRASH between the seal and the activation: the tombstone
     // landed (encoded independently here — the wire format pinned),
     // the provenance row did not.
@@ -261,9 +276,10 @@ fn seal_without_activation_resumes_and_activates() {
     assert_eq!(report.copied, 0);
     assert_eq!(report.target_summary, expected);
     assert!(report.archived_to.is_some());
-    // The activation landed and is idempotent.
+    // The ACTIVATED state: the pending marker left with the
+    // activation — the normal opens work and the chain validates.
     let mut target = SqliteMedium::open(&target_db).unwrap();
-    target.mark_migrated_from(&expected.head).unwrap();
+    assert_eq!(target.validate().unwrap(), expected);
 }
 
 #[test]
@@ -273,7 +289,7 @@ fn source_moved_between_copy_and_cutover_fails_closed() {
     let target_db = dir.0.join("store.db");
     let mut legacy = legacy_store(&legacy_root, "divergence-campaign", 3);
     let expected = legacy.validate().unwrap();
-    let mut target = SqliteMedium::open(&target_db).unwrap();
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
     let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
     drop(legacy);
     // A foreign session appends to the source AFTER the copy: the
@@ -310,9 +326,18 @@ fn foreign_target_chain_is_refused() {
     let founding_b = founding_record("campaign-b");
     append_accepted(&mut target, &founding_b, &[object(0)], None);
     drop(target);
-    // Never merged: the target's head is not on the source chain.
+    // Never hijacked, never merged: the standalone campaign is
+    // refused at the migration-target lifecycle gate (the review
+    // corrective) — the operator's foreign use of the path is left
+    // intact for their own decision.
     let refusal = migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap_err();
-    assert!(matches!(refusal, MigrationError::Diverged { .. }));
+    assert!(matches!(
+        refusal,
+        MigrationError::Medium(MediumError::Sqlite {
+            op: "open_migration_target",
+            ..
+        })
+    ));
     let mut target = SqliteMedium::open(&target_db).unwrap();
     assert_eq!(
         target.validate().unwrap().records,
@@ -412,10 +437,18 @@ fn restored_older_source_is_refused_never_merged() {
     migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap();
     // The operator restores the OLDER backup at the original path.
     std::fs::rename(&backup, &legacy_root).unwrap();
-    // The refusal: the database's head (the grown chain) is not on
-    // the older chain — divergent histories are never merged.
+    // The refusal: the target is already an ACTIVATED migration —
+    // never re-migrated in place (the lifecycle gate); the restored
+    // older source requires the operator's own fresh decision (a
+    // fresh target path, or the archive's manual reconciliation).
     let refusal = migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &journal).unwrap_err();
-    assert!(matches!(refusal, MigrationError::Diverged { .. }));
+    assert!(matches!(
+        refusal,
+        MigrationError::Medium(MediumError::Sqlite {
+            op: "open_migration_target",
+            ..
+        })
+    ));
     // The target still holds the grown chain; the restored older
     // source is untouched (no second seal, no second archive).
     let mut target = SqliteMedium::open(&target_db).unwrap();
@@ -430,4 +463,121 @@ fn restored_older_source_is_refused_never_merged() {
         expected.records,
         "the restored older source stands untouched"
     );
+}
+
+#[test]
+fn migration_target_lifecycle_refuses_gameplay_until_activation() {
+    // THE REVIEW CORRECTIVE'S LIFECYCLE MATRIX: a migration target is
+    // NOT a live campaign until its activation — every state short of
+    // the activation refuses the normal opens (and therefore every
+    // gameplay constructor above them).
+    let dir = TestDir::new("lifecycle");
+    let legacy_root = dir.0.join("store");
+    let target_db = dir.0.join("store.db");
+    let journal = dir.0.join("journal.t1");
+    let mut legacy = legacy_store(&legacy_root, "lifecycle-campaign", 3);
+    let expected = legacy.validate().unwrap();
+    drop(legacy);
+    // PARTIAL COPY: the founding plus one regular reach the target,
+    // the process dies.
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
+    let founding = founding_record("lifecycle-campaign");
+    let head = append_accepted(&mut target, &founding, &[object(0)], None);
+    let record = regular_record(head, 0, 1);
+    append_accepted(&mut target, &record, &[object(1)], Some(head));
+    drop(target);
+    assert!(matches!(
+        SqliteMedium::open(&target_db),
+        Err(MediumError::MigrationPending { .. })
+    ));
+    assert!(matches!(
+        SqliteMedium::open_read_only(&target_db),
+        Err(MediumError::MigrationPending { .. })
+    ));
+    // COPY COMPLETE, STILL UNACTIVATED: the resume finishes the copy;
+    // without the cutover the target STILL refuses the normal opens.
+    let mut legacy = LocalFileMedium::open(&legacy_root).unwrap();
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
+    let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
+    assert_eq!(
+        copied.appended, 2,
+        "the resume appended only the missing records"
+    );
+    assert_eq!(copied.target_summary, expected);
+    drop(legacy);
+    drop(target);
+    assert!(matches!(
+        SqliteMedium::open(&target_db),
+        Err(MediumError::MigrationPending { .. })
+    ));
+    // ACTIVATED: the cutover completes the lifecycle — the pending
+    // marker leaves with the activation and the normal opens work.
+    let mut target = SqliteMedium::open_migration_target(&target_db).unwrap();
+    migrate::cutover_seal_activate(&legacy_root, &expected.head, &mut target).unwrap();
+    drop(target);
+    let mut activated = SqliteMedium::open(&target_db).unwrap();
+    assert_eq!(activated.validate().unwrap(), expected);
+    assert_eq!(
+        activated.campaign().map(|(_, _, id)| id.to_owned()),
+        Some("lifecycle-campaign".to_owned())
+    );
+    let _ = journal;
+}
+
+#[test]
+fn open_migration_target_refuses_standalone_and_activated() {
+    // The migration-mode constructor's own refusals: a founded
+    // standalone campaign is never hijacked into a migration, and a
+    // completed (activated) migration is never re-migrated in place.
+    let dir = TestDir::new("mode-refusals");
+    let legacy_root = dir.0.join("store");
+    let target_db = dir.0.join("store.db");
+    let standalone_db = dir.0.join("standalone.db");
+    // A FOUNDED STANDALONE CAMPAIGN.
+    let mut standalone = SqliteMedium::open(&standalone_db).unwrap();
+    let founding = founding_record("standalone-campaign");
+    append_accepted(&mut standalone, &founding, &[object(0)], None);
+    drop(standalone);
+    assert!(matches!(
+        SqliteMedium::open_migration_target(&standalone_db),
+        Err(MediumError::Sqlite {
+            op: "open_migration_target",
+            ..
+        })
+    ));
+    // AN ACTIVATED MIGRATION TARGET.
+    drop(legacy_store(&legacy_root, "mode-campaign", 1));
+    migrate::migrate_local_to_sqlite(&legacy_root, &target_db, &dir.0.join("journal.t1")).unwrap();
+    assert!(matches!(
+        SqliteMedium::open_migration_target(&target_db),
+        Err(MediumError::Sqlite {
+            op: "open_migration_target",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn activation_without_pending_refuses() {
+    // The transactional activation's lifecycle precondition: a target
+    // without the pending marker (here: the copy performed on a
+    // NORMAL-mode instance — a standalone campaign by lifecycle)
+    // refuses the activation, even with the matching head.
+    let dir = TestDir::new("no-pending");
+    let legacy_root = dir.0.join("store");
+    let target_db = dir.0.join("store.db");
+    let mut legacy = legacy_store(&legacy_root, "no-pending-campaign", 2);
+    let mut target = SqliteMedium::open(&target_db).unwrap();
+    let copied = migrate::copy_legacy_chain(&mut legacy, &mut target).unwrap();
+    drop(legacy);
+    let refusal = target
+        .mark_migrated_from(&copied.target_summary.head)
+        .unwrap_err();
+    assert!(matches!(
+        refusal,
+        MediumError::Sqlite {
+            op: "mark_migrated_from",
+            ..
+        }
+    ));
 }

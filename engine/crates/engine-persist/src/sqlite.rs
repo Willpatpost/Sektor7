@@ -67,6 +67,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use engine_core::{Decoder, Encoder};
+
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::hash::{Hash, hash_object};
@@ -82,6 +84,12 @@ const META_HEAD: &str = "head";
 const META_AUTHORITY: &str = "authority";
 #[allow(dead_code)]
 const META_PROVENANCE: &str = "provenance";
+
+/// §6.1's migration-target lifecycle (the PP-B1 review corrective):
+/// present while the database is an unactivated migration target —
+/// the normal opens refuse it; only `open_migration_target`
+/// proceeds, and the activation removes it transactionally.
+const META_MIGRATION_PENDING: &str = "migration-pending";
 
 /// The ratified schema (the design's §3.1 DDL, `IF NOT EXISTS` for
 /// open-time idempotence — two concurrent openers serialize on
@@ -283,6 +291,21 @@ impl SqliteMedium {
             [],
         )
         .map_err(|e| sqlite_err("seed head row", e))?;
+        // §6.1's target lifecycle (the review corrective): a
+        // migration-pending database is not a live campaign — the
+        // normal open refuses it; only `open_migration_target`
+        // proceeds (and the activation removes the marker).
+        if let Some(row) = read_meta_row(&conn, META_MIGRATION_PENDING)? {
+            decode_migration_pending(&row)?;
+            return Err(MediumError::MigrationPending {
+                detail: format!(
+                    "{} is an unactivated migration target — complete the \
+                     migration (a re-run resumes the copy) or remove the \
+                     unactivated target; it is not a live campaign",
+                    db_path.display()
+                ),
+            });
+        }
         Self::finish_open(conn, db_path, false, fault)
     }
 
@@ -310,7 +333,70 @@ impl SqliteMedium {
                 detail: format!("expected wal, observed {mode}"),
             });
         }
+        // §6.1's target lifecycle (the review corrective): a pending
+        // migration target is not a live campaign — the audit open
+        // refuses it too.
+        if let Some(row) = read_meta_row(&conn, META_MIGRATION_PENDING)? {
+            decode_migration_pending(&row)?;
+            return Err(MediumError::MigrationPending {
+                detail: format!(
+                    "{} is an unactivated migration target — not a live campaign",
+                    db_path.display()
+                ),
+            });
+        }
         Self::finish_open(conn, db_path, true, None)
+    }
+
+    /// §6.1's target lifecycle (the review corrective): opens the
+    /// database AS a migration target — the only constructor that
+    /// proceeds past the pending refusal. A fresh unfounded database
+    /// receives the persistent `migration-pending` marker (from that
+    /// instant it is distinguishable from a standalone campaign, so
+    /// an interrupted migration can never be mistaken for one); a
+    /// pending target resumes. Anything else refuses: an already
+    /// activated target (the provenance row present — a completed
+    /// migration is never re-migrated in place) and a founded
+    /// standalone campaign (no marker — never hijacked into a
+    /// migration).
+    pub fn open_migration_target(path: impl Into<PathBuf>) -> Result<Self, MediumError> {
+        let db_path = path.into();
+        let conn = Connection::open(&db_path).map_err(|e| sqlite_err("open", e))?;
+        configure_writable(&conn, &SqliteMediumConfig::default())?;
+        conn.execute_batch(SCHEMA_SQL)
+            .map_err(|e| sqlite_err("create schema", e))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('head', x'')",
+            [],
+        )
+        .map_err(|e| sqlite_err("seed head row", e))?;
+        match read_meta_row(&conn, META_MIGRATION_PENDING)? {
+            None => {
+                if read_meta_row(&conn, META_PROVENANCE)?.is_some() {
+                    return Err(MediumError::Sqlite {
+                        op: "open_migration_target",
+                        detail: "the database is already an activated migration \
+                                 target — never re-migrate it in place"
+                            .to_owned(),
+                    });
+                }
+                if read_meta_head(&conn)?.is_some() {
+                    return Err(MediumError::Sqlite {
+                        op: "open_migration_target",
+                        detail: "the database is a founded standalone campaign — \
+                                 a migration target must be a fresh database"
+                            .to_owned(),
+                    });
+                }
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![META_MIGRATION_PENDING, migration_pending_bytes()],
+                )
+                .map_err(|e| sqlite_err("write migration-pending row", e))?;
+            }
+            Some(row) => decode_migration_pending(&row)?,
+        }
+        Self::finish_open(conn, db_path, false, None)
     }
 
     /// The shared open tail: the head read, the cold walk, the
@@ -390,45 +476,75 @@ impl SqliteMedium {
         Ok(())
     }
 
-    /// §6.1's activation (PP-B1): writes the `provenance` meta row
-    /// binding this database to the sealed legacy source's head —
-    /// write-once, idempotent on the identical binding, fail-closed
-    /// on a contradiction. The caller owns the seal-first ordering
-    /// (the legacy `MIGRATED` tombstone must be verified before this
-    /// is called) and the parity proof; this method re-verifies that
-    /// the binding head is the database's current head.
+    /// §6.1's activation (PP-B1, the review corrective — now
+    /// transactionally coherent): ONE `BEGIN IMMEDIATE` transaction
+    /// that reads the committed head and verifies it equals the
+    /// sealed source's head, REQUIRES the `migration-pending` marker
+    /// (the target lifecycle's precondition — an activation without
+    /// a pending target is an incoherent lifecycle), writes the
+    /// provenance row write-once (a contradiction is fail-closed),
+    /// and REMOVES the pending marker — the complete
+    /// pending→activated transition commits atomically. The caller
+    /// owns the seal-first ordering (the legacy `MIGRATED` tombstone
+    /// must be verified before this is called).
     pub fn mark_migrated_from(&mut self, source_head: &Hash) -> Result<(), MediumError> {
-        let observed = read_meta_head(&self.conn)?;
-        if observed != Some(*source_head) {
-            return Err(MediumError::Chain { rule: "divergence" });
-        }
         let encoded = provenance_bytes(source_head);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| sqlite_err("provenance transaction", e))?;
-        let present: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![META_PROVENANCE],
-                |row| row.get(0),
-            )
-            .map(Some)
-            .or_else(no_rows_as_none)
-            .map_err(|e| sqlite_err("read provenance row", e))?;
-        match present {
+        // The binding head is verified INSIDE the transaction — the
+        // activation cannot interleave with a concurrent head change.
+        let observed = read_meta_head(&tx)?;
+        if observed != Some(*source_head) {
+            return Err(MediumError::Chain { rule: "divergence" });
+        }
+        // The lifecycle state machine: a FRESH activation requires
+        // the pending marker (the target lifecycle's precondition —
+        // an activation without a pending target or a completed
+        // binding is an incoherent lifecycle); a COMPLETED
+        // activation (the provenance row already binding this
+        // migration — the interruption between the activation and
+        // the archive) is the idempotent no-op.
+        let pending = read_meta_row(&tx, META_MIGRATION_PENDING)?;
+        match read_meta_row(&tx, META_PROVENANCE)? {
             None => {
+                let marker = pending.ok_or_else(|| MediumError::Sqlite {
+                    op: "mark_migrated_from",
+                    detail: "the database carries no migration-pending marker \
+                                 and no completed activation — it is not an \
+                                 unactivated migration target"
+                        .to_owned(),
+                })?;
+                decode_migration_pending(&marker)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES (?1, ?2)",
                     params![META_PROVENANCE, encoded],
                 )
                 .map_err(|e| sqlite_err("insert provenance row", e))?;
+                // The lifecycle transition: the pending marker
+                // leaves with the activation — one commit.
+                tx.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    params![META_MIGRATION_PENDING],
+                )
+                .map_err(|e| sqlite_err("clear migration-pending row", e))?;
             }
             Some(existing) => {
                 if existing != encoded {
                     return Err(MediumError::CorruptHead {
                         detail: "the provenance row contradicts this migration".to_owned(),
                     });
+                }
+                // The completed activation — idempotent. A leftover
+                // pending marker (an impossible mid-transaction state,
+                // evidence of tampering) still clears.
+                if pending.is_some() {
+                    tx.execute(
+                        "DELETE FROM meta WHERE key = ?1",
+                        params![META_MIGRATION_PENDING],
+                    )
+                    .map_err(|e| sqlite_err("clear migration-pending row", e))?;
                 }
             }
         }
@@ -1403,6 +1519,52 @@ fn advance_cursor(cursor: &mut Option<SqliteCursor>, record: &RevisionRecord, id
 /// its meaning, the authority-row precedent).
 fn provenance_bytes(source_head: &Hash) -> Vec<u8> {
     source_head.as_bytes().to_vec()
+}
+
+/// Reads a meta row by key (`None` when absent).
+fn read_meta_row(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, MediumError> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(no_rows_as_none)
+    .map_err(|e| sqlite_err("read meta row", e))
+}
+
+/// The migration-pending marker's wire domain (§6.1's target
+/// lifecycle — the review corrective).
+const MIGRATION_PENDING_DOMAIN: &str = "sektor7/engine-persist/migration-pending/1";
+const MIGRATION_PENDING_VERSION: u32 = 1;
+
+/// The pending marker's canonical bytes: the domain and its version.
+fn migration_pending_bytes() -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.write_str(MIGRATION_PENDING_DOMAIN);
+    enc.write_u32(MIGRATION_PENDING_VERSION);
+    enc.into_bytes()
+}
+
+/// Decodes and verifies the pending marker (a corrupt marker is
+/// fail-closed `CorruptHead` — the lifecycle evidence is never
+/// guessed).
+fn decode_migration_pending(bytes: &[u8]) -> Result<(), MediumError> {
+    let corrupt = |detail: String| MediumError::CorruptHead { detail };
+    let mut dec = Decoder::new(bytes);
+    dec.read_domain(MIGRATION_PENDING_DOMAIN)
+        .map_err(|e| corrupt(format!("the migration-pending row: {e}")))?;
+    let version = dec
+        .read_u32()
+        .map_err(|e| corrupt(format!("the migration-pending row: {e}")))?;
+    if version != MIGRATION_PENDING_VERSION {
+        return Err(corrupt(format!(
+            "unsupported migration-pending version {version}"
+        )));
+    }
+    dec.finish()
+        .map_err(|e| corrupt(format!("the migration-pending row: {e}")))?;
+    Ok(())
 }
 
 /// The authority row's encoding: `[32-byte founding hash][1-byte

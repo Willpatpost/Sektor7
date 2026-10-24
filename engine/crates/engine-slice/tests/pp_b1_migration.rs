@@ -11,7 +11,10 @@
 use std::path::PathBuf;
 
 use engine_core::{LodLevel, PresenceSample, Spine};
-use engine_persist::{CommitOutcome, ConsequenceId, KeyPhase, T1Journal, migrate_local_to_sqlite};
+use engine_persist::{
+    CommitOutcome, ConsequenceId, KeyPhase, LocalFileMedium, SqliteMedium, T1Journal,
+    copy_legacy_chain, migrate_local_to_sqlite,
+};
 use engine_slice::crossing::SessionCrossing;
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
@@ -205,4 +208,56 @@ fn migrated_campaign_recovers_through_the_sqlite_provider() {
         Some(KeyPhase::InConfirmedChain),
         "the continuation's captures are canonically confirmed over the migrated chain"
     );
+}
+
+#[test]
+fn pending_migration_target_refuses_gameplay_sessions() {
+    // THE REVIEW CORRECTIVE (Finding 1): a partially-copied migration
+    // target must refuse AUTHORITATIVE GAMEPLAY PROGRESSION through
+    // the real session constructors — it is not a live campaign
+    // until the seal-first activation completes.
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("pending-refusal");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "pending-campaign").unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    drop(crossing);
+    // THE INTERRUPTED COPY: the target receives the chain but never
+    // its activation — the lifecycle's PENDING state.
+    let mut legacy = LocalFileMedium::open(dir.store()).unwrap();
+    let mut target = SqliteMedium::open_migration_target(dir.db()).unwrap();
+    copy_legacy_chain(&mut legacy, &mut target).unwrap();
+    drop(legacy);
+    drop(target);
+    // THE GAMEPLAY REFUSAL: both real constructors refuse the pending
+    // target — never a silent standalone campaign.
+    assert!(
+        SessionCrossing::open_at(
+            &StoreLocation::Database(dir.db()),
+            T1Journal::open(dir.0.join("journal-open.t1")).unwrap(),
+            "pending-campaign",
+        )
+        .is_err(),
+        "the pending target refuses a fresh gameplay session"
+    );
+    assert!(
+        SessionCrossing::recover_at(
+            &StoreLocation::Database(dir.db()),
+            &dir.journal(),
+            "pending-campaign",
+        )
+        .is_err(),
+        "the pending target refuses the recovery session"
+    );
+    // Completing the migration (the seal + the activation + the
+    // archive) returns the campaign to a live, recoverable state.
+    migrate_local_to_sqlite(&dir.store(), &dir.db(), &dir.journal()).unwrap();
+    let (_spine, _director, _crossing) = SessionCrossing::recover_at(
+        &StoreLocation::Database(dir.db()),
+        &dir.journal(),
+        "pending-campaign",
+    )
+    .expect("the completed migration is a live campaign again");
 }

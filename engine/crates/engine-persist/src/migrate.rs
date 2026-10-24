@@ -273,7 +273,10 @@ fn write_tombstone(root: &Path, head: &Hash) -> Result<(), MigrationError> {
 /// target's current head and continued from there, never restarted,
 /// never merged with a foreign chain) — then proves the parity (the
 /// complete `ChainSummary` equality). Idempotent: a complete target
-/// appends nothing and just re-proves the parity.
+/// appends nothing and just re-proves the parity. **The target must
+/// be a migration-mode instance** (`SqliteMedium::open_migration_target`):
+/// the pending-target lifecycle is enforced at the open gates and
+/// the activation, never inside the copy itself.
 pub fn copy_legacy_chain(
     legacy: &mut LocalFileMedium,
     target: &mut SqliteMedium,
@@ -509,7 +512,19 @@ pub fn migrate_local_to_sqlite(
         let bytes =
             fs::read(&tombstone_path).map_err(|e| io_err("read MIGRATED", &tombstone_path, e))?;
         let sealed_head = decode_tombstone(&bytes)?;
-        let mut target = SqliteMedium::open(target_db).map_err(MigrationError::Medium)?;
+        // The target's lifecycle state decides the opener (the
+        // review corrective): a PENDING target (the interruption
+        // between the seal and the activation) opens in migration
+        // mode; an ACTIVATED one (the interruption between the
+        // activation and the archive) opens normally — and the
+        // idempotent activation accepts the completed binding.
+        let mut target = match SqliteMedium::open(target_db) {
+            Ok(target) => target,
+            Err(MediumError::MigrationPending { .. }) => {
+                SqliteMedium::open_migration_target(target_db).map_err(MigrationError::Medium)?
+            }
+            Err(other) => return Err(MigrationError::Medium(other)),
+        };
         let target_summary = target.validate().map_err(MigrationError::Medium)?;
         if target_summary.head != sealed_head {
             return Err(MigrationError::Diverged {
@@ -534,9 +549,14 @@ pub fn migrate_local_to_sqlite(
     }
 
     // The fresh migration: validate and copy (idempotent), then the
-    // cutover, then the archive.
+    // cutover, then the archive. The target opens in MIGRATION MODE
+    // (the review corrective's lifecycle): a fresh database receives
+    // the persistent migration-pending marker, so an interrupted
+    // migration can never be mistaken for a standalone campaign —
+    // the normal opens refuse a pending target until the activation.
     let mut legacy = LocalFileMedium::open(legacy_root).map_err(MigrationError::Medium)?;
-    let mut target = SqliteMedium::open(target_db).map_err(MigrationError::Medium)?;
+    let mut target =
+        SqliteMedium::open_migration_target(target_db).map_err(MigrationError::Medium)?;
     let copied = copy_legacy_chain(&mut legacy, &mut target)?;
     cutover_seal_activate(legacy_root, &copied.target_summary.head, &mut target)?;
     // The handles must close before the archive rename: Windows
