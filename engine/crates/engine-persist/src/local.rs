@@ -84,6 +84,13 @@ pub(crate) const HEAD_FILE: &str = "HEAD";
 pub(crate) const HEAD_LOCK: &str = "HEAD.lock";
 pub(crate) const HEAD_TMP: &str = "HEAD.tmp";
 
+/// The §6.1 offline migration's seal marker (PP-B1): its presence
+/// means the directory was migrated to a SQLite campaign database
+/// and is archived evidence — new binaries refuse to open it as a
+/// source (binaries predating the tombstone cannot be made to honor
+/// it; the ratified documented operational limitation).
+pub(crate) const MIGRATED_MARKER: &str = "MIGRATED";
+
 /// Documented maximum for a stored object's size (matches the Batch 1
 /// byte-length maximum; enforced by stat before any read allocates).
 const MAX_OBJECT_BYTES: u64 = MAX_BYTE_LEN;
@@ -169,6 +176,18 @@ impl LocalFileMedium {
         fault: Option<FaultControl>,
     ) -> Result<Self, MediumError> {
         let root = root.into();
+        // The §6.1 seal admission (PP-B1): a MIGRATED tombstone means
+        // this directory is archived evidence, never a live source —
+        // refuse before touching anything.
+        if root.join(MIGRATED_MARKER).is_file() {
+            return Err(MediumError::Sealed {
+                detail: format!(
+                    "the store at {} was migrated offline — the directory is \
+                     archived evidence, never a live campaign source",
+                    root.display()
+                ),
+            });
+        }
         let objects = root.join(OBJECTS_DIR);
         let quarantine = root.join(QUARANTINE_DIR);
         fs::create_dir_all(&objects).map_err(|e| io_err("create objects dir", &objects, e))?;
@@ -303,29 +322,7 @@ impl LocalFileMedium {
     }
 
     fn read_head_file(&self) -> Result<Option<Hash>, MediumError> {
-        let path = self.root.join(HEAD_FILE);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_err("read HEAD", &path, e)),
-        };
-        let corrupt = |error: engine_core::SaveError| MediumError::CorruptHead {
-            detail: error.to_string(),
-        };
-        let mut dec = Decoder::new(&bytes);
-        dec.read_domain(HEAD_DOMAIN).map_err(corrupt)?;
-        let version = dec.read_u32().map_err(corrupt)?;
-        if version != HEAD_VERSION {
-            return Err(MediumError::CorruptHead {
-                detail: format!("unsupported HEAD version {version}"),
-            });
-        }
-        let hash_bytes = dec.read_bytes(Hash::WIDTH, "head").map_err(corrupt)?;
-        let id = Hash::from_bytes(hash_bytes).ok_or_else(|| MediumError::CorruptHead {
-            detail: "hash width".into(),
-        })?;
-        dec.finish().map_err(corrupt)?;
-        Ok(Some(id))
+        read_head_at(&self.root)
     }
 
     /// A pre-window fault check — an injected failure is a clean,
@@ -1251,6 +1248,35 @@ impl CanonicalMedium for LocalFileMedium {
     fn durability_tier(&self) -> SyncTier {
         self.platform_tier
     }
+}
+
+/// Reads and decodes the authoritative HEAD file at a store root —
+/// the raw, cursor-free read (the offline migration's cutover
+/// recheck under its own held lock, PP-B1 §6.1).
+pub(crate) fn read_head_at(root: &Path) -> Result<Option<Hash>, MediumError> {
+    let path = root.join(HEAD_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("read HEAD", &path, e)),
+    };
+    let corrupt = |error: engine_core::SaveError| MediumError::CorruptHead {
+        detail: error.to_string(),
+    };
+    let mut dec = Decoder::new(&bytes);
+    dec.read_domain(HEAD_DOMAIN).map_err(corrupt)?;
+    let version = dec.read_u32().map_err(corrupt)?;
+    if version != HEAD_VERSION {
+        return Err(MediumError::CorruptHead {
+            detail: format!("unsupported HEAD version {version}"),
+        });
+    }
+    let hash_bytes = dec.read_bytes(Hash::WIDTH, "head").map_err(corrupt)?;
+    let id = Hash::from_bytes(hash_bytes).ok_or_else(|| MediumError::CorruptHead {
+        detail: "hash width".into(),
+    })?;
+    dec.finish().map_err(corrupt)?;
+    Ok(Some(id))
 }
 
 fn platform_tier() -> SyncTier {

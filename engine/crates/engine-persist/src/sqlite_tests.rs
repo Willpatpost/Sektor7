@@ -369,7 +369,7 @@ fn pp_b1_trusted_cursor_appends_do_zero_walk_work() {
     medium.append(&record, &[object], Some(founding.id())).unwrap();
     assert_eq!(medium.walk_stats().last_append_walked, 0);
     // A fresh medium's session open walks the full chain once.
-    let mut reopened = SqliteMedium::open(&path).unwrap();
+    let reopened = SqliteMedium::open(&path).unwrap();
     assert_eq!(reopened.walk_stats().cold_walk_records, 2);
     assert_eq!(reopened.walk_stats().last_append_walked, 0);
     cleanup_db(&path);
@@ -401,7 +401,7 @@ fn pp_b1_corrupt_referenced_object_row_fails_closed() {
     .unwrap();
     drop(raw);
 
-    let mut medium = SqliteMedium::open(&path);
+    let medium = SqliteMedium::open(&path);
     assert!(
         matches!(medium, Err(MediumError::ReferencedObjectCorrupt { .. })),
         "the session open fails closed on referenced corruption"
@@ -458,10 +458,10 @@ fn pp_b1_unverifiable_chain_never_falsely_confirms() {
     .unwrap();
     drop(raw);
 
-    let mut medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), None);
+    let medium = SqliteMedium::open_with(&path, &SqliteMediumConfig::default(), None);
     assert!(medium.is_err(), "the open itself fails closed");
     // A read-only audit connection sees the same corruption.
-    let mut audit = SqliteMedium::open_read_only(&path);
+    let audit = SqliteMedium::open_read_only(&path);
     assert!(audit.is_err(), "the audit open fails closed too");
     // Even a forced reconcile path cannot validate: the medium never
     // opens, so no false confirmation is possible — the fail-closed

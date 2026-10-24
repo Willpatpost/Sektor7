@@ -163,6 +163,16 @@ pub enum MediumError {
         /// The database engine's message.
         detail: String,
     },
+    /// The local store directory carries a `MIGRATED` tombstone (the
+    /// §6.1 offline migration's seal, PP-B1): it is archived
+    /// evidence, not a live campaign source — new binaries refuse to
+    /// open it. Binaries predating the tombstone cannot be made to
+    /// honor it (the ratified documented operational limitation);
+    /// the tombstone is evidence and is never deleted.
+    Sealed {
+        /// The refusing store's context.
+        detail: String,
+    },
 }
 
 impl fmt::Display for MediumError {
@@ -196,6 +206,9 @@ impl fmt::Display for MediumError {
             }
             MediumError::Sqlite { op, detail } => {
                 write!(f, "sqlite operation {op} failed: {detail}")
+            }
+            MediumError::Sealed { detail } => {
+                write!(f, "the store is sealed as migrated: {detail}")
             }
         }
     }

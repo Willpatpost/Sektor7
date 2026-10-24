@@ -389,6 +389,53 @@ impl SqliteMedium {
         }
         Ok(())
     }
+
+    /// §6.1's activation (PP-B1): writes the `provenance` meta row
+    /// binding this database to the sealed legacy source's head —
+    /// write-once, idempotent on the identical binding, fail-closed
+    /// on a contradiction. The caller owns the seal-first ordering
+    /// (the legacy `MIGRATED` tombstone must be verified before this
+    /// is called) and the parity proof; this method re-verifies that
+    /// the binding head is the database's current head.
+    pub fn mark_migrated_from(&mut self, source_head: &Hash) -> Result<(), MediumError> {
+        let observed = read_meta_head(&self.conn)?;
+        if observed != Some(*source_head) {
+            return Err(MediumError::Chain { rule: "divergence" });
+        }
+        let encoded = provenance_bytes(source_head);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_err("provenance transaction", e))?;
+        let present: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_PROVENANCE],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(no_rows_as_none)
+            .map_err(|e| sqlite_err("read provenance row", e))?;
+        match present {
+            None => {
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![META_PROVENANCE, encoded],
+                )
+                .map_err(|e| sqlite_err("insert provenance row", e))?;
+            }
+            Some(existing) => {
+                if existing != encoded {
+                    return Err(MediumError::CorruptHead {
+                        detail: "the provenance row contradicts this migration".to_owned(),
+                    });
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| sqlite_err("commit provenance row", e))?;
+        Ok(())
+    }
 }
 
 // --------------------------------------------------- the CanonicalMedium impl
@@ -1310,6 +1357,13 @@ fn advance_cursor(cursor: &mut Option<SqliteCursor>, record: &RevisionRecord, id
 }
 
 // --------------------------------------------------------- the meta rows
+
+/// The §6.1 provenance row's value: the sealed legacy chain's head
+/// (the binding the activation writes once; the row's key carries
+/// its meaning, the authority-row precedent).
+fn provenance_bytes(source_head: &Hash) -> Vec<u8> {
+    source_head.as_bytes().to_vec()
+}
 
 /// The authority row's encoding: `[32-byte founding hash][1-byte
 /// authority mode][campaign id UTF-8]`.

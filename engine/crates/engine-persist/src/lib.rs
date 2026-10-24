@@ -45,6 +45,7 @@ pub mod hash;
 pub mod journal;
 pub mod local;
 pub mod medium;
+pub mod migrate;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
@@ -54,6 +55,8 @@ pub mod sqlite;
 mod tests;
 #[cfg(test)]
 mod sqlite_tests;
+#[cfg(test)]
+mod migrate_tests;
 
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
@@ -75,6 +78,10 @@ pub use local::{AppendTimings, LocalFileMedium, WalkStats};
 pub use medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
+};
+pub use migrate::{
+    archive_legacy, copy_legacy_chain, cutover_seal_activate, migrate_local_to_sqlite, CopiedChain,
+    MigrationError, MigrationReport,
 };
 pub use pipeline::{
     BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
