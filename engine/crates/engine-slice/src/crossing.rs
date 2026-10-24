@@ -10,28 +10,29 @@
 //! Stage 4 path never constructs plans, so its behavior and every
 //! frozen fingerprint are mechanically untouched.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT};
 use engine_core::{
-    Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, Level, LodLevel,
-    ObligationView, SaveError, Schedule, Spine, Tick,
+    CompactionError, Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, HistoryKind,
+    Level, LodLevel, ObligationView, SaveError, Schedule, Spine, Tick,
 };
 
 use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, CaptureReceipt,
-    ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
-    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
-    MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError, RevisionRecord,
-    SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState, reconcile,
+    ClassifiedSpan, CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope,
+    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan,
+    KeyPhase, MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError,
+    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
+    reconcile,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
 use crate::region::{
-    CaptureStatus, RegionCheckpoint, RegionDirector, RegionEntry, gather_region_entries, lod_byte,
-    read_flag, read_lod_level,
+    CaptureStatus, LaneSummaryError, RegionCheckpoint, RegionDirector, RegionEntry,
+    gather_region_entries, lod_byte, read_flag, read_lod_level,
 };
 use crate::store::{SessionStore, StoreLocation};
 
@@ -375,6 +376,31 @@ pub enum TransitionError {
     /// incompatibility or a coherence failure) — fail closed with the
     /// evidence.
     Recovery(RecoveryError),
+    /// The spine-history compaction refused the requested window
+    /// (PP-B2 — nothing to summarize, or the retained window exceeds
+    /// the ledger length).
+    Compaction(CompactionError),
+}
+
+/// The explicit session compaction's report (PP-B2 — the GO's §2/§3
+/// composition: the spine-history cut plus the consequence-lane
+/// summarization, one explicit operation, never a silent default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCompaction {
+    /// The spine's history representation after the compaction (the
+    /// subsequent snapshot publication takes the `spine-history/2`
+    /// form through the spine's own save dispatch).
+    pub history: HistoryKind,
+    /// The lane summary's per-region boundary actually established
+    /// (the highest fully-applied-and-confirmed contiguous episode
+    /// per region; monotonic across successive compactions).
+    pub lane_boundary: [u64; REGION_COUNT],
+    /// The number of consequence identities summarized out of the
+    /// retained applied lane.
+    pub summarized_identities: u64,
+    /// The total summarized applied amount (now carried in the
+    /// per-NPC conservation aggregates).
+    pub summarized_amount: u64,
 }
 
 impl From<PipelineError> for TransitionError {
@@ -725,6 +751,104 @@ impl SessionCrossing {
         }
     }
 
+    /// The explicit, versioned session compaction (PP-B2 — the GO's
+    /// §2/§3 composition): the consequence-lane summarization under
+    /// the ratified eligibility rule, plus the spine-history cut, as
+    /// ONE explicit operation — never a silent default, never
+    /// automatic on the existing paths (the pipeline-free and
+    /// crossing lifecycles publish full fidelity unless the operator
+    /// compacts). The subsequent [`Self::publish_snapshot`] takes the
+    /// `spine-history/2` form through the spine's own save dispatch.
+    ///
+    /// **The lane eligibility** (per region, the contiguous ascending
+    /// episode prefix): an episode is summarizable iff NONE of its
+    /// identities is pending (pending captures are referenced — the
+    /// dormant region's outstanding held obligations and the T1
+    /// intent) and EVERY applied identity of it is canonically
+    /// confirmed (the chain's per-key evidence — `is_confirmed`).
+    /// Identities fully materialized and confirmed are unreferenced
+    /// by definition; the retained lanes keep everything an
+    /// outstanding reference can reach. The boundary is monotonic
+    /// across successive compactions.
+    ///
+    /// **The spine cut**: `retain_tail` ledger records stay verbatim;
+    /// the prefix is summarized into the authenticated SHA-256 chain
+    /// (see [`Spine::compact`]).
+    pub fn compact_session(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        retain_tail: u64,
+    ) -> Result<SessionCompaction, TransitionError> {
+        // Phase 1 — the lane eligibility walk.
+        let mut boundary = director
+            .ledger()
+            .summarized()
+            .map(|summary| summary.boundary)
+            .unwrap_or([0; REGION_COUNT]);
+        for (region, slot) in boundary.iter_mut().enumerate() {
+            let mut pending_episodes: BTreeSet<u64> = BTreeSet::new();
+            let mut applied_by_episode: BTreeMap<u64, Vec<ConsequenceId>> = BTreeMap::new();
+            for (id, _) in director.ledger().pending_entries() {
+                if id.region as usize == region {
+                    pending_episodes.insert(id.episode);
+                }
+            }
+            for (id, _) in director.ledger().applied_entries() {
+                if id.region as usize == region && id.episode > *slot {
+                    applied_by_episode.entry(id.episode).or_default().push(id);
+                }
+            }
+            for (episode, ids) in applied_by_episode {
+                if pending_episodes.contains(&episode) {
+                    break;
+                }
+                if ids.iter().all(|id| self.pipeline.is_confirmed(*id)) {
+                    *slot = episode;
+                } else {
+                    break;
+                }
+            }
+        }
+        // Phase 2 — the lane summarization (the prunes into the
+        // conservation aggregates; the typed refusals are the
+        // state-incompatibility class — the eligibility verification
+        // above makes them unreachable in coherent states, and a
+        // refusal here is the fail-closed signal, never a silent
+        // strand).
+        let (summarized_identities, summarized_amount) = director
+            .summarize_lanes(boundary)
+            .map_err(|error| match error {
+                LaneSummaryError::BoundaryRegression { region, .. } => {
+                    TransitionError::InstallIncompatible {
+                        region,
+                        detail: "lane-boundary-regression",
+                    }
+                }
+                LaneSummaryError::RetainedBelowBoundary { id } => {
+                    TransitionError::InstallIncompatible {
+                        region: id.region as usize,
+                        detail: "lane-retained-below-boundary",
+                    }
+                }
+                LaneSummaryError::TotalsOverflow => TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "lane-totals-overflow",
+                },
+            })?;
+        // Phase 3 — the spine history cut (the explicit versioned
+        // operation; typed refusals for a degenerate window).
+        let history = spine
+            .compact(retain_tail)
+            .map_err(TransitionError::Compaction)?;
+        Ok(SessionCompaction {
+            history,
+            lane_boundary: boundary,
+            summarized_identities,
+            summarized_amount,
+        })
+    }
+
     /// The canonical re-drive: batches the actionable unconfirmed
     /// journal keys into a consequence-batch/2 revision on the chain
     /// (the pending-T1 → confirmed-canonical transition — the gating
@@ -898,9 +1022,12 @@ impl SessionCrossing {
         // 4. The coherence verification — the REAL canonical-chain
         //    confirmation evidence from the re-opened pipeline (never
         //    an empty map), and the anchor built from the LEDGER's
-        //    own per-identity state (journal-independent).
+        //    own per-identity state (journal-independent; a compacted
+        //    snapshot's summarized coverage reconstructs from the
+        //    same chain evidence under the lane boundary's
+        //    attestation — PP-B2).
         let confirmed = crossing.pipeline.confirmed_evidence();
-        let anchor = build_anchor(&spine, &director)?;
+        let anchor = build_anchor(&spine, &director, &confirmed)?;
         let outcome = reconcile(&anchor, &scan, &confirmed).map_err(TransitionError::Recovery)?;
         if let Some(effect) = outcome.report.applied.first() {
             return Err(TransitionError::InstallIncompatible {
@@ -1223,11 +1350,24 @@ fn is_session_object(bytes: &[u8]) -> bool {
 /// per-identity evidence, never inferred from aggregate counters —
 /// is the credits-lane coverage. The coherence check: the world's
 /// credits must equal the sum of the ledger's applied amounts per
-/// NPC (both session-origin — the snapshot's internal coherence; a
-/// divergence is the fail-closed halt).
+/// NPC, composed with the compacted lane summary's carried
+/// aggregates (both session-origin — the snapshot's internal
+/// coherence; a divergence is the fail-closed halt).
+///
+/// **The summarized coverage (PP-B2)**: for identities at or below
+/// the lane summary's boundary, the anchor's coverage reconstructs
+/// from the CHAIN's confirmed evidence under the boundary's
+/// materialization attestation (the writer's compaction-time
+/// eligibility verification: applied AND confirmed AND unreferenced)
+/// — nothing is inferred, because the reconstruction's two inputs
+/// are both retained (the boundary in the snapshot, the coverage on
+/// the chain). The composition gate proves them equal to the carried
+/// aggregates: a below-boundary identity the chain does NOT confirm
+/// is an over-claiming summary — fail closed.
 fn build_anchor(
     spine: &Spine<NpcWorld>,
     director: &RegionDirector,
+    confirmed: &BTreeMap<ConsequenceId, ConfirmedEvidence>,
 ) -> Result<RecoveryAnchor, TransitionError> {
     let mut anchor = RecoveryAnchor::new(SourcePosition {
         head: None,
@@ -1259,15 +1399,60 @@ fn build_anchor(
         }
         anchor = anchor.with_identity(id, counters, award);
     }
-    // The coherence: the world's credits == the sum of the ledger's
-    // applied amounts per NPC — both session-origin (the snapshot's
-    // internal coherence; a divergence is the halt).
+    // The summarized coverage and its composition gate (PP-B2).
+    let carried_totals: Vec<u64> = director
+        .ledger()
+        .summarized()
+        .map(|summary| summary.applied_totals.clone())
+        .unwrap_or_else(|| vec![0u64; NPC_COUNT]);
+    if let Some(summary) = director.ledger().summarized() {
+        let mut synthesized_totals = vec![0u64; NPC_COUNT];
+        for (id, evidence) in confirmed {
+            if id.episode <= summary.boundary[id.region as usize] {
+                let amount = evidence
+                    .coverage
+                    .iter()
+                    .map(|classified| classified.span.hi.saturating_sub(classified.span.lo))
+                    .sum();
+                let counters = CounterValues {
+                    milestones: amount,
+                    pending_signals: 0,
+                    captured: 0,
+                    credits: amount,
+                };
+                let mut award = AwardState::new();
+                for occurrence in 1..=amount {
+                    award.award_durable(occurrence);
+                }
+                anchor = anchor.with_identity(*id, counters, award);
+                synthesized_totals[id.npc as usize] =
+                    synthesized_totals[id.npc as usize].saturating_add(amount);
+            }
+        }
+        // The composition gate (fail-closed): the chain-reconstructed
+        // coverage must compose EXACTLY to the carried aggregates —
+        // an identity the chain does not confirm, or a coverage
+        // disagreement, is an over-claiming summary.
+        for (npc, total) in synthesized_totals.iter().enumerate() {
+            if *total != carried_totals[npc] {
+                return Err(TransitionError::InstallIncompatible {
+                    region: npc % REGION_COUNT,
+                    detail: "lane-summary-composition",
+                });
+            }
+        }
+    }
+    // The coherence: the world's credits == the retained applied
+    // amounts + the carried aggregates, per NPC — both
+    // session-origin (the snapshot's internal coherence; a
+    // divergence is the halt).
     let mut applied_amounts = vec![0u64; NPC_COUNT];
     for (id, amount) in director.ledger().applied_entries() {
         applied_amounts[id.npc as usize] += amount;
     }
     for (npc, amounts) in applied_amounts.iter().enumerate() {
-        if *amounts != spine.world().credits()[npc] {
+        let total = amounts.saturating_add(carried_totals[npc]);
+        if total != spine.world().credits()[npc] {
             return Err(TransitionError::InstallIncompatible {
                 region: npc % REGION_COUNT,
                 detail: "applied-amounts-conservation",

@@ -59,6 +59,60 @@ pub struct CaptureLedger {
     /// independently of the historical T1 journal — never inferred
     /// from aggregate counters).
     applied: BTreeMap<ConsequenceId, u64>,
+    /// The compacted lane summary (PP-B2, D-PP-3's per-identity
+    /// clarification): `None` on an uncompacted session. The
+    /// summarized identities are fully materialized (applied into the
+    /// world's credits) AND canonically confirmed — the eligibility
+    /// rule guarantees no outstanding obligation, pending T1 intent,
+    /// or unmaterialized confirmed evidence references them — so
+    /// their per-identity lane records are replaced by the coverage
+    /// boundary (the writer's single-authority materialization
+    /// attestation; the coverage itself reconstructs from the chain's
+    /// confirmed evidence at recovery) plus the per-NPC conservation
+    /// aggregates. The retained lanes keep every identity an
+    /// outstanding reference can reach — never aggregate totals
+    /// alone.
+    summarized: Option<LaneSummary>,
+}
+
+/// The compacted consequence-lane summary (see
+/// [`CaptureLedger::summarized`]): the summarized coverage boundary
+/// and the conservation aggregates for the identities summarized out
+/// of the retained lanes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneSummary {
+    /// Per region: the highest episode whose captured identities are
+    /// all applied and canonically confirmed — every identity
+    /// `(region, episode <= boundary, npc)` is summarized; the
+    /// retained lanes hold none of them.
+    pub boundary: [u64; REGION_COUNT],
+    /// Per NPC: the summarized applied amounts (the conservation
+    /// cross-check composing with the retained applied lane to the
+    /// world's credits).
+    pub applied_totals: Vec<u64>,
+}
+
+/// Typed refusals of the lane summarization
+/// ([`CaptureLedger::summarize_applied_below`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneSummaryError {
+    /// The new boundary regresses below the established summary's
+    /// boundary — the summarized set is monotonic (identities
+    /// attested summarized are never un-summarized).
+    BoundaryRegression {
+        region: usize,
+        observed: u64,
+        established: u64,
+    },
+    /// A pending identity sits at or below the boundary — pending
+    /// captures are referenced (the dormant region's outstanding held
+    /// obligations and the T1 intent) and are never summarizable; the
+    /// caller's eligibility verification should have stopped the
+    /// boundary below this episode.
+    RetainedBelowBoundary { id: ConsequenceId },
+    /// A conservation aggregate overflowed — the counters are not
+    /// representable.
+    TotalsOverflow,
 }
 
 /// Status of one capture key.
@@ -149,6 +203,78 @@ impl CaptureLedger {
         self.pending.values().sum()
     }
 
+    /// The compacted lane summary, when the session's lanes were
+    /// compacted (PP-B2).
+    pub fn summarized(&self) -> Option<&LaneSummary> {
+        self.summarized.as_ref()
+    }
+
+    /// Summarizes the applied lane's identities at or below the
+    /// per-region `boundary` into the conservation aggregates (PP-B2,
+    /// the explicit compaction's lane half — the caller verified the
+    /// eligibility: every covered identity applied AND canonically
+    /// confirmed AND unreferenced). The retained lanes keep every
+    /// identity an outstanding reference can reach; the summarized
+    /// identities' materialization is attested by the boundary and
+    /// their coverage reconstructs from the chain's confirmed
+    /// evidence at recovery. Returns the summarized identity count
+    /// and total amount.
+    pub(crate) fn summarize_applied_below(
+        &mut self,
+        boundary: [u64; REGION_COUNT],
+    ) -> Result<(u64, u64), LaneSummaryError> {
+        if let Some(prior) = &self.summarized {
+            for (region, (observed, established)) in
+                boundary.iter().zip(prior.boundary.iter()).enumerate()
+            {
+                if observed < established {
+                    return Err(LaneSummaryError::BoundaryRegression {
+                        region,
+                        observed: *observed,
+                        established: *established,
+                    });
+                }
+            }
+        }
+        // Pending identities are referenced — never summarizable. A
+        // pending entry below the boundary means the caller's
+        // eligibility verification failed: refuse, never silently
+        // strand a referenced identity out of the retained lanes.
+        for id in self.pending.keys() {
+            if id.episode <= boundary[id.region as usize] {
+                return Err(LaneSummaryError::RetainedBelowBoundary { id: *id });
+            }
+        }
+        let mut totals = self
+            .summarized
+            .as_ref()
+            .map(|summary| summary.applied_totals.clone())
+            .unwrap_or_else(|| vec![0u64; NPC_COUNT]);
+        let mut count = 0u64;
+        let mut amount_total = 0u64;
+        let mut removed = Vec::new();
+        for (id, amount) in &self.applied {
+            if id.episode <= boundary[id.region as usize] {
+                totals[id.npc as usize] = totals[id.npc as usize]
+                    .checked_add(*amount)
+                    .ok_or(LaneSummaryError::TotalsOverflow)?;
+                amount_total = amount_total
+                    .checked_add(*amount)
+                    .ok_or(LaneSummaryError::TotalsOverflow)?;
+                count += 1;
+                removed.push(*id);
+            }
+        }
+        for id in removed {
+            self.applied.remove(&id);
+        }
+        self.summarized = Some(LaneSummary {
+            boundary,
+            applied_totals: totals,
+        });
+        Ok((count, amount_total))
+    }
+
     fn fingerprint(&self, fp: &mut Fingerprinter) {
         // Domain version 2 (Batch 2 corrective): keys moved from
         // per-episode timestamps to per-NPC consequence deltas. Batch 4:
@@ -170,6 +296,23 @@ impl CaptureLedger {
         fp.write_usize(self.applied.len());
         for id in self.applied.keys() {
             fp.write_u64(pack_crossing(*id));
+        }
+        // The compacted lane summary (PP-B2): appended ONLY when the
+        // lanes were compacted — an uncompacted session's output is
+        // byte-identical to the frozen /2 domain (every historical
+        // pin mechanically preserved); a compacted session's
+        // authoritative state includes the boundary and the
+        // aggregates, so they hash (and compacted lanes can never
+        // alias uncompacted ones — the applied-key sections already
+        // differ).
+        if let Some(summary) = &self.summarized {
+            for boundary in summary.boundary {
+                fp.write_u64(boundary);
+            }
+            fp.write_usize(summary.applied_totals.len());
+            for total in &summary.applied_totals {
+                fp.write_u64(*total);
+            }
         }
     }
 }
@@ -540,6 +683,19 @@ impl RegionDirector {
 
     pub fn ledger(&self) -> &CaptureLedger {
         &self.ledger
+    }
+
+    /// The lane summarization's director entry (PP-B2 — the explicit
+    /// compaction's consequence-lane half): applies the
+    /// eligibility-verified boundary to the capture ledger (see
+    /// [`CaptureLedger::summarize_applied_below`]). Engine code calls
+    /// this only through [`crate::crossing::SessionCrossing::compact_session`],
+    /// which verifies the eligibility first.
+    pub(crate) fn summarize_lanes(
+        &mut self,
+        boundary: [u64; REGION_COUNT],
+    ) -> Result<(u64, u64), LaneSummaryError> {
+        self.ledger.summarize_applied_below(boundary)
     }
 
     /// The LOD the controller would transition `region` to under this
@@ -1017,7 +1173,15 @@ impl RegionDirector {
         // independently of the historical T1 journal (the second
         // review corrective; v2's ids-only applied form never
         // shipped in an accepted build, so the walk reads v3 only).
-        enc.write_u8(3);
+        // v4 (PP-B2) adds the compacted lane summary after the
+        // retained lanes: the per-region summarized-episode boundary
+        // and the per-NPC conservation aggregates. An uncompacted
+        // session writes v3 byte-identically to the accepted form.
+        enc.write_u8(if self.ledger.summarized.is_some() {
+            4
+        } else {
+            3
+        });
         enc.write_count(self.ledger.pending.len());
         for (id, delta) in &self.ledger.pending {
             enc.write_u32(id.region);
@@ -1031,6 +1195,15 @@ impl RegionDirector {
             enc.write_u64(id.episode);
             enc.write_u32(id.npc);
             enc.write_u64(*amount);
+        }
+        if let Some(summary) = &self.ledger.summarized {
+            for boundary in summary.boundary {
+                enc.write_u64(boundary);
+            }
+            enc.write_count(summary.applied_totals.len());
+            for total in &summary.applied_totals {
+                enc.write_u64(*total);
+            }
         }
     }
 
@@ -1141,16 +1314,20 @@ impl RegionDirector {
         // order (the BTree iteration's form). The section's in-band
         // schema version: v3 carries the per-identity applied amounts
         // (v2's ids-only form never shipped in an accepted build —
-        // both versions named here, the walk reads v3 only).
-        match dec.read_u8()? {
-            3 => {}
+        // both versions named here, the walk reads v3 only); v4
+        // (PP-B2) additionally carries the compacted lane summary —
+        // the per-region boundary and the per-NPC conservation
+        // aggregates — after the retained lanes.
+        let lane_compacted = match dec.read_u8()? {
+            3 => false,
+            4 => true,
             discriminant => {
                 return Err(SaveError::Enum {
                     section: SECTION,
                     discriminant: u64::from(discriminant),
                 });
             }
-        }
+        };
         let pending_count = dec.read_count(NPC_COUNT as u64, SECTION, "pending-count")?;
         let mut pending = BTreeMap::new();
         let mut prev: Option<ConsequenceId> = None;
@@ -1179,10 +1356,56 @@ impl RegionDirector {
             prev = Some(id);
             applied.insert(id, amount);
         }
+        let summarized = if lane_compacted {
+            let mut boundary = [0u64; REGION_COUNT];
+            for slot in boundary.iter_mut() {
+                *slot = dec.read_u64()?;
+            }
+            let totals_count = dec.read_count(NPC_COUNT as u64, SECTION, "lane-totals-count")?;
+            if totals_count != NPC_COUNT as u64 {
+                return Err(SaveError::Integrity(
+                    "region-director-save/lane-totals-count",
+                ));
+            }
+            let mut applied_totals = Vec::with_capacity(NPC_COUNT);
+            for _ in 0..totals_count {
+                applied_totals.push(dec.read_u64()?);
+            }
+            Some(LaneSummary {
+                boundary,
+                applied_totals,
+            })
+        } else {
+            None
+        };
+        // The compacted lane gates (fail-closed): the retained lanes
+        // are disjoint from the summarized coverage — no identity at
+        // or below its region's boundary survives in the retained
+        // lanes (the eligibility rule's invariant) — and the boundary
+        // never exceeds a region's current episode counter (no
+        // summarizing future episodes).
+        if let Some(summary) = &summarized {
+            for id in pending.keys().chain(applied.keys()) {
+                if id.episode <= summary.boundary[id.region as usize] {
+                    return Err(SaveError::Integrity("region-director-save/lane-overlap"));
+                }
+            }
+            for (region, state) in states.iter().enumerate() {
+                if summary.boundary[region] > state.episode {
+                    return Err(SaveError::Integrity(
+                        "region-director-save/lane-boundary-frontier",
+                    ));
+                }
+            }
+        }
         let mut director = RegionDirector::new(config)
             .map_err(|_| SaveError::Integrity("region-director-save/lod-config"))?;
         director.states = states;
-        director.ledger = CaptureLedger { pending, applied };
+        director.ledger = CaptureLedger {
+            pending,
+            applied,
+            summarized,
+        };
         Ok(director)
     }
 }
