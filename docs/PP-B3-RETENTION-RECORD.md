@@ -28,6 +28,7 @@ the full workspace suite, every existing regression green):
 | `88e7d81` | The multi-checkpoint example + the benchmark §8 + this record | 588 passed + 1 ignored |
 | `b3377fd` | The review corrective — the HOLD's four findings F1–F4 (§16) | 597 passed + 1 ignored |
 | `d721620` | The renewed-review corrective — R1, the whole-manifest completion (§17) | 601 passed + 1 ignored |
+| `1927e2b` | The renewed-review correctives — R2 and R3 (§18) | 605 passed + 1 ignored |
 
 From the PP-B2 baseline of 550 tests: **38 new tests**, every one of
 them a PP-B3 behavior; no existing test was modified except where a
@@ -45,7 +46,10 @@ reclamation is now distinguished from restartable work by the typed
 **The renewed review of the corrected branch returned HOLD with
 one remaining bounded finding (R1)**; the corrective (`d721620`,
 §17) adds **4 further tests** (the workspace 601 passed + 1
-ignored).
+ignored). **The review of the R1-corrected branch closed R1 and
+returned HOLD with two bounded findings (R2 and R3)**; the
+correctives (`1927e2b`, §18) add **4 further tests** (the
+workspace 605 passed + 1 ignored).
 
 The scope — the GO's eleven deliverables, each mapped to its
 implementation and regression:
@@ -473,7 +477,7 @@ cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
 
-The expected surfaces: the workspace green (the pod count 601 + 1
+The expected surfaces: the workspace green (the pod count 605 + 1
 ignored may differ by platform for the SDL soak, always stated);
 the four PP-B3 suites green (the crash regression's child dying at
 exit 8; the reclamation's children dying at exits 9 and 10 — §16;
@@ -874,3 +878,164 @@ entry point: the renewed verdict or the owner's rig evidence
 Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
 further implementation remain unauthorized until separate explicit
 owner GOs.
+
+**SUPERSEDED — the renewed verdict arrived: R1 CLOSED (do not
+reopen without new contradictory evidence); HOLD with two bounded
+findings (R2 and R3). The correctives are delivered at `1927e2b`
+and the FINAL RENEWED STOP stands in §18.**
+
+## §18 — The renewed review's HOLD: the R2 and R3 correctives
+
+The renewed verdict on `d721620`/`7462899`: **R1 CLOSED** (the
+`reclaim_pending` implementation, the audited three-state
+selection, and the exit-11/exit-12 regressions accepted; the CI
+40227543159 verified) — **HOLD with two bounded corrective
+findings (R2 and R3)**, authorized as bounded PP-B3 correctness
+corrections under the existing owner GO. The corrective code
+commit **`1927e2b`** (this docs-only verification commit amends
+the record around it; the chain `7462899` → `1927e2b`).
+
+**R2 — the checkpoint-after-reclamation lifecycle.** The finding
+(disclosed in §17's honest boundaries, confirmed by the review's
+source read): the checkpoint RANGE WALK classified only the
+session-snapshot family (Publication), the consequence-batch
+domain (Anchor), the checkpoint-metadata boundary, and the
+founding — a canonical reclamation AUDIT sitting between
+checkpoints hit the `checkpoint-walk/unclassifiable` refusal, so a
+checkpoint published after a reclamation could never complete.
+THE FIX (`walk_checkpoint_range`): the `reclamation-ledger/1`
+domain classifies as RETAINED EVIDENCE — a `RangeKind::Anchor`
+exactly like a confirming revision, never a reclaimable snapshot
+publication — with the STRICT DECODE as the fail-closed gate (an
+invalid, missing, or incoherent ledger object refuses the
+checkpoint, never merely skipped), and the audit's retained
+position participating in the ancestry and the skip tables
+exactly like a confirming anchor (an anchor standing on a
+reclaimable publication jumps to the audit — the nearest retained
+record — under the same skip computation). No existing revision
+format changed; the historical fingerprints hold. THE
+REGRESSIONS: `checkpoints_continue_across_reclamations_and_recover`
+(the nine-step lifecycle over LocalFileMedium — checkpoint,
+checkpoint, RECLAIM, the continuation with a publication standing
+ON the audit (parent asserted) and a full confirmation cycle,
+CHECKPOINT 3 over the audit (the previously impossible step),
+recover and validate (the walk 11 records with the audit retained
+in the ancestry), RECLAIM the next range (progressing past the
+completed MK1), continue, CHECKPOINT 4 over the second audit,
+reopen and recover — the exactly-once behavior, the historical
+key-reuse rejection and the reclaimed-dependency resolution, the
+permanent MK metadata and both audits readable, the final walk 14
+records with both reclaimed ranges skipped, and the wider-window
+nothing-eligible refusal);
+`the_sqlite_lifecycle_continues_across_reclamations` (the same
+essential cadence over `StoreLocation::Database` — the provider
+parity);
+`a_missing_retained_audit_object_fails_the_checkpoint_closed`
+(the audit's ledger object removed by hand — the store's
+validation fails AND the next checkpoint's range walk refuses
+with the typed missing-object error, never skipping the audit).
+
+**R3 — the journal-generation ownership.** The finding:
+`reclaimable_journal_files` selected stale generations by the
+directory-wide `journal-*.t1` filename predicate excluding the
+active — NOT proof of campaign ownership (in a shared directory
+a foreign campaign's root or generation matches the predicate,
+and the reclamation could delete it or its lock). THE FIX: (1)
+THE GENERATIONS MANIFEST (rotation.rs — the versioned domain
+`engine-persist/journal-generations/1`, strict decode: the
+domain/version gates, bounded counts, the plain-file-name rule,
+the duplicate rejection, no trailing bytes): the campaign's own
+recorded lineage — the generation names THIS campaign's rotations
+created or rotated away from — maintained by the rotation itself
+(the pre-flip active captured BEFORE the flip, the new
+generation's name, deduplicated, written atomically
+tmp+fsync+rename+dir-sync after the pointer flip; a crash between
+the flip and the record's write leaves the new generation
+unrecorded — conservatively retained, the next rotation records
+it as its prior active); `read_journal_generations` (a missing
+record means NO generation is eligible — ownership conservatively
+unproven: a pre-rotation campaign has no stale generations) and
+`retire_journal_generations` (the reclamation's Phase B removes
+the retired names). (2) `reclaimable_journal_files` rewritten: the
+candidates are the MANIFEST's names minus the active — never a
+directory scan. (3) THE CAMPAIGN-ROOT BINDING (`reclaim_checkpoint`):
+the journal path supplied must equal the crossing's own
+`journal_root` (the path it opened or recovered with) — a foreign
+root fails closed `reclaim/journal-root` before anything. The
+pre-rotation compatibility preserved (no pointer means no
+rotation — the root IS the active, never touched); the lock
+handling unchanged (each retired name's `.lock` removed with it,
+never another file). THE REGRESSION:
+`shared_directory_campaigns_never_cross_journal_ownership` (two
+independent campaigns — different roots, different stores — in
+ONE shared directory, both carrying pending actionable T1
+evidence, both rotated (A twice); A reclaims its eligible history
+and B's journals, lock, pointer, and canonical state are
+byte-identical and unchanged; A's own root and first generation
+retired while its active journal stands and its manifest names
+only the active; an UNOWNED `journal-*.t1` (real journal bytes,
+no manifest record) is retained — no ownership evidence, no
+deletion; B recovers independently with its pending plan replayed
+exactly once; A recovers with its cleanup correct and the
+completed ranges refusing; a reclamation handed B's root fails
+closed on the campaign-root binding; B's INTERRUPTED rotation (the
+pointer hand-rewritten to its root — the pre-flip state) recovers
+through the previous authoritative journal and a subsequent
+rotation re-lands its pointer with A untouched throughout).
+
+**The verification at `1927e2b`:** fmt and `clippy --workspace
+--all-targets -- -D warnings` green; the workspace **605 passed +
+1 intentionally ignored, 0 failed** (the R1 corrective's 601 +
+the 4 R2/R3 tests); the `pp_b3_reclaim` matrix 20 passed 0 failed
+(the 16 prior plus the 4 new); the checkpoint, rotation, and
+membership matrices green unchanged; the double release-mode
+selftest green both runs (605 / 45 suites, identical results
+modulo timings — the frozen Stage-0 fingerprint pins hold,
+`engine-core` untouched); `cargo build --workspace` green. **The
+CI: run 40232169084 GREEN on all three platforms, verified
+firsthand job-level over the corrected head `1927e2b`**
+(ubuntu-latest 3m38s; windows-latest 4m10s; macos-15 ARM64
+2m40s; via the PR #3 pull_request event — the CI vehicle, never
+merged; the annotations are the known runner-infrastructure
+notes). The protected branches verified unchanged (main=5dbb377,
+stage5=047faf9, macos-port=ba395d8, design=a47ef10, pp-b1=bfe60b7,
+pp-b2=00109b0); PRs #1/#2 unchanged, open/draft.
+
+**The honest boundaries of the R2/R3 correctives:**
+- The generations manifest is the ROTATION-MAINTAINED lineage
+  under the single-writer discipline — an explicit ownership
+  record, not a cryptographic proof: a hand-corrupted manifest
+  naming foreign files would be honored by the retirement (the
+  strict decode validates the record's form, not the provenance
+  of the names it carries). The single-writer discipline plus the
+  campaign-root binding bound that surface; a stronger
+  content-bound ownership proof would be a new design, outside
+  these bounded corrections.
+- The manifest's crash window (between the pointer flip and the
+  record's write) leaves the new generation unrecorded —
+  conservatively retained forever unless a later rotation records
+  it as its prior active. Retention is the safe direction.
+- No new process-kill seams were required by R2/R3 (the
+  lifecycle and ownership regressions are deterministic
+  in-process constructions; the interrupted-rotation case is the
+  hand-reconstructed pre-flip durable state, the F1-established
+  pattern).
+
+**The preserved invariants:** D-PP-4's architecture; the
+D-PP-4a/4b rejections; the SK/MK structure and the digest-chain
+computation; the immutable revision-record bytes and the
+byte-identical existing formats; the permanent MK metadata and
+confirming-evidence guarantees; the fully corrected F1–F4 and R1
+behaviors; PP-B1/B2 behavior; the fingerprints and recovery
+contracts; no PP-B4 threading or background GC; no persistence
+redesign.
+
+**THE FINAL RENEWED STOP.** PP-B3's R2/R3 correctives are
+delivered and stopped for the renewed independent PASS/HOLD
+review. The tested code SHA `1927e2b`; the CI 40232169084 green
+×3 over it; the workspace 605 passed + 1 intentionally ignored at
+it. The next entry point: the renewed verdict or the owner's rig
+evidence (§12). This record never declares the batch CLOSED. The
+physical Windows acceptance is NOT yet requested. PP-B4, Stage 6,
+and all further implementation remain unauthorized until separate
+explicit owner GOs.
