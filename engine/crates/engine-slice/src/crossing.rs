@@ -774,12 +774,47 @@ impl SessionCrossing {
     /// **The spine cut**: `retain_tail` ledger records stay verbatim;
     /// the prefix is summarized into the authenticated SHA-256 chain
     /// (see [`Spine::compact`]).
+    ///
+    /// **The failure atomicity** (the review corrective): a REJECTED
+    /// compound compaction leaves both session components unchanged.
+    /// The spine-window preflight (phase 0) decides the compound's own
+    /// typed refusals read-only, BEFORE the lane summarization can
+    /// mutate anything; the lane summarization itself is
+    /// all-or-nothing (its coherence refusals precede every mutation,
+    /// and its arithmetic refusals fire on local state only); and
+    /// after the preflight passes, the spine cut cannot refuse — so
+    /// no error path observes a partially compacted session.
     pub fn compact_session(
         &mut self,
         spine: &mut Spine<NpcWorld>,
         director: &mut RegionDirector,
         retain_tail: u64,
     ) -> Result<SessionCompaction, TransitionError> {
+        // Phase 0 — the spine-window preflight: the compound's typed
+        // refusals for a degenerate window are decided BEFORE any
+        // session component mutates (the lane summarization must
+        // never run only for a rejected spine cut to strand a
+        // half-compacted session). The check is read-only (the
+        // ledger length), its conditions are exactly [`Spine::compact`]'s
+        // own, and after it passes the phase-3 cut cannot refuse —
+        // nothing between here and there touches the spine.
+        let ledger_len = spine.ledger_retained().len() as u64;
+        if retain_tail > ledger_len {
+            return Err(TransitionError::Compaction(
+                CompactionError::RetainExceedsLedger {
+                    ledger_len,
+                    retain: retain_tail,
+                },
+            ));
+        }
+        if ledger_len - retain_tail == 0 {
+            return Err(TransitionError::Compaction(
+                CompactionError::NothingToSummarize {
+                    ledger_len,
+                    retain: retain_tail,
+                },
+            ));
+        }
         // Phase 1 — the lane eligibility walk.
         let mut boundary = director
             .ledger()

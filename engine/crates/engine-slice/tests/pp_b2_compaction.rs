@@ -17,13 +17,14 @@
 use std::path::PathBuf;
 
 use engine_core::{
-    Decoder, Encoder, Fingerprinter, HistoryKind, LodLevel, PresenceSample, Spine, World,
+    CompactionError, Decoder, Encoder, Fingerprinter, HistoryKind, LodLevel, PresenceSample, Spine,
+    World,
 };
 use engine_persist::{
     AppendOutcome, AuthorityMode, CanonicalMedium, LocalFileMedium, RevisionRecord, StoredObject,
     T1Journal,
 };
-use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
+use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError, save_session};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 
@@ -770,4 +771,129 @@ fn director_v4_gates_fail_closed() {
         let mut dec = Decoder::new(&doctored);
         assert!(RegionDirector::restore(&mut dec).is_err());
     }
+}
+
+#[test]
+fn rejected_compound_compaction_leaves_the_session_unchanged() {
+    // F1's regression (the review corrective): a REJECTED compound
+    // compaction leaves BOTH session components byte-unchanged — the
+    // spine-window preflight decides the compound's typed refusals
+    // read-only, BEFORE the lane summarization can mutate anything.
+    // The fixture holds genuinely eligible applied-and-confirmed
+    // consequences (the reactivated regions' sets), so the lane half
+    // WOULD summarize if the compound proceeded — the byte-identical
+    // session after every refusal proves it never did (on the
+    // pre-corrective ordering this assertion fails: the lane
+    // summarization ran before the rejected spine cut).
+    let dir = TestDir::new("f1-atomicity");
+    let (mut spine, mut director, mut crossing) = confirmed_reactivation_prefix(&dir);
+
+    // The degenerate windows on the fresh session (no existing
+    // summarized records): both typed refusals, each leaving the
+    // COMPLETE session envelope byte-identical (the spine history
+    // representation, the active state, the world, the director
+    // lanes, the frontiers — everything save_session carries).
+    let ledger_len = spine.ledger_retained().len() as u64;
+    assert!(ledger_len > 0, "the fixture holds a real history");
+    let bytes_before = save_session(&spine, &director).unwrap();
+    for (retain, expected) in [
+        (
+            ledger_len + 5,
+            CompactionError::RetainExceedsLedger {
+                ledger_len,
+                retain: ledger_len + 5,
+            },
+        ),
+        (
+            ledger_len,
+            CompactionError::NothingToSummarize {
+                ledger_len,
+                retain: ledger_len,
+            },
+        ),
+    ] {
+        let error = crossing
+            .compact_session(&mut spine, &mut director, retain)
+            .unwrap_err();
+        let TransitionError::Compaction(refusal) = error else {
+            panic!("the typed compaction refusal surfaces (retain {retain}): {error:?}")
+        };
+        assert_eq!(
+            refusal, expected,
+            "the exact typed refusal (retain {retain})"
+        );
+        assert_eq!(
+            save_session(&spine, &director).unwrap(),
+            bytes_before,
+            "the rejected compound left the session byte-unchanged (retain {retain})"
+        );
+    }
+
+    // The valid compaction succeeds — the eligibility was real.
+    let report = crossing
+        .compact_session(&mut spine, &mut director, 10)
+        .unwrap();
+    assert!(
+        report.summarized_identities > 0,
+        "the fixture was genuinely eligible"
+    );
+    assert!(matches!(report.history, HistoryKind::Compacted { .. }));
+
+    // The failed repeats after the prior success: the same refusals
+    // against the compacted session, again byte-unchanged.
+    let bytes_after_success = save_session(&spine, &director).unwrap();
+    let compacted_len = spine.ledger_retained().len() as u64;
+    assert_eq!(compacted_len, 10, "the retained window is exact");
+    for (retain, expected) in [
+        (
+            compacted_len,
+            CompactionError::NothingToSummarize {
+                ledger_len: compacted_len,
+                retain: compacted_len,
+            },
+        ),
+        (
+            compacted_len + 1,
+            CompactionError::RetainExceedsLedger {
+                ledger_len: compacted_len,
+                retain: compacted_len + 1,
+            },
+        ),
+    ] {
+        let error = crossing
+            .compact_session(&mut spine, &mut director, retain)
+            .unwrap_err();
+        let TransitionError::Compaction(refusal) = error else {
+            panic!("the repeat refusal surfaces (retain {retain}): {error:?}")
+        };
+        assert_eq!(
+            refusal, expected,
+            "the exact repeat refusal (retain {retain})"
+        );
+        assert_eq!(
+            save_session(&spine, &director).unwrap(),
+            bytes_after_success,
+            "the rejected repeat left the session byte-unchanged (retain {retain})"
+        );
+    }
+
+    // The subsequent valid compaction, publication, and the real B4
+    // recovery remain successful.
+    let repeat = crossing
+        .compact_session(&mut spine, &mut director, 5)
+        .unwrap();
+    assert!(matches!(repeat.history, HistoryKind::Compacted { .. }));
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    drop(crossing);
+    let (recovered_spine, recovered_director, recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "prefix-campaign").unwrap();
+    assert!(matches!(
+        recovered_spine.history_kind(),
+        HistoryKind::Compacted { .. }
+    ));
+    assert!(
+        recovered_director.ledger().summarized().is_some(),
+        "the lane summary survived the round trip"
+    );
+    drop(recovered_crossing);
 }
