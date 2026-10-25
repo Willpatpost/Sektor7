@@ -522,6 +522,13 @@ pub struct SessionCrossing {
     /// from the pipeline's ACTIVE journal path after a rotation (the
     /// pipeline holds the rotated generation; the root never moves).
     journal_root: PathBuf,
+    /// THE AUTHORITY GUARD (the review corrective R4): true when a
+    /// rotation failed AFTER the authoritative pointer changed — the
+    /// in-memory pipeline then holds a journal the campaign root no
+    /// longer selects, and every further authoritative operation
+    /// refuses until a fresh recovery re-derives the crossing from
+    /// the pointer.
+    journal_authority_lost: bool,
 }
 
 impl SessionCrossing {
@@ -574,7 +581,26 @@ impl SessionCrossing {
             pipeline,
             store: location.clone(),
             journal_root,
+            journal_authority_lost: false,
         })
+    }
+
+    /// THE AUTHORITY GUARD (the review corrective R4): a crossing
+    /// whose rotation failed AFTER the authoritative pointer changed
+    /// is explicitly unusable for further authoritative progression —
+    /// the in-memory pipeline holds a journal the campaign root no
+    /// longer selects, and no T1 write may silently continue through
+    /// it. Every mutation refuses until a fresh recovery re-derives
+    /// the crossing from the pointer. The medium-level `checkpoint`
+    /// boundary stays usable (it never writes through the journal).
+    fn assert_journal_authority(&self) -> Result<(), TransitionError> {
+        if self.journal_authority_lost {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "rotation/authority-lost",
+            });
+        }
+        Ok(())
     }
 
     /// The graceful lifecycle boundary (PP-B1): the ratified `TRUNCATE`
@@ -646,6 +672,7 @@ impl SessionCrossing {
         to: LodLevel,
         now: Tick,
     ) -> Result<(), TransitionError> {
+        self.assert_journal_authority()?;
         // Phase 1 — validate: dormant with a checkpoint, and the
         // ledger statuses coherent (the legacy phase-0 standard — an
         // unknown key the checkpoint claims is incoherent recovery
@@ -724,6 +751,7 @@ impl SessionCrossing {
         now: Tick,
         gap: impl FnOnce(&mut Spine<NpcWorld>, &mut RegionDirector),
     ) -> Result<Option<CaptureReceipt>, TransitionError> {
+        self.assert_journal_authority()?;
         // Phase 1 — validate.
         let from = director.levels()[region];
         if from == LodLevel::Dormant {
@@ -793,6 +821,7 @@ impl SessionCrossing {
         spine: &Spine<NpcWorld>,
         director: &RegionDirector,
     ) -> Result<Hash, TransitionError> {
+        self.assert_journal_authority()?;
         let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
         let object = StoredObject::new(bytes)?;
         let snapshot_hash = object.hash();
@@ -850,6 +879,7 @@ impl SessionCrossing {
         director: &mut RegionDirector,
         retain_tail: u64,
     ) -> Result<SessionCompaction, TransitionError> {
+        self.assert_journal_authority()?;
         // Phase 0 — the spine-window preflight: the compound's typed
         // refusals for a degenerate window are decided BEFORE any
         // session component mutates (the lane summarization must
@@ -995,6 +1025,7 @@ impl SessionCrossing {
         director: &mut RegionDirector,
         retain_tail: u64,
     ) -> Result<CheckpointReport, TransitionError> {
+        self.assert_journal_authority()?;
         // Phase 1 — the session compaction (the preflight discipline
         // inside compact_session).
         let _compaction = self.compact_session(spine, director, retain_tail)?;
@@ -1126,6 +1157,7 @@ impl SessionCrossing {
     /// single-writer discipline closes the swap/flip window — no
     /// append can interleave.
     pub fn rotate_journal(&mut self) -> Result<JournalRotation, TransitionError> {
+        self.assert_journal_authority()?;
         // THE CHAIN-VERIFIED ANCHOR: the newest session snapshot's
         // director state (a compaction the operator has not published
         // is not subsumption evidence — the anchor on the chain is).
@@ -1180,11 +1212,40 @@ impl SessionCrossing {
             .map_err(PipelineError::Journal)?;
         // THE SWAP: this crossing's pipeline reopens over the new
         // journal — the keys reseeded from it, the confirmed set
-        // re-derived from the chain.
-        let journal = T1Journal::open(&rotation.new_path).map_err(PipelineError::Journal)?;
+        // re-derived from the chain. THE POST-FLIP FAILURE RULE
+        // (the review corrective R4): the pointer now names the new
+        // journal, so a failure here must NEVER return control to an
+        // operational stale-journal writer — the crossing is
+        // explicitly unusable for further authoritative progression
+        // (every mutation refuses) until a fresh recovery re-derives
+        // it from the pointer.
+        match self.rebuild_pipeline_after_rotation(&rotation.new_path) {
+            Ok(()) => Ok(rotation),
+            Err(error) => {
+                self.journal_authority_lost = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// THE POST-FLIP SWAP (the review corrective R4): rebuild this
+    /// crossing's pipeline over the rotation's new journal — called
+    /// only after the authoritative pointer names it. A failure
+    /// poisons the crossing (see [`SessionCrossing::rotate_journal`]).
+    fn rebuild_pipeline_after_rotation(&mut self, new_path: &Path) -> Result<(), TransitionError> {
+        if ROTATION_SWAP_FAULT.load(Ordering::Relaxed) {
+            return Err(TransitionError::JournalFailed(PipelineError::Medium(
+                MediumError::Io {
+                    op: "rotation swap (injected fault)",
+                    path: new_path.display().to_string(),
+                    source: std::io::Error::other("injected pipeline-rebuild failure"),
+                },
+            )));
+        }
+        let journal = T1Journal::open(new_path).map_err(PipelineError::Journal)?;
         let medium = SessionStore::open(&self.store).map_err(PipelineError::Medium)?;
         self.pipeline = CommitPipeline::open(medium, journal)?;
-        Ok(rotation)
+        Ok(())
     }
 
     /// The journal this crossing's pipeline holds (diagnostics — the
@@ -1243,6 +1304,7 @@ impl SessionCrossing {
         legacy_journal: &Path,
         generations: u64,
     ) -> Result<ReclamationReport, TransitionError> {
+        self.assert_journal_authority()?;
         // THE CAMPAIGN-ROOT BINDING (the review corrective R3): the
         // reclamation's journal retirement authority is THIS
         // crossing's campaign journal root — the path the crossing
@@ -1651,6 +1713,7 @@ impl SessionCrossing {
     /// (the pending-T1 → confirmed-canonical transition — the gating
     /// demonstration's other side).
     pub fn commit_canonical(&mut self) -> Result<CommitOutcome, TransitionError> {
+        self.assert_journal_authority()?;
         Ok(self.pipeline.commit_canonical()?)
     }
 
@@ -1957,6 +2020,15 @@ fn reclaim_after_medium_seam() {
         std::process::exit(12);
     }
 }
+
+/// Test-only (the review corrective R4's deterministic fault
+/// injection): when armed, the post-flip pipeline rebuild fails
+/// with a real I/O error — the post-flip failure that must poison
+/// the crossing (the pointer names the new journal; the in-memory
+/// writer must never continue through the stale one). Engine code
+/// never arms this; the static is process-local.
+#[doc(hidden)]
+pub static ROTATION_SWAP_FAULT: AtomicBool = AtomicBool::new(false);
 
 /// Phase 5 — the staged prepare/install bundle (§5.5.2): PREPARE
 /// performs every fallible step and precondition re-validation

@@ -32,6 +32,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine_core::{Decoder, Encoder, SaveError};
@@ -64,6 +65,14 @@ pub struct JournalRotation {
     /// The cancellation records carried over (each surviving only
     /// while its target survives).
     pub retained_cancellations: u64,
+    /// THE DURABILITY WARNING (the review corrective R4): a failure
+    /// of the post-flip pointer directory sync — the flip itself
+    /// succeeded (the live authority IS the new journal), but its
+    /// power-loss durability is uncertain. Carried in the report,
+    /// never an error return: an error after the authority changed
+    /// would hand control back to an operational stale-journal
+    /// writer.
+    pub durability_warning: Option<String>,
 }
 
 /// Resolves the campaign's active journal: the pointer file beside
@@ -137,6 +146,25 @@ fn generations_path(legacy_path: &Path) -> PathBuf {
     legacy_path.with_file_name(name)
 }
 
+/// Test-only (the review corrective R4's deterministic fault
+/// injection): when armed, the ownership record's read and write
+/// return a real I/O error — the PRE-FLIP failure path (with the
+/// record maintained before the pointer flip, the error returns
+/// with the authority unchanged). Engine code never arms this; the
+/// static is process-local.
+#[doc(hidden)]
+pub static GENERATIONS_IO_FAULT: AtomicBool = AtomicBool::new(false);
+
+/// Test-only (the review corrective R4's deterministic fault
+/// injection): when armed, the pointer directory sync after the
+/// flip is skipped and reported as the rotation report's
+/// durability warning — the POST-FLIP degraded-durability path
+/// (never an error return: the live authority is already the new
+/// journal). Engine code never arms this; the static is
+/// process-local.
+#[doc(hidden)]
+pub static POINTER_DIR_SYNC_FAULT: AtomicBool = AtomicBool::new(false);
+
 /// THE CAMPAIGN'S JOURNAL-GENERATION OWNERSHIP RECORD (the review
 /// corrective R3): the generation names THIS campaign's rotations
 /// have created or rotated away from — the retirement authority the
@@ -149,6 +177,13 @@ fn generations_path(legacy_path: &Path) -> PathBuf {
 /// crash between the flip and the record's write is retained, and
 /// the next rotation records it as its prior active).
 pub fn read_journal_generations(root: &Path) -> Result<Vec<String>, JournalError> {
+    if GENERATIONS_IO_FAULT.load(Ordering::Relaxed) {
+        return Err(io_err(
+            "read journal generations (injected fault)",
+            &generations_path(root),
+            std::io::Error::other("injected ownership-record I/O failure"),
+        ));
+    }
     let manifest = generations_path(root);
     match fs::metadata(&manifest) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -251,6 +286,13 @@ fn decode_generations(bytes: &[u8]) -> Result<Vec<String>, JournalError> {
 /// Writes the ownership record atomically (tmp + fsync + rename +
 /// the directory sync — the pointer's discipline).
 fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), JournalError> {
+    if GENERATIONS_IO_FAULT.load(Ordering::Relaxed) {
+        return Err(io_err(
+            "write journal generations (injected fault)",
+            &generations_path(root),
+            std::io::Error::other("injected ownership-record I/O failure"),
+        ));
+    }
     let manifest = generations_path(root);
     let tmp = root.with_file_name(format!(
         "{}{JOURNAL_GENERATIONS_SUFFIX}.tmp",
@@ -342,20 +384,48 @@ pub fn rotate_journal(
     if scan.tail != TailState::Clean {
         return Err(rejected());
     }
-    // (4) THE DURABLE ACTIVE-PATH FLIP: tmp + fsync + rename onto
-    // the pointer, then the directory sync — atomic, so a crash
-    // leaves either the pre-rotation pointer state or the completed
-    // flip, never a torn pointer.
+    // (4) THE OWNERSHIP RECORD — BEFORE THE FLIP (the review
+    // corrective R4): the campaign's generation lineage — the
+    // pre-flip active and the new generation, deduplicated — is
+    // maintained beside the root BEFORE the authoritative pointer
+    // changes. The publication ordering makes every ownership-record
+    // failure a PRE-FLIP failure: the error returns with the
+    // authority unchanged (the caller stays safely on the current
+    // journal — a manifest I/O failure can never hand control back
+    // to an operational stale-journal writer, because the pointer
+    // has not moved). A crash between this write and the flip
+    // leaves the new generation recorded but inert — the pointer
+    // still names the prior journal (the authority and a superset),
+    // and a recorded-but-never-active generation is harmless.
     let name = new_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(JournalError::Format(SaveError::Integrity(
             "journal-rotation/name",
         )))?;
-    // The pre-flip active — the generation becoming stale (captured
-    // BEFORE the flip so the ownership record below names the prior
-    // generation, not the new one).
     let prior_active = active_journal_path(legacy_path)?;
+    let mut owned = read_journal_generations(legacy_path)?;
+    if let Some(prior_name) = prior_active.file_name().and_then(|prior| prior.to_str())
+        && !owned.iter().any(|recorded| recorded == prior_name)
+    {
+        owned.push(prior_name.to_owned());
+    }
+    if !owned.iter().any(|recorded| recorded == name) {
+        owned.push(name.to_owned());
+    }
+    write_journal_generations(legacy_path, &owned)?;
+    // (5) THE DURABLE ACTIVE-PATH FLIP: tmp + fsync + rename onto
+    // the pointer — atomic, so a crash leaves either the
+    // pre-rotation pointer state or the completed flip, never a
+    // torn pointer. THE AUTHORITY BOUNDARY (the review corrective
+    // R4): the rename is the last fallible step that may return an
+    // error — after it, the live pointer names the new journal, so
+    // no later failure may return an error that leaves the caller
+    // operational on the stale journal. The directory sync that
+    // follows is a DURABILITY step, not an authority step: its
+    // failure means the flip may not survive a power loss — the
+    // live authority is still the new journal — so it is carried
+    // as the report's durability warning, never an error return.
     let tmp_path = legacy_path.with_file_name(format!(
         "{}{JOURNAL_ACTIVE_SUFFIX}.tmp",
         legacy_path
@@ -372,34 +442,21 @@ pub fn rotate_journal(
     drop(file);
     fs::rename(&tmp_path, pointer_path(legacy_path))
         .map_err(|e| io_err("flip journal pointer", legacy_path, e))?;
-    sync_parent_dir(&pointer_path(legacy_path))
-        .map_err(|e| io_err("sync journal dir", legacy_path, e))?;
-    // (5) THE OWNERSHIP RECORD (the review corrective R3): the
-    // campaign's generation lineage — the pre-flip active (now
-    // stale) and the new generation, deduplicated — maintained
-    // beside the root. The reclamation's journal retirement
-    // authority is THIS record, never a directory-wide filename
-    // pattern (a shared directory's foreign campaign files match
-    // the journal-*.t1 predicate). A crash between the flip and
-    // this write leaves the new generation unrecorded:
-    // conservatively retained (the next rotation records it as its
-    // prior active).
-    let mut owned = read_journal_generations(legacy_path)?;
-    if let Some(prior_name) = prior_active.file_name().and_then(|prior| prior.to_str())
-        && !owned.iter().any(|recorded| recorded == prior_name)
-    {
-        owned.push(prior_name.to_owned());
-    }
-    if !owned.iter().any(|recorded| recorded == name) {
-        owned.push(name.to_owned());
-    }
-    write_journal_generations(legacy_path, &owned)?;
+    let durability_warning = if POINTER_DIR_SYNC_FAULT.load(Ordering::Relaxed) {
+        Some("journal-rotation/pointer-dir-sync (injected fault)".to_owned())
+    } else {
+        match sync_parent_dir(&pointer_path(legacy_path)) {
+            Ok(()) => None,
+            Err(e) => Some(io_err("sync journal dir", legacy_path, e).to_string()),
+        }
+    };
     Ok(JournalRotation {
         new_path,
         legacy_path: legacy_path.to_path_buf(),
         retained: retained.iter().map(|transaction| transaction.id).collect(),
         retired: retired.to_vec(),
         retained_cancellations: retained_cancellations.len() as u64,
+        durability_warning,
     })
 }
 

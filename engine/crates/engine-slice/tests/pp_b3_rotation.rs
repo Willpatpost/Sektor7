@@ -15,17 +15,20 @@
 //! the capture locks and copies THE ACTIVE journal, never the stale
 //! legacy.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::Ordering;
 
 use engine_core::{LodLevel, PresenceSample, Spine};
 use engine_persist::{
     AwardCheckpoint, CancellationReason, ClassifiedSpan, ConsequenceEnvelope, ConsequenceId,
-    CounterValues, Coverage, DurabilityClass, FrontierEntry, OccurrenceSpan, SignalLane,
-    SourceBaseline, SourcePosition, T1Journal, TransactionId, TransactionInput,
-    active_journal_path,
+    CounterValues, Coverage, DurabilityClass, FrontierEntry, GENERATIONS_IO_FAULT, JournalError,
+    MediumError, OccurrenceSpan, POINTER_DIR_SYNC_FAULT, PipelineError, SignalLane, SourceBaseline,
+    SourcePosition, T1Journal, TransactionId, TransactionInput, active_journal_path,
+    read_journal_generations,
 };
 use engine_slice::backup::{backup_campaign, verify_backup};
-use engine_slice::crossing::SessionCrossing;
+use engine_slice::crossing::{ROTATION_SWAP_FAULT, SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 use engine_slice::store::StoreLocation;
@@ -805,4 +808,405 @@ fn an_interrupted_later_flip_selects_the_previous_authoritative_journal() {
         "the root pointer re-lands at the campaign root"
     );
     assert_ne!(rotation3.new_path, rotation2.new_path);
+}
+
+// ------------------------------------- the review corrective R4's windows
+
+/// The child-process plumbing (the R4 fault-injection regressions):
+/// the fault statics are process-global and the harness runs this
+/// file's tests in parallel, so every fault-armed scenario runs in
+/// its OWN spawned process — the parent verifies the durable
+/// outcomes firsthand.
+const ROTATION_CHILD_STORE_ENV: &str = "S7_PP_B3_ROTATION_CHILD_STORE";
+const ROTATION_CHILD_JOURNAL_ENV: &str = "S7_PP_B3_ROTATION_CHILD_JOURNAL";
+
+/// The R4 child (the pre-flip manifest I/O failure): the campaign,
+/// the armed ownership-record fault, the refused rotation, and the
+/// post-failure boundary — proving the caller stays operational on
+/// the still-authoritative journal.
+#[test]
+fn pp_b3_rotation_child_manifest_fault() {
+    let Ok(store) = std::env::var(ROTATION_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal_path = std::env::var(ROTATION_CHILD_JOURNAL_ENV).unwrap();
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&journal_path).unwrap();
+    let mut crossing =
+        SessionCrossing::open(Path::new(&store), journal, "child-manifest-fault").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    // THE INJECTED PRE-FLIP FAILURE: the ownership record's I/O
+    // error — with the record maintained BEFORE the flip, the error
+    // returns with the authority unchanged.
+    GENERATIONS_IO_FAULT.store(true, Ordering::SeqCst);
+    let error = crossing
+        .rotate_journal()
+        .expect_err("the ownership-record I/O failure refuses the rotation");
+    assert!(
+        matches!(
+            error,
+            TransitionError::JournalFailed(PipelineError::Journal(JournalError::Io { .. }))
+        ),
+        "the injected manifest I/O error surfaces: {error:?}"
+    );
+    // THE AUTHORITY UNCHANGED and the crossing still holds it; a
+    // subsequent boundary journals into the still-authoritative
+    // journal (never a stale-journal divergence).
+    assert_eq!(
+        active_journal_path(Path::new(&journal_path)).unwrap(),
+        Path::new(&journal_path)
+    );
+    assert_eq!(crossing.pipeline_journal_path(), Path::new(&journal_path));
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+}
+
+#[test]
+fn a_manifest_io_failure_before_the_flip_leaves_the_authority_unchanged() {
+    // THE R4 PRE-FLIP FAILURE (the review corrective R4): a real
+    // I/O error at the ownership-manifest boundary — injected
+    // deterministically in a spawned child (the fault statics are
+    // process-global; the harness runs this file's tests in
+    // parallel) — returns BEFORE the authoritative pointer changes:
+    // the child's post-failure boundary lands in the
+    // still-authoritative journal, and the parent verifies the
+    // pointer unchanged, the recovery resolving the same journal
+    // with the plans replayed exactly once, and a retry rotation
+    // succeeding.
+    let dir = TestDir::new("manifest-io-failure");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_rotation_child_manifest_fault"])
+        .env(ROTATION_CHILD_STORE_ENV, dir.store())
+        .env(ROTATION_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child's assertion chain passed: the injected manifest I/O failure refused the rotation with the authority unchanged, the crossing still operational on the authoritative journal"
+    );
+    // THE AUTHORITY UNCHANGED: no pointer — the root IS the active
+    // journal — and the child's post-failure T1 evidence landed in
+    // it.
+    assert_eq!(active_journal_path(&dir.journal()).unwrap(), dir.journal());
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert!(
+        scan.committed.len() >= 2,
+        "the far boundary plus the post-failure boundary journaled into the still-authoritative journal"
+    );
+    // THE RECOVERY resolves the same journal; the plans replay
+    // exactly once; a retry rotation succeeds.
+    let (_spine, recovered_director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-manifest-fault")
+            .expect("the recovery resolves the unchanged authority");
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Dormant,
+        "the outstanding plans replayed exactly once"
+    );
+    let rotation = crossing
+        .rotate_journal()
+        .expect("the retry rotation succeeds once the fault clears");
+    assert_eq!(
+        active_journal_path(&dir.journal()).unwrap(),
+        rotation.new_path
+    );
+    assert!(rotation.durability_warning.is_none());
+}
+
+/// The R4 child (the post-flip degraded durability): the campaign,
+/// the armed pointer-dir-sync fault, the rotation completing with
+/// the warning, the rebind, and the post-rotation boundary —
+/// proving the caller continues on the NEW authoritative journal.
+#[test]
+fn pp_b3_rotation_child_dir_sync_fault() {
+    let Ok(store) = std::env::var(ROTATION_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal_path = std::env::var(ROTATION_CHILD_JOURNAL_ENV).unwrap();
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&journal_path).unwrap();
+    let mut crossing =
+        SessionCrossing::open(Path::new(&store), journal, "child-dir-sync-fault").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    // THE INJECTED POST-FLIP DEGRADED DURABILITY: the rotation
+    // completes with the warning and the crossing REBINDS to the
+    // new authoritative journal (the pointer and the in-memory
+    // writer agree).
+    POINTER_DIR_SYNC_FAULT.store(true, Ordering::SeqCst);
+    let rotation = crossing
+        .rotate_journal()
+        .expect("the rotation completes with the degraded-durability warning");
+    assert!(
+        rotation.durability_warning.is_some(),
+        "the failed directory sync surfaces as the report's durability warning"
+    );
+    assert_eq!(
+        active_journal_path(Path::new(&journal_path)).unwrap(),
+        rotation.new_path
+    );
+    assert_eq!(
+        crossing.pipeline_journal_path(),
+        rotation.new_path.as_path(),
+        "the recovery-selected journal and the in-memory writer agree"
+    );
+    // The post-rotation boundary journals INTO THE NEW GENERATION.
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+}
+
+#[test]
+fn a_pointer_dir_sync_failure_after_the_flip_still_rebinds_the_authority() {
+    // THE R4 POST-FLIP DEGRADED DURABILITY (the review corrective
+    // R4): a real failure of the pointer directory sync AFTER the
+    // authority has changed — injected deterministically in a
+    // spawned child — is carried as the rotation report's
+    // durability warning, never an error return: the live authority
+    // is the new journal, the child's crossing REBINDS to it (the
+    // pointer and the in-memory writer agree), and the child's
+    // post-rotation boundary lands in the new generation only —
+    // never the stale journal.
+    let dir = TestDir::new("dir-sync-failure");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_rotation_child_dir_sync_fault"])
+        .env(ROTATION_CHILD_STORE_ENV, dir.store())
+        .env(ROTATION_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child's assertion chain passed: the degraded-durability rotation completed, the crossing rebound, the post-rotation boundary landed in the new generation"
+    );
+    // THE PARENT'S DURABLE VERIFICATION: the pointer names the new
+    // journal; the child's post-rotation T1 evidence is in the new
+    // generation and NOT in the stale one.
+    let active = active_journal_path(&dir.journal()).unwrap();
+    assert_ne!(active, dir.journal());
+    let new_scan = T1Journal::scan_file(&active).unwrap();
+    assert!(
+        new_scan.committed.len() >= 2,
+        "the survivor plus the post-rotation boundary journaled into the new authoritative generation"
+    );
+    let old_scan = T1Journal::scan_file(dir.journal()).unwrap();
+    let newest = new_scan.committed.last().unwrap().id;
+    assert!(
+        old_scan.committed.iter().all(|entry| entry.id != newest),
+        "the stale journal receives nothing after the flip"
+    );
+    // THE RECOVERY resolves the new generation; the plan replays
+    // exactly once.
+    let (_spine, recovered_director, _crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-dir-sync-fault")
+            .expect("the recovery resolves the new authority");
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Dormant,
+        "the outstanding plan replayed exactly once"
+    );
+}
+
+/// The R4 child (the post-flip swap failure): the campaign, the
+/// armed pipeline-rebuild fault, the refused swap, and the poison —
+/// proving every further authoritative operation refuses.
+#[test]
+fn pp_b3_rotation_child_swap_fault() {
+    let Ok(store) = std::env::var(ROTATION_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal_path = std::env::var(ROTATION_CHILD_JOURNAL_ENV).unwrap();
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&journal_path).unwrap();
+    let mut crossing =
+        SessionCrossing::open(Path::new(&store), journal, "child-swap-fault").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    // THE INJECTED POST-FLIP SWAP FAILURE.
+    ROTATION_SWAP_FAULT.store(true, Ordering::SeqCst);
+    let error = crossing
+        .rotate_journal()
+        .expect_err("the injected pipeline-rebuild failure refuses the swap");
+    assert!(
+        matches!(
+            error,
+            TransitionError::JournalFailed(PipelineError::Medium(MediumError::Io { .. }))
+        ),
+        "the injected swap failure surfaces: {error:?}"
+    );
+    // THE AUTHORITY HAS CHANGED: the pointer names the new journal.
+    assert_ne!(
+        active_journal_path(Path::new(&journal_path)).unwrap(),
+        Path::new(&journal_path)
+    );
+    // THE POISON: every further authoritative operation refuses —
+    // no T1 write may silently continue through the stale journal.
+    for detail in [
+        match crossing.publish_snapshot(&spine, &director) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the poisoned publication refuses, got {other:?}"),
+            Ok(_) => panic!("a poisoned crossing never publishes"),
+        },
+        match crossing.commit_canonical() {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the poisoned commit refuses, got {other:?}"),
+            Ok(_) => panic!("a poisoned crossing never confirms"),
+        },
+        match crossing.reclaim_checkpoint(Path::new(&journal_path), 1) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the poisoned reclamation refuses, got {other:?}"),
+            Ok(_) => panic!("a poisoned crossing never reclaims"),
+        },
+    ] {
+        assert_eq!(detail, "rotation/authority-lost");
+    }
+    let now = spine.clock();
+    match crossing.deactivate(&mut spine, &mut director, 4, now) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => {
+            assert_eq!(detail, "rotation/authority-lost");
+        }
+        Err(other) => panic!("the poisoned deactivation refuses, got {other:?}"),
+        Ok(_) => panic!("a poisoned crossing never journals a capture"),
+    }
+}
+
+#[test]
+fn a_pipeline_rebuild_failure_after_the_flip_poisons_the_crossing() {
+    // THE R4 POST-FLIP POISON (the review corrective R4): a real
+    // failure of the post-flip pipeline reconstruction — injected
+    // deterministically in a spawned child — returns the error AND
+    // leaves the crossing EXPLICITLY UNUSABLE for further
+    // authoritative progression (every mutation refuses; the
+    // in-memory writer never continues through the journal the
+    // campaign root no longer selects), while the parent's recovery
+    // resolves the new authoritative journal, replays the
+    // outstanding plan exactly once, and a repeat rotation keeps
+    // the lineage coherent.
+    let dir = TestDir::new("swap-failure");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_rotation_child_swap_fault"])
+        .env(ROTATION_CHILD_STORE_ENV, dir.store())
+        .env(ROTATION_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child's assertion chain passed: the injected swap failure refused, the poison refused every further authoritative operation, the pointer named the new journal"
+    );
+    // THE AUTHORITY HAS CHANGED: the pointer names the new journal.
+    let active = active_journal_path(&dir.journal()).unwrap();
+    assert_ne!(active, dir.journal());
+    // THE RECOVERY resolves the NEW authoritative journal; the plan
+    // replays exactly once.
+    let (mut spine, mut director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-swap-fault")
+            .expect("the recovery resolves the new authority");
+    assert_eq!(
+        director.levels()[4],
+        LodLevel::Dormant,
+        "the outstanding plan replayed exactly once through the new authority"
+    );
+    assert_eq!(crossing.pipeline_journal_path(), active);
+    // THE REPEAT ROTATION after the recovery: the lineage coherent.
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    let rotation = crossing
+        .rotate_journal()
+        .expect("the repeat rotation succeeds after the recovery");
+    assert_eq!(
+        active_journal_path(&dir.journal()).unwrap(),
+        rotation.new_path
+    );
+    {
+        let lineage = read_journal_generations(&dir.journal()).unwrap();
+        let root_name = dir
+            .journal()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let active_name = active.file_name().unwrap().to_str().unwrap().to_owned();
+        let new_name = rotation
+            .new_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(lineage.contains(&root_name));
+        assert!(lineage.contains(&active_name));
+        assert!(lineage.contains(&new_name));
+    }
 }
