@@ -29,6 +29,7 @@ the full workspace suite, every existing regression green):
 | `b3377fd` | The review corrective — the HOLD's four findings F1–F4 (§16) | 597 passed + 1 ignored |
 | `d721620` | The renewed-review corrective — R1, the whole-manifest completion (§17) | 601 passed + 1 ignored |
 | `1927e2b` | The renewed-review correctives — R2 and R3 (§18) | 605 passed + 1 ignored |
+| `8fc9632` | The renewed-review corrective — R4, the safe publication ordering (§19) | 614 passed + 1 ignored |
 
 From the PP-B2 baseline of 550 tests: **38 new tests**, every one of
 them a PP-B3 behavior; no existing test was modified except where a
@@ -49,7 +50,12 @@ one remaining bounded finding (R1)**; the corrective (`d721620`,
 ignored). **The review of the R1-corrected branch closed R1 and
 returned HOLD with two bounded findings (R2 and R3)**; the
 correctives (`1927e2b`, §18) add **4 further tests** (the
-workspace 605 passed + 1 ignored).
+workspace 605 passed + 1 ignored). **The review of the
+R2/R3-corrected branch closed R2 and R3 and returned HOLD with
+one bounded finding (R4)**; the corrective (`8fc9632`, §19) adds
+**6 further test functions** (the workspace 614 passed + 1
+ignored — the 611 distinct tests plus the three child processes'
+own nested single-test reports in the harness output).
 
 The scope — the GO's eleven deliverables, each mapped to its
 implementation and regression:
@@ -477,8 +483,10 @@ cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
 
-The expected surfaces: the workspace green (the pod count 605 + 1
-ignored may differ by platform for the SDL soak, always stated);
+The expected surfaces: the workspace green (the pod count 614 + 1
+ignored may differ by platform for the SDL soak, always stated;
+the count includes the three R4 child processes' own nested
+single-test reports — §19);
 the four PP-B3 suites green (the crash regression's child dying at
 exit 8; the reclamation's children dying at exits 9 and 10 — §16;
 the R1 windows' children dying at exits 11 and 12 — §17); the benchmark §8's numbers at release speed (the flat
@@ -1039,3 +1047,164 @@ evidence (§12). This record never declares the batch CLOSED. The
 physical Windows acceptance is NOT yet requested. PP-B4, Stage 6,
 and all further implementation remain unauthorized until separate
 explicit owner GOs.
+
+**SUPERSEDED — the renewed verdict arrived: R2 and R3 CLOSED (do
+not reopen without new contradictory evidence); HOLD with one
+bounded finding (R4). The corrective is delivered at `8fc9632`
+and the FINAL RENEWED STOP stands in §19.**
+
+## §19 — The renewed review's HOLD: the R4 corrective (the safe publication ordering)
+
+The renewed verdict on `1927e2b`/`6bd4b27`: **R2 CLOSED**
+(checkpoint-after-reclamation continuity, provider parity, and
+audit retention) and **R3 CLOSED for the authorized
+normal-operation ownership model** (the rotation-maintained
+campaign generation manifest, shared-directory isolation, and
+campaign-root binding) — **HOLD with one bounded corrective
+finding (R4)**, authorized as a bounded PP-B3 correctness
+correction under the existing owner GO. The corrective code
+commit **`8fc9632`** (this docs-only verification commit amends
+the record around it; the chain `6bd4b27` → `8fc9632`).
+
+**THE FINDING (R4) — the failure after the authoritative journal
+pointer publication.** The counterexample: journal B is written
+and scan-verified while the live crossing holds journal A; the
+root `.active` pointer is atomically switched to B; the R3
+ownership-manifest read/write/sync FAILS; `rotate_journal`
+returns `Err` via `?`; the crossing never performs the pipeline
+swap; the live crossing keeps writing journal A while crash
+recovery resolves B — additional T1 effects written to A are not
+present in B, violating the single-authoritative-journal and
+recoverability guarantees. The issue is the ORDINARY ERROR-RETURN
+PATH after the authority pointer may have changed (not the
+already accepted process-crash retention behavior).
+
+**THE CORRECTIVE — three parts.** (1) **THE PUBLICATION
+ORDERING** (rotation.rs): the ownership record (the R3
+generations manifest) is maintained BEFORE the pointer flip —
+every manifest failure is a PRE-FLIP failure: the error returns
+with the authority unchanged, the caller stays safely on the
+current journal (a manifest I/O failure can never hand control
+back to an operational stale-journal writer, because the pointer
+has not moved). A crash between the manifest write and the flip
+leaves the new generation recorded but inert — the pointer still
+names the prior journal (the authority and a superset); a
+recorded-but-never-active generation is harmless. (2) **THE
+AUTHORITY BOUNDARY** (rotation.rs): the pointer rename is the
+LAST fallible step that may return an error — after it, the live
+pointer names the new journal, so no later failure may return an
+error that leaves the caller operational on the stale journal.
+The post-rename directory sync is a DURABILITY step, not an
+authority step: its failure means the flip may not survive a
+power loss — the live authority is still the new journal — so it
+is carried as the report's new `durability_warning` field
+(`Option<String>` on `JournalRotation`), never an error return.
+(3) **THE POST-FLIP POISON** (crossing.rs): the driver's
+post-flip pipeline reconstruction (the audited fallible
+post-flip steps: the journal reopen, the medium open, the
+pipeline rebuild) is extracted into `rebuild_pipeline_after_rotation`;
+a failure sets `journal_authority_lost` and EVERY further
+authoritative operation — `publish_snapshot`, `deactivate` (the
+shared six-phase transition driver), `activate`,
+`commit_canonical`, `compact_session`, `publish_checkpoint`,
+`rotate_journal`, `reclaim_checkpoint` — refuses with the typed
+`rotation/authority-lost` until a fresh recovery re-derives the
+crossing from the pointer (the medium-level `checkpoint` boundary
+stays usable — it never writes through the journal). The
+conservative retention for orphaned/unrecorded generations, R3's
+strict campaign isolation, and the backup/recovery pointer
+semantics are all preserved.
+
+**THE FAULT INJECTION (deterministic, real returned I/O errors —
+never natural disk-full).** `GENERATIONS_IO_FAULT` (the ownership
+record's read/write returns the injected `JournalError::Io` — the
+pre-flip failure path), `POINTER_DIR_SYNC_FAULT` (the post-flip
+pointer directory sync skipped and reported as the durability
+warning), and `ROTATION_SWAP_FAULT` (the post-flip pipeline
+rebuild fails with the injected `MediumError::Io`). The statics
+are process-local and the harness runs the file's tests in
+parallel, so each fault-armed scenario runs in its OWN spawned
+child process (the child/parent pattern the exit-8-through-12
+seams established) — the parent verifies the durable outcomes
+firsthand. **THE REGRESSIONS (3 child/parent pairs,
+pp_b3_rotation.rs):**
+`a_manifest_io_failure_before_the_flip_leaves_the_authority_unchanged`
+(the child: the refused rotation with the typed Io error, the
+authority-unchanged asserts, and the post-failure boundary
+landing in the still-authoritative journal; the parent: the
+pointer unchanged, the journal carrying the child's post-failure
+T1 evidence, the recovery resolving the same journal with the
+plans replayed exactly once, and the retry rotation succeeding
+with no durability warning);
+`a_pointer_dir_sync_failure_after_the_flip_still_rebinds_the_authority`
+(the child: the rotation completing WITH the warning and the
+rebind — the pointer and the in-memory writer agree — plus the
+post-rotation boundary into the new generation; the parent: the
+durable verification — the new generation carries the
+post-rotation T1 evidence while the stale journal receives
+nothing new — and the recovery resolving the new authority with
+the plan replayed exactly once);
+`a_pipeline_rebuild_failure_after_the_flip_poisons_the_crossing`
+(the child: the refused swap with the typed Io error, the
+authority-changed assert, and the poison refusing publication,
+commit, reclamation, and deactivation; the parent: the recovery
+resolving the NEW authoritative journal with the outstanding plan
+replayed exactly once, the repeat rotation succeeding, and the
+lineage coherent — the manifest carrying the root and both
+generations).
+
+**The verification at `8fc9632`:** fmt and `clippy --workspace
+--all-targets -- -D warnings` green; `cargo build --workspace`
+green; the workspace **614 passed + 1 intentionally ignored, 0
+failed** (the R2/R3 correctives' 605 plus the 6 new test
+functions plus the 3 child processes' own nested single-test
+reports in the harness output — 611 distinct tests); the
+`pp_b3_rotation` matrix 10 passed 0 failed (the 4 prior tests
+plus the 3 parents and the 3 children); the reclaim, checkpoint,
+and membership matrices green unchanged; the double release-mode
+selftest green both runs (identical results modulo timings — the
+frozen Stage-0 fingerprint pins hold, `engine-core` untouched).
+**The CI: run 40241079631 GREEN on all three platforms, verified
+firsthand job-level over the corrected head `8fc9632`**
+(macos-15 ARM64 2m35s; ubuntu-latest 3m42s; windows-latest
+3m48s; via the PR #3 pull_request event — the CI vehicle, never
+merged; the annotations are the known runner-infrastructure
+notes). The protected branches verified unchanged (main=5dbb377,
+stage5=047faf9, macos-port=ba395d8, design=a47ef10, pp-b1=bfe60b7,
+pp-b2=00109b0); PRs #1/#2 unchanged, open/draft.
+
+**The surviving limitations (stated honestly):**
+- The durability warning's semantics: a failed post-flip pointer
+  directory sync means the LIVE authority is the new journal
+  (correct) but the flip may not survive a POWER LOSS. That is
+  the safe direction: the pre-rotation pointer state names the
+  PRIOR journal — a superset holding every outstanding effect —
+  so a power-loss reversion recovers everything (the pre-flip
+  crash semantics the rotation always had). The warning surfaces
+  in the rotation report for the operator; the caller continues
+  on the authoritative journal.
+- The manifest's crash window (between the pre-flip manifest
+  write and the flip) leaves the new generation recorded but
+  inert — harmless (the prior journal is the authority and a
+  superset; a recorded-but-never-active generation is inert).
+- The fault-injection statics are test-only (`#[doc(hidden)]`,
+  process-local, never armed by engine code); the production
+  paths carry no seams.
+
+**The preserved invariants:** D-PP-4's architecture; the
+D-PP-4a/4b rejections; the SK/MK structure; the immutable
+revision-record bytes; the permanent metadata and
+confirming-evidence guarantees; the fully corrected F1–F4 and
+R1–R3 behaviors; PP-B1/B2 behavior; the fingerprints and
+recovery contracts; no PP-B4 threading, queues, or unrelated
+architecture changes.
+
+**THE FINAL RENEWED STOP.** PP-B3's R4 corrective is delivered
+and stopped for the renewed independent PASS/HOLD review. The
+tested code SHA `8fc9632`; the CI 40241079631 green ×3 over it;
+the workspace 614 passed + 1 intentionally ignored at it. The
+next entry point: the renewed verdict or the owner's rig evidence
+(§12). This record never declares the batch CLOSED. The physical
+Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
+further implementation remain unauthorized until separate explicit
+owner GOs.
