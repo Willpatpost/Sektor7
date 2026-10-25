@@ -27,6 +27,7 @@ the full workspace suite, every existing regression green):
 | `f93a101` | The audited explicit two-phase reclamation | 587 passed + 1 ignored |
 | `88e7d81` | The multi-checkpoint example + the benchmark §8 + this record | 588 passed + 1 ignored |
 | `b3377fd` | The review corrective — the HOLD's four findings F1–F4 (§16) | 597 passed + 1 ignored |
+| `d721620` | The renewed-review corrective — R1, the whole-manifest completion (§17) | 601 passed + 1 ignored |
 
 From the PP-B2 baseline of 550 tests: **38 new tests**, every one of
 them a PP-B3 behavior; no existing test was modified except where a
@@ -41,6 +42,10 @@ passed + 1 ignored) and updates the three existing idempotent
 re-run assertions to the corrected F3 semantics — a completed
 reclamation is now distinguished from restartable work by the typed
 `reclaim/nothing-eligible` refusal, never a repeated no-op.
+**The renewed review of the corrected branch returned HOLD with
+one remaining bounded finding (R1)**; the corrective (`d721620`,
+§17) adds **4 further tests** (the workspace 601 passed + 1
+ignored).
 
 The scope — the GO's eleven deliverables, each mapped to its
 implementation and regression:
@@ -468,10 +473,11 @@ cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
 
-The expected surfaces: the workspace green (the pod count 597 + 1
+The expected surfaces: the workspace green (the pod count 601 + 1
 ignored may differ by platform for the SDL soak, always stated);
 the four PP-B3 suites green (the crash regression's child dying at
-exit 8; the reclamation's children dying at exits 9 and 10 — §16); the benchmark §8's numbers at release speed (the flat
+exit 8; the reclamation's children dying at exits 9 and 10 — §16;
+the R1 windows' children dying at exits 11 and 12 — §17); the benchmark §8's numbers at release speed (the flat
 reclaimed steady state is the structural claim — the absolute
 milliseconds are the rig's).
 
@@ -717,3 +723,154 @@ renewed verdict or the owner's rig evidence (§12). This record
 never declares the batch CLOSED. PP-B4, Stage 6, and all further
 implementation remain unauthorized until separate explicit owner
 GOs.
+
+**SUPERSEDED — the renewed verdict arrived: HOLD with one
+remaining bounded finding (R1). The corrective is delivered at
+`d721620` and the FINAL RENEWED STOP stands in §17.**
+
+## §17 — The renewed review's HOLD: the R1 corrective (the whole-manifest completion)
+
+The renewed verdict on `b3377fd`/`c794b01`: **HOLD — one remaining
+bounded corrective finding (R1)**, with the authorization to make
+the bounded correction exclusively on `production-persistence-b3`
+and STOP again for the renewed review. The corrective code commit
+**`d721620`** (this docs-only verification commit amends the record
+around it; the chain `129c9bd` → `b3377fd` → `c794b01` →
+`d721620`).
+
+**THE FINDING (R1) — incomplete Phase B classified as fully
+reclaimed.** The target selection considered a checkpoint fully
+reclaimed when none of its INDEXED REVISION RECORDS remained —
+insufficient against the durable audit's manifest, which also
+requires the deletion of the referenced content objects, the
+possible quarantined copies, and the audited stale journal
+generations with their sidecar locks. Two interruption windows:
+**(A) the last-unit window** — a death after the LAST indexed
+record's deletion and before its referenced objects leaves every
+indexed record absent while the manifest is incomplete; the next
+call skipped the checkpoint. **(B) the post-medium/pre-journal
+window** — a death after the canonical medium's manifest deletes
+and before the audited stale-journal retirement leaves the journal
+cleanup permanently incomplete. The existing exit-10 test killed
+after the FIRST unit's record deletion while another indexed
+record remained, so neither window was covered.
+
+**THE CORRECTIVE.** (1) The THREE-STATE SELECTION
+(`reclaim_checkpoint`): per candidate oldest-first beyond the
+window, the audit is discovered per candidate
+(`find_installed_reclamation`); an UNAUDITED range with present
+indexed records selects the FRESH path; an AUDITED range gets the
+coherence verification (fail closed on invalid bindings — the
+resume standard) and then THE WHOLE-MANIFEST COMPLETION CHECK —
+the medium's `reclaim_pending(units)` probe OR the driver-side
+journal check (any audited journal name or its `.lock` still a
+file) — pending selects the RESUME (carrying the discovered
+ledger: no duplicate audit, no re-derivation, no re-read of
+already-deleted range bytes); only a fully satisfied manifest is
+completed and SKIPPED. A subsequent call reports
+`reclaim/nothing-eligible` only AFTER the cleanup truly completes.
+(2) `CanonicalMedium::reclaim_pending` (both providers + the
+SessionStore seam): the local medium probes each unit's record
+file, its content objects, AND the quarantined copies (the sweep's
+moved bytes with their `.reason` files); SQLite probes the record
+and object rows (SELECT EXISTS over the raw 32-byte identity
+blobs — the one-transaction atomicity means a remaining row is an
+uncommitted Phase B). (3) The GAP-AWARE AUDIT DISCOVERY: the
+per-candidate descent crosses legitimately reclaimed ranges via
+the most recent on-chain MK's skip table (the established
+compacted-walk treatment — an uncovered absence still fails
+closed), so an audit sitting below a later-reclaimed range is
+discovered without a legitimate gap being reinterpreted as
+corruption.
+
+**THE REAL-KILL EVIDENCE (two deterministic child seams, both
+windows).** `ARM_RECLAIM_LAST_UNIT` (local.rs, exit 11 — after the
+LAST unit's record deletion, before its objects) and
+`ARM_RECLAIM_AFTER_MEDIUM` (crossing.rs, exit 12 — after
+`medium.reclaim`, before the journal retirement). The regressions:
+`a_real_death_at_the_last_unit_resumes_and_converges` (window A:
+the durable post-death walk already skips both index members — the
+misclassification's exact precondition, asserted; the recovery
+plus the same retry RESUMES (never nothing-eligible), completes
+the last unit's objects including the sweep-quarantined copies,
+appends NO second audit (the head unchanged), converges onto the
+cleanly-reclaimed twin's identical object sets with an empty
+quarantine; the reclaimed key's reuse still rejected and a
+depends_on naming the reclaimed member still resolved via the
+permanent index; the subsequent call refuses nothing-eligible) and
+`a_real_death_before_the_journal_retirement_resumes_and_completes`
+(window B, over the ROTATED two-checkpoint campaign: the stale
+root journal AND its sidecar lock still on disk post-death — the
+incomplete retirement visible; the recovery plus the same retry
+removes zero medium bytes (idempotent) and retires the audited
+stale journal with its lock, converging onto the twin's identical
+object sets and byte-identical audit head; the subsequent call
+refuses nothing-eligible). Both children rebuild their fixtures at
+environment-provided paths (the `rotated_two_checkpoint_campaign_at`
+path-based core).
+
+**The verification at `d721620`:** fmt and `clippy --workspace
+--all-targets -- -D warnings` green (the selection's target tuple
+factored into the `ReclaimTarget` type); the workspace **601
+passed + 1 intentionally ignored, 0 failed** (the F1–F4
+corrective's 597 + the 4 R1 tests); the `pp_b3_reclaim` matrix 16
+passed 0 failed (the 12 prior plus the 4 new); the checkpoint,
+rotation, and membership matrices green unchanged; the double
+release-mode selftest green both runs (601 / 45 suites, identical
+results modulo timings — the frozen Stage-0 fingerprint pins hold,
+`engine-core` untouched); `cargo build --workspace` green. **The
+CI: run 40227543159 GREEN on all three platforms, verified
+firsthand job-level over the corrected head `d721620`**
+(ubuntu-latest 7m33s — the Linux-only Vulkan offscreen smoke is
+the long step; windows-latest 3m48s; macos-15 ARM64 3m42s; via the
+PR #3 pull_request event — the CI vehicle, never merged; the
+annotations are the known runner-infrastructure notes). The
+protected branches verified unchanged (main=5dbb377,
+stage5=047faf9, macos-port=ba395d8, design=a47ef10, pp-b1=bfe60b7,
+pp-b2=00109b0); PRs #1/#2 unchanged, open/draft.
+
+**The honest boundaries of the R1 corrective:**
+- The two new seams are PROCESS-TERMINATION kills (deterministic
+  exit-code deaths at the exact durable boundaries): they
+  establish real-death restartability of the audited protocol and
+  the whole-manifest completion, NOT platform-wide power-loss
+  durability (D-PP-7's rig domain, never claimed).
+- The SQLite provider's transactional semantics make window A
+  structurally impossible on that provider (the Phase-B delete is
+  one all-or-nothing transaction — there is no intermediate
+  records-gone-objects-present state); its `reclaim_pending` row
+  probe is exercised by the parity test's completed re-run, and
+  window B's driver-side journal handling is provider-independent
+  (covered by the local real-kill test over the same driver path).
+- A disclosed latent gap, PRE-EXISTING and unexercised by any test
+  (an identified follow-up, never silently skipped): the
+  checkpoint RANGE WALK classifies the session-snapshot family,
+  the consequence-batch domain, the checkpoint-metadata boundary,
+  and the founding — it does NOT classify the
+  reclamation-ledger/1 domain, so a checkpoint published AFTER a
+  reclamation would refuse at the range walk. Every existing test
+  publishes its checkpoints before any reclamation (the audited
+  cadence of the delivered machinery); the R1 gap-aware descent
+  handles the audit-discovery side of the interleaved ordering
+  defensively, but the range-walk classification is outside R1's
+  bounded scope and remains for a future authorized corrective.
+- The fail-closed wrong-deletion case is unchanged: a hand-deleted
+  range record with SOME present selects the fresh path and fails
+  at the digest walk.
+
+**The preserved invariants:** D-PP-4's architecture; the
+D-PP-4a/4b rejections; the two-revision SK/MK structure; the
+immutable revision-record bytes; the permanent MK metadata and
+confirming-evidence guarantees; PP-B1/B2 behavior; the fingerprints
+and recovery contracts; no automatic reclamation, no new policy
+defaults, no PP-B4 orchestration.
+
+**THE FINAL RENEWED STOP.** PP-B3's R1 corrective is delivered and
+stopped for the renewed independent PASS/HOLD review. The tested
+code SHA `d721620`; the CI 40227543159 green ×3 over it; the
+workspace 601 passed + 1 intentionally ignored at it. The next
+entry point: the renewed verdict or the owner's rig evidence
+(§12). This record never declares the batch CLOSED. The physical
+Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
+further implementation remain unauthorized until separate explicit
+owner GOs.
