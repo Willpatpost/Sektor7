@@ -675,6 +675,13 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         Ok(pipeline)
     }
 
+    /// The pipeline's journal (read-only access — the rotation's
+    /// classification and the diagnostics read the durable T1
+    /// state; the instance and its sidecar lock stay owned here).
+    pub fn journal(&self) -> &T1Journal {
+        &self.journal
+    }
+
     /// Stages one consequential envelope — the in-memory accrual
     /// (never guaranteed across a crash). A tracked identity staged
     /// again with different content is a conflicting reuse and fails

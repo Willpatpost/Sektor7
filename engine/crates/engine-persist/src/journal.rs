@@ -1957,7 +1957,7 @@ fn platform_tier() -> SyncTier {
     }
 }
 
-fn io_err(op: &'static str, path: &Path, source: io::Error) -> JournalError {
+pub(crate) fn io_err(op: &'static str, path: &Path, source: io::Error) -> JournalError {
     JournalError::Io {
         op,
         path: path.display().to_string(),
@@ -1968,13 +1968,13 @@ fn io_err(op: &'static str, path: &Path, source: io::Error) -> JournalError {
 /// The Unix parent-directory sync after creation (std exposes no
 /// Windows directory flush — the tier carries the limitation).
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

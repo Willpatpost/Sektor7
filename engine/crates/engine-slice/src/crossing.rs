@@ -23,12 +23,13 @@ use engine_core::{
 use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
-    CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope, ConsequenceId,
-    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
-    MediumError, OccurrenceSpan, PipelineError, ReclaimedIndexEntry, Reconciliation,
-    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
-    SourcePosition, StoredObject, T1Journal, TailState, chain_range_digest, compute_digest_seed,
-    publish_checkpoint_mk, reconcile,
+    CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
+    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
+    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, ReclaimedIndexEntry,
+    Reconciliation, RecordedCancellation, RecoveryAnchor, RecoveryError, RevisionRecord,
+    SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
+    TransactionId, active_journal_path, chain_range_digest, compute_digest_seed,
+    publish_checkpoint_mk, reconcile, rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -1066,6 +1067,94 @@ impl SessionCrossing {
         })
     }
 
+    /// The explicit T1 journal rotation (PP-B3, D-PP-4's §4.4
+    /// survival rules, the conservative form) over the live
+    /// single-writer session: each committed transaction is
+    /// classified against the CHAIN-VERIFIED anchor — the newest
+    /// session snapshot's lane-summary boundary (never the caller's
+    /// unpublished in-memory state) — and the chain-derived
+    /// confirmed set. A transaction retires only when it is canceled
+    /// (inert by construction) or when EVERY one of its consequential
+    /// identities is canonically confirmed AND subsumed below the
+    /// verified anchor's lane boundary (materialized-and-confirmed-
+    /// subsumed, the §4.4 retirement rule); everything else survives
+    /// — the outstanding unconfirmed work, the plans, and the
+    /// confirmed-but-unmaterialized captures (their episodes sit
+    /// above the boundary until the reactivation materializes them).
+    /// The surviving set is written to a fresh re-anchored journal
+    /// (the mechanism's own scan verification and atomic pointer
+    /// flip), and this crossing's pipeline reopens over the new
+    /// journal (the keys reseeded from it, the confirmed set
+    /// re-derived from the chain; the staged in-memory accrual is
+    /// honestly lost, P0-5). The legacy journal is retained on disk,
+    /// untouched, until the reclamation boundary. The synchronous
+    /// single-writer discipline closes the swap/flip window — no
+    /// append can interleave.
+    pub fn rotate_journal(&mut self) -> Result<JournalRotation, TransitionError> {
+        // THE CHAIN-VERIFIED ANCHOR: the newest session snapshot's
+        // director state (a compaction the operator has not published
+        // is not subsumption evidence — the anchor on the chain is).
+        let Some((_anchor_spine, anchor_director)) = latest_snapshot_at(&self.store)? else {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "journal-rotation/no-anchor",
+            });
+        };
+        let boundary = anchor_director
+            .ledger()
+            .summarized()
+            .map(|summary| summary.boundary);
+        let subsumed = |identity: &ConsequenceId| {
+            boundary.is_some_and(|boundary| identity.episode <= boundary[identity.region as usize])
+        };
+        // THE CLASSIFICATION (§4.4): retire iff canceled, or
+        // actionable with every identity confirmed AND subsumed
+        // below the verified anchor's boundary.
+        let journal = self.pipeline.journal();
+        let mut retained: Vec<CommittedTransaction> = Vec::new();
+        let mut retired: Vec<TransactionId> = Vec::new();
+        for transaction in journal.transactions() {
+            let canceled = journal.is_canceled(transaction.id);
+            let settled = transaction
+                .envelopes
+                .iter()
+                .all(|envelope| self.pipeline.is_confirmed(envelope.id) && subsumed(&envelope.id));
+            if canceled || settled {
+                retired.push(transaction.id);
+            } else {
+                retained.push(transaction.clone());
+            }
+        }
+        // Cancellations survive while their target survives.
+        let retained_ids: BTreeSet<TransactionId> =
+            retained.iter().map(|transaction| transaction.id).collect();
+        let retained_cancellations: Vec<RecordedCancellation> = journal
+            .cancellations()
+            .iter()
+            .filter(|cancellation| retained_ids.contains(&cancellation.target))
+            .cloned()
+            .collect();
+        // THE MECHANISM: write + scan-verify + flip — the pointer
+        // lands beside the journal this crossing holds.
+        let legacy = journal.path().to_path_buf();
+        let rotation = rotate_journal(&legacy, &retained, &retained_cancellations, &retired)
+            .map_err(PipelineError::Journal)?;
+        // THE SWAP: this crossing's pipeline reopens over the new
+        // journal — the keys reseeded from it, the confirmed set
+        // re-derived from the chain.
+        let journal = T1Journal::open(&rotation.new_path).map_err(PipelineError::Journal)?;
+        let medium = SessionStore::open(&self.store).map_err(PipelineError::Medium)?;
+        self.pipeline = CommitPipeline::open(medium, journal)?;
+        Ok(rotation)
+    }
+
+    /// The journal this crossing's pipeline holds (diagnostics — the
+    /// rotation's swap and the recovery's pointer resolution are
+    /// observable here).
+    pub fn pipeline_journal_path(&self) -> &Path {
+        self.pipeline.journal().path()
+    }
+
     /// The canonical re-drive: batches the actionable unconfirmed
     /// journal keys into a consequence-batch/2 revision on the chain
     /// (the pending-T1 → confirmed-canonical transition — the gating
@@ -1154,11 +1243,22 @@ impl SessionCrossing {
         //    after canonical confirmation — the accepted B3 coherence
         //    case: a confirmed consequence materialized in a verified
         //    snapshot needs no historical T1) is an EMPTY scan: the
-        //    chain and the snapshot carry the truth.
-        let scan = match T1Journal::scan_file(journal_path) {
+        //    chain and the snapshot carry the truth. THE
+        //    active-journal resolution (PP-B3): the rotation's
+        //    pointer beside the legacy path names the rotated
+        //    journal; a missing pointer resolves the legacy itself —
+        //    every pre-rotation campaign recovers identically.
+        let active_journal = active_journal_path(journal_path).map_err(PipelineError::Journal)?;
+        // A POINTER-RESOLVED journal that does not exist is a broken
+        // rotation state — fail closed, never the empty fallback. The
+        // absent-LEGACY case (no pointer present) keeps the accepted
+        // B3 coherence semantics: an empty scan, the chain and the
+        // snapshot carrying the truth.
+        let pointer_present = active_journal != journal_path;
+        let scan = match T1Journal::scan_file(&active_journal) {
             Ok(scan) => scan,
             Err(engine_persist::JournalError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
+                if source.kind() == std::io::ErrorKind::NotFound && !pointer_present =>
             {
                 JournalScan {
                     committed: Vec::new(),
@@ -1179,7 +1279,7 @@ impl SessionCrossing {
         //    re-applied), every later one claims against zero — the
         //    prior install's capture zeroed the scratch exactly as
         //    the live sequence did.
-        let journal = T1Journal::open(journal_path).map_err(PipelineError::Journal)?;
+        let journal = T1Journal::open(&active_journal).map_err(PipelineError::Journal)?;
         let mut crossing = SessionCrossing::open_at(location, journal, campaign)?;
         let mut restored = vec![false; NPC_COUNT];
         for transaction in &scan.committed {

@@ -53,7 +53,9 @@ use std::path::{Path, PathBuf};
 
 use engine_core::{Decoder, Encoder};
 use engine_persist::hash::{Hash, hash_object};
-use engine_persist::{CanonicalMedium, ChainSummary, MediumError, SqliteMedium, T1Journal};
+use engine_persist::{
+    CanonicalMedium, ChainSummary, MediumError, SqliteMedium, T1Journal, active_journal_path,
+};
 
 use crate::crossing::SessionCrossing;
 use crate::store::StoreLocation;
@@ -376,7 +378,16 @@ pub fn backup_campaign(
     // ENTIRE capture — a live session's T1Journal holds it for its
     // lifetime, so the acquisition either establishes the boundary
     // mechanically or refuses (never blocks, never captures under a
-    // live session).
+    // live session). THE active-journal resolution (PP-B3): the
+    // rotation's pointer beside the legacy path names the rotated
+    // journal — the boundary, the captured bytes, and the manifest's
+    // source-journal provenance all bind THE ACTIVE journal; a
+    // missing pointer resolves the legacy itself (the pre-rotation
+    // compatibility: every existing campaign backs up identically).
+    let journal_path =
+        &active_journal_path(journal_path).map_err(|error| BackupError::Incoherent {
+            detail: format!("the active-journal pointer does not resolve: {error}"),
+        })?;
     let journal_guard = JournalGuard::try_acquire(journal_path)?;
     fs::create_dir(output_dir).map_err(|e| io_err("create the backup directory", output_dir, e))?;
     // (1) The source must validate — the actual chain validation; a

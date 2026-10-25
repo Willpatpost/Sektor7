@@ -50,6 +50,7 @@ pub mod migrate;
 pub mod pipeline;
 pub mod record;
 pub mod recovery;
+pub mod rotation;
 pub mod sqlite;
 
 #[cfg(test)]
@@ -101,6 +102,7 @@ pub use recovery::{
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
 };
+pub use rotation::{JOURNAL_ACTIVE_SUFFIX, JournalRotation, active_journal_path, rotate_journal};
 pub use sqlite::{
     SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };
