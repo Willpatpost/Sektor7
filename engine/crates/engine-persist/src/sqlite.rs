@@ -940,6 +940,45 @@ impl CanonicalMedium for SqliteMedium {
         tx.commit().map_err(|e| sqlite_err("commit reclaim", e))?;
         Ok(removed)
     }
+
+    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
+        // The whole-manifest completion probe (the review corrective
+        // R1) over this provider's atomicity model: the Phase-B
+        // transaction is all-or-nothing, so any remaining row — a
+        // unit's record row or a referenced object row — means the
+        // transaction never committed and the reclamation is
+        // restartable work, never a completed one. The raw 32-byte
+        // identity blobs, the established binding form.
+        for unit in units {
+            let record_pending = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE hash = ?1)",
+                    params![unit.record.as_bytes()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|found| found != 0)
+                .map_err(|e| sqlite_err("probe reclaim record", e))?;
+            if record_pending {
+                return Ok(true);
+            }
+            for object in &unit.objects {
+                let object_pending = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                        params![object.as_bytes()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|found| found != 0)
+                    .map_err(|e| sqlite_err("probe reclaim object", e))?;
+                if object_pending {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 // ------------------------------------------------------------ the inserts

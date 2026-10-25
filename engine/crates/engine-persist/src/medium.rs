@@ -372,4 +372,18 @@ pub trait CanonicalMedium {
     /// validation (the existing MissingObject). Returns the count of
     /// objects removed by this call.
     fn reclaim(&mut self, units: &[crate::reclaim::ReclaimUnit]) -> Result<u64, MediumError>;
+
+    /// The manifest-completion probe (PP-B3's Phase B, the review
+    /// corrective R1): does ANY audited byte remain — a unit's
+    /// record object, a referenced content object, or a copy the
+    /// orphan sweep quarantined? A reclamation's completion is
+    /// judged against the WHOLE audited manifest, never record
+    /// presence alone: an interrupted Phase B that removed every
+    /// record file but not yet the objects (or the sweep-moved
+    /// copies) is RESTARTABLE WORK, not a completed reclamation.
+    /// Read-only; the same manifest [`Self::reclaim`] deletes from.
+    fn reclaim_pending(
+        &mut self,
+        units: &[crate::reclaim::ReclaimUnit],
+    ) -> Result<bool, MediumError>;
 }

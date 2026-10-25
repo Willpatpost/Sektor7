@@ -1304,14 +1304,20 @@ impl SessionCrossing {
                 });
             }
         }
-        // THE TARGET SELECTION (the review corrective F3): the
-        // oldest checkpoint beyond the window whose range is NOT
-        // fully reclaimed. MK records are permanent — a completed
-        // reclamation stays in the summary forever — so completed
-        // ranges are skipped, incomplete ones (an interrupted
-        // Phase B) are resumed, and the reclamation progresses
-        // generation by generation.
-        let mut target: Option<(Hash, Hash, CheckpointMetadata)> = None;
+        // THE TARGET SELECTION (the review correctives F3 + R1): the
+        // oldest checkpoint beyond the window with manifest-authorized
+        // work remaining. MK records are permanent — a completed
+        // reclamation stays in the summary forever — so the selection
+        // distinguishes three states: an UNAUDITED range with present
+        // indexed records (the fresh eligibility, proven against the
+        // still-present bytes below); an AUDITED range whose manifest
+        // is NOT yet satisfied (an interrupted Phase B — resumed,
+        // even when every indexed record file is already gone: the
+        // referenced objects, the sweep-quarantined copies, or the
+        // audited stale journal generations may remain); and an
+        // AUDITED range whose manifest IS fully satisfied (completed
+        // — skipped, never repeated).
+        let mut target: Option<ReclaimTarget> = None;
         for candidate in summary.checkpoints[generations as usize..].iter().rev() {
             let mk_record = medium
                 .read_record(candidate)
@@ -1339,63 +1345,88 @@ impl SessionCrossing {
                     detail: "reclaim/metadata-binding",
                 });
             }
-            // Fully reclaimed? Every index member absent.
-            let mut any_present = false;
-            for entry in &metadata.index {
-                match medium.read_record(&entry.hash) {
-                    Ok(_) => {
-                        any_present = true;
+            match find_installed_reclamation(&mut medium, candidate)? {
+                Some((record_id, ledger)) => {
+                    // THE AUDIT-COHERENCE verification (fail closed on
+                    // invalid bindings — the resume standard): the
+                    // bindings AND the manifest must cover exactly the
+                    // permanent index's identities.
+                    if ledger.sk != sk
+                        || ledger.range_digest != metadata.range_digest
+                        || ledger.records != metadata.range_records
+                    {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "reclaim/audit-incoherent",
+                        });
+                    }
+                    let index_hashes: BTreeSet<Hash> =
+                        metadata.index.iter().map(|entry| entry.hash).collect();
+                    let unit_hashes: BTreeSet<Hash> =
+                        ledger.units.iter().map(|unit| unit.record).collect();
+                    if index_hashes != unit_hashes {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "reclaim/audit-incoherent",
+                        });
+                    }
+                    // THE WHOLE-MANIFEST COMPLETION CHECK (the review
+                    // corrective R1): completion is judged against the
+                    // ENTIRE durable audit — the medium's unit bytes
+                    // (the record files, the referenced objects, the
+                    // sweep-quarantined copies) AND the audited stale
+                    // journal generations with their sidecar locks.
+                    // Any remaining byte is restartable work; only a
+                    // fully satisfied manifest is complete.
+                    let journal_dir = legacy_journal.parent().unwrap_or_else(|| Path::new("."));
+                    let journals_pending = ledger.journal_files.iter().any(|name| {
+                        journal_dir.join(name).is_file()
+                            || journal_dir.join(format!("{name}.lock")).is_file()
+                    });
+                    if medium
+                        .reclaim_pending(&ledger.units)
+                        .map_err(PipelineError::Medium)?
+                        || journals_pending
+                    {
+                        target = Some((*candidate, sk, metadata, Some((record_id, ledger))));
                         break;
                     }
-                    Err(MediumError::MissingObject { .. }) => {}
-                    Err(other) => return Err(PipelineError::Medium(other).into()),
+                    // Completed — the manifest fully satisfied — skip.
+                }
+                None => {
+                    // The fresh-eligibility probe: record presence.
+                    let mut any_present = false;
+                    for entry in &metadata.index {
+                        match medium.read_record(&entry.hash) {
+                            Ok(_) => {
+                                any_present = true;
+                                break;
+                            }
+                            Err(MediumError::MissingObject { .. }) => {}
+                            Err(other) => return Err(PipelineError::Medium(other).into()),
+                        }
+                    }
+                    if any_present {
+                        target = Some((*candidate, sk, metadata, None));
+                        break;
+                    }
                 }
             }
-            if any_present {
-                target = Some((*candidate, sk, metadata));
-                break;
-            }
         }
-        let Some((oldest_mk, sk, metadata)) = target else {
+        let Some((oldest_mk, sk, metadata, installed)) = target else {
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "reclaim/nothing-eligible",
             });
         };
-        // THE PRE-SCAN for an installed audit (the restart): the
-        // bounded descent from the head to the target MK — the audit
-        // always sits above its checkpoint, and everything below the
-        // oldest MK may already be reclaimed (the descent never
-        // crosses a gap). An installed audit means Phase A already
-        // verified and durably recorded the eligibility: the
-        // re-derivation verifies the installed record, never
-        // re-requiring the (now partially deleted) range bytes.
-        let (ledger_id, ledger) = match find_installed_reclamation(&mut medium, &oldest_mk)? {
-            Some((record_id, ledger)) => {
-                // THE READ-BACK verification of the installed audit:
-                // the bindings AND the manifest must cover exactly
-                // the permanent index's identities.
-                if ledger.sk != sk
-                    || ledger.range_digest != metadata.range_digest
-                    || ledger.records != metadata.range_records
-                {
-                    return Err(TransitionError::InstallIncompatible {
-                        region: 0,
-                        detail: "reclaim/audit-incoherent",
-                    });
-                }
-                let index_hashes: BTreeSet<Hash> =
-                    metadata.index.iter().map(|entry| entry.hash).collect();
-                let unit_hashes: BTreeSet<Hash> =
-                    ledger.units.iter().map(|unit| unit.record).collect();
-                if index_hashes != unit_hashes {
-                    return Err(TransitionError::InstallIncompatible {
-                        region: 0,
-                        detail: "reclaim/audit-incoherent",
-                    });
-                }
-                (record_id, ledger)
-            }
+        // THE PRE-SCAN: the installed audit — discovered and
+        // coherence-verified by the selection above — means Phase A
+        // already durably recorded the eligibility: the re-derivation
+        // verifies the installed record, never re-requiring the (now
+        // partially deleted) range bytes; no audit means the FULL
+        // Phase A below.
+        let (ledger_id, ledger) = match installed {
+            Some((record_id, ledger)) => (record_id, ledger),
             None => {
                 // THE FULL PHASE A: the digest RECOMPUTED against the
                 // still-present range bytes — the pre-reclamation
@@ -1535,6 +1566,13 @@ impl SessionCrossing {
         let removed_objects = medium
             .reclaim(&ledger.units)
             .map_err(PipelineError::Medium)?;
+        // THE MEDIUM-COMMITTED/JOURNAL-RETIREMENT-UNCOMMITTED crash
+        // seam (test-only — see [`ARM_RECLAIM_AFTER_MEDIUM`], the
+        // review corrective R1's real-kill evidence): every
+        // manifest-authorized medium byte is gone; the audited stale
+        // journal generations never retire — the restart resumes
+        // from the installed audit and completes the cleanup.
+        reclaim_after_medium_seam();
         // The stale journal generations (only those named in the
         // audited ledger — only after the rotation's verified active
         // journal stands), each with its sidecar lock.
@@ -1877,6 +1915,28 @@ pub static ARM_RECLAIM_AFTER_AUDIT: AtomicBool = AtomicBool::new(false);
 fn reclaim_after_audit_seam() {
     if ARM_RECLAIM_AFTER_AUDIT.load(Ordering::Relaxed) {
         std::process::exit(9);
+    }
+}
+
+/// Test-only (the genuine medium-committed/journal-retirement-
+/// uncommitted reclamation crash seam, the review corrective R1's
+/// real-kill evidence): when armed, the reclamation hard-exits AFTER
+/// the canonical medium's manifest deletes complete and BEFORE the
+/// audited stale journal generations retire — every indexed record
+/// and object is gone while the manifest is NOT complete (the
+/// journal files and their sidecar locks remain), the exact
+/// post-medium window the whole-manifest completion probe closes
+/// (exit 12, distinct from the after-audit seam's 9, the mid-unit
+/// seam's 10, and the last-unit seam's 11). Engine code never arms
+/// this; the static is process-local, so only the child that armed
+/// it dies.
+#[doc(hidden)]
+pub static ARM_RECLAIM_AFTER_MEDIUM: AtomicBool = AtomicBool::new(false);
+
+/// The after-medium seam's exit point (see [`ARM_RECLAIM_AFTER_MEDIUM`]).
+fn reclaim_after_medium_seam() {
+    if ARM_RECLAIM_AFTER_MEDIUM.load(Ordering::Relaxed) {
+        std::process::exit(12);
     }
 }
 
@@ -2419,12 +2479,30 @@ fn nearest_retained_ancestor(
     cursor
 }
 
+/// The reclamation selection's target: the checkpoint's MK, its SK,
+/// its decoded metadata, and the installed audit when one exists
+/// (the review corrective R1 — the selection carries the discovered
+/// ledger so the pre-scan never re-derives it).
+type ReclaimTarget = (
+    Hash,
+    Hash,
+    CheckpointMetadata,
+    Option<(Hash, ReclamationLedger)>,
+);
+
 /// Finds the installed reclamation audit for a checkpoint (the
-/// restart's re-derivation): the bounded descent from the head down
-/// TO the target MK — the audit always sits above its checkpoint,
-/// and everything below the oldest MK may already be reclaimed (the
-/// descent never crosses a gap). A reclamation-ledger/1 first
-/// content object decodes and binds by its mk.
+/// selection's re-derivation): the bounded descent from the head
+/// down TO the target MK — the audit always sits above its
+/// checkpoint. THE COMPACTED MODE (the review corrective R1): the
+/// per-candidate discovery now descends past candidates whose
+/// audits sit below later-reclaimed ranges — an absent parent is a
+/// gap, legitimate only under the most recent on-chain MK's skip
+/// table (the record's first content object carrying the
+/// checkpoint-metadata domain, the established gap-aware descent);
+/// anything else is hard corruption, fail closed — never a
+/// legitimate gap reinterpreted as corruption. A
+/// reclamation-ledger/1 first content object decodes and binds by
+/// its mk.
 fn find_installed_reclamation(
     medium: &mut SessionStore,
     target_mk: &Hash,
@@ -2432,6 +2510,7 @@ fn find_installed_reclamation(
     let Some(mut current) = medium.head().map_err(PipelineError::Medium)? else {
         return Ok(None);
     };
+    let mut skip_table: Option<(Hash, CheckpointMetadata)> = None;
     loop {
         if current == *target_mk {
             // The target checkpoint itself: its object is the
@@ -2442,19 +2521,52 @@ fn find_installed_reclamation(
         let record = medium
             .read_record(&current)
             .map_err(PipelineError::Medium)?;
+        let parent = record.parent;
         if let Some(object) = record.content_refs.first() {
             let bytes = medium.read_object(object).map_err(PipelineError::Medium)?;
-            if peek_object_domain(&bytes).as_deref() == Some(RECLAMATION_LEDGER_DOMAIN) {
-                let ledger = ReclamationLedger::decode(&bytes).map_err(PipelineError::Format)?;
-                if &ledger.mk == target_mk {
-                    return Ok(Some((current, ledger)));
+            if let Some(domain) = peek_object_domain(&bytes).as_deref() {
+                if domain == RECLAMATION_LEDGER_DOMAIN {
+                    let ledger =
+                        ReclamationLedger::decode(&bytes).map_err(PipelineError::Format)?;
+                    if &ledger.mk == target_mk {
+                        return Ok(Some((current, ledger)));
+                    }
+                } else if domain == CHECKPOINT_METADATA_DOMAIN {
+                    let metadata =
+                        CheckpointMetadata::decode(&bytes).map_err(PipelineError::Format)?;
+                    skip_table = Some((current, metadata));
                 }
             }
         }
-        let Some(parent) = record.parent else {
+        let Some(parent) = parent else {
             return Ok(None);
         };
-        current = parent;
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some((owner, table)) = skip_table.as_ref() else {
+                    return Err(
+                        PipelineError::Medium(MediumError::MissingObject { hash: parent }).into(),
+                    );
+                };
+                let jump = if current == *owner {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(jump) = jump else {
+                    return Err(
+                        PipelineError::Medium(MediumError::MissingObject { hash: parent }).into(),
+                    );
+                };
+                current = jump;
+            }
+            Err(other) => return Err(PipelineError::Medium(other).into()),
+        }
     }
 }
 

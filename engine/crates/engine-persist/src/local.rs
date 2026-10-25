@@ -1152,7 +1152,7 @@ impl LocalFileMedium {
     fn reclaim_units_locked(&self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
         let quarantine_dir = self.root.join(QUARANTINE_DIR);
         let mut removed = 0u64;
-        for unit in units {
+        for (index, unit) in units.iter().enumerate() {
             let record_path = self.object_path(&unit.record);
             if record_path.is_file() {
                 fs::remove_file(&record_path)
@@ -1165,6 +1165,15 @@ impl LocalFileMedium {
             // orphaning window the audited manifest closes on the
             // retry.
             reclaim_mid_unit_seam();
+            // The genuine last-unit crash seam (test-only — see
+            // [`ARM_RECLAIM_LAST_UNIT`], the review corrective R1's
+            // real-kill evidence): the LAST indexed record is removed
+            // while its referenced content objects have not run —
+            // record presence alone would then misclassify the
+            // reclamation as complete.
+            if index + 1 == units.len() {
+                reclaim_last_unit_seam();
+            }
             for object in &unit.objects {
                 let object_path = self.object_path(object);
                 if object_path.is_file() {
@@ -1187,6 +1196,34 @@ impl LocalFileMedium {
             }
         }
         Ok(removed)
+    }
+
+    /// The whole-manifest completion probe (the review corrective
+    /// R1): any remaining audited byte — a unit's record file, a
+    /// referenced content object in place, or a copy the orphan
+    /// sweep moved into quarantine (with its reason file) — means
+    /// the reclamation is NOT complete, however many record files
+    /// are already gone. Read-only, lock-free (existence checks
+    /// against the same paths [`Self::reclaim_units_locked`]
+    /// removes).
+    fn reclaim_pending_locked(&self, units: &[ReclaimUnit]) -> bool {
+        let quarantine_dir = self.root.join(QUARANTINE_DIR);
+        for unit in units {
+            if self.object_path(&unit.record).is_file() {
+                return true;
+            }
+            for object in &unit.objects {
+                if self.object_path(object).is_file()
+                    || quarantine_dir.join(object.hex()).is_file()
+                    || quarantine_dir
+                        .join(format!("{}.reason", object.hex()))
+                        .is_file()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // ---------------------------------------------------- orphan protocol
@@ -1459,6 +1496,10 @@ impl CanonicalMedium for LocalFileMedium {
         let _ = self.unlock();
         removed
     }
+
+    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
+        Ok(self.reclaim_pending_locked(units))
+    }
 }
 
 /// Test-only (the genuine mid-unit reclamation crash seam, the
@@ -1476,6 +1517,25 @@ pub static ARM_RECLAIM_MID_UNIT: AtomicBool = AtomicBool::new(false);
 fn reclaim_mid_unit_seam() {
     if ARM_RECLAIM_MID_UNIT.load(Ordering::Relaxed) {
         std::process::exit(10);
+    }
+}
+
+/// Test-only (the genuine last-unit reclamation crash seam, the
+/// review corrective R1's real-kill evidence): when armed, the
+/// reclamation delete hard-exits AFTER the LAST unit's record object
+/// is removed and BEFORE its referenced content objects — every
+/// indexed record is then absent while the manifest is NOT complete,
+/// the exact misclassification window the whole-manifest completion
+/// probe closes (exit 11, distinct from the mid-unit seam's 10 and
+/// the after-audit seam's 9). Engine code never arms this; the
+/// static is process-local, so only the child that armed it dies.
+#[doc(hidden)]
+pub static ARM_RECLAIM_LAST_UNIT: AtomicBool = AtomicBool::new(false);
+
+/// The last-unit seam's exit point (see [`ARM_RECLAIM_LAST_UNIT`]).
+fn reclaim_last_unit_seam() {
+    if ARM_RECLAIM_LAST_UNIT.load(Ordering::Relaxed) {
+        std::process::exit(11);
     }
 }
 

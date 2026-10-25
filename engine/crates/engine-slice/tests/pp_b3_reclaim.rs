@@ -24,12 +24,14 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
-use engine_persist::local::ARM_RECLAIM_MID_UNIT;
+use engine_persist::local::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
 use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, PipelineError,
     RevisionRecord, SqliteMedium, StoredObject, T1Journal,
 };
-use engine_slice::crossing::{ARM_RECLAIM_AFTER_AUDIT, SessionCrossing, TransitionError};
+use engine_slice::crossing::{
+    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
+};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 use engine_slice::store::StoreLocation;
@@ -1187,6 +1189,381 @@ fn the_sqlite_provider_reclaims_with_transactional_atomicity() {
     let detail = match recovered.reclaim_checkpoint(&dir.journal(), 1) {
         Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
         Err(other) => panic!("the completed sqlite re-run refuses, got {other:?}"),
+        Ok(_) => panic!("a completed reclamation never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+}
+
+// ---------------------------------- the review corrective R1's windows
+
+/// The canonical two-checkpoint campaign with a rotation before the
+/// reclamation (the full-stack shape): an outstanding unconfirmed
+/// far-boundary transaction surviving re-anchored, the legacy root
+/// journal becoming a stale generation under the audited retirement.
+fn rotated_two_checkpoint_campaign(
+    dir: &TestDir,
+    campaign: &str,
+) -> (
+    Spine<NpcWorld>,
+    RegionDirector,
+    SessionCrossing,
+    Hash,
+    PathBuf,
+) {
+    rotated_two_checkpoint_campaign_at(&dir.store(), &dir.journal(), campaign)
+}
+
+/// The path-based core (the real-child crash tests rebuild this
+/// campaign in a spawned process from environment-provided paths).
+fn rotated_two_checkpoint_campaign_at(
+    store: &Path,
+    journal_path: &Path,
+    campaign: &str,
+) -> (
+    Spine<NpcWorld>,
+    RegionDirector,
+    SessionCrossing,
+    Hash,
+    PathBuf,
+) {
+    let far = far_from_region_4();
+    let (mut spine, mut director, mut crossing, s1, _mk1) =
+        two_checkpoint_campaign_at(store, journal_path, campaign);
+    // The outstanding unconfirmed transaction over the
+    // post-reactivation accrual, then the rotation: the survivor
+    // re-anchors into a fresh generation and the legacy root journal
+    // becomes a stale generation under the audited retirement.
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let rotation = crossing.rotate_journal().expect("the rotation completes");
+    (spine, director, crossing, s1, rotation.new_path)
+}
+
+/// The R1 child (the window-A real death): the campaign, then the
+/// armed last-unit seam — the process dies AFTER the LAST indexed
+/// record's deletion and BEFORE its referenced objects, the exact
+/// state record-presence completion misclassifies as fully
+/// reclaimed.
+#[test]
+fn pp_b3_reclaim_child_last_unit() {
+    let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal = std::env::var(RECLAIM_CHILD_JOURNAL_ENV).unwrap();
+    let (spine, director, mut crossing, _s1, _mk1) =
+        two_checkpoint_campaign_at(Path::new(&store), Path::new(&journal), "child-last-unit");
+    drop(spine);
+    drop(director);
+    ARM_RECLAIM_LAST_UNIT.store(true, Ordering::SeqCst);
+    crossing
+        .reclaim_checkpoint(Path::new(&journal), 1)
+        .expect("the child reaches the armed seam");
+    panic!("the armed seam must terminate the child before this point");
+}
+
+#[test]
+fn a_real_death_at_the_last_unit_resumes_and_converges() {
+    // THE WINDOW-A REAL DEATH (the review corrective R1): a genuine
+    // child process dies AFTER the LAST indexed record's deletion
+    // and BEFORE its referenced objects — every indexed record is
+    // then absent while the manifest is NOT complete, the exact
+    // state the record-presence completion check misclassified as
+    // fully reclaimed. THE WHOLE-MANIFEST COMPLETION CHECK must
+    // classify it as restartable work: the recovery plus the same
+    // retry resumes from the installed audit — no second audit, no
+    // re-read of the removed records — completes the deletion
+    // (including the copies the next open's orphan sweep
+    // quarantined), and converges onto the cleanly-reclaimed twin's
+    // exact storage state; only then does the subsequent call
+    // refuse nothing-eligible.
+    let dir = TestDir::new("death-last-unit");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_reclaim_child_last_unit"])
+        .env(RECLAIM_CHILD_STORE_ENV, dir.store())
+        .env(RECLAIM_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(11),
+        "the child died after the last record deletion, before its objects"
+    );
+
+    // THE TWIN: the same campaign, reclaimed cleanly — the intended
+    // final storage state (the key captured before its reclamation:
+    // the deterministic campaign makes the identities identical).
+    let twin = TestDir::new("death-last-unit-twin");
+    let (spine, director, mut twin_crossing, twin_s1, _mk1) =
+        two_checkpoint_campaign(&twin, "child-last-unit");
+    drop(spine);
+    drop(director);
+    let s1_key = {
+        let mut medium = LocalFileMedium::open(twin.store()).unwrap();
+        medium
+            .read_record(&twin_s1)
+            .unwrap()
+            .idempotency_key
+            .unwrap()
+    };
+    let twin_reclaim = twin_crossing
+        .reclaim_checkpoint(&twin.journal(), 1)
+        .expect("the twin's reclamation completes");
+    assert_eq!(twin_reclaim.eligible_records, 2);
+    drop(twin_crossing);
+
+    // THE DURABLE POST-DEATH STATE: the audit installed, EVERY
+    // indexed record gone (the walk skips both S1 and SK1 — the
+    // misclassification's exact precondition), the last unit's
+    // objects still present (orphaned — the next open's sweep
+    // quarantines them), the authoritative state still validating.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.reclaimed_records, 2,
+            "both index members are gaps — record presence alone says complete"
+        );
+        assert_eq!(summary.records, 7);
+    }
+
+    // THE RESUME: the recovery plus the same retry — the whole-
+    // manifest completion check classifies the range as restartable
+    // (never nothing-eligible), the deletes complete from the
+    // manifest, and NO second audit is appended (the head stands).
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-last-unit")
+            .expect("the post-crash recovery works from SK2");
+    let head_before = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.head().unwrap().unwrap()
+    };
+    let reclamation = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect("the re-run resumes from the whole-manifest completion check");
+    assert_eq!(reclamation.eligible_records, 2);
+    assert!(
+        reclamation.removed_objects >= 1,
+        "the resumed deletes complete the last unit's orphaned objects"
+    );
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(
+            medium.head().unwrap().unwrap(),
+            head_before,
+            "no second audit — the resumed re-run appends nothing"
+        );
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.records, 7);
+    }
+
+    // THE CONVERGENCE onto the twin: identical object sets, the
+    // quarantine drained — the intended storage state, not merely
+    // quarantined orphans.
+    assert_eq!(
+        object_names(&dir.store()),
+        object_names(&twin.store()),
+        "the same retry converges on the intended storage state"
+    );
+    let remaining = std::fs::read_dir(dir.store().join("quarantine"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        remaining, 0,
+        "the orphaned copies are removed, not retained"
+    );
+
+    // THE HISTORICAL UNIVERSE preserved through the resumed
+    // completion: the reclaimed key's reuse still rejected; a
+    // depends_on naming the reclaimed member still resolved via the
+    // permanent index with the strictly-earlier epoch.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let reuse_object = publication_object(b"last-unit-reuse");
+        let reuse_record = RevisionRecord::regular(head, head_epoch, 9000)
+            .with_idempotency_key(s1_key)
+            .with_content_refs(vec![reuse_object.hash()]);
+        let error = medium
+            .append(&reuse_record, &[reuse_object], Some(head))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "duplicate-idempotency-key"
+                }
+            ),
+            "the reclaimed key's reuse stays rejected after the resumed completion: {error:?}"
+        );
+        let dep_object = publication_object(b"last-unit-dependency");
+        let dep_record = RevisionRecord::regular(head, head_epoch, 9001)
+            .with_idempotency_key(b"last-unit/dependency-key".to_vec())
+            .with_content_refs(vec![dep_object.hash()])
+            .with_depends_on(vec![twin_s1]);
+        match medium
+            .append(&dep_record, &[dep_object], Some(head))
+            .unwrap()
+        {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the reclaimed dependency resolves: {other:?}"),
+        }
+    }
+
+    // THE CONVERGED IDEMPOTENCE: the subsequent call refuses —
+    // nothing eligible only AFTER the cleanup truly completed.
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the converged re-run refuses, got {other:?}"),
+        Ok(_) => panic!("a completed reclamation never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+}
+
+/// The R1 child (the window-B real death): the rotated campaign,
+/// then the armed after-medium seam — the process dies AFTER the
+/// canonical medium's manifest deletes complete and BEFORE the
+/// audited stale journal generations retire.
+#[test]
+fn pp_b3_reclaim_child_before_journals() {
+    let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal = std::env::var(RECLAIM_CHILD_JOURNAL_ENV).unwrap();
+    let (spine, director, mut crossing, _s1, _active) = rotated_two_checkpoint_campaign_at(
+        Path::new(&store),
+        Path::new(&journal),
+        "child-before-journals",
+    );
+    drop(spine);
+    drop(director);
+    ARM_RECLAIM_AFTER_MEDIUM.store(true, Ordering::SeqCst);
+    crossing
+        .reclaim_checkpoint(Path::new(&journal), 1)
+        .expect("the child reaches the armed seam");
+    panic!("the armed seam must terminate the child before this point");
+}
+
+#[test]
+fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
+    // THE WINDOW-B REAL DEATH (the review corrective R1): a genuine
+    // child process dies AFTER the canonical medium's manifest
+    // deletes complete and BEFORE the audited stale journal
+    // generations retire — every indexed record and object is gone
+    // while the manifest is NOT complete (the stale root journal
+    // and its sidecar lock remain on disk). THE WHOLE-MANIFEST
+    // COMPLETION CHECK must classify it as restartable work: the
+    // recovery plus the same retry removes zero medium bytes
+    // (idempotent) and completes the audited journal retirement —
+    // converging onto the cleanly-reclaimed twin's exact storage
+    // state, the active journal still authoritative; only then does
+    // the subsequent call refuse nothing-eligible.
+    let dir = TestDir::new("death-before-journals");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_reclaim_child_before_journals"])
+        .env(RECLAIM_CHILD_STORE_ENV, dir.store())
+        .env(RECLAIM_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(12),
+        "the child died after the medium deletes, before the journal retirement"
+    );
+
+    // THE TWIN: the same rotated campaign, reclaimed cleanly — the
+    // intended final storage state (the stale root journal retired).
+    let twin = TestDir::new("death-before-journals-twin");
+    let (spine, director, mut twin_crossing, _s1, _active) =
+        rotated_two_checkpoint_campaign(&twin, "child-before-journals");
+    drop(spine);
+    drop(director);
+    let twin_reclaim = twin_crossing
+        .reclaim_checkpoint(&twin.journal(), 1)
+        .expect("the twin's reclamation completes");
+    assert_eq!(twin_reclaim.eligible_records, 2);
+    assert!(
+        !twin.journal().is_file(),
+        "the twin's stale root journal is retired"
+    );
+    drop(twin_crossing);
+
+    // THE DURABLE POST-DEATH STATE: every manifest-authorized medium
+    // byte gone (the walk skips both index members), the chain
+    // validating — and the audited stale journal generation STILL
+    // PRESENT with its sidecar lock: the incomplete retirement,
+    // visible on disk.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.records, 7);
+    }
+    let root_lock = {
+        let name = dir
+            .journal()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        dir.journal().with_file_name(format!("{name}.lock"))
+    };
+    assert!(
+        dir.journal().is_file(),
+        "the audited stale journal generation remains — the manifest is not complete"
+    );
+    assert!(root_lock.is_file(), "its sidecar lock remains with it");
+
+    // THE RESUME: the recovery plus the same retry — the journal
+    // side of the manifest completes (the medium side already
+    // satisfied: idempotent, zero removed).
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-before-journals")
+            .expect("the post-crash recovery follows the pointer to the active journal");
+    let reclamation = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect("the re-run resumes from the whole-manifest completion check");
+    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(
+        reclamation.removed_objects, 0,
+        "the medium side was already complete — only the journal retirement remained"
+    );
+    assert!(
+        reclamation.journal_files.contains(&dir.journal()),
+        "the audited stale journal retires on the resumed run"
+    );
+    assert!(!dir.journal().is_file(), "the stale root journal is gone");
+    assert!(!root_lock.is_file(), "the sidecar lock retired with it");
+
+    // THE CONVERGENCE onto the twin: identical object sets and a
+    // byte-identical audit head.
+    assert_eq!(
+        object_names(&dir.store()),
+        object_names(&twin.store()),
+        "the same retry converges on the intended storage state"
+    );
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let mut twin_medium = LocalFileMedium::open(twin.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let twin_head = twin_medium.head().unwrap().unwrap();
+        assert_eq!(head, twin_head);
+        assert_eq!(
+            medium.read_record(&head).unwrap().canonical_bytes(),
+            twin_medium
+                .read_record(&twin_head)
+                .unwrap()
+                .canonical_bytes(),
+            "the audit revision is byte-identical to the twin's"
+        );
+    }
+
+    // THE CONVERGED IDEMPOTENCE: the subsequent call refuses —
+    // nothing eligible only AFTER the cleanup truly completed.
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the converged re-run refuses, got {other:?}"),
         Ok(_) => panic!("a completed reclamation never repeats"),
     };
     assert_eq!(detail, "reclaim/nothing-eligible");

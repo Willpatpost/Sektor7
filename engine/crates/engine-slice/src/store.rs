@@ -153,4 +153,14 @@ impl CanonicalMedium for SessionStore {
             SessionStore::Sqlite(medium) => medium.reclaim(units),
         }
     }
+
+    fn reclaim_pending(
+        &mut self,
+        units: &[engine_persist::ReclaimUnit],
+    ) -> Result<bool, MediumError> {
+        match self {
+            SessionStore::Local(medium) => medium.reclaim_pending(units),
+            SessionStore::Sqlite(medium) => medium.reclaim_pending(units),
+        }
+    }
 }
