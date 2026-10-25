@@ -99,7 +99,7 @@ pub use pipeline::{
 };
 pub use reclaim::{
     RECLAMATION_LEDGER_DOMAIN, RECLAMATION_LEDGER_KEY_DOMAIN, RECLAMATION_LEDGER_VERSION,
-    ReclamationLedger, publish_reclamation_ledger, reclamation_ledger_idempotency_key,
+    ReclaimUnit, ReclamationLedger, publish_reclamation_ledger, reclamation_ledger_idempotency_key,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{

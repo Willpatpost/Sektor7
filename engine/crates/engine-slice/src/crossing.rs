@@ -24,13 +24,13 @@ use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
     CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
-    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
-    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, RECLAMATION_LEDGER_DOMAIN,
-    ReclaimedIndexEntry, ReclamationLedger, Reconciliation, RecordedCancellation, RecoveryAnchor,
-    RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition,
-    StoredObject, T1Journal, TailState, TransactionId, active_journal_path, chain_range_digest,
-    compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger, reconcile,
-    rotate_journal,
+    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash,
+    JOURNAL_ACTIVE_SUFFIX, JournalRotation, JournalScan, KeyPhase, MediumError, OccurrenceSpan,
+    PipelineError, RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger,
+    Reconciliation, RecordedCancellation, RecoveryAnchor, RecoveryError, RevisionRecord,
+    SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
+    TransactionId, active_journal_path, chain_range_digest, compute_digest_seed,
+    publish_checkpoint_mk, publish_reclamation_ledger, reconcile, rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -514,6 +514,14 @@ pub struct SessionCrossing {
     /// additional handles serialize safely alongside the pipeline's
     /// own).
     store: StoreLocation,
+    /// The campaign's journal ROOT — the single authoritative
+    /// active-path location (the review corrective F1): every
+    /// rotation publishes its pointer at `<root>.active`, and the
+    /// recovery and the backup resolve the active journal from that
+    /// one root, across any number of successive rotations. Distinct
+    /// from the pipeline's ACTIVE journal path after a rotation (the
+    /// pipeline holds the rotated generation; the root never moves).
+    journal_root: PathBuf,
 }
 
 impl SessionCrossing {
@@ -560,10 +568,12 @@ impl SessionCrossing {
                 _ => return Err(PipelineError::UnfoundedMedium),
             }
         }
+        let journal_root = journal.path().to_path_buf();
         let pipeline = CommitPipeline::open(medium, journal)?;
         Ok(SessionCrossing {
             pipeline,
             store: location.clone(),
+            journal_root,
         })
     }
 
@@ -1160,9 +1170,13 @@ impl SessionCrossing {
             .cloned()
             .collect();
         // THE MECHANISM: write + scan-verify + flip — the pointer
-        // lands beside the journal this crossing holds.
-        let legacy = journal.path().to_path_buf();
-        let rotation = rotate_journal(&legacy, &retained, &retained_cancellations, &retired)
+        // ALWAYS lands at THE CAMPAIGN ROOT (the review corrective
+        // F1: one stable authority across repeated rotations — the
+        // recovery and the backup resolve the active journal from
+        // the root's single pointer, never from a pointer published
+        // beside a rotated generation).
+        let root = self.journal_root.clone();
+        let rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
             .map_err(PipelineError::Journal)?;
         // THE SWAP: this crossing's pipeline reopens over the new
         // journal — the keys reseeded from it, the confirmed set
@@ -1182,44 +1196,69 @@ impl SessionCrossing {
 
     /// The explicit two-phase reclamation (PP-B3, D-PP-4's
     /// verify-before-reclaim retention protocol — explicit, never
-    /// automatic, never a silent threshold). PHASE A (the
-    /// eligibility + the audit — NO destructive action before the
-    /// audit is durably established): the compacted walk validates;
-    /// the retention window holds (the recovery works from the
-    /// newest SK — the `generations` newest checkpoints must remain,
-    /// so only a checkpoint with newer ones above it is eligible);
-    /// the completed SK/MK binding verifies and the metadata
+    /// automatic, never a silent threshold; the review correctives
+    /// F2/F3/F4 incorporated). PHASE A (the eligibility + the audit
+    /// — NO destructive action before the audit is durably
+    /// established): THE RETENTION WINDOW IS VALIDATED FIRST (a
+    /// positive `generations` — the recovery works from the newest
+    /// SK, so a zero-generation window that could eventually delete
+    /// every anchor is refused before anything); the compacted walk
+    /// validates; THE PRE-DELETION ANCHOR INVARIANT verifies that
+    /// the newest checkpoint's SK — never in any reclaim index — is
+    /// present and carries a session-snapshot object (a verified,
+    /// recoverable anchor remains after the deletion — never a
+    /// post-delete check establishing a deletion prerequisite); THE
+    /// TARGET SELECTION picks the oldest checkpoint beyond the
+    /// window whose range is NOT fully reclaimed (MK records are
+    /// permanent, so a completed reclamation is distinguished from
+    /// restartable incomplete work — the reclamation progresses
+    /// generation by generation, never repeating a completed
+    /// range); the completed SK/MK binding verifies and the metadata
     /// decodes; the digest is RECOMPUTED against the still-present
     /// range bytes (the eligibility proof that what the index names
-    /// is exactly what was walked and hashed); and the audit
-    /// revision — a reclamation-ledger/1 object keyed
-    /// deterministically by the reclaimed MK — is appended and read
+    /// is exactly what was walked and hashed) while THE COMPLETE
+    /// DELETION MANIFEST — one unit per indexed record with its
+    /// referenced content objects — is collected while the bytes
+    /// are present; and the audit revision (a
+    /// reclamation-ledger/1 object keyed deterministically by the
+    /// reclaimed MK, carrying the manifest) is appended and read
     /// back verified. PHASE B (the deletes — idempotent +
-    /// restartable, a re-run deleting only what remains): the
-    /// indexed revisions and their content objects removed together
-    /// (the whole-revision units), and the old journal file removed
-    /// only when the rotation's verified active journal stands (the
-    /// survival set). The post-conditions verify: the compacted walk
-    /// validates over the gapped chain (the skip tables cover the
-    /// gaps), the membership universe carries the reclaimed
-    /// identities and keys, and the newest snapshot (the recovery
-    /// anchor) remains discoverable. NEVER the founding, the
-    /// confirming anchors, the MK records and their metadata (all
-    /// permanent), or the retained window's snapshots; bytes are
-    /// never rewritten.
+    /// restartable, deleting from the AUDITED manifest, never a
+    /// re-read of a possibly-absent record, so an interrupted
+    /// unit's orphaned objects are discoverable and the retry
+    /// converges): each unit's record object and its content
+    /// objects removed together, quarantined copies removed from
+    /// the quarantine, and the stale journal generations (each with
+    /// its sidecar lock) removed only when the rotation's verified
+    /// active journal stands (the survival set). The
+    /// post-conditions verify: the compacted walk validates over
+    /// the gapped chain (the skip tables cover the gaps), the
+    /// membership universe carries the reclaimed identities and
+    /// keys, and the newest snapshot (the recovery anchor) remains
+    /// discoverable. NEVER the founding, the confirming anchors,
+    /// the MK records and their metadata (all permanent), or the
+    /// retained window's snapshots; bytes are never rewritten.
     pub fn reclaim_checkpoint(
         &mut self,
         legacy_journal: &Path,
         generations: u64,
     ) -> Result<ReclamationReport, TransitionError> {
-        // PHASE A — the eligibility + the audit.
+        // PHASE A — the eligibility + the audit. THE WINDOW
+        // VALIDATION first (the review corrective F2): the retention
+        // window must be positive — a zero-generation window could
+        // eventually authorize deleting the newest SK, the only
+        // recovery anchor. Refused BEFORE anything.
+        if generations < 1 {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "reclaim/invalid-window",
+            });
+        }
         let mut medium = SessionStore::open(&self.store).map_err(PipelineError::Medium)?;
         let summary = medium.validate().map_err(PipelineError::Medium)?;
         // The retention window: the recovery works from the newest
-        // SK — the `generations` newest checkpoints must remain; the
-        // OLDEST (the walk's last) is the target only when newer
-        // ones stand above it.
-        let Some(oldest_mk) = summary.checkpoints.last().copied() else {
+        // SK — the `generations` newest checkpoints must remain.
+        let Some(newest_mk) = summary.checkpoints.first().copied() else {
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "reclaim/no-checkpoint",
@@ -1231,33 +1270,98 @@ impl SessionCrossing {
                 detail: "reclaim/retention-window",
             });
         }
-        // The completed SK/MK verification: the binding + the decode.
-        let mk_record = medium
-            .read_record(&oldest_mk)
-            .map_err(PipelineError::Medium)?;
-        let Some(sk) = mk_record.parent else {
-            return Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "reclaim/mk-unfounded",
-            });
-        };
-        let Some(metadata_object) = mk_record.content_refs.first() else {
-            return Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "reclaim/mk-no-metadata",
-            });
-        };
-        let metadata_bytes = medium
-            .read_object(metadata_object)
-            .map_err(PipelineError::Medium)?;
-        let metadata =
-            CheckpointMetadata::decode(&metadata_bytes).map_err(PipelineError::Format)?;
-        if metadata.sk != sk {
-            return Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "reclaim/metadata-binding",
-            });
+        // THE PRE-DELETION ANCHOR INVARIANT (the review corrective
+        // F2): the newest checkpoint's SK — never in any reclaim
+        // index — must be present and carry a session-snapshot
+        // object BEFORE anything: a verified, recoverable anchor
+        // remains after the deletion.
+        {
+            let newest_record = medium
+                .read_record(&newest_mk)
+                .map_err(PipelineError::Medium)?;
+            let Some(anchor_sk) = newest_record.parent else {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/mk-unfounded",
+                });
+            };
+            let sk_record = medium
+                .read_record(&anchor_sk)
+                .map_err(PipelineError::Medium)?;
+            let Some(anchor_object) = sk_record.content_refs.first() else {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/anchor-not-snapshot",
+                });
+            };
+            let anchor_bytes = medium
+                .read_object(anchor_object)
+                .map_err(PipelineError::Medium)?;
+            if !is_session_object(&anchor_bytes) {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/anchor-not-snapshot",
+                });
+            }
         }
+        // THE TARGET SELECTION (the review corrective F3): the
+        // oldest checkpoint beyond the window whose range is NOT
+        // fully reclaimed. MK records are permanent — a completed
+        // reclamation stays in the summary forever — so completed
+        // ranges are skipped, incomplete ones (an interrupted
+        // Phase B) are resumed, and the reclamation progresses
+        // generation by generation.
+        let mut target: Option<(Hash, Hash, CheckpointMetadata)> = None;
+        for candidate in summary.checkpoints[generations as usize..].iter().rev() {
+            let mk_record = medium
+                .read_record(candidate)
+                .map_err(PipelineError::Medium)?;
+            let Some(sk) = mk_record.parent else {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/mk-unfounded",
+                });
+            };
+            let Some(metadata_object) = mk_record.content_refs.first() else {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/mk-no-metadata",
+                });
+            };
+            let metadata_bytes = medium
+                .read_object(metadata_object)
+                .map_err(PipelineError::Medium)?;
+            let metadata =
+                CheckpointMetadata::decode(&metadata_bytes).map_err(PipelineError::Format)?;
+            if metadata.sk != sk {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "reclaim/metadata-binding",
+                });
+            }
+            // Fully reclaimed? Every index member absent.
+            let mut any_present = false;
+            for entry in &metadata.index {
+                match medium.read_record(&entry.hash) {
+                    Ok(_) => {
+                        any_present = true;
+                        break;
+                    }
+                    Err(MediumError::MissingObject { .. }) => {}
+                    Err(other) => return Err(PipelineError::Medium(other).into()),
+                }
+            }
+            if any_present {
+                target = Some((*candidate, sk, metadata));
+                break;
+            }
+        }
+        let Some((oldest_mk, sk, metadata)) = target else {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "reclaim/nothing-eligible",
+            });
+        };
         // THE PRE-SCAN for an installed audit (the restart): the
         // bounded descent from the head to the target MK — the audit
         // always sits above its checkpoint, and everything below the
@@ -1266,10 +1370,11 @@ impl SessionCrossing {
         // verified and durably recorded the eligibility: the
         // re-derivation verifies the installed record, never
         // re-requiring the (now partially deleted) range bytes.
-        let (ledger_id, journal_files) = match find_installed_reclamation(&mut medium, &oldest_mk)?
-        {
+        let (ledger_id, ledger) = match find_installed_reclamation(&mut medium, &oldest_mk)? {
             Some((record_id, ledger)) => {
-                // THE READ-BACK verification of the installed audit.
+                // THE READ-BACK verification of the installed audit:
+                // the bindings AND the manifest must cover exactly
+                // the permanent index's identities.
                 if ledger.sk != sk
                     || ledger.range_digest != metadata.range_digest
                     || ledger.records != metadata.range_records
@@ -1279,26 +1384,44 @@ impl SessionCrossing {
                         detail: "reclaim/audit-incoherent",
                     });
                 }
-                (record_id, ledger.journal_files)
+                let index_hashes: BTreeSet<Hash> =
+                    metadata.index.iter().map(|entry| entry.hash).collect();
+                let unit_hashes: BTreeSet<Hash> =
+                    ledger.units.iter().map(|unit| unit.record).collect();
+                if index_hashes != unit_hashes {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "reclaim/audit-incoherent",
+                    });
+                }
+                (record_id, ledger)
             }
             None => {
                 // THE FULL PHASE A: the digest RECOMPUTED against the
                 // still-present range bytes — the pre-reclamation
-                // verification. The digest covers the RANGE
-                // PUBLICATIONS oldest-first (epoch order); SK's own
-                // retirement entry is an index member but never a
-                // digest member.
+                // verification — AND the complete deletion manifest
+                // collected while the bytes are present (the review
+                // corrective F4: an interrupted Phase B deletes from
+                // the manifest, never a re-read of a possibly-absent
+                // record). The digest covers the RANGE PUBLICATIONS
+                // oldest-first (epoch order); SK's own retirement
+                // entry is an index member but never a digest
+                // member.
                 let mut indexed: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
                 indexed.sort_unstable_by_key(|entry| entry.epoch);
                 let mut range_bytes = Vec::with_capacity(indexed.len());
+                let mut units: Vec<ReclaimUnit> = Vec::with_capacity(indexed.len());
                 for entry in &indexed {
-                    if entry.hash == sk {
-                        continue;
-                    }
                     let record = medium
                         .read_record(&entry.hash)
                         .map_err(PipelineError::Medium)?;
-                    range_bytes.push(record.canonical_bytes());
+                    if entry.hash != sk {
+                        range_bytes.push(record.canonical_bytes());
+                    }
+                    units.push(ReclaimUnit {
+                        record: entry.hash,
+                        objects: record.content_refs.clone(),
+                    });
                 }
                 let recomputed = chain_range_digest(&metadata.seed, &range_bytes);
                 if recomputed != metadata.range_digest {
@@ -1307,9 +1430,9 @@ impl SessionCrossing {
                         detail: "reclaim/digest-mismatch",
                     });
                 }
-                // The journal survival evidence: the old journal is
-                // removable only after the rotation's verified active
-                // journal stands.
+                // The journal survival evidence: the stale journal
+                // generations are removable only after the rotation's
+                // verified active journal stands.
                 let journal_files = reclaimable_journal_files(legacy_journal)?;
                 // THE AUDIT REVISION — appended BEFORE any
                 // destructive action, then read back verified.
@@ -1324,7 +1447,8 @@ impl SessionCrossing {
                         .iter()
                         .filter(|entry| entry.key.is_some())
                         .count() as u64,
-                    journal_files: journal_files.clone(),
+                    journal_files,
+                    units,
                 };
                 let head = medium.head().map_err(PipelineError::Medium)?;
                 let Some(head) = head else {
@@ -1395,23 +1519,29 @@ impl SessionCrossing {
                         detail: "reclaim/audit-readback",
                     });
                 }
-                (ledger_id, journal_files)
+                (ledger_id, ledger)
             }
         };
-        // PHASE B — the deletes: idempotent + restartable (a re-run
-        // deletes only what remains). The whole-revision units: each
-        // indexed record object and its content objects, together.
-        let records: Vec<Hash> = metadata.index.iter().map(|entry| entry.hash).collect();
-        let removed_objects = medium.reclaim(&records).map_err(PipelineError::Medium)?;
-        // The old journal files (only those named in the audited
-        // ledger — only after the rotation's verified active journal
-        // stands).
+        // THE AUDIT-COMMITTED/DELETES-UNCOMMITTED crash seam
+        // (test-only — see [`ARM_RECLAIM_AFTER_AUDIT`], the review
+        // corrective F4's real-kill evidence): the audit IS durably
+        // on the chain; Phase B never runs — the restart resumes
+        // from the installed audit and completes to convergence.
+        reclaim_after_audit_seam();
+        // PHASE B — the deletes: idempotent + restartable, driven by
+        // the AUDITED MANIFEST (an interrupted unit's orphaned
+        // objects are discoverable from the ledger — including
+        // copies the v1.4 sweep quarantined).
+        let removed_objects = medium
+            .reclaim(&ledger.units)
+            .map_err(PipelineError::Medium)?;
+        // The stale journal generations (only those named in the
+        // audited ledger — only after the rotation's verified active
+        // journal stands), each with its sidecar lock.
         let mut removed_journals = Vec::new();
-        for name in &journal_files {
-            let path = legacy_journal
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(name);
+        for name in &ledger.journal_files {
+            let dir = legacy_journal.parent().unwrap_or_else(|| Path::new("."));
+            let path = dir.join(name);
             if path.is_file() {
                 std::fs::remove_file(&path).map_err(|error| {
                     TransitionError::JournalFailed(PipelineError::Medium(MediumError::Io {
@@ -1421,6 +1551,16 @@ impl SessionCrossing {
                     }))
                 })?;
                 removed_journals.push(path);
+            }
+            let lock = dir.join(format!("{name}.lock"));
+            if lock.is_file() {
+                std::fs::remove_file(&lock).map_err(|error| {
+                    TransitionError::JournalFailed(PipelineError::Medium(MediumError::Io {
+                        op: "reclaim journal lock",
+                        path: lock.display().to_string(),
+                        source: error,
+                    }))
+                })?;
             }
         }
         // THE POST-CONDITIONS: the compacted walk validates over the
@@ -1576,6 +1716,11 @@ impl SessionCrossing {
         //    the live sequence did.
         let journal = T1Journal::open(&active_journal).map_err(PipelineError::Journal)?;
         let mut crossing = SessionCrossing::open_at(location, journal, campaign)?;
+        // The campaign journal ROOT (the review corrective F1): the
+        // pointer's authoritative location — NOT the resolved active
+        // journal the pipeline holds. Repeated rotations and the
+        // recovery both resolve from this one root.
+        crossing.journal_root = journal_path.to_path_buf();
         let mut restored = vec![false; NPC_COUNT];
         for transaction in &scan.committed {
             if canceled.contains(&transaction.id) {
@@ -1711,6 +1856,27 @@ pub static ARM_AFTER_SK_EXIT: AtomicBool = AtomicBool::new(false);
 fn after_sk_seam() {
     if ARM_AFTER_SK_EXIT.load(Ordering::Relaxed) {
         std::process::exit(8);
+    }
+}
+
+/// Test-only (the genuine audit-committed/deletes-uncommitted
+/// reclamation crash seam, the review corrective F4's real-kill
+/// evidence): when armed, the reclamation hard-exits AFTER the
+/// audit revision is durably installed and read back verified and
+/// BEFORE any Phase B deletion — the exact restart boundary (exit
+/// 9, distinct from the after-SK seam's 8 and the mid-unit seam's
+/// 10). A process death here leaves the audit on the chain and the
+/// range intact: the re-run's pre-scan recognizes the installed
+/// audit and resumes to completion. Engine code never arms this;
+/// the static is process-local, so only the child that armed it
+/// dies.
+#[doc(hidden)]
+pub static ARM_RECLAIM_AFTER_AUDIT: AtomicBool = AtomicBool::new(false);
+
+/// The after-audit seam's exit point (see [`ARM_RECLAIM_AFTER_AUDIT`]).
+fn reclaim_after_audit_seam() {
+    if ARM_RECLAIM_AFTER_AUDIT.load(Ordering::Relaxed) {
+        std::process::exit(9);
     }
 }
 
@@ -2292,20 +2458,54 @@ fn find_installed_reclamation(
     }
 }
 
-/// The old journal files removable alongside the range (PP-B3's
-/// Phase B): only after the rotation's verified active journal
-/// stands — no pointer means no rotation, and the legacy journal IS
-/// the active one (never touched).
-fn reclaimable_journal_files(legacy_journal: &Path) -> Result<Vec<String>, TransitionError> {
-    let active = active_journal_path(legacy_journal).map_err(PipelineError::Journal)?;
-    if active == legacy_journal {
+/// The stale journal generations removable alongside the range
+/// (PP-B3's Phase B, the review corrective F1): only after the
+/// rotation's verified active journal stands — no pointer means no
+/// rotation, and the campaign root journal IS the active one (never
+/// touched). With the pointer present, every journal file beside
+/// the root EXCEPT the current active generation is a stale
+/// generation (the root's own file and every prior rotated
+/// generation), each removable under the audited retirement — the
+/// prior generations never accumulate.
+fn reclaimable_journal_files(root: &Path) -> Result<Vec<String>, TransitionError> {
+    let active = active_journal_path(root).map_err(PipelineError::Journal)?;
+    if active == root {
         return Ok(Vec::new());
     }
-    // The active journal must scan green before the legacy is
-    // removable (the survival set stands).
+    // The active journal must scan green before any stale generation
+    // is removable (the survival set stands).
+    let active_name = active
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
     T1Journal::scan_file(active).map_err(PipelineError::Journal)?;
-    let Some(name) = legacy_journal.file_name() else {
+    let Some(dir) = root.parent() else {
         return Ok(Vec::new());
     };
-    Ok(vec![name.to_string_lossy().to_string()])
+    let Some(root_name) = root.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let mut stale = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // The pointer family and the sidecar locks are handled
+            // separately (the pointer must survive to keep resolving
+            // the active journal; the locks are removed with their
+            // journals by the caller).
+            if name.ends_with(JOURNAL_ACTIVE_SUFFIX) || name.ends_with(".lock") {
+                continue;
+            }
+            let is_journal =
+                name == root_name || (name.starts_with("journal-") && name.ends_with(".t1"));
+            if !is_journal || active_name.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            stale.push(name);
+        }
+    }
+    stale.sort();
+    Ok(stale)
 }

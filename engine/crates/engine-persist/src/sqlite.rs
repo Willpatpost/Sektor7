@@ -80,6 +80,7 @@ use crate::medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
 };
+use crate::reclaim::ReclaimUnit;
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 
 /// The `meta` row keys (the design's §3.1 layout).
@@ -893,7 +894,7 @@ impl CanonicalMedium for SqliteMedium {
         SyncTier::TransactionalWalFull
     }
 
-    fn reclaim(&mut self, records: &[Hash]) -> Result<u64, MediumError> {
+    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
         if self.read_only {
             return Err(MediumError::Sqlite {
                 op: "reclaim",
@@ -905,21 +906,17 @@ impl CanonicalMedium for SqliteMedium {
             .transaction()
             .map_err(|e| sqlite_err("begin reclaim", e))?;
         let mut removed = 0u64;
-        for record_id in records {
-            let refs: Vec<Hash> = match load_record_verified(&tx, record_id) {
-                Ok(bytes) => RevisionRecord::decode(&bytes)
-                    .map_err(MediumError::Format)?
-                    .content_refs
-                    .clone(),
-                Err(MediumError::MissingObject { .. }) => Vec::new(),
-                Err(error) => {
-                    let _ = tx.rollback();
-                    return Err(error);
-                }
-            };
+        // The manifest-driven deletes (the review corrective F4):
+        // never a re-read of a possibly-absent record — every
+        // deletion comes from the audited units, and the single
+        // transaction makes the whole Phase B atomic on this
+        // provider (an interrupted process leaves either the
+        // pre-transaction state or the completed deletion — no
+        // partial unit, no orphaned row).
+        for unit in units {
             match tx.execute(
                 "DELETE FROM records WHERE hash = ?1",
-                params![record_id.as_bytes()],
+                params![unit.record.as_bytes()],
             ) {
                 Ok(count) => removed += count as u64,
                 Err(error) => {
@@ -927,10 +924,10 @@ impl CanonicalMedium for SqliteMedium {
                     return Err(sqlite_err("delete record", error));
                 }
             }
-            for reference in refs {
+            for object in &unit.objects {
                 match tx.execute(
                     "DELETE FROM objects WHERE hash = ?1",
-                    params![reference.as_bytes()],
+                    params![object.as_bytes()],
                 ) {
                     Ok(count) => removed += count as u64,
                     Err(error) => {

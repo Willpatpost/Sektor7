@@ -147,10 +147,10 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
-    fn reclaim(&mut self, records: &[engine_persist::Hash]) -> Result<u64, MediumError> {
+    fn reclaim(&mut self, units: &[engine_persist::ReclaimUnit]) -> Result<u64, MediumError> {
         match self {
-            SessionStore::Local(medium) => medium.reclaim(records),
-            SessionStore::Sqlite(medium) => medium.reclaim(records),
+            SessionStore::Local(medium) => medium.reclaim(units),
+            SessionStore::Sqlite(medium) => medium.reclaim(units),
         }
     }
 }

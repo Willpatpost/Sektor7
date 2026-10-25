@@ -40,6 +40,26 @@ pub const RECLAMATION_LEDGER_KEY_DOMAIN: &str = "engine-persist/reclamation-ledg
 /// Documented maxima (bounded decode).
 pub const MAX_RECLAMATION_JOURNAL_FILES: u64 = 1 << 16;
 pub const MAX_RECLAMATION_JOURNAL_NAME: u64 = 1024;
+pub const MAX_RECLAMATION_UNITS: u64 = 1 << 16;
+pub const MAX_RECLAMATION_UNIT_OBJECTS: u64 = 1 << 16;
+
+/// One audited deletion unit (the review corrective F4): the record
+/// identity and its referenced content objects — the COMPLETE
+/// manifest collected while the range bytes were still present
+/// (Phase A's digest verification reads every range record). The
+/// manifest makes an interrupted Phase B resumable: the re-run
+/// deletes from the AUDIT, never a re-read of a possibly-absent
+/// record, so a process death between a record deletion and its
+/// object deletions converges on the retry instead of orphaning
+/// content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimUnit {
+    /// The reclaimed revision's identity (its record object).
+    pub record: Hash,
+    /// The revision's referenced content objects (from its
+    /// content_refs, read before any deletion).
+    pub objects: Vec<Hash>,
+}
 
 /// The reclamation audit's bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +89,13 @@ pub struct ReclamationLedger {
     /// after the rotation's verified active journal and survival set
     /// stand; empty when no rotation preceded).
     pub journal_files: Vec<String>,
+    /// The COMPLETE deletion manifest (the review corrective F4):
+    /// one unit per indexed record — the record identity and its
+    /// referenced content objects — collected during Phase A's
+    /// digest verification while the bytes were present. Phase B
+    /// deletes from this manifest, so an interrupted deletion
+    /// converges on the retry.
+    pub units: Vec<ReclaimUnit>,
 }
 
 impl ReclamationLedger {
@@ -83,6 +110,14 @@ impl ReclamationLedger {
         enc.write_bytes(&self.seed);
         enc.write_u64(self.records);
         enc.write_u64(self.reclaimed_keys);
+        enc.write_count(self.units.len());
+        for unit in &self.units {
+            enc.write_bytes(unit.record.as_bytes());
+            enc.write_count(unit.objects.len());
+            for object in &unit.objects {
+                enc.write_bytes(object.as_bytes());
+            }
+        }
         enc.write_count(self.journal_files.len());
         for name in &self.journal_files {
             enc.write_str(name);
@@ -118,6 +153,24 @@ impl ReclamationLedger {
                 "reclamation-ledger/keys-exceed-records",
             ));
         }
+        let unit_count = dec.read_count(MAX_RECLAMATION_UNITS, SECTION, "unit-count")?;
+        let mut units = Vec::with_capacity(unit_count as usize);
+        for _ in 0..unit_count {
+            let record = read_hash(&mut dec, SECTION)?;
+            if record == Hash::ZERO {
+                return Err(SaveError::Integrity("reclamation-ledger/zero-identity"));
+            }
+            let object_count =
+                dec.read_count(MAX_RECLAMATION_UNIT_OBJECTS, SECTION, "unit-object-count")?;
+            let mut objects = Vec::with_capacity(object_count as usize);
+            for _ in 0..object_count {
+                objects.push(read_hash(&mut dec, SECTION)?);
+            }
+            units.push(ReclaimUnit { record, objects });
+        }
+        if records != units.len() as u64 {
+            return Err(SaveError::Integrity("reclamation-ledger/unit-count"));
+        }
         let count = dec.read_count(MAX_RECLAMATION_JOURNAL_FILES, SECTION, "journal-count")?;
         let mut journal_files = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -135,6 +188,7 @@ impl ReclamationLedger {
             records,
             reclaimed_keys,
             journal_files,
+            units,
         })
     }
 }
@@ -201,6 +255,23 @@ mod tests {
             records: 3,
             reclaimed_keys: 2,
             journal_files: vec!["journal.t1".to_owned()],
+            units: vec![
+                ReclaimUnit {
+                    record: hash_object(b"sample-record-a"),
+                    objects: vec![hash_object(b"sample-object-a")],
+                },
+                ReclaimUnit {
+                    record: hash_object(b"sample-record-b"),
+                    objects: Vec::new(),
+                },
+                ReclaimUnit {
+                    record: hash_object(b"sample-record-c"),
+                    objects: vec![
+                        hash_object(b"sample-object-c1"),
+                        hash_object(b"sample-object-c2"),
+                    ],
+                },
+            ],
         }
     }
 
@@ -271,6 +342,14 @@ mod tests {
         assert!(matches!(
             ReclamationLedger::decode(&ledger.canonical_bytes()),
             Err(SaveError::Integrity("reclamation-ledger/zero-identity"))
+        ));
+        // The manifest-count coherence (the audited record count must
+        // equal the unit count).
+        let mut ledger = sample_ledger();
+        ledger.records = ledger.units.len() as u64 + 1;
+        assert!(matches!(
+            ReclamationLedger::decode(&ledger.canonical_bytes()),
+            Err(SaveError::Integrity("reclamation-ledger/unit-count"))
         ));
     }
 

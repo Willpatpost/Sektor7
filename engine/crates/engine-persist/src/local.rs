@@ -58,6 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use engine_core::wire::MAX_BYTE_LEN;
@@ -72,6 +73,7 @@ use crate::medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
 };
+use crate::reclaim::ReclaimUnit;
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 
 /// The HEAD pointer's domain (a persisted wire format; visible to
@@ -1133,34 +1135,53 @@ impl LocalFileMedium {
         }
     }
 
-    /// Phase B's delete half (PP-B3): remove each named revision's
-    /// record object and content objects — the whole-revision units.
-    /// Idempotent (absent files are already reclaimed, never errors);
-    /// the eligibility was verified and audited BEFORE this call
-    /// (Phase A); bytes are never rewritten. Returns the count of
-    /// object files removed by this call.
-    fn reclaim_records_locked(&self, records: &[Hash]) -> Result<u64, MediumError> {
+    /// Phase B's delete half (PP-B3, the review corrective F4):
+    /// remove each AUDITED unit — the record object and its
+    /// referenced content objects — from the reclamation ledger's
+    /// manifest, never a re-read of a possibly-absent record (an
+    /// interrupted deletion converges on the retry instead of
+    /// orphaning content). Idempotent (absent files are already
+    /// reclaimed, never errors); the eligibility was verified and
+    /// audited BEFORE this call (Phase A); bytes are never rewritten.
+    /// A unit's content objects that the v1.4 sweep QUARANTINED after
+    /// an interrupted deletion are removed from the quarantine too —
+    /// the audit authorizes their removal wherever they are, so the
+    /// retry converges on the intended storage state rather than
+    /// persisting orphaned evidence. Returns the count of files
+    /// removed by this call.
+    fn reclaim_units_locked(&self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
+        let quarantine_dir = self.root.join(QUARANTINE_DIR);
         let mut removed = 0u64;
-        for record_id in records {
-            let refs: Vec<Hash> = match self.load_object(record_id) {
-                Ok(bytes) => RevisionRecord::decode(&bytes)
-                    .map_err(MediumError::Format)?
-                    .content_refs
-                    .clone(),
-                Err(MediumError::MissingObject { .. }) => Vec::new(),
-                Err(error) => return Err(error),
-            };
-            let record_path = self.object_path(record_id);
+        for unit in units {
+            let record_path = self.object_path(&unit.record);
             if record_path.is_file() {
                 fs::remove_file(&record_path)
                     .map_err(|e| io_err("reclaim record", &record_path, e))?;
                 removed += 1;
             }
-            for reference in refs {
-                let object_path = self.object_path(&reference);
+            // The genuine mid-unit crash seam (test-only — see
+            // [`ARM_RECLAIM_MID_UNIT`]): the record object IS removed;
+            // its referenced content objects never run — the exact
+            // orphaning window the audited manifest closes on the
+            // retry.
+            reclaim_mid_unit_seam();
+            for object in &unit.objects {
+                let object_path = self.object_path(object);
                 if object_path.is_file() {
                     fs::remove_file(&object_path)
                         .map_err(|e| io_err("reclaim object", &object_path, e))?;
+                    removed += 1;
+                }
+                let quarantined = quarantine_dir.join(object.hex());
+                if quarantined.is_file() {
+                    fs::remove_file(&quarantined)
+                        .map_err(|e| io_err("reclaim quarantined object", &quarantined, e))?;
+                    removed += 1;
+                }
+                let reason = quarantine_dir.join(format!("{}.reason", object.hex()));
+                if reason.is_file() {
+                    fs::remove_file(&reason)
+                        .map_err(|e| io_err("reclaim quarantine reason", &reason, e))?;
                     removed += 1;
                 }
             }
@@ -1432,11 +1453,29 @@ impl CanonicalMedium for LocalFileMedium {
         self.platform_tier
     }
 
-    fn reclaim(&mut self, records: &[Hash]) -> Result<u64, MediumError> {
+    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
         self.lock()?;
-        let removed = self.reclaim_records_locked(records);
+        let removed = self.reclaim_units_locked(units);
         let _ = self.unlock();
         removed
+    }
+}
+
+/// Test-only (the genuine mid-unit reclamation crash seam, the
+/// review corrective F4's real-kill evidence): when armed, the
+/// reclamation delete hard-exits AFTER a unit's record object is
+/// removed and BEFORE its referenced content objects — the exact
+/// orphaning window the audited manifest closes on the retry (exit
+/// 10, distinct from the after-SK seam's 8). Engine code never arms
+/// this; the static is process-local, so only the child that armed
+/// it dies.
+#[doc(hidden)]
+pub static ARM_RECLAIM_MID_UNIT: AtomicBool = AtomicBool::new(false);
+
+/// The mid-unit seam's exit point (see [`ARM_RECLAIM_MID_UNIT`]).
+fn reclaim_mid_unit_seam() {
+    if ARM_RECLAIM_MID_UNIT.load(Ordering::Relaxed) {
+        std::process::exit(10);
     }
 }
 
