@@ -25,12 +25,13 @@ use engine_persist::{
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
     CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
     ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
-    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, RECLAMATION_LEDGER_DOMAIN,
-    ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger, Reconciliation, RecordedCancellation,
-    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
-    SourcePosition, StoredObject, T1Journal, TailState, TransactionId, active_journal_path,
-    chain_range_digest, compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
-    read_journal_generations, reconcile, retire_journal_generations, rotate_journal,
+    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
+    RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger, Reconciliation,
+    RecordedCancellation, RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry,
+    SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState, TransactionId,
+    active_journal_path, chain_range_digest, compute_digest_seed, publish_checkpoint_mk,
+    publish_reclamation_ledger, read_journal_generations, reconcile, retire_journal_generations,
+    rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -522,13 +523,33 @@ pub struct SessionCrossing {
     /// from the pipeline's ACTIVE journal path after a rotation (the
     /// pipeline holds the rotated generation; the root never moves).
     journal_root: PathBuf,
-    /// THE AUTHORITY GUARD (the review corrective R4): true when a
-    /// rotation failed AFTER the authoritative pointer changed — the
-    /// in-memory pipeline then holds a journal the campaign root no
-    /// longer selects, and every further authoritative operation
-    /// refuses until a fresh recovery re-derives the crossing from
-    /// the pointer.
-    journal_authority_lost: bool,
+    /// THE AUTHORITY GUARD (the review correctives R4 + R5): the
+    /// crossing's usability for authoritative progression. `Lost`
+    /// (R4): a rotation failed after the pointer changed — the
+    /// in-memory pipeline holds a journal the root no longer
+    /// selects; only a fresh recovery repairs it.
+    /// `DurabilityUnresolved` (R5): the pointer flipped but its
+    /// power-loss durability is unresolved — the pre-rotation
+    /// journal is a superset only of the evidence at rotation time,
+    /// never of future writes to the new journal, so NO further
+    /// authoritative T1 write may proceed until the durability is
+    /// re-established (the repair method) or a verified recovery
+    /// repairs it.
+    journal_authority: JournalAuthority,
+}
+
+/// The crossing's journal-authority state (the review correctives
+/// R4 + R5).
+enum JournalAuthority {
+    /// Healthy: authoritative progression permitted.
+    Healthy,
+    /// R4: the pointer changed but the pipeline rebuild failed —
+    /// unrecoverable in-process; only a fresh recovery repairs it.
+    Lost,
+    /// R5: the pointer flipped but its power-loss durability is
+    /// unresolved — repairable in-process via the durability
+    /// re-establishment.
+    DurabilityUnresolved,
 }
 
 impl SessionCrossing {
@@ -581,26 +602,35 @@ impl SessionCrossing {
             pipeline,
             store: location.clone(),
             journal_root,
-            journal_authority_lost: false,
+            journal_authority: JournalAuthority::Healthy,
         })
     }
 
-    /// THE AUTHORITY GUARD (the review corrective R4): a crossing
-    /// whose rotation failed AFTER the authoritative pointer changed
-    /// is explicitly unusable for further authoritative progression —
-    /// the in-memory pipeline holds a journal the campaign root no
-    /// longer selects, and no T1 write may silently continue through
-    /// it. Every mutation refuses until a fresh recovery re-derives
-    /// the crossing from the pointer. The medium-level `checkpoint`
-    /// boundary stays usable (it never writes through the journal).
+    /// THE AUTHORITY GUARD (the review correctives R4 + R5): a
+    /// crossing whose rotation failed after the authoritative
+    /// pointer changed — or whose pointer flip's power-loss
+    /// durability remains unresolved — is explicitly unusable for
+    /// further authoritative progression: no T1 write may silently
+    /// continue through a journal the campaign root no longer
+    /// selects, and none may precede a durably established pointer
+    /// (the pre-rotation journal is a superset only of the evidence
+    /// at rotation time, never of future writes to the new journal).
+    /// Every mutation refuses until the durability is re-established
+    /// (the R5 repair) or a fresh recovery re-derives the crossing
+    /// from the pointer. The medium-level `checkpoint` boundary
+    /// stays usable (it never writes through the journal).
     fn assert_journal_authority(&self) -> Result<(), TransitionError> {
-        if self.journal_authority_lost {
-            return Err(TransitionError::InstallIncompatible {
+        match self.journal_authority {
+            JournalAuthority::Healthy => Ok(()),
+            JournalAuthority::Lost => Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "rotation/authority-lost",
-            });
+            }),
+            JournalAuthority::DurabilityUnresolved => Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "rotation/pointer-durability",
+            }),
         }
-        Ok(())
     }
 
     /// The graceful lifecycle boundary (PP-B1): the ratified `TRUNCATE`
@@ -1210,6 +1240,22 @@ impl SessionCrossing {
         let root = self.journal_root.clone();
         let rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
             .map_err(PipelineError::Journal)?;
+        // THE DURABILITY GATE (the review corrective R5): the
+        // pointer flip succeeded (the live authority IS the new
+        // journal), but an UNRESOLVED durability is never a durably
+        // completed transition — the crossing fails closed (no
+        // further authoritative T1 writes: the pre-rotation journal
+        // is a superset only of the evidence existing at rotation
+        // time, never of future writes to the new journal) until
+        // the durability is re-established (the R5 repair) or a
+        // verified recovery repairs it.
+        if let PointerDurability::Unresolved { .. } = rotation.pointer_durability {
+            self.journal_authority = JournalAuthority::DurabilityUnresolved;
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "rotation/pointer-durability",
+            });
+        }
         // THE SWAP: this crossing's pipeline reopens over the new
         // journal — the keys reseeded from it, the confirmed set
         // re-derived from the chain. THE POST-FLIP FAILURE RULE
@@ -1222,10 +1268,41 @@ impl SessionCrossing {
         match self.rebuild_pipeline_after_rotation(&rotation.new_path) {
             Ok(()) => Ok(rotation),
             Err(error) => {
-                self.journal_authority_lost = true;
+                self.journal_authority = JournalAuthority::Lost;
                 Err(error)
             }
         }
+    }
+
+    /// THE R5 REPAIR: re-establish the pointer's power-loss
+    /// durability (the directory sync) and, with it proven, rebuild
+    /// this crossing's pipeline over the pointer-resolved
+    /// authoritative journal — the crossing reopens for
+    /// authoritative progression. Valid only in the
+    /// durability-unresolved state (idempotent when healthy; the
+    /// R4-lost state is unrecoverable in-process); a re-sync failure
+    /// leaves the fail-closed state intact; a rebuild failure
+    /// escalates to the R4 authority-lost state.
+    pub fn reestablish_pointer_durability(&mut self) -> Result<(), TransitionError> {
+        match self.journal_authority {
+            JournalAuthority::Healthy => return Ok(()),
+            JournalAuthority::Lost => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "rotation/authority-lost",
+                });
+            }
+            JournalAuthority::DurabilityUnresolved => {}
+        }
+        engine_persist::reestablish_pointer_durability(&self.journal_root)
+            .map_err(PipelineError::Journal)?;
+        let active = active_journal_path(&self.journal_root).map_err(PipelineError::Journal)?;
+        if let Err(error) = self.rebuild_pipeline_after_rotation(&active) {
+            self.journal_authority = JournalAuthority::Lost;
+            return Err(error);
+        }
+        self.journal_authority = JournalAuthority::Healthy;
+        Ok(())
     }
 
     /// THE POST-FLIP SWAP (the review corrective R4): rebuild this
@@ -1803,6 +1880,16 @@ impl SessionCrossing {
         //    journal; a missing pointer resolves the legacy itself —
         //    every pre-rotation campaign recovers identically.
         let active_journal = active_journal_path(journal_path).map_err(PipelineError::Journal)?;
+        // THE DURABILITY VERIFICATION (the review corrective R5):
+        // the recovery never proceeds on a possibly-unsynced
+        // pointer — a fresh recovery cannot silently clear an
+        // unresolved durability-uncertain condition merely by
+        // reading the currently visible pointer; the directory sync
+        // is completed here (or the recovery fails closed) before
+        // any progression. On platforms where std exposes no
+        // directory flush (Windows) this is the ratified no-op.
+        engine_persist::reestablish_pointer_durability(journal_path)
+            .map_err(PipelineError::Journal)?;
         // A POINTER-RESOLVED journal that does not exist is a broken
         // rotation state — fail closed, never the empty fallback. The
         // absent-LEGACY case (no pointer present) keeps the accepted

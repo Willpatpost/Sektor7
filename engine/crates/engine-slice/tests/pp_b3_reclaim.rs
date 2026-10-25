@@ -26,8 +26,9 @@ use std::sync::atomic::Ordering;
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
 use engine_persist::local::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
 use engine_persist::{
-    AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, PipelineError,
-    RevisionRecord, SqliteMedium, StoredObject, T1Journal, read_journal_generations,
+    AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, POINTER_DIR_SYNC_FAULT,
+    PipelineError, RevisionRecord, SqliteMedium, StoredObject, T1Journal, active_journal_path,
+    read_journal_generations,
 };
 use engine_slice::crossing::{
     ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
@@ -2065,4 +2066,128 @@ fn shared_directory_campaigns_never_cross_journal_ownership() {
         "A's active journal still stands"
     );
     assert_eq!(std::fs::read(&b_root).unwrap(), b_root_bytes);
+}
+
+// ------------------------------------- the review corrective R5's eligibility
+
+/// The R5 child (the full-stack durability failure): the
+/// two-checkpoint campaign, the armed pointer-dir-sync fault at
+/// the rotation, the refused rotation with the crossing FAILING
+/// CLOSED — the reclamation itself refuses (the prior journal may
+/// still be selected after a power loss; its retirement waits) —
+/// then the disarmed repair re-opening the crossing with new T1
+/// evidence in the active generation.
+#[test]
+fn pp_b3_reclaim_child_durability_closed() {
+    let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal = std::env::var(RECLAIM_CHILD_JOURNAL_ENV).unwrap();
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director, mut crossing, _s1, _mk1) = two_checkpoint_campaign_at(
+        Path::new(&store),
+        Path::new(&journal),
+        "child-durability-closed",
+    );
+    // The outstanding unconfirmed transaction, then the rotation
+    // under the armed pointer-durability fault.
+    POINTER_DIR_SYNC_FAULT.store(true, Ordering::SeqCst);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let detail = match crossing.rotate_journal() {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the unresolved durability refuses the rotation, got {other:?}"),
+        Ok(_) => panic!("an unresolved pointer durability is never a completed rotation"),
+    };
+    assert_eq!(detail, "rotation/pointer-durability");
+    // THE FAIL-CLOSED RECLAMATION: the prior journal may still be
+    // selected after a power loss — its retirement waits until the
+    // durability is established (the R5 requirement: no retirement
+    // of a journal that a power-loss pointer reversion could still
+    // select).
+    let detail = match crossing.reclaim_checkpoint(Path::new(&journal), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the closed reclamation refuses, got {other:?}"),
+        Ok(_) => panic!("no journal retirement precedes the established pointer"),
+    };
+    assert_eq!(detail, "rotation/pointer-durability");
+    // THE REPAIR (the fault disarmed): the durability
+    // re-established, the crossing re-opened, the new T1 evidence
+    // in the active generation.
+    POINTER_DIR_SYNC_FAULT.store(false, Ordering::SeqCst);
+    crossing
+        .reestablish_pointer_durability()
+        .expect("the repair re-establishes the pointer durability");
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+}
+
+#[test]
+fn the_old_journals_retire_only_after_the_durability_is_recovered() {
+    // THE R5 FULL-STACK ELIGIBILITY (the review corrective R5): the
+    // reclamation's journal retirement waits for the established
+    // pointer durability — the child's failed rotation leaves the
+    // crossing closed (the reclamation refusing: the prior journal
+    // may still be selected after a power loss), and only after the
+    // child's repair and the parent's verified recovery does the
+    // reclamation retire the old journals with the outstanding T1
+    // evidence preserved exactly.
+    let dir = TestDir::new("durability-eligibility");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_reclaim_child_durability_closed"])
+        .env(RECLAIM_CHILD_STORE_ENV, dir.store())
+        .env(RECLAIM_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child's assertion chain passed: the failed rotation failed closed, the reclamation refused, the repair re-opened the crossing"
+    );
+    // THE DURABLE STATE: the pointer names the new generation; the
+    // prior journals all retained (nothing retired while the
+    // durability was unresolved).
+    let active = active_journal_path(&dir.journal()).unwrap();
+    assert_ne!(active, dir.journal());
+    assert!(
+        dir.journal().is_file(),
+        "the prior root journal is retained until the established retirement"
+    );
+    // THE RECOVERY (the durability verified): the outstanding plans
+    // replay exactly once; the crossing holds the new generation.
+    let (_spine, director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-durability-closed")
+            .expect("the recovery verifies the durability and resolves the new authority");
+    assert_eq!(
+        director.levels()[4],
+        LodLevel::Dormant,
+        "the outstanding plans replayed exactly once"
+    );
+    assert_eq!(crossing.pipeline_journal_path(), active);
+    // THE RECLAMATION (the durability established): MK1's eligible
+    // range AND the old root journal retire — the proper
+    // old-journal eligibility after the recovered failure.
+    let reclamation = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect("the reclamation completes after the verified recovery");
+    assert_eq!(reclamation.eligible_records, 2);
+    assert!(
+        reclamation.journal_files.contains(&dir.journal()),
+        "the old root journal retires once the durability is established"
+    );
+    assert!(!dir.journal().is_file(), "the prior root journal is gone");
+    assert!(active.is_file(), "the active generation stands");
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.reclaimed_records, 2);
+    }
+    // THE NOTHING-ELIGIBLE RE-RUN.
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the completed re-run refuses, got {other:?}"),
+        Ok(_) => panic!("a completed reclamation never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
 }

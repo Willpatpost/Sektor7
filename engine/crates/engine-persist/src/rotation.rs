@@ -48,6 +48,30 @@ pub const JOURNAL_ACTIVE_SUFFIX: &str = ".active";
 /// The pointer's bounded content (a file name).
 const MAX_ACTIVE_NAME_BYTES: u64 = 255;
 
+/// The pointer flip's durability state (the review corrective R5):
+/// the rename is atomic and the LIVE authority is the new journal,
+/// but the flip is POWER-LOSS-DURABLE only once the pointer
+/// directory sync completes. An unresolved state is NEVER a durably
+/// completed transition: the caller fails closed (no further
+/// authoritative T1 writes — the pre-rotation journal is a superset
+/// only of the evidence existing at rotation time, never of future
+/// writes to the new journal) until the durability is re-established
+/// ([`reestablish_pointer_durability`]) or a verified recovery
+/// repairs it. On platforms where std exposes no directory flush
+/// (Windows) the sync is the ratified no-op and this state is
+/// unreachable through natural failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointerDurability {
+    /// The pointer flip is durably established (the directory sync
+    /// completed).
+    Established,
+    /// The rename succeeded (the live authority IS the new journal)
+    /// but the directory sync failed: the flip may revert under
+    /// power loss. Carries the failure detail; never a durably
+    /// completed transition.
+    Unresolved { detail: String },
+}
+
 /// The rotation's report — the exact accounting of what moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRotation {
@@ -65,14 +89,11 @@ pub struct JournalRotation {
     /// The cancellation records carried over (each surviving only
     /// while its target survives).
     pub retained_cancellations: u64,
-    /// THE DURABILITY WARNING (the review corrective R4): a failure
-    /// of the post-flip pointer directory sync — the flip itself
-    /// succeeded (the live authority IS the new journal), but its
-    /// power-loss durability is uncertain. Carried in the report,
-    /// never an error return: an error after the authority changed
-    /// would hand control back to an operational stale-journal
-    /// writer.
-    pub durability_warning: Option<String>,
+    /// THE POINTER FLIP'S DURABILITY STATE (the review correctives
+    /// R4 + R5): see [`PointerDurability`]. An `Unresolved` outcome
+    /// is never a durably completed transition — the driver fails
+    /// closed until the durability is re-established.
+    pub pointer_durability: PointerDurability,
 }
 
 /// Resolves the campaign's active journal: the pointer file beside
@@ -115,6 +136,28 @@ pub fn active_journal_path(legacy_path: &Path) -> Result<PathBuf, JournalError> 
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(name))
+}
+
+/// Re-establishes the pointer's power-loss durability (the review
+/// corrective R5): the directory sync retried on demand — the
+/// active-journal authority is whatever the pointer currently names
+/// (correct in the live filesystem); this makes that choice durable.
+/// The recovery completes this verification before any progression
+/// (a fresh recovery never silently clears an unresolved
+/// durability-uncertain condition merely by reading the visible
+/// pointer); the durability-unresolved crossing exposes it as the
+/// repair path. On platforms where std exposes no directory flush
+/// (Windows) the sync is the ratified no-op.
+pub fn reestablish_pointer_durability(root: &Path) -> Result<(), JournalError> {
+    if POINTER_DIR_SYNC_FAULT.load(Ordering::Relaxed) {
+        return Err(io_err(
+            "re-sync journal dir (injected fault)",
+            root,
+            std::io::Error::other("injected pointer durability failure"),
+        ));
+    }
+    let pointer = pointer_path(root);
+    sync_parent_dir(&pointer).map_err(|e| io_err("re-sync journal dir", root, e))
 }
 
 /// The pointer file's path (beside the legacy journal).
@@ -425,7 +468,12 @@ pub fn rotate_journal(
     // follows is a DURABILITY step, not an authority step: its
     // failure means the flip may not survive a power loss — the
     // live authority is still the new journal — so it is carried
-    // as the report's durability warning, never an error return.
+    // as the report's pointer_durability state (the review
+    // corrective R5): the caller FAILS CLOSED on Unresolved — no
+    // further authoritative T1 writes until the durability is
+    // re-established — because the pre-rotation journal is a
+    // superset only of the evidence existing at rotation time,
+    // never of future writes to the new journal.
     let tmp_path = legacy_path.with_file_name(format!(
         "{}{JOURNAL_ACTIVE_SUFFIX}.tmp",
         legacy_path
@@ -442,12 +490,16 @@ pub fn rotate_journal(
     drop(file);
     fs::rename(&tmp_path, pointer_path(legacy_path))
         .map_err(|e| io_err("flip journal pointer", legacy_path, e))?;
-    let durability_warning = if POINTER_DIR_SYNC_FAULT.load(Ordering::Relaxed) {
-        Some("journal-rotation/pointer-dir-sync (injected fault)".to_owned())
+    let pointer_durability = if POINTER_DIR_SYNC_FAULT.load(Ordering::Relaxed) {
+        PointerDurability::Unresolved {
+            detail: "journal-rotation/pointer-dir-sync (injected fault)".to_owned(),
+        }
     } else {
         match sync_parent_dir(&pointer_path(legacy_path)) {
-            Ok(()) => None,
-            Err(e) => Some(io_err("sync journal dir", legacy_path, e).to_string()),
+            Ok(()) => PointerDurability::Established,
+            Err(e) => PointerDurability::Unresolved {
+                detail: io_err("sync journal dir", legacy_path, e).to_string(),
+            },
         }
     };
     Ok(JournalRotation {
@@ -456,7 +508,7 @@ pub fn rotate_journal(
         retained: retained.iter().map(|transaction| transaction.id).collect(),
         retired: retired.to_vec(),
         retained_cancellations: retained_cancellations.len() as u64,
-        durability_warning,
+        pointer_durability,
     })
 }
 

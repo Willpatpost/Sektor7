@@ -23,9 +23,9 @@ use engine_core::{LodLevel, PresenceSample, Spine};
 use engine_persist::{
     AwardCheckpoint, CancellationReason, ClassifiedSpan, ConsequenceEnvelope, ConsequenceId,
     CounterValues, Coverage, DurabilityClass, FrontierEntry, GENERATIONS_IO_FAULT, JournalError,
-    MediumError, OccurrenceSpan, POINTER_DIR_SYNC_FAULT, PipelineError, SignalLane, SourceBaseline,
-    SourcePosition, T1Journal, TransactionId, TransactionInput, active_journal_path,
-    read_journal_generations,
+    MediumError, OccurrenceSpan, POINTER_DIR_SYNC_FAULT, PipelineError, PointerDurability,
+    SignalLane, SourceBaseline, SourcePosition, T1Journal, TransactionId, TransactionInput,
+    active_journal_path, read_journal_generations,
 };
 use engine_slice::backup::{backup_campaign, verify_backup};
 use engine_slice::crossing::{ROTATION_SWAP_FAULT, SessionCrossing, TransitionError};
@@ -934,13 +934,19 @@ fn a_manifest_io_failure_before_the_flip_leaves_the_authority_unchanged() {
         active_journal_path(&dir.journal()).unwrap(),
         rotation.new_path
     );
-    assert!(rotation.durability_warning.is_none());
+    assert_eq!(
+        rotation.pointer_durability,
+        PointerDurability::Established,
+        "the retry rotation's flip is durably established"
+    );
 }
 
-/// The R4 child (the post-flip degraded durability): the campaign,
-/// the armed pointer-dir-sync fault, the rotation completing with
-/// the warning, the rebind, and the post-rotation boundary —
-/// proving the caller continues on the NEW authoritative journal.
+/// The R5 child (the post-flip pointer-durability failure): the
+/// campaign, the armed pointer-dir-sync fault, the refused rotation
+/// with the crossing FAILING CLOSED, the failing repair and the
+/// armed-fault recovery both refusing, and the disarmed repair
+/// re-opening the crossing — proving no authoritative T1 write
+/// precedes a durably established pointer.
 #[test]
 fn pp_b3_rotation_child_dir_sync_fault() {
     let Ok(store) = std::env::var(ROTATION_CHILD_STORE_ENV) else {
@@ -962,28 +968,90 @@ fn pp_b3_rotation_child_dir_sync_fault() {
         &far,
         &mut journaled,
     );
-    // THE INJECTED POST-FLIP DEGRADED DURABILITY: the rotation
-    // completes with the warning and the crossing REBINDS to the
-    // new authoritative journal (the pointer and the in-memory
-    // writer agree).
+    // THE INJECTED POST-FLIP DURABILITY FAILURE: the pointer flip
+    // succeeds (the live authority IS the new journal) but the
+    // directory sync fails — an UNRESOLVED durability is never a
+    // durably completed transition; the rotation refuses and the
+    // crossing FAILS CLOSED.
     POINTER_DIR_SYNC_FAULT.store(true, Ordering::SeqCst);
-    let rotation = crossing
-        .rotate_journal()
-        .expect("the rotation completes with the degraded-durability warning");
+    let detail = match crossing.rotate_journal() {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the unresolved durability refuses the rotation, got {other:?}"),
+        Ok(_) => panic!("an unresolved pointer durability is never a completed rotation"),
+    };
+    assert_eq!(detail, "rotation/pointer-durability");
+    // THE LIVE AUTHORITY CHANGED: the pointer names the new journal.
+    let active = active_journal_path(Path::new(&journal_path)).unwrap();
+    assert_ne!(active, Path::new(&journal_path));
+    // THE FAIL-CLOSED STATE: no new authoritative T1 transaction may
+    // commit while the pointer durability remains unresolved.
+    for detail in [
+        match crossing.publish_snapshot(&spine, &director) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the closed publication refuses, got {other:?}"),
+            Ok(_) => panic!("no authoritative write precedes the established pointer"),
+        },
+        match crossing.commit_canonical() {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the closed commit refuses, got {other:?}"),
+            Ok(_) => panic!("no authoritative write precedes the established pointer"),
+        },
+    ] {
+        assert_eq!(detail, "rotation/pointer-durability");
+    }
+    let now = spine.clock();
+    match crossing.deactivate(&mut spine, &mut director, 4, now) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => {
+            assert_eq!(detail, "rotation/pointer-durability");
+        }
+        Err(other) => panic!("the closed deactivation refuses, got {other:?}"),
+        Ok(_) => panic!("no authoritative T1 capture precedes the established pointer"),
+    }
+    // THE FAILING REPAIR (the fault still armed): the
+    // re-establishment refuses, the fail-closed state intact.
+    let error = crossing
+        .reestablish_pointer_durability()
+        .expect_err("the armed fault refuses the re-establishment");
     assert!(
-        rotation.durability_warning.is_some(),
-        "the failed directory sync surfaces as the report's durability warning"
+        matches!(
+            error,
+            TransitionError::JournalFailed(PipelineError::Journal(JournalError::Io { .. }))
+        ),
+        "the injected re-sync failure surfaces: {error:?}"
     );
-    assert_eq!(
-        active_journal_path(Path::new(&journal_path)).unwrap(),
-        rotation.new_path
+    match crossing.publish_snapshot(&spine, &director) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => {
+            assert_eq!(detail, "rotation/pointer-durability");
+        }
+        Err(other) => panic!("the still-closed publication refuses, got {other:?}"),
+        Ok(_) => panic!("the failed repair leaves the crossing closed"),
+    }
+    // THE ARMED-FAULT RECOVERY REFUSES: a fresh recovery cannot
+    // silently clear the unresolved condition merely by reading the
+    // visible pointer — the durability verification fails closed.
+    let error = match SessionCrossing::recover(
+        Path::new(&store),
+        Path::new(&journal_path),
+        "child-dir-sync-fault",
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("the armed fault refuses the recovery's durability verification"),
+    };
+    assert!(
+        matches!(
+            error,
+            TransitionError::JournalFailed(PipelineError::Journal(JournalError::Io { .. }))
+        ),
+        "the recovery fails closed on the unresolved durability: {error:?}"
     );
-    assert_eq!(
-        crossing.pipeline_journal_path(),
-        rotation.new_path.as_path(),
-        "the recovery-selected journal and the in-memory writer agree"
-    );
-    // The post-rotation boundary journals INTO THE NEW GENERATION.
+    // THE SUCCESSFUL REPAIR (the fault disarmed): the durability
+    // re-established, the crossing re-opened — and the new T1
+    // write lands in the new authoritative generation.
+    POINTER_DIR_SYNC_FAULT.store(false, Ordering::SeqCst);
+    crossing
+        .reestablish_pointer_durability()
+        .expect("the repair re-establishes the pointer durability");
+    assert_eq!(crossing.pipeline_journal_path(), active);
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
@@ -1002,16 +1070,20 @@ fn pp_b3_rotation_child_dir_sync_fault() {
 }
 
 #[test]
-fn a_pointer_dir_sync_failure_after_the_flip_still_rebinds_the_authority() {
-    // THE R4 POST-FLIP DEGRADED DURABILITY (the review corrective
-    // R4): a real failure of the pointer directory sync AFTER the
-    // authority has changed — injected deterministically in a
-    // spawned child — is carried as the rotation report's
-    // durability warning, never an error return: the live authority
-    // is the new journal, the child's crossing REBINDS to it (the
-    // pointer and the in-memory writer agree), and the child's
-    // post-rotation boundary lands in the new generation only —
-    // never the stale journal.
+fn a_pointer_dir_sync_failure_after_the_flip_fails_closed_until_reestablished() {
+    // THE R5 POST-FLIP DURABILITY FAILURE (the review corrective
+    // R5): a real failure of the pointer directory sync after the
+    // rename — injected deterministically in a spawned child — is
+    // NEVER a durably completed transition: the child's crossing
+    // fails closed (no authoritative T1 write while the pointer
+    // durability remains unresolved), the armed repair and the
+    // armed-fault recovery both refuse, and only the disarmed
+    // repair re-opens the crossing — the child's post-repair T1
+    // evidence landing in the new authoritative generation. The
+    // parent verifies the durable state, the recovery (the
+    // durability verified for real) resolving the same journal with
+    // the plans replayed exactly once, and the repeat rotation
+    // durably established.
     let dir = TestDir::new("dir-sync-failure");
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "pp_b3_rotation_child_dir_sync_fault"])
@@ -1022,17 +1094,17 @@ fn a_pointer_dir_sync_failure_after_the_flip_still_rebinds_the_authority() {
     assert_eq!(
         status.code(),
         Some(0),
-        "the child's assertion chain passed: the degraded-durability rotation completed, the crossing rebound, the post-rotation boundary landed in the new generation"
+        "the child's assertion chain passed: the unresolved durability failed closed, the armed repair and recovery refused, the disarmed repair re-opened the crossing with the post-repair T1 evidence in the new generation"
     );
     // THE PARENT'S DURABLE VERIFICATION: the pointer names the new
-    // journal; the child's post-rotation T1 evidence is in the new
+    // journal; the child's post-repair T1 evidence is in the new
     // generation and NOT in the stale one.
     let active = active_journal_path(&dir.journal()).unwrap();
     assert_ne!(active, dir.journal());
     let new_scan = T1Journal::scan_file(&active).unwrap();
     assert!(
         new_scan.committed.len() >= 2,
-        "the survivor plus the post-rotation boundary journaled into the new authoritative generation"
+        "the survivor plus the post-repair boundary journaled into the new authoritative generation"
     );
     let old_scan = T1Journal::scan_file(dir.journal()).unwrap();
     let newest = new_scan.committed.last().unwrap().id;
@@ -1040,15 +1112,48 @@ fn a_pointer_dir_sync_failure_after_the_flip_still_rebinds_the_authority() {
         old_scan.committed.iter().all(|entry| entry.id != newest),
         "the stale journal receives nothing after the flip"
     );
-    // THE RECOVERY resolves the new generation; the plan replays
-    // exactly once.
-    let (_spine, recovered_director, _crossing) =
+    // THE RECOVERY (the durability verified for real — the fault
+    // died with the child): the same journal resolved, the plans
+    // replayed exactly once; the repeat rotation durably
+    // established.
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director, mut crossing) =
         SessionCrossing::recover(&dir.store(), &dir.journal(), "child-dir-sync-fault")
-            .expect("the recovery resolves the new authority");
+            .expect("the recovery verifies the durability and resolves the new authority");
     assert_eq!(
-        recovered_director.levels()[4],
+        director.levels()[4],
         LodLevel::Dormant,
-        "the outstanding plan replayed exactly once"
+        "the outstanding plans replayed exactly once"
+    );
+    assert_eq!(crossing.pipeline_journal_path(), active);
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    let rotation = crossing
+        .rotate_journal()
+        .expect("the repeat rotation succeeds after the verified recovery");
+    assert_eq!(
+        active_journal_path(&dir.journal()).unwrap(),
+        rotation.new_path
+    );
+    assert_eq!(
+        rotation.pointer_durability,
+        PointerDurability::Established,
+        "the repeat rotation's flip is durably established"
     );
 }
 
