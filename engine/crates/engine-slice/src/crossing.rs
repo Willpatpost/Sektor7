@@ -999,6 +999,15 @@ impl SessionCrossing {
                 detail: "checkpoint-empty-range",
             });
         }
+        // SK's own retirement entry (the mandatory condition 2): the
+        // self-retirement's identity and key join the index — the
+        // membership universe preserves both after the whole-revision
+        // reclamation (a retired SK's key can never be reused).
+        index.push(ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk,
+            sk_epoch,
+        ));
         let skips = compute_checkpoint_skips(sk_parent, &walked);
         // The digest: the range's canonical bytes OLDEST first (the
         // reverse of the descent order).

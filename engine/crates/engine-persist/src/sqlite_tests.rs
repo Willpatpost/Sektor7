@@ -13,6 +13,10 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 
+use crate::checkpoint::{
+    CheckpointMetadata, ReclaimedIndexEntry, SkipEntry, chain_range_digest, compute_digest_seed,
+    publish_checkpoint_mk,
+};
 use crate::hash::Hash;
 use crate::local::LocalFileMedium;
 use crate::medium::{
@@ -734,5 +738,140 @@ fn pp_b1_child_killed_after_commit_recovers_installed() {
     let summary = medium.validate().unwrap();
     assert_eq!(summary.records, 2);
     assert_eq!(summary.head, committed.id());
+    cleanup_db(&path);
+}
+
+#[test]
+fn pp_b3_compacted_walk_parity_over_simulated_reclamation() {
+    // THE SQLite-side compacted walk (the LocalFileMedium parity,
+    // PP-B3's membership universe): the same checkpointed campaign,
+    // the same simulated reclamation (the record and object ROWS
+    // deleted by hand on the scratch database — never a live
+    // campaign), the same honest summary, and the same membership
+    // behavior — the reclaimed key's reuse rejected (the chain-wide
+    // uniqueness never weakened), the reclaim-indexed depends_on
+    // resolving with the strictly-earlier epoch.
+    let path = temp_db("pp-b3-compacted");
+
+    fn accepted(
+        medium: &mut SqliteMedium,
+        record: &RevisionRecord,
+        objects: &[StoredObject],
+    ) -> Hash {
+        let parent = record.parent;
+        match medium.append(record, objects, parent).unwrap() {
+            AppendOutcome::Accepted { id, .. } => id,
+            other => panic!("expected acceptance, got {other:?}"),
+        }
+    }
+
+    let mut medium = SqliteMedium::open(&path).unwrap();
+    // The chain: F(e0) ← S1(e1) ← S2(e2) ← SK(e3) ← MK(e4), with the
+    // honest metadata (the self-retirement skip to the founding; the
+    // index [S1, S2, SK] — SK's own retirement entry included; the
+    // founding-seeded digest over the range's bytes oldest first).
+    let founding_record = founding("pp-b3-parity");
+    let founding_id = accepted(&mut medium, &founding_record, &[]);
+    let keyed = |parent: Hash, parent_epoch: u64, key: &[u8], payload: &[u8]| {
+        let object = sample_object(payload);
+        let record = RevisionRecord::regular(parent, parent_epoch, parent_epoch * 10 + 7)
+            .with_idempotency_key(key.to_vec())
+            .with_content_refs(vec![object.hash()]);
+        (record, object)
+    };
+    let (s1_record, s1_object) = keyed(founding_id, 0, b"pp-b3/key-a", b"s1-payload");
+    let s1_content = s1_object.hash();
+    let s1 = accepted(&mut medium, &s1_record, &[s1_object]);
+    let (s2_record, s2_object) = keyed(s1, 1, b"pp-b3/key-b", b"s2-payload");
+    let s2_content = s2_object.hash();
+    let s2 = accepted(&mut medium, &s2_record, &[s2_object]);
+    let (sk_record, sk_object) = keyed(s2, 2, b"pp-b3/key-sk", b"sk-payload");
+    let sk_content = sk_object.hash();
+    let sk = accepted(&mut medium, &sk_record, &[sk_object]);
+    let seed = compute_digest_seed(&founding_id);
+    let s1_bytes = medium.read_record(&s1).unwrap().canonical_bytes();
+    let s2_bytes = medium.read_record(&s2).unwrap().canonical_bytes();
+    let range_digest = chain_range_digest(&seed, &[s1_bytes, s2_bytes]);
+    let index = vec![
+        ReclaimedIndexEntry::new(Some(b"pp-b3/key-a".to_vec()), s1, 1),
+        ReclaimedIndexEntry::new(Some(b"pp-b3/key-b".to_vec()), s2, 2),
+        ReclaimedIndexEntry::new(Some(b"pp-b3/key-sk".to_vec()), sk, 3),
+    ];
+    let metadata = CheckpointMetadata::new(
+        sk,
+        s2,
+        vec![SkipEntry::self_skip(founding_id)],
+        index,
+        range_digest,
+        seed,
+    );
+    let (mk, outcome) = publish_checkpoint_mk(&mut medium, sk, 3, &metadata, 40).unwrap();
+    assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+    drop(medium);
+
+    // THE simulated reclamation: the record and object rows removed
+    // by hand (commit 4's whole-revision deletes on the scratch
+    // database; the tables are keyed by the raw identity bytes).
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (revision, content) in [(s1, s1_content), (s2, s2_content), (sk, sk_content)] {
+            conn.execute(
+                "DELETE FROM records WHERE hash = ?1",
+                params![revision.as_bytes()],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM objects WHERE hash = ?1",
+                params![content.as_bytes()],
+            )
+            .unwrap();
+        }
+    }
+
+    // THE compacted walk: the reopen validates the gapped chain and
+    // reports the honest summary — identical to the file medium's.
+    let mut medium = SqliteMedium::open(&path).unwrap();
+    let summary = medium.validate().unwrap();
+    assert_eq!(summary.head, mk);
+    assert_eq!(summary.founding, founding_id);
+    assert_eq!(
+        summary.records, 2,
+        "MK and the founding only — the gap skipped"
+    );
+    assert_eq!(summary.checkpoints, vec![mk]);
+    assert_eq!(summary.reclaimed_records, 3);
+    assert_eq!(summary.reclaimed_keys, 3);
+
+    // The reclaimed key's reuse is rejected (the membership universe
+    // preserved the historical keys).
+    let (reuse_record, reuse_object) = keyed(mk, 4, b"pp-b3/key-b", b"reuse-payload");
+    let error = medium
+        .append(&reuse_record, &[reuse_object], Some(mk))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MediumError::Chain {
+                rule: "duplicate-idempotency-key"
+            }
+        ),
+        "the reclaimed key's reuse is rejected: {error:?}"
+    );
+
+    // The reclaim-indexed depends_on resolves with the
+    // strictly-earlier epoch (S1's indexed epoch 1 < the record's 5).
+    let (dep_record, dep_object) = keyed(mk, 4, b"pp-b3/key-new", b"dep-payload");
+    let dep_record = dep_record.with_depends_on(vec![s1]);
+    let new_head = match medium.append(&dep_record, &[dep_object], Some(mk)).unwrap() {
+        AppendOutcome::Accepted { id, .. } => id,
+        other => panic!("the reclaim-indexed dependency must resolve: {other:?}"),
+    };
+    let summary = medium.validate().unwrap();
+    assert_eq!(summary.head, new_head);
+    assert_eq!(summary.records, 3);
+    assert_eq!(
+        summary.reclaimed_records, 3,
+        "the append changed nothing about history"
+    );
     cleanup_db(&path);
 }

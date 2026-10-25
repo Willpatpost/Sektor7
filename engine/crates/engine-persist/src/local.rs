@@ -63,6 +63,9 @@ use std::time::Instant;
 use engine_core::wire::MAX_BYTE_LEN;
 use engine_core::{Decoder, Encoder};
 
+use crate::checkpoint::{
+    CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata, ReclaimedIndexEntry, peek_object_domain,
+};
 use crate::fault::{FaultControl, FaultPoint};
 use crate::hash::{Hash, hash_object};
 use crate::medium::{
@@ -109,6 +112,14 @@ struct Cursor {
     /// a *prior revision*, never a content hash that happens to be
     /// reachable).
     record_ids: BTreeSet<Hash>,
+    /// The reclaim-indexed revisions (identity → epoch) from every
+    /// on-chain MK's index whose records are genuinely absent — the
+    /// historical membership evidence (PP-B3's condition 2: a
+    /// reclaimed revision's key-dedup and depends_on resolution
+    /// survive its deletion). The observational counts (the MK list,
+    /// the reclaimed totals) live on the [`ChainSummary`] the walk
+    /// returns, never on the cursor.
+    reclaimed: BTreeMap<Hash, u64>,
     founding: Hash,
     authority: AuthorityMode,
     campaign_id: String,
@@ -414,9 +425,16 @@ impl LocalFileMedium {
         if let Some(cursor) = &self.cursor {
             // A dependency must name a prior revision of the
             // authoritative chain — the record-id index, never the
-            // mixed reachable set (a content hash is not a revision).
+            // mixed reachable set (a content hash is not a revision)
+            // — or a reclaim-indexed revision with its indexed epoch
+            // strictly below the candidate's (PP-B3's condition 2).
             for dependency in &record.depends_on {
-                if !cursor.record_ids.contains(dependency) {
+                let resolves = cursor.record_ids.contains(dependency)
+                    || cursor
+                        .reclaimed
+                        .get(dependency)
+                        .is_some_and(|&dep_epoch| dep_epoch < record.epoch);
+                if !resolves {
                     return Err(MediumError::Chain {
                         rule: "depends-on-unresolvable",
                     });
@@ -691,8 +709,15 @@ impl LocalFileMedium {
     /// uniqueness, checked epoch linkage **including the trusted-cursor
     /// boundary** (the oldest suffix revision sits exactly one epoch
     /// above the trusted head), and dependency ancestry (every
-    /// depends_on reference names a trusted revision or a strictly
-    /// older suffix revision).
+    /// depends_on reference names a trusted revision, a strictly
+    /// older suffix revision, or a reclaim-indexed revision with its
+    /// indexed epoch strictly earlier). A suffix may pass a foreign
+    /// MK — its record and metadata object validate like any other,
+    /// but its index is not absorbed into this handle's cursor: the
+    /// membership universe is rebuilt by the cold walk at the next
+    /// open (under the single-writer discipline a mid-handle foreign
+    /// MK is one this process published through another,
+    /// already-closed handle).
     fn walk_suffix(
         &self,
         target: Hash,
@@ -704,10 +729,16 @@ impl LocalFileMedium {
         let mut newer_epoch: Option<u64> = None;
         let mut visited = BTreeSet::new();
         let mut suffix_keys = BTreeSet::new();
-        let (trusted_keys, trusted_record_ids) = self
+        let (trusted_keys, trusted_record_ids, reclaimed) = self
             .cursor
             .as_ref()
-            .map(|cursor| (cursor.seen_keys.clone(), cursor.record_ids.clone()))
+            .map(|cursor| {
+                (
+                    cursor.seen_keys.clone(),
+                    cursor.record_ids.clone(),
+                    cursor.reclaimed.clone(),
+                )
+            })
             .unwrap_or_default();
         loop {
             if current == until {
@@ -739,7 +770,10 @@ impl LocalFileMedium {
                         let resolves = trusted_record_ids.contains(dependency)
                             || positions
                                 .get(dependency)
-                                .is_some_and(|position| *position > index);
+                                .is_some_and(|position| *position > index)
+                            || reclaimed
+                                .get(dependency)
+                                .is_some_and(|&dep_epoch| dep_epoch < record.epoch);
                         if !resolves {
                             return Err(MediumError::Chain {
                                 rule: "depends-on-unresolvable",
@@ -813,8 +847,16 @@ impl LocalFileMedium {
     /// epoch-linked with checked arithmetic, key-unique; every
     /// referenced object loaded and hash-verified; every depends_on
     /// reference resolving to a strictly earlier revision of the same
-    /// authoritative history. Rebuilds the cursor and returns the
-    /// summary.
+    /// authoritative history (retained, or reclaim-indexed with its
+    /// indexed epoch). Rebuilds the cursor and returns the summary.
+    ///
+    /// **The compacted mode (PP-B3):** an absent parent is a
+    /// legitimately-reclaimed revision only when the most recent
+    /// on-chain MK's skip table covers the gap — a skip for exactly
+    /// the record whose parent is absent (or that MK's own self
+    /// entry), jumping to the nearest retained ancestor under the
+    /// gap-aware strictly-earlier epoch linkage. An uncovered absence
+    /// is hard corruption — fail closed, never assumed reclamation.
     fn cold_walk_from(&mut self, head: Hash) -> Result<ChainSummary, MediumError> {
         let mut seen_ids = BTreeSet::new();
         let mut seen_keys = BTreeSet::new();
@@ -824,9 +866,21 @@ impl LocalFileMedium {
         let mut current = head;
         let mut newer_epoch: Option<u64> = None;
         let mut head_epoch = 0u64;
-        // (id, depends_on) per record in walk order (newest first) —
-        // dependency ancestry is validated once the chain is complete.
-        let mut walked: Vec<(Hash, Vec<Hash>)> = Vec::new();
+        // (id, epoch, depends_on) per record in walk order (newest
+        // first) — dependency ancestry is validated once the chain is
+        // complete.
+        let mut walked: Vec<(Hash, u64, Vec<Hash>)> = Vec::new();
+        // The staged per-MK index entries — merged into the universe
+        // only after the walk completes (pre-reclamation the range
+        // records are still present and retained; only genuinely
+        // absent entries are reclaimed members).
+        let mut staged_indexes: Vec<ReclaimedIndexEntry> = Vec::new();
+        let mut checkpoints: Vec<Hash> = Vec::new();
+        // The most recent MK's skip context — the gap cover for
+        // everything below it — and the pending-gap flag the linkage
+        // check consumes at the jump target.
+        let mut skip_table: Option<(Hash, CheckpointMetadata)> = None;
+        let mut gap_pending = false;
         let (founding_id, authority, campaign_id) = loop {
             if !seen_ids.insert(current) {
                 return Err(MediumError::Chain { rule: "cycle" });
@@ -837,13 +891,23 @@ impl LocalFileMedium {
                 head_epoch = record.epoch;
             }
             // Checked linkage: an epoch of u64::MAX has no successor —
-            // it must fail closed, never wrap.
-            if let Some(epoch) = newer_epoch
-                && record.epoch.checked_add(1) != Some(epoch)
-            {
-                return Err(MediumError::Chain {
-                    rule: "epoch-regression",
-                });
+            // it must fail closed, never wrap. Across a skip-table
+            // jump the linkage is gap-aware instead: the target must
+            // sit STRICTLY below the pre-gap record (any gap size ≥ 1
+            // — the reclaimed span was removed whole).
+            if let Some(epoch) = newer_epoch {
+                if gap_pending {
+                    if record.epoch >= epoch {
+                        return Err(MediumError::Chain {
+                            rule: "epoch-regression",
+                        });
+                    }
+                    gap_pending = false;
+                } else if record.epoch.checked_add(1) != Some(epoch) {
+                    return Err(MediumError::Chain {
+                        rule: "epoch-regression",
+                    });
+                }
             }
             if let Some(key) = &record.idempotency_key
                 && !seen_keys.insert(key.clone())
@@ -852,18 +916,63 @@ impl LocalFileMedium {
                     rule: "duplicate-idempotency-key",
                 });
             }
-            for reference in &record.content_refs {
-                self.load_referenced(reference)?;
+            let mut first_object: Option<Vec<u8>> = None;
+            for (position, reference) in record.content_refs.iter().enumerate() {
+                let bytes = self.load_referenced(reference)?;
+                if position == 0 {
+                    first_object = Some(bytes);
+                }
                 if reachable.insert(*reference) {
                     content_objects += 1;
                 }
             }
+            // The MK recognition: a record whose first content object
+            // carries the checkpoint-metadata domain — its index
+            // joins the membership universe (staged for the post-walk
+            // merge) and its skip table becomes the gap cover for
+            // everything below it.
+            if let Some(bytes) = first_object {
+                let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+                if domain == CHECKPOINT_METADATA_DOMAIN {
+                    let metadata =
+                        CheckpointMetadata::decode(&bytes).map_err(MediumError::Format)?;
+                    staged_indexes.extend(metadata.index.iter().cloned());
+                    checkpoints.push(current);
+                    skip_table = Some((current, metadata));
+                }
+            }
             reachable.insert(current);
-            walked.push((current, record.depends_on.clone()));
+            walked.push((current, record.epoch, record.depends_on.clone()));
             records += 1;
             newer_epoch = Some(record.epoch);
             match record.parent {
-                Some(parent) => current = parent,
+                Some(parent) => {
+                    // The compacted walk: an absent parent is a gap —
+                    // legitimate only under the covering skip table;
+                    // anything else is hard corruption (fail closed,
+                    // never assumed reclamation).
+                    if self.object_path(&parent).is_file() {
+                        current = parent;
+                    } else {
+                        let Some((owner, table)) = skip_table.as_ref() else {
+                            return Err(MediumError::MissingObject { hash: parent });
+                        };
+                        let target = if current == *owner {
+                            table
+                                .self_skip()
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        } else {
+                            table
+                                .skip_for(&current)
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        };
+                        let Some(target) = target else {
+                            return Err(MediumError::MissingObject { hash: parent });
+                        };
+                        gap_pending = true;
+                        current = target;
+                    }
+                }
                 None => match record.kind {
                     RecordKind::Founding {
                         authority,
@@ -884,22 +993,56 @@ impl LocalFileMedium {
                 },
             }
         };
+        // The membership universe merge: only genuinely-absent
+        // entries are reclaimed members — pre-reclamation the range
+        // records are still present, retained, and already accounted
+        // (their index entries are the evidence for the FUTURE
+        // reclamation, never double-counted).
+        let mut reclaimed: BTreeMap<Hash, u64> = BTreeMap::new();
+        let mut reclaimed_records = 0u64;
+        let mut reclaimed_keys = 0u64;
+        for entry in staged_indexes {
+            if seen_ids.contains(&entry.hash) {
+                continue;
+            }
+            if reclaimed.insert(entry.hash, entry.epoch).is_some() {
+                return Err(MediumError::Chain {
+                    rule: "checkpoint-index-incoherent",
+                });
+            }
+            if let Some(key) = &entry.key
+                && !seen_keys.insert(key.clone())
+            {
+                return Err(MediumError::Chain {
+                    rule: "duplicate-idempotency-key",
+                });
+            }
+            if entry.key.is_some() {
+                reclaimed_keys += 1;
+            }
+            reclaimed_records += 1;
+        }
         // Dependency ancestry, deferred until the chain is complete:
         // the walk runs newest-first, so a record at position i can
-        // only depend on revisions at positions > i (strictly earlier).
-        // A dependency naming a nonexistent revision, a content hash,
-        // itself, or any later revision is unresolvable — hash
-        // consistency alone never makes a chain semantically valid.
+        // only depend on revisions at positions > i (strictly
+        // earlier), or on a reclaim-indexed revision with its indexed
+        // epoch strictly below the referencing record's. A dependency
+        // naming a nonexistent revision, a content hash, itself, or
+        // any later revision is unresolvable — hash consistency
+        // alone never makes a chain semantically valid.
         let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
-        for (index, (id, _)) in walked.iter().enumerate() {
+        for (index, (id, _, _)) in walked.iter().enumerate() {
             positions.insert(*id, index);
         }
-        for (index, (_, dependencies)) in walked.iter().enumerate() {
+        for (index, (_, record_epoch, dependencies)) in walked.iter().enumerate() {
             for dependency in dependencies {
-                if !positions
+                let resolves = positions
                     .get(dependency)
                     .is_some_and(|position| *position > index)
-                {
+                    || reclaimed
+                        .get(dependency)
+                        .is_some_and(|&dep_epoch| dep_epoch < *record_epoch);
+                if !resolves {
                     return Err(MediumError::Chain {
                         rule: "depends-on-unresolvable",
                     });
@@ -913,6 +1056,7 @@ impl LocalFileMedium {
             seen_keys,
             reachable,
             record_ids: seen_ids,
+            reclaimed,
             founding: founding_id,
             authority,
             campaign_id: campaign_id.clone(),
@@ -926,6 +1070,9 @@ impl LocalFileMedium {
             campaign_id,
             records,
             content_objects,
+            checkpoints,
+            reclaimed_records,
+            reclaimed_keys,
         })
     }
 
@@ -962,6 +1109,7 @@ impl LocalFileMedium {
                     seen_keys,
                     reachable,
                     record_ids,
+                    reclaimed: BTreeMap::new(),
                     founding: *id,
                     authority: *authority,
                     campaign_id: campaign_id.clone(),

@@ -37,6 +37,7 @@ use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
 
+use engine_core::wire::MAX_TAG_LEN;
 use engine_core::{Decoder, Encoder, SaveError};
 
 use crate::hash::Hash;
@@ -57,6 +58,15 @@ pub const CHECKPOINT_MK_KEY_DOMAIN: &str = "engine-persist/checkpoint-mk/1";
 /// Documented maxima (bounded decode, checked before allocation).
 pub const MAX_CHECKPOINT_SKIPS: u64 = 1 << 16;
 pub const MAX_CHECKPOINT_INDEX: u64 = 1 << 16;
+
+/// Peeks an object's leading domain tag — the checkpoint recognition
+/// for chain walks (the walk reuses bytes it already loaded and
+/// hash-verified; no payload parse). A record whose first content
+/// object's domain is [`CHECKPOINT_METADATA_DOMAIN`] is an MK.
+pub fn peek_object_domain(bytes: &[u8]) -> Result<&str, SaveError> {
+    let mut dec = Decoder::new(bytes);
+    dec.read_str(MAX_TAG_LEN, "checkpoint-peek")
+}
 
 /// One skip-table entry: a RETAINED revision whose direct parent has
 /// been legitimately reclaimed jumps to its NEAREST RETAINED

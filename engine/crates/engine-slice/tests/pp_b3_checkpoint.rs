@@ -235,7 +235,10 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
         vec![s2, s1],
         "the reclaimable range, newest first"
     );
-    assert_eq!(metadata.range_records, 2, "the range count");
+    assert_eq!(
+        metadata.range_records, 3,
+        "the retired-set count (the two publications + SK's own retirement entry)"
+    );
     // THE skip table: the non-circular self-retirement entry (the
     // reserved zero identity naming the referencing MK itself) and
     // C1's skip past the reclaimable run to the founding.
@@ -249,7 +252,9 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
         "the self entry and the confirmation's skip to the founding"
     );
     // THE membership index: both historical identity classes for
-    // every range revision, sorted by hash.
+    // every range revision — plus SK's own retirement entry (the
+    // mandatory condition 2: the retired SK's key stays in the
+    // universe) — sorted by hash.
     let mut expected_index = [s1, s2]
         .iter()
         .map(|revision| {
@@ -257,6 +262,11 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
             ReclaimedIndexEntry::new(record.idempotency_key.clone(), *revision, record.epoch)
         })
         .collect::<Vec<_>>();
+    expected_index.push(ReclaimedIndexEntry::new(
+        sk_record.idempotency_key.clone(),
+        report.sk,
+        sk_record.epoch,
+    ));
     expected_index.sort_unstable_by_key(|entry| entry.hash);
     assert_eq!(
         metadata.index, expected_index,

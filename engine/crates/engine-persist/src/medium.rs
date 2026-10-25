@@ -301,6 +301,20 @@ pub struct ChainSummary {
     pub records: u64,
     /// Distinct content objects referenced across the chain.
     pub content_objects: u64,
+    /// The checkpoint-metadata revisions (MKs) on the chain, in walk
+    /// order (newest first) — the permanent anchors (PP-B3). Empty
+    /// before any checkpoint exists.
+    pub checkpoints: Vec<Hash>,
+    /// The reclaim-indexed records across every on-chain MK's index
+    /// whose revision objects are genuinely absent (0 before any
+    /// reclamation — an index whose records are still present is
+    /// evidence for their FUTURE reclamation, not reclaimed state).
+    pub reclaimed_records: u64,
+    /// The idempotency keys carried by those genuinely-absent index
+    /// entries (keys are chain-unique, so this counts distinct keys)
+    /// — the historical membership evidence (PP-B3's mandatory
+    /// condition 2). 0 before any reclamation.
+    pub reclaimed_keys: u64,
 }
 
 /// The storage boundary the future CommitPipeline will operate over
