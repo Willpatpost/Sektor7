@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    CanonicalMedium, Hash, LocalFileMedium, MediumError, PipelineError, RevisionRecord,
-    StoredObject, T1Journal,
+    AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, PipelineError,
+    RevisionRecord, StoredObject, T1Journal,
 };
 use engine_slice::crossing::{SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
@@ -131,6 +131,29 @@ fn run_ticks_near(
         director.apply(spine, std::slice::from_ref(presence));
         spine.run_tick();
     }
+}
+
+/// One confirmation cycle (the B2 crash-arc pattern): the far
+/// boundary (the deactivation with its captures), the canonical
+/// confirmation, the reactivation, and the accrual run — the HWM
+/// guard means the NEXT cycle's captures need the post-reactivation
+/// accrual.
+fn confirm_cycle(
+    crossing: &mut SessionCrossing,
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    far: &PresenceSample,
+    near: &PresenceSample,
+) {
+    durable_boundary(crossing, spine, director, far);
+    let engine_persist::CommitOutcome::Confirmed(_) = crossing
+        .commit_canonical()
+        .expect("the cycle's confirmation")
+    else {
+        panic!("the cycle confirms")
+    };
+    durable_boundary(crossing, spine, director, near);
+    run_ticks_near(spine, director, near, 100);
 }
 
 /// A well-formed domain-tagged content object (the reuse-append
@@ -415,4 +438,165 @@ fn the_full_stack_rotates_then_reclaims_the_range_and_the_old_journal() {
         .expect("the re-run completes");
     assert_eq!(rerun.removed_objects, 0);
     assert!(rerun.journal_files.is_empty(), "already removed");
+}
+
+#[test]
+fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
+    // THE GO's multi-checkpoint example, VERBATIM: F ← S1 ← C1 ←
+    // S2 ← S2′ ← C2 ← SK1 ← MK1 ← S3 ← C3 ← S4 ← C4 ← SK2 ← MK2
+    // (S3.parent = MK1). The reclamation of MK1's range retires SK1
+    // whole with its publications (S1, S2, S2′); SK2 remains the
+    // newest discoverable snapshot; MK1/MK2 stand permanent; the
+    // walk traverses the self-skip past SK1 and the anchors' skips
+    // past the reclaimed publications; the range-1 key reuse is
+    // rejected; and a depends_on naming the reclaimed S2′ resolves
+    // via MK1's permanent index with the strictly-earlier epoch.
+    let dir = TestDir::new("example");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "example-campaign").unwrap();
+    // S1.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // C1 — the first confirmation cycle.
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    // S2, then S2′ (the tick run between them — the states must
+    // differ, the snapshot content hash being the idempotency key).
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // C2 — the second cycle.
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    // SK1 + MK1 — checkpoint 1, the range [S2′, S2, S1] in descent
+    // order.
+    let report1 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the first checkpoint publishes");
+    assert_eq!(
+        report1.range.len(),
+        3,
+        "the range carries S1, S2, and S2′ (descent order)"
+    );
+    // S3 — its parent IS MK1 (the example's S3.parent = MK1).
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let s3 = crossing.publish_snapshot(&spine, &director).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(
+            medium.read_record(&s3).unwrap().parent,
+            Some(report1.mk),
+            "S3.parent = MK1 (the example's shape)"
+        );
+    }
+    // C3 — the third cycle; S4; C4 — the fourth.
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    // SK2 + MK2 — checkpoint 2, the range [S4, S3].
+    let report2 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the second checkpoint publishes");
+    assert_eq!(report2.range.len(), 2, "the range carries S3 and S4");
+    // The probes' inputs, captured BEFORE the reclamation: S2's
+    // idempotency key (the reuse probe) and S2′'s identity (the
+    // dependency probe).
+    let (s2_key, s2_prime) = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let s2_prime = report1.range[0];
+        let s2 = report1.range[1];
+        let key = medium.read_record(&s2).unwrap().idempotency_key.unwrap();
+        (key, s2_prime)
+    };
+
+    // THE RECLAMATION of MK1's range (generations = 1: SK2 — the
+    // newest snapshot — remains the recovery anchor).
+    let reclamation = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect("the example's reclamation completes");
+    assert_eq!(reclamation.mk, report1.mk);
+    assert_eq!(reclamation.sk, report1.sk);
+    assert_eq!(
+        reclamation.eligible_records, 4,
+        "S1, S2, S2′, and SK1's own retirement entry"
+    );
+    assert_eq!(reclamation.removed_objects, 8, "the whole-revision units");
+
+    // SK1 RETIRED WHOLE; MK1/MK2 PERMANENT with their metadata
+    // objects; the walk validating through the self-skip past SK1
+    // and the anchors' skips past the reclaimed publications.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert!(
+            medium.read_record(&report1.sk).is_err(),
+            "SK1 retired whole"
+        );
+        let mk1 = medium.read_record(&report1.mk).unwrap();
+        let mk2 = medium.read_record(&report2.mk).unwrap();
+        medium
+            .read_object(mk1.content_refs.first().unwrap())
+            .unwrap();
+        medium
+            .read_object(mk2.content_refs.first().unwrap())
+            .unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.checkpoints, vec![report2.mk, report1.mk]);
+        assert_eq!(summary.reclaimed_records, 4);
+        assert_eq!(summary.reclaimed_keys, 4);
+        assert_eq!(
+            summary.records, 11,
+            "F, C1, C2, MK1, S3, C3, S4, C4, SK2, MK2, and the audit"
+        );
+    }
+    // THE RANGE-1 KEY REUSE REJECTED — S2's key, preserved by MK1's
+    // permanent index (the mandatory condition 2).
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let object = publication_object(b"example-reuse");
+        let record = RevisionRecord::regular(head, head_epoch, 9000)
+            .with_idempotency_key(s2_key)
+            .with_content_refs(vec![object.hash()]);
+        let error = medium.append(&record, &[object], Some(head)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "duplicate-idempotency-key"
+                }
+            ),
+            "the range-1 key reuse is rejected: {error:?}"
+        );
+    }
+    // THE RECLAIMED DEPENDENCY: a depends_on naming S2′ resolves via
+    // MK1's index with the strictly-earlier epoch.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let object = publication_object(b"example-dependency");
+        let record = RevisionRecord::regular(head, head_epoch, 9001)
+            .with_idempotency_key(b"example/dependency-key".to_vec())
+            .with_content_refs(vec![object.hash()])
+            .with_depends_on(vec![s2_prime]);
+        match medium.append(&record, &[object], Some(head)).unwrap() {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the reclaimed dependency resolves: {other:?}"),
+        }
+    }
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    // SK2 THE NEWEST DISCOVERABLE — the recovery works from it.
+    let (_spine, _director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "example-campaign")
+            .expect("the recovery works from SK2");
+    // THE IDEMPOTENT RE-RUN.
+    let rerun = recovered_crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect("the re-run completes");
+    assert_eq!(rerun.removed_objects, 0);
+    assert_eq!(rerun.ledger, reclamation.ledger);
 }

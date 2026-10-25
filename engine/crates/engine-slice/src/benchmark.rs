@@ -105,6 +105,59 @@ fn campaign_dir(name: &str) -> PathBuf {
     path
 }
 
+/// One retention-measurement campaign (the PP-B3 benchmark's local
+/// fixture): the publications, the two checkpoints, and the audited
+/// reclamation of the oldest range — the lean form (no confirmation
+/// cycles: the storage effect is the measurement, not the lane
+/// machinery). Returns (the store bytes before, the store bytes
+/// after, the objects removed).
+fn retention_campaign(
+    root: &Path,
+    label: &str,
+    ticks: u64,
+    publications_per_range: usize,
+    generations: u64,
+) -> (u64, u64, u64) {
+    let near = PresenceSample {
+        position: (-100.0, 0.0),
+        velocity: (0.0, 0.0),
+    };
+    let dir = root.join(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut spine, mut director) = scenario_pair(ticks, &near);
+    let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+    let mut crossing =
+        SessionCrossing::open(&dir.join("store"), journal, "benchmark-retention").unwrap();
+    for _ in 0..publications_per_range {
+        for _ in 0..20 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        crossing.publish_snapshot(&spine, &director).unwrap();
+    }
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    for _ in 0..publications_per_range {
+        for _ in 0..20 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        crossing.publish_snapshot(&spine, &director).unwrap();
+    }
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    let before = dir_size(&dir.join("store"));
+    let reclamation = crossing
+        .reclaim_checkpoint(&dir.join("journal.t1"), generations)
+        .unwrap();
+    let after = dir_size(&dir.join("store"));
+    drop(crossing);
+    let _ = std::fs::remove_dir_all(&dir);
+    (before, after, reclamation.removed_objects)
+}
+
 /// Runs the persistence benchmark and prints the report.
 pub fn run() {
     println!(
@@ -597,6 +650,105 @@ pub fn run() {
     }
     println!(
         "  design §7.3 projection: the compacted steady state ≈250-400 KB (the active-state scale + the retained window) — compare the measured compacted sizes above"
+    );
+
+    // 8. PP-B3 — the canonical retention economics (the checkpoint +
+    // the reclamation + the rotation): the storage before/after the
+    // audited reclamation across the campaign sweep, the interval
+    // sensitivity (the publication count per range), and the
+    // operation costs.
+    println!("8. PP-B3 retention (the checkpoint + the reclamation + the rotation)");
+    // 8a. The storage sweep: the lean two-checkpoint campaign at
+    // increasing durations; the audited reclamation of the oldest
+    // range under the generations=1 window.
+    for ticks in [150, 600, 1200, 2400] {
+        let (before, after, removed) =
+            retention_campaign(&root, &format!("sweep-{ticks}"), ticks, 2, 1);
+        let reduction = 100.0 * (before - after) as f64 / before as f64;
+        println!(
+            "  {ticks} ticks: {before} B → {after} B after the reclamation (−{reduction:.1}%, {removed} objects removed)"
+        );
+    }
+    // 8b. The interval sensitivity: the publications per range (2 vs
+    // 8) — the reclaimed bytes scale with the range size while the
+    // retained anchors and metadata stay flat.
+    for publications in [2, 8] {
+        let (before, after, removed) = retention_campaign(
+            &root,
+            &format!("interval-{publications}"),
+            600,
+            publications,
+            1,
+        );
+        println!(
+            "  {publications} publications per range: {before} B → {after} B ({removed} objects removed)"
+        );
+    }
+    // 8c. The operation costs (fresh scenarios — the operations
+    // mutate): the checkpoint publication, the journal rotation (over
+    // one outstanding journal transaction), and the reclamation.
+    let mut checkpoint_samples = Vec::new();
+    let mut rotation_samples = Vec::new();
+    let mut reclamation_samples = Vec::new();
+    for index in 0..5 {
+        let dir = root.join(format!("costs-{index}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut spine, mut director) = scenario_pair(600, &near);
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.join("store"), journal, "benchmark-costs").unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        for _ in 0..20 {
+            director.apply(&mut spine, std::slice::from_ref(&near));
+            spine.run_tick();
+        }
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        let start = Instant::now();
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .unwrap();
+        checkpoint_samples.push(start.elapsed());
+        for _ in 0..2 {
+            for _ in 0..20 {
+                director.apply(&mut spine, std::slice::from_ref(&near));
+                spine.run_tick();
+            }
+            crossing.publish_snapshot(&spine, &director).unwrap();
+        }
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .unwrap();
+        // One outstanding journal transaction — the rotation's
+        // survivor set.
+        let now = spine.clock();
+        crossing
+            .deactivate(&mut spine, &mut director, 4, now)
+            .unwrap();
+        let start = Instant::now();
+        crossing.rotate_journal().unwrap();
+        rotation_samples.push(start.elapsed());
+        let start = Instant::now();
+        crossing
+            .reclaim_checkpoint(&dir.join("journal.t1"), 1)
+            .unwrap();
+        reclamation_samples.push(start.elapsed());
+        drop(crossing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    report(
+        "the checkpoint publication (compact + SK + MK)",
+        &mut checkpoint_samples,
+    );
+    report(
+        "the journal rotation (the survivor re-anchor + the flip)",
+        &mut rotation_samples,
+    );
+    report(
+        "the reclamation (the audit + the deletes)",
+        &mut reclamation_samples,
+    );
+    println!(
+        "  interpretation: docs/PP-B3-RETENTION-RECORD.md (the measured-vs-budget analysis; pod results, not physical-rig evidence)"
     );
 
     // The storage summary.
