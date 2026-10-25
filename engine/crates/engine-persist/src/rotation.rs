@@ -28,12 +28,13 @@
 //! legacy journal itself (the pre-rotation compatibility: every
 //! existing campaign and backup behaves identically).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use engine_core::SaveError;
+use engine_core::{Decoder, Encoder, SaveError};
 
 use crate::journal::{
     CommittedTransaction, JournalError, RecordedCancellation, T1Journal, TailState, TransactionId,
@@ -112,6 +113,160 @@ fn pointer_path(legacy_path: &Path) -> PathBuf {
     let mut name = legacy_path.file_name().unwrap_or_default().to_os_string();
     name.push(JOURNAL_ACTIVE_SUFFIX);
     legacy_path.with_file_name(name)
+}
+
+/// The campaign's journal-generation ownership record's suffix
+/// (beside the root — the review corrective R3).
+pub const JOURNAL_GENERATIONS_SUFFIX: &str = ".generations";
+
+/// The ownership record's versioned domain.
+pub const JOURNAL_GENERATIONS_DOMAIN: &str = "engine-persist/journal-generations/1";
+pub const JOURNAL_GENERATIONS_VERSION: u32 = 1;
+
+/// Documented maxima (bounded decode).
+pub const MAX_JOURNAL_GENERATIONS: u64 = 1 << 16;
+pub const MAX_GENERATION_NAME_BYTES: u64 = 255;
+/// The ownership record's whole-file bound (the read allocates only
+/// under it).
+pub const MAX_JOURNAL_GENERATIONS_FILE_BYTES: u64 = 1 << 20;
+
+/// The ownership record's path (beside the root).
+fn generations_path(legacy_path: &Path) -> PathBuf {
+    let mut name = legacy_path.file_name().unwrap_or_default().to_os_string();
+    name.push(JOURNAL_GENERATIONS_SUFFIX);
+    legacy_path.with_file_name(name)
+}
+
+/// THE CAMPAIGN'S JOURNAL-GENERATION OWNERSHIP RECORD (the review
+/// corrective R3): the generation names THIS campaign's rotations
+/// have created or rotated away from — the retirement authority the
+/// reclamation trusts, so a shared directory's foreign
+/// `journal-*.t1` files (matching the filename predicate) are never
+/// deletion candidates. Maintained by the rotation (atomic
+/// tmp+fsync+rename); a missing record means no generation is
+/// eligible (ownership conservatively unproven — a pre-rotation
+/// campaign has no stale generations; a generation unrecorded by a
+/// crash between the flip and the record's write is retained, and
+/// the next rotation records it as its prior active).
+pub fn read_journal_generations(root: &Path) -> Result<Vec<String>, JournalError> {
+    let manifest = generations_path(root);
+    match fs::metadata(&manifest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err("stat journal generations", &manifest, e)),
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(JournalError::Format(SaveError::Integrity(
+                    "journal-generations/not-a-file",
+                )));
+            }
+            if metadata.len() > MAX_JOURNAL_GENERATIONS_FILE_BYTES {
+                return Err(JournalError::Format(SaveError::Limit {
+                    section: "journal-generations",
+                    kind: "file-length",
+                    value: metadata.len(),
+                    max: MAX_JOURNAL_GENERATIONS_FILE_BYTES,
+                }));
+            }
+        }
+    }
+    let bytes =
+        fs::read(&manifest).map_err(|e| io_err("read journal generations", &manifest, e))?;
+    decode_generations(&bytes)
+}
+
+/// Removes the retired names from the ownership record (the
+/// reclamation's journal retirement calls this after the deletions
+/// — dead entries are inert either way, the record stays honest).
+pub fn retire_journal_generations(root: &Path, retired: &[String]) -> Result<(), JournalError> {
+    let names = read_journal_generations(root)?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let retired_set: BTreeSet<&String> = retired.iter().collect();
+    let remaining: Vec<String> = names
+        .into_iter()
+        .filter(|name| !retired_set.contains(name))
+        .collect();
+    write_journal_generations(root, &remaining)
+}
+
+/// Encodes the ownership record (the versioned domain, the bounded
+/// count, the plain file names).
+fn encode_generations(names: &[String]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.write_str(JOURNAL_GENERATIONS_DOMAIN);
+    enc.write_u32(JOURNAL_GENERATIONS_VERSION);
+    enc.write_count(names.len());
+    for name in names {
+        enc.write_str(name);
+    }
+    enc.into_bytes()
+}
+
+/// Strict decode: the domain and version gates, the bounded count,
+/// the plain-file-name rule (never empty, never a traversal or
+/// separator form), the duplicate rejection, no trailing bytes.
+fn decode_generations(bytes: &[u8]) -> Result<Vec<String>, JournalError> {
+    const SECTION: &str = "journal-generations";
+    let mut dec = Decoder::new(bytes);
+    dec.read_domain(JOURNAL_GENERATIONS_DOMAIN)
+        .map_err(JournalError::Format)?;
+    let version = dec.read_u32().map_err(JournalError::Format)?;
+    if version != JOURNAL_GENERATIONS_VERSION {
+        return Err(JournalError::Format(SaveError::Version {
+            observed: version,
+            supported: JOURNAL_GENERATIONS_VERSION,
+        }));
+    }
+    let count = dec
+        .read_count(MAX_JOURNAL_GENERATIONS, SECTION, "count")
+        .map_err(JournalError::Format)?;
+    let mut names = Vec::with_capacity(count as usize);
+    let mut seen = BTreeSet::new();
+    for _ in 0..count {
+        let name = dec
+            .read_str(MAX_GENERATION_NAME_BYTES, SECTION)
+            .map_err(JournalError::Format)?;
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(JournalError::Format(SaveError::Integrity(
+                "journal-generations/name",
+            )));
+        }
+        if !seen.insert(name.to_owned()) {
+            return Err(JournalError::Format(SaveError::Integrity(
+                "journal-generations/duplicate",
+            )));
+        }
+        names.push(name.to_owned());
+    }
+    dec.finish().map_err(JournalError::Format)?;
+    Ok(names)
+}
+
+/// Writes the ownership record atomically (tmp + fsync + rename +
+/// the directory sync — the pointer's discipline).
+fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), JournalError> {
+    let manifest = generations_path(root);
+    let tmp = root.with_file_name(format!(
+        "{}{JOURNAL_GENERATIONS_SUFFIX}.tmp",
+        root.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let bytes = encode_generations(names);
+    let mut file =
+        File::create(&tmp).map_err(|e| io_err("create journal generations tmp", &tmp, e))?;
+    file.write_all(&bytes)
+        .map_err(|e| io_err("write journal generations tmp", &tmp, e))?;
+    file.sync_all()
+        .map_err(|e| io_err("sync journal generations tmp", &tmp, e))?;
+    drop(file);
+    fs::rename(&tmp, &manifest).map_err(|e| io_err("write journal generations", &manifest, e))?;
+    sync_parent_dir(&manifest).map_err(|e| io_err("sync journal dir", &manifest, e))?;
+    Ok(())
 }
 
 /// Writes the surviving set to a fresh journal, scan-verifies it,
@@ -197,6 +352,10 @@ pub fn rotate_journal(
         .ok_or(JournalError::Format(SaveError::Integrity(
             "journal-rotation/name",
         )))?;
+    // The pre-flip active — the generation becoming stale (captured
+    // BEFORE the flip so the ownership record below names the prior
+    // generation, not the new one).
+    let prior_active = active_journal_path(legacy_path)?;
     let tmp_path = legacy_path.with_file_name(format!(
         "{}{JOURNAL_ACTIVE_SUFFIX}.tmp",
         legacy_path
@@ -215,6 +374,26 @@ pub fn rotate_journal(
         .map_err(|e| io_err("flip journal pointer", legacy_path, e))?;
     sync_parent_dir(&pointer_path(legacy_path))
         .map_err(|e| io_err("sync journal dir", legacy_path, e))?;
+    // (5) THE OWNERSHIP RECORD (the review corrective R3): the
+    // campaign's generation lineage — the pre-flip active (now
+    // stale) and the new generation, deduplicated — maintained
+    // beside the root. The reclamation's journal retirement
+    // authority is THIS record, never a directory-wide filename
+    // pattern (a shared directory's foreign campaign files match
+    // the journal-*.t1 predicate). A crash between the flip and
+    // this write leaves the new generation unrecorded:
+    // conservatively retained (the next rotation records it as its
+    // prior active).
+    let mut owned = read_journal_generations(legacy_path)?;
+    if let Some(prior_name) = prior_active.file_name().and_then(|prior| prior.to_str())
+        && !owned.iter().any(|recorded| recorded == prior_name)
+    {
+        owned.push(prior_name.to_owned());
+    }
+    if !owned.iter().any(|recorded| recorded == name) {
+        owned.push(name.to_owned());
+    }
+    write_journal_generations(legacy_path, &owned)?;
     Ok(JournalRotation {
         new_path,
         legacy_path: legacy_path.to_path_buf(),

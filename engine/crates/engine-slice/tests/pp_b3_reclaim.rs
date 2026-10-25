@@ -27,7 +27,7 @@ use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
 use engine_persist::local::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
 use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, PipelineError,
-    RevisionRecord, SqliteMedium, StoredObject, T1Journal,
+    RevisionRecord, SqliteMedium, StoredObject, T1Journal, read_journal_generations,
 };
 use engine_slice::crossing::{
     ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
@@ -1567,4 +1567,502 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
         Ok(_) => panic!("a completed reclamation never repeats"),
     };
     assert_eq!(detail, "reclaim/nothing-eligible");
+}
+
+// ---------------------------------- the review correctives R2 and R3
+
+#[test]
+fn checkpoints_continue_across_reclamations_and_recover() {
+    // THE R2 LIFECYCLE (the review corrective R2): the checkpoint
+    // range walk classifies a canonical reclamation AUDIT as
+    // retained evidence — never an unclassifiable refusal — so the
+    // real cadence works: checkpoint, checkpoint, RECLAIM, continue
+    // the session (real simulation and canonical consequences),
+    // checkpoint again over the audit, recover and validate, reclaim
+    // the next eligible range, continue, checkpoint again, and
+    // reopen — with the exactly-once behavior, the historical
+    // identity membership, the permanent metadata, the retained
+    // audit records, and the skip-table ancestry all verified.
+    let dir = TestDir::new("lifecycle-across-reclamations");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "lifecycle").unwrap();
+    // (1) Checkpoint 1 — the range [S1].
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report1 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    let s1_key = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium
+            .read_record(&report1.range[0])
+            .unwrap()
+            .idempotency_key
+            .unwrap()
+    };
+    // (2) Checkpoint 2 — the range [S3].
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let report2 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    let s3 = report2.range[0];
+    // (3) RECLAIM checkpoint 1's eligible history — the audit lands
+    // on the chain between MK2 and everything after.
+    let r1 = crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
+    assert_eq!(r1.mk, report1.mk);
+    let audit1 = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.head().unwrap().unwrap()
+    };
+    // (4) CONTINUE the actual session: a publication standing ON the
+    // audit, then a full confirmation cycle — journaled captures,
+    // the canonical consequence commit, the reactivation, the
+    // accrual.
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let s4 = crossing.publish_snapshot(&spine, &director).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(
+            medium.read_record(&s4).unwrap().parent,
+            Some(audit1),
+            "the continuation's publication stands on the retained audit"
+        );
+    }
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    // (5) CHECKPOINT 3 — the range walk crosses the audit: the R2
+    // classification (previously the unclassifiable refusal).
+    let report3 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("checkpoint 3 publishes over the reclamation audit");
+    assert_eq!(report3.range, vec![s4]);
+    // (6) RECOVER and validate.
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (mut spine, mut director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "lifecycle")
+            .expect("the mid-lifecycle recovery anchors from SK3");
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.checkpoints,
+            vec![report3.mk, report2.mk, report1.mk]
+        );
+        assert_eq!(summary.reclaimed_records, r1.eligible_records);
+        // The walk: MK3, SK3, C4, S4, A1, MK2, SK2, S3, MK1, C1,
+        // and the founding — the audit retained in the ancestry,
+        // MK1's reclaimed range skipped under its tables (MK2's
+        // range still stands at this point).
+        assert_eq!(summary.records, 11);
+        let audit = medium.read_record(&audit1).unwrap();
+        medium
+            .read_object(audit.content_refs.first().unwrap())
+            .unwrap();
+    }
+    // (7) RECLAIM the next eligible range (MK2's — MK1 completed and
+    // skipped): the second audit lands above MK3.
+    let r2 = crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
+    assert_eq!(
+        r2.mk, report2.mk,
+        "the reclamation progresses past the completed MK1"
+    );
+    let audit2 = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.head().unwrap().unwrap()
+    };
+    // (8) CONTINUE again + CHECKPOINT 4 — the range walk crosses the
+    // second audit.
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let s5 = crossing.publish_snapshot(&spine, &director).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(
+            medium.read_record(&s5).unwrap().parent,
+            Some(audit2),
+            "the second continuation stands on the second retained audit"
+        );
+    }
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report4 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("checkpoint 4 publishes over the second audit");
+    assert_eq!(report4.range, vec![s5]);
+    // (9) REOPEN and recover: the exactly-once recovery, the
+    // historical membership, the permanent metadata, the audits, and
+    // the skip-table ancestry.
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (recovered_spine, recovered_director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "lifecycle")
+            .expect("the end-of-lifecycle recovery anchors from SK4");
+    assert_eq!(recovered_director.levels()[4], LodLevel::Full);
+    drop(recovered_spine);
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.checkpoints,
+            vec![report4.mk, report3.mk, report2.mk, report1.mk]
+        );
+        assert_eq!(
+            summary.reclaimed_records,
+            r1.eligible_records + r2.eligible_records
+        );
+        // The walk: MK4, SK4, C5, S5, A2, MK3, SK3, C4, S4, A1, MK2,
+        // MK1, C1, and the founding — both audits retained in the
+        // ancestry, both reclaimed ranges skipped under the tables.
+        assert_eq!(summary.records, 14);
+        for report in [&report1, &report2, &report3, &report4] {
+            let mk = medium.read_record(&report.mk).unwrap();
+            medium
+                .read_object(mk.content_refs.first().unwrap())
+                .unwrap();
+        }
+        for audit in [audit1, audit2] {
+            let record = medium.read_record(&audit).unwrap();
+            medium
+                .read_object(record.content_refs.first().unwrap())
+                .unwrap();
+        }
+    }
+    // THE HISTORICAL MEMBERSHIP across the lifecycle: the reclaimed
+    // key's reuse rejected; the reclaimed dependency resolved via
+    // the permanent index.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let reuse_object = publication_object(b"lifecycle-reuse");
+        let reuse_record = RevisionRecord::regular(head, head_epoch, 9000)
+            .with_idempotency_key(s1_key)
+            .with_content_refs(vec![reuse_object.hash()]);
+        let error = medium
+            .append(&reuse_record, &[reuse_object], Some(head))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "duplicate-idempotency-key"
+                }
+            ),
+            "the reclaimed key's reuse is rejected across the lifecycle: {error:?}"
+        );
+        let dep_object = publication_object(b"lifecycle-dependency");
+        let dep_record = RevisionRecord::regular(head, head_epoch, 9001)
+            .with_idempotency_key(b"lifecycle/dependency-key".to_vec())
+            .with_content_refs(vec![dep_object.hash()])
+            .with_depends_on(vec![s3]);
+        match medium
+            .append(&dep_record, &[dep_object], Some(head))
+            .unwrap()
+        {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the reclaimed dependency resolves: {other:?}"),
+        }
+    }
+    // THE COMPLETED RANGES: the wider window protects MK4-MK2 and
+    // finds only completed work — nothing eligible.
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 3) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the completed re-run refuses, got {other:?}"),
+        Ok(_) => panic!("a completed reclamation never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+}
+
+#[test]
+fn the_sqlite_lifecycle_continues_across_reclamations() {
+    // THE R2 LIFECYCLE over the SQLite provider (the parity): the
+    // same cadence — checkpoint, checkpoint, reclaim, continue,
+    // checkpoint over the audit, recover, reclaim, continue,
+    // checkpoint over the second audit, recover — the audit
+    // classification and the ancestry proven over both providers.
+    let dir = TestDir::new("sqlite-lifecycle");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "sqlite-lifecycle",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report1 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let report2 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    let r1 = crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report3 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("checkpoint 3 publishes over the reclamation audit");
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (mut spine, mut director, mut crossing) = SessionCrossing::recover_at(
+        &StoreLocation::Database(dir.db()),
+        &dir.journal(),
+        "sqlite-lifecycle",
+    )
+    .unwrap();
+    let r2 = crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
+    assert_eq!(
+        r2.mk, report2.mk,
+        "the reclamation progresses past the completed MK1"
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report4 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("checkpoint 4 publishes over the second audit");
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (_spine, _director, _crossing) = SessionCrossing::recover_at(
+        &StoreLocation::Database(dir.db()),
+        &dir.journal(),
+        "sqlite-lifecycle",
+    )
+    .expect("the sqlite end-of-lifecycle recovery anchors from SK4");
+    {
+        let mut medium = SqliteMedium::open(dir.db()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.checkpoints,
+            vec![report4.mk, report3.mk, report2.mk, report1.mk]
+        );
+        assert_eq!(
+            summary.reclaimed_records,
+            r1.eligible_records + r2.eligible_records
+        );
+        assert_eq!(summary.records, 14);
+    }
+}
+
+#[test]
+fn a_missing_retained_audit_object_fails_the_checkpoint_closed() {
+    // THE FAIL-CLOSED CASE (the review corrective R2): a retained
+    // reclamation audit's required object removed by hand — the next
+    // checkpoint's range walk REFUSES (the missing evidence surfaces
+    // as the typed error), never skipping the audit and never
+    // guessing; the hand-corrupted store fails the validation the
+    // same way.
+    let dir = TestDir::new("missing-audit");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "missing-audit").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .unwrap();
+    crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
+    let audit = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.head().unwrap().unwrap()
+    };
+    // The continuation over the audit, then the audit's required
+    // ledger object REMOVED by hand.
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let record = medium.read_record(&audit).unwrap();
+        let object = record.content_refs.first().copied().unwrap();
+        std::fs::remove_file(dir.store().join("objects").join(object.hex())).unwrap();
+        assert!(
+            medium.validate().is_err(),
+            "the hand-corrupted store fails the validation"
+        );
+    }
+    // THE REFUSAL: the range walk fails closed on the missing
+    // retained evidence.
+    let error = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect_err("the missing audit object refuses the checkpoint");
+    assert!(
+        matches!(
+            error,
+            TransitionError::JournalFailed(PipelineError::Medium(
+                MediumError::MissingObject { .. }
+            ))
+        ),
+        "the missing retained audit object fails closed: {error:?}"
+    );
+}
+
+#[test]
+fn shared_directory_campaigns_never_cross_journal_ownership() {
+    // THE R3 OWNERSHIP BOUNDARY (the review corrective R3): the
+    // journal retirement authority is the CAMPAIGN'S OWN recorded
+    // lineage — the generations manifest the rotation maintains
+    // beside the root — never a directory-wide filename predicate.
+    // Two independent campaigns share one directory, both carrying
+    // pending actionable T1 evidence, both rotated (A twice);
+    // campaign A reclaims its eligible history and campaign B's
+    // journals, locks, canonical state, and active pointer stand
+    // untouched; B recovers independently with its pending plan
+    // replayed; an unowned journal-*.t1 file in the shared
+    // directory is retained (ownership conservatively unproven); an
+    // interrupted rotation of B recovers and re-rotates within its
+    // own lineage; and a reclamation handed a foreign root fails
+    // closed.
+    let dir = TestDir::new("shared-directory");
+    let shared = dir.0.clone();
+    let a_root = shared.join("journal-a.t1");
+    let b_root = shared.join("journal-b.t1");
+    let a_store = shared.join("store-a");
+    let b_store = shared.join("store-b");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // CAMPAIGN A: the rotated two-checkpoint campaign, then the
+    // continuation and a SECOND rotation.
+    let (mut spine_a, mut director_a, mut crossing_a, _s1, a_gen1) =
+        rotated_two_checkpoint_campaign_at(&a_store, &a_root, "shared-a");
+    durable_boundary(&mut crossing_a, &mut spine_a, &mut director_a, &near);
+    run_ticks_near(&mut spine_a, &mut director_a, &near, 100);
+    durable_boundary(&mut crossing_a, &mut spine_a, &mut director_a, &far);
+    let rotation_a2 = crossing_a.rotate_journal().expect("A's second rotation");
+    drop(spine_a);
+    drop(director_a);
+    // CAMPAIGN B: the rotated two-checkpoint campaign (one
+    // rotation), its pending plan outstanding.
+    let (spine_b, director_b, crossing_b, _s1, b_active) =
+        rotated_two_checkpoint_campaign_at(&b_store, &b_root, "shared-b");
+    drop(spine_b);
+    drop(director_b);
+    // The unowned, ambiguously named file — real journal bytes under
+    // a name no campaign's manifest records.
+    let mystery = shared.join("journal-mystery.t1");
+    std::fs::copy(&b_root, &mystery).unwrap();
+    // B's durable state captured before A's reclamation.
+    let b_root_bytes = std::fs::read(&b_root).unwrap();
+    let b_active_bytes = std::fs::read(&b_active).unwrap();
+    let b_pointer = shared.join("journal-b.t1.active");
+    let b_pointer_bytes = std::fs::read(&b_pointer).unwrap();
+    let b_summary = {
+        let mut medium = LocalFileMedium::open(&b_store).unwrap();
+        medium.validate().unwrap()
+    };
+    // A RECLAIMS its eligible history (generations = 1: MK2
+    // protected) — the retirement stays within A's own recorded
+    // lineage.
+    let reclamation = crossing_a
+        .reclaim_checkpoint(&a_root, 1)
+        .expect("A's reclamation completes within its own lineage");
+    assert_eq!(reclamation.eligible_records, 2);
+    assert!(reclamation.journal_files.contains(&a_root));
+    assert!(reclamation.journal_files.contains(&a_gen1));
+    assert!(!a_root.is_file(), "A's stale root retired");
+    assert!(!a_gen1.is_file(), "A's first generation retired");
+    assert!(rotation_a2.new_path.is_file(), "A's active journal stands");
+    {
+        // A's ownership record now names only its active generation.
+        let remaining = read_journal_generations(&a_root).unwrap();
+        let active_name = rotation_a2
+            .new_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(remaining, vec![active_name]);
+    }
+    // B UNTOUCHED: the journals, the pointer, the lock, the
+    // canonical state — byte-identical.
+    assert_eq!(std::fs::read(&b_root).unwrap(), b_root_bytes);
+    assert_eq!(std::fs::read(&b_active).unwrap(), b_active_bytes);
+    assert_eq!(std::fs::read(&b_pointer).unwrap(), b_pointer_bytes);
+    assert!(
+        shared.join("journal-b.t1.lock").is_file(),
+        "B's root lock stands"
+    );
+    {
+        let mut medium = LocalFileMedium::open(&b_store).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary, b_summary);
+    }
+    // THE UNOWNED FILE retained (ownership unproven).
+    assert!(
+        mystery.is_file(),
+        "the unowned journal-*.t1 is retained — no ownership evidence, no deletion"
+    );
+    // B RECOVERS independently: its pending plan replays exactly
+    // once through its own active journal.
+    drop(crossing_b);
+    let (_spine_b, recovered_b, _crossing_b) =
+        SessionCrossing::recover(&b_store, &b_root, "shared-b")
+            .expect("B recovers through its own pointer");
+    assert_eq!(
+        recovered_b.levels()[4],
+        LodLevel::Dormant,
+        "B's outstanding plan replayed exactly once"
+    );
+    // A RECOVERS: its cleanup and journal selection correct; the
+    // completed ranges refuse.
+    drop(crossing_a);
+    let (_spine_a, recovered_a, mut crossing_a) =
+        SessionCrossing::recover(&a_store, &a_root, "shared-a")
+            .expect("A recovers through its own pointer");
+    assert_eq!(recovered_a.levels()[4], LodLevel::Dormant);
+    let detail = match crossing_a.reclaim_checkpoint(&a_root, 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("A's completed re-run refuses, got {other:?}"),
+        Ok(_) => panic!("a completed reclamation never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+    // THE FOREIGN ROOT REFUSES: A's reclamation handed B's root
+    // fails closed — the campaign-root binding.
+    let detail = match crossing_a.reclaim_checkpoint(&b_root, 3) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the foreign root refuses, got {other:?}"),
+        Ok(_) => panic!("a foreign root must never direct this campaign's deletions"),
+    };
+    assert_eq!(detail, "reclaim/journal-root");
+    // THE INTERRUPTED ROTATION boundary: B's pointer hand-rewritten
+    // to its root (the pre-flip durable state); B recovers through
+    // the previous authoritative journal and a subsequent rotation
+    // re-lands its pointer — A's active journal untouched
+    // throughout.
+    let b_root_name = b_root.file_name().unwrap().to_str().unwrap().to_owned();
+    std::fs::write(&b_pointer, &b_root_name).unwrap();
+    let (_spine, recovered_b, mut crossing_b) =
+        SessionCrossing::recover(&b_store, &b_root, "shared-b")
+            .expect("B recovers through the previous authoritative journal");
+    assert_eq!(recovered_b.levels()[4], LodLevel::Dormant);
+    let rotation_b2 = crossing_b.rotate_journal().expect("B's second rotation");
+    assert!(rotation_b2.new_path.is_file());
+    assert!(
+        rotation_a2.new_path.is_file(),
+        "A's active journal still stands"
+    );
+    assert_eq!(std::fs::read(&b_root).unwrap(), b_root_bytes);
 }

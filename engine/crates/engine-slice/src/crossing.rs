@@ -24,13 +24,13 @@ use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
     CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
-    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash,
-    JOURNAL_ACTIVE_SUFFIX, JournalRotation, JournalScan, KeyPhase, MediumError, OccurrenceSpan,
-    PipelineError, RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger,
-    Reconciliation, RecordedCancellation, RecoveryAnchor, RecoveryError, RevisionRecord,
-    SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
-    TransactionId, active_journal_path, chain_range_digest, compute_digest_seed,
-    publish_checkpoint_mk, publish_reclamation_ledger, reconcile, rotate_journal,
+    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
+    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, RECLAMATION_LEDGER_DOMAIN,
+    ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger, Reconciliation, RecordedCancellation,
+    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
+    SourcePosition, StoredObject, T1Journal, TailState, TransactionId, active_journal_path,
+    chain_range_digest, compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
+    read_journal_generations, reconcile, retire_journal_generations, rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -1243,6 +1243,18 @@ impl SessionCrossing {
         legacy_journal: &Path,
         generations: u64,
     ) -> Result<ReclamationReport, TransitionError> {
+        // THE CAMPAIGN-ROOT BINDING (the review corrective R3): the
+        // reclamation's journal retirement authority is THIS
+        // crossing's campaign journal root — the path the crossing
+        // opened or recovered with — never an arbitrary caller path
+        // (a shared directory's foreign root must never direct this
+        // campaign's deletions).
+        if legacy_journal != self.journal_root.as_path() {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "reclaim/journal-root",
+            });
+        }
         // PHASE A — the eligibility + the audit. THE WINDOW
         // VALIDATION first (the review corrective F2): the retention
         // window must be positive — a zero-generation window could
@@ -1601,6 +1613,12 @@ impl SessionCrossing {
                 })?;
             }
         }
+        // The ownership record updated (the review corrective R3):
+        // the retired names leave the campaign's lineage (the
+        // manifest rewritten atomically — dead entries are inert
+        // either way; the record stays honest).
+        retire_journal_generations(legacy_journal, &ledger.journal_files)
+            .map_err(PipelineError::Journal)?;
         // THE POST-CONDITIONS: the compacted walk validates over the
         // gapped chain (the skip tables cover the gaps), and the
         // newest snapshot — the recovery anchor, the retention
@@ -2398,6 +2416,21 @@ fn walk_checkpoint_range(
                 record,
                 kind: RangeKind::Anchor,
             });
+        } else if domain == RECLAMATION_LEDGER_DOMAIN {
+            // A canonical reclamation audit (the review corrective
+            // R2): RETAINED EVIDENCE — the explicit+logged record of
+            // a prior reclamation, never a reclaimable snapshot
+            // publication. The strict decode is the fail-closed gate
+            // (an invalid, missing, or incoherent ledger object
+            // refuses the checkpoint — never merely skipped), and
+            // the audit's retained position participates in the
+            // ancestry and the skip tables exactly like a
+            // confirming anchor.
+            ReclamationLedger::decode(&bytes).map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
         } else if domain == CHECKPOINT_METADATA_DOMAIN {
             // The prior checkpoint's MK — the permanent boundary.
             // Its metadata carries the campaign's founding-derived
@@ -2571,14 +2604,19 @@ fn find_installed_reclamation(
 }
 
 /// The stale journal generations removable alongside the range
-/// (PP-B3's Phase B, the review corrective F1): only after the
-/// rotation's verified active journal stands — no pointer means no
-/// rotation, and the campaign root journal IS the active one (never
-/// touched). With the pointer present, every journal file beside
-/// the root EXCEPT the current active generation is a stale
-/// generation (the root's own file and every prior rotated
-/// generation), each removable under the audited retirement — the
-/// prior generations never accumulate.
+/// (PP-B3's Phase B, the review correctives F1 + R3): only after
+/// the rotation's verified active journal stands — no pointer means
+/// no rotation, and the campaign root journal IS the active one
+/// (never touched). THE OWNERSHIP RECORD (R3): the eligible stale
+/// generations are the CAMPAIGN'S OWN recorded lineage — the
+/// generations manifest the rotation maintains beside the root —
+/// NEVER a directory-wide filename pattern (in a shared directory a
+/// foreign campaign's files match the journal-*.t1 predicate; only
+/// the campaign's own rotation lineage is deletion authority). A
+/// missing record (a pre-rotation campaign, or a generation
+/// unrecorded by a crash between the flip and the record's write)
+/// means the unlisted generations are NOT eligible — ownership
+/// conservatively unproven, the files retained.
 fn reclaimable_journal_files(root: &Path) -> Result<Vec<String>, TransitionError> {
     let active = active_journal_path(root).map_err(PipelineError::Journal)?;
     if active == root {
@@ -2591,32 +2629,13 @@ fn reclaimable_journal_files(root: &Path) -> Result<Vec<String>, TransitionError
         .and_then(|name| name.to_str())
         .map(str::to_owned);
     T1Journal::scan_file(active).map_err(PipelineError::Journal)?;
-    let Some(dir) = root.parent() else {
-        return Ok(Vec::new());
-    };
-    let Some(root_name) = root.file_name().and_then(|name| name.to_str()) else {
-        return Ok(Vec::new());
-    };
+    let names = read_journal_generations(root).map_err(PipelineError::Journal)?;
     let mut stale = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            // The pointer family and the sidecar locks are handled
-            // separately (the pointer must survive to keep resolving
-            // the active journal; the locks are removed with their
-            // journals by the caller).
-            if name.ends_with(JOURNAL_ACTIVE_SUFFIX) || name.ends_with(".lock") {
-                continue;
-            }
-            let is_journal =
-                name == root_name || (name.starts_with("journal-") && name.ends_with(".t1"));
-            if !is_journal || active_name.as_deref() == Some(name.as_str()) {
-                continue;
-            }
-            stale.push(name);
+    for name in names {
+        if active_name.as_deref() == Some(name.as_str()) {
+            continue;
         }
+        stale.push(name);
     }
     stale.sort();
     Ok(stale)

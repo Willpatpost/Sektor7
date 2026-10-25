@@ -107,7 +107,10 @@ pub use recovery::{
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
 };
-pub use rotation::{JOURNAL_ACTIVE_SUFFIX, JournalRotation, active_journal_path, rotate_journal};
+pub use rotation::{
+    JOURNAL_ACTIVE_SUFFIX, JournalRotation, active_journal_path, read_journal_generations,
+    retire_journal_generations, rotate_journal,
+};
 pub use sqlite::{
     SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,
 };
