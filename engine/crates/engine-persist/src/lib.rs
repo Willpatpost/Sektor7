@@ -37,6 +37,7 @@
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
+pub mod checkpoint;
 pub mod consequence;
 pub mod encounter;
 pub mod envelope;
@@ -58,6 +59,12 @@ mod sqlite_tests;
 #[cfg(test)]
 mod tests;
 
+pub use checkpoint::{
+    CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,
+    CheckpointMetadata, ReclaimedIndexEntry, SkipEntry, chain_range_digest,
+    checkpoint_mk_idempotency_key, compute_digest_seed, compute_range_digest,
+    publish_checkpoint_mk,
+};
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
 };
@@ -84,8 +91,9 @@ pub use migrate::{
     cutover_seal_activate, migrate_local_to_sqlite,
 };
 pub use pipeline::{
-    BatchEntry, CaptureReceipt, CommitOutcome, CommitPipeline, ConfirmationLabel,
-    ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError, ReconcileOutcome,
+    BatchEntry, CONSEQUENCE_BATCH_DOMAIN, CaptureReceipt, CommitOutcome, CommitPipeline,
+    ConfirmationLabel, ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError,
+    ReconcileOutcome,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{

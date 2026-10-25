@@ -10,23 +10,25 @@
 //! Stage 4 path never constructs plans, so its behavior and every
 //! frozen fingerprint are mechanically untouched.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT};
+use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT, MAX_TAG_LEN};
 use engine_core::{
     CompactionError, Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, HistoryKind,
     Level, LodLevel, ObligationView, SaveError, Schedule, Spine, Tick,
 };
 
 use engine_persist::{
-    AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CanonicalMedium, CaptureReceipt,
-    ClassifiedSpan, CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope,
-    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan,
-    KeyPhase, MediumError, OccurrenceSpan, PipelineError, RecoveryAnchor, RecoveryError,
-    RevisionRecord, SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState,
-    reconcile,
+    AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
+    CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
+    CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope, ConsequenceId,
+    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalScan, KeyPhase,
+    MediumError, OccurrenceSpan, PipelineError, ReclaimedIndexEntry, Reconciliation,
+    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
+    SourcePosition, StoredObject, T1Journal, TailState, chain_range_digest, compute_digest_seed,
+    publish_checkpoint_mk, reconcile,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -401,6 +403,28 @@ pub struct SessionCompaction {
     /// The total summarized applied amount (now carried in the
     /// per-NPC conservation aggregates).
     pub summarized_amount: u64,
+}
+
+/// The SK/MK checkpoint publication's report (PP-B3, D-PP-4's
+/// two-revision composition).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointReport {
+    /// The snapshot-publication revision SK (the compacted session
+    /// snapshot, published through the existing path).
+    pub sk: Hash,
+    /// The checkpoint-metadata revision MK (SK's immediate child,
+    /// referencing the permanent metadata object).
+    pub mk: Hash,
+    /// The reclaimable range this checkpoint indexes — the
+    /// non-confirming session-snapshot publications between the
+    /// boundary (the prior MK or the founding) and SK, in descent
+    /// order (newest first).
+    pub range: Vec<Hash>,
+    /// The skip-table size (the self-retirement entry included).
+    pub skips: u64,
+    /// The range digest commitment (the previously-verified
+    /// commitment over the range's record bytes).
+    pub range_digest: [u8; 32],
 }
 
 impl From<PipelineError> for TransitionError {
@@ -884,6 +908,155 @@ impl SessionCrossing {
         })
     }
 
+    /// The SK/MK checkpoint publication (PP-B3 — D-PP-4's ratified
+    /// two-revision composition): ONE explicit operation composing
+    /// the existing disciplines —
+    ///
+    /// 1. **The session compaction** ([`Self::compact_session`] —
+    ///    the F1 preflight inside; the spine takes the
+    ///    `spine-history/2` form, the lanes summarize under the
+    ///    eligibility rule).
+    /// 2. **SK** — the compacted session snapshot publication (the
+    ///    existing [`Self::publish_snapshot`] path; SK is a normal
+    ///    snapshot, recoverable through the established recovery —
+    ///    and if the compound below fails, an ordinary valid
+    ///    publication, never a fabricated checkpoint).
+    /// 3. **The range walk** — from SK's parent down to the boundary
+    ///    (the prior checkpoint's MK, or the founding), classifying
+    ///    each record by its content object's domain: the
+    ///    session-snapshot publications (this checkpoint's OWN
+    ///    reclaimable range), the confirming revisions (retained
+    ///    anchors — never reclaimable, D-PP-4a), the checkpoint
+    ///    metadata (the prior MK — the permanent boundary). The
+    ///    skip table (every retained record standing on a reclaimed
+    ///    parent jumps to its nearest retained ancestor, plus the
+    ///    non-circular self-retirement entry), the compact
+    ///    reclaimed-record index ({key?, hash, epoch} — both
+    ///    historical identity classes, D-PP-4b's rejection honored),
+    ///    and the digest commitment (the running SHA-256 over the
+    ///    range's record bytes, oldest first, seeded from the
+    ///    founding — computed while the records are still present:
+    ///    the previously-verified commitment).
+    /// 4. **MK** — SK's IMMEDIATE child, one content object (the
+    ///    permanent metadata), the deterministic checkpoint key. An
+    ///    `Unknown` outcome reconciles under the existing lock-held
+    ///    discipline; a retry is idempotent; anything unresolved
+    ///    fails closed.
+    ///
+    /// The crash-after-SK-before-MK window (the mandatory PP-B3
+    /// regression): SK stands as an ordinary valid snapshot — the
+    /// recovery finds it, no checkpoint status is fabricated, no
+    /// reclaim eligibility exists (the reclamation requires the
+    /// completed MK) — and a retry re-derives and completes MK
+    /// safely.
+    ///
+    /// An empty range refuses (the typed `checkpoint-empty-range`):
+    /// an explicit checkpoint that indexes nothing is not a
+    /// checkpoint — every published MK is meaningful.
+    pub fn publish_checkpoint(
+        &mut self,
+        spine: &mut Spine<NpcWorld>,
+        director: &mut RegionDirector,
+        retain_tail: u64,
+    ) -> Result<CheckpointReport, TransitionError> {
+        // Phase 1 — the session compaction (the preflight discipline
+        // inside compact_session).
+        let _compaction = self.compact_session(spine, director, retain_tail)?;
+        // Phase 2 — SK: the compacted snapshot publication (the
+        // existing path).
+        let sk = self.publish_snapshot(spine, director)?;
+        // The genuine SK-committed/MK-uncommitted crash seam
+        // (test-only — see [`ARM_AFTER_SK_EXIT`]): a death here
+        // leaves the ordinary snapshot standing with no checkpoint
+        // status — the mandatory regression's exact boundary.
+        after_sk_seam();
+        // Phase 3 — the range walk + the metadata computation (a
+        // fresh medium handle; the crossing's established pattern).
+        let mut medium = SessionStore::open(&self.store)?;
+        let sk_record = medium.read_record(&sk).map_err(PipelineError::Medium)?;
+        let sk_epoch = sk_record.epoch;
+        let Some(sk_parent) = sk_record.parent else {
+            return Err(PipelineError::UnfoundedMedium.into());
+        };
+        let (walked, _boundary, seed) = walk_checkpoint_range(&mut medium, sk_parent)?;
+        let mut range = Vec::new();
+        let mut index = Vec::new();
+        let mut chain_bytes = Vec::new();
+        for entry in &walked {
+            if matches!(entry.kind, RangeKind::Publication) {
+                range.push(entry.record.id());
+                index.push(ReclaimedIndexEntry::new(
+                    entry.record.idempotency_key.clone(),
+                    entry.record.id(),
+                    entry.record.epoch,
+                ));
+                chain_bytes.push(entry.record.canonical_bytes());
+            }
+        }
+        if range.is_empty() {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "checkpoint-empty-range",
+            });
+        }
+        let skips = compute_checkpoint_skips(sk_parent, &walked);
+        // The digest: the range's canonical bytes OLDEST first (the
+        // reverse of the descent order).
+        chain_bytes.reverse();
+        let range_digest = chain_range_digest(&seed, &chain_bytes);
+        let metadata = CheckpointMetadata::new(sk, sk_parent, skips, index, range_digest, seed);
+        // Phase 4 — MK: the immediate child. An Unknown reconciles
+        // against the candidate; a NotInstalled reconciles into one
+        // idempotent retry (the deterministic key); anything still
+        // unresolved fails closed — never a guessed outcome.
+        let tick = spine.clock().as_u64();
+        let (mk_candidate, outcome) =
+            publish_checkpoint_mk(&mut medium, sk, sk_epoch, &metadata, tick)?;
+        let mk = match outcome {
+            AppendOutcome::Accepted { id, .. } => id,
+            AppendOutcome::RejectedStaleParent { .. } => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-mk-parent-not-sk",
+                });
+            }
+            AppendOutcome::Unknown { .. } => {
+                match medium
+                    .reconcile_unknown(&mk_candidate)
+                    .map_err(PipelineError::Medium)?
+                {
+                    Reconciliation::Installed { id } => id,
+                    Reconciliation::NotInstalled { .. } => {
+                        let (_, retry) =
+                            publish_checkpoint_mk(&mut medium, sk, sk_epoch, &metadata, tick)?;
+                        match retry {
+                            AppendOutcome::Accepted { id, .. } => id,
+                            _ => {
+                                return Err(TransitionError::InstallIncompatible {
+                                    region: 0,
+                                    detail: "checkpoint-mk-unresolved",
+                                });
+                            }
+                        }
+                    }
+                    Reconciliation::Unverifiable { .. } => {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "checkpoint-mk-unverifiable",
+                        });
+                    }
+                }
+            }
+        };
+        Ok(CheckpointReport {
+            sk,
+            mk,
+            range,
+            skips: metadata.skips.len() as u64,
+            range_digest,
+        })
+    }
+
     /// The canonical re-drive: batches the actionable unconfirmed
     /// journal keys into a consequence-batch/2 revision on the chain
     /// (the pending-T1 → confirmed-canonical transition — the gating
@@ -1115,6 +1288,25 @@ pub static ARM_MID_INSTALL_EXIT: AtomicBool = AtomicBool::new(false);
 fn mid_install_seam() {
     if ARM_MID_INSTALL_EXIT.load(Ordering::Relaxed) {
         std::process::exit(7);
+    }
+}
+
+/// Test-only (the genuine SK-committed/MK-uncommitted crash seam,
+/// PP-B3's mandatory regression): when armed, the checkpoint
+/// publication hard-exits AFTER SK commits but BEFORE MK — the exact
+/// two-revision-composition boundary (exit 8, distinct from the
+/// mid-install convention's 7). A process death here leaves the
+/// ordinary compacted snapshot standing with NO checkpoint status
+/// and NO reclaim eligibility — the recovery must find SK as an
+/// ordinary publication. Engine code never arms this; the static is
+/// process-local, so only the child that armed it dies.
+#[doc(hidden)]
+pub static ARM_AFTER_SK_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The after-SK seam's exit point (see [`ARM_AFTER_SK_EXIT`]).
+fn after_sk_seam() {
+    if ARM_AFTER_SK_EXIT.load(Ordering::Relaxed) {
+        std::process::exit(8);
     }
 }
 
@@ -1495,4 +1687,164 @@ fn build_anchor(
         }
     }
     Ok(anchor)
+}
+
+// ------- The SK/MK checkpoint's range walk (PP-B3, D-PP-4) -------
+
+/// The session-snapshot domain FAMILY — the checkpoint range-walk's
+/// reclaimable-class recognition prefix (any version; the store is
+/// domain-agnostic, the classification is this application's
+/// policy).
+const SESSION_SNAPSHOT_FAMILY: &str = "engine-slice/session-snapshot";
+
+/// The range walk's classification for one walked chain record.
+enum RangeKind {
+    /// A session-snapshot publication — this checkpoint's own
+    /// reclaimable range member.
+    Publication,
+    /// A confirming revision — a retained anchor (never reclaimable,
+    /// D-PP-4a's rejection absolute).
+    Anchor,
+}
+
+/// One walked chain record with its classification.
+struct WalkedRecord {
+    record: RevisionRecord,
+    kind: RangeKind,
+}
+
+/// Peeks a content object's leading domain tag (the classification
+/// input; no payload parsed).
+fn peek_object_domain(bytes: &[u8]) -> Option<String> {
+    Decoder::new(bytes)
+        .read_str(MAX_TAG_LEN, "checkpoint-walk")
+        .ok()
+        .map(|domain| domain.to_owned())
+}
+
+/// Walks the chain from SK's parent down to the range boundary —
+/// the prior checkpoint's MK (the permanent boundary; its metadata
+/// carries the campaign's founding-derived digest seed) or the
+/// founding record (the root; the fresh seed) — classifying each
+/// record by its content object's domain. Returns the walked records
+/// in DESCENT order (newest first). An unclassifiable record (an
+/// unknown content domain, or a regular record carrying no content
+/// reference) refuses the checkpoint — the walk never guesses.
+fn walk_checkpoint_range(
+    medium: &mut SessionStore,
+    sk_parent: Hash,
+) -> Result<(Vec<WalkedRecord>, Hash, [u8; 32]), TransitionError> {
+    let mut walked = Vec::new();
+    let mut cursor = sk_parent;
+    loop {
+        let record = medium.read_record(&cursor).map_err(PipelineError::Medium)?;
+        let Some(parent) = record.parent else {
+            // The founding — the root boundary; the fresh
+            // founding-derived seed.
+            let boundary = record.id();
+            let seed = compute_digest_seed(&boundary);
+            return Ok((walked, boundary, seed));
+        };
+        let Some(first) = record.content_refs.first().copied() else {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "checkpoint-walk/unclassifiable",
+            });
+        };
+        let bytes = medium.read_object(&first).map_err(PipelineError::Medium)?;
+        let Some(domain) = peek_object_domain(&bytes) else {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "checkpoint-walk/unreadable-domain",
+            });
+        };
+        if domain.starts_with(SESSION_SNAPSHOT_FAMILY) {
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Publication,
+            });
+        } else if domain == CONSEQUENCE_BATCH_DOMAIN {
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == CHECKPOINT_METADATA_DOMAIN {
+            // The prior checkpoint's MK — the permanent boundary.
+            // Its metadata carries the campaign's founding-derived
+            // seed (the same seed every checkpoint of the campaign
+            // uses — no re-walk below the boundary required).
+            let metadata = CheckpointMetadata::decode(&bytes).map_err(PipelineError::Format)?;
+            let boundary = record.id();
+            return Ok((walked, boundary, metadata.seed));
+        } else {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "checkpoint-walk/unclassifiable",
+            });
+        }
+        cursor = parent;
+    }
+}
+
+/// Computes the checkpoint's skip table: the non-circular
+/// self-retirement entry, plus one entry for every RETAINED record
+/// standing on a reclaimable parent — every confirming anchor whose
+/// parent is a range member — each jumping to its NEAREST RETAINED
+/// ancestor (the first non-publication record below the reclaimed
+/// run; the walk's boundary when the run ends there). The
+/// self-retirement entry targets SK's nearest retained ancestor:
+/// sk_parent itself while sk_parent is retained (an anchor or a
+/// prior boundary), or the bottom of SK's reclaim run when sk_parent
+/// is itself a range publication — MK's parent SK is reclaimed
+/// together with its range, so MK jumps past the whole run. A skip
+/// standing on SK itself is never emitted: dead by construction
+/// (nothing retained references a retired SK but MK, whose traversal
+/// IS the self entry).
+fn compute_checkpoint_skips(sk_parent: Hash, walked: &[WalkedRecord]) -> Vec<SkipEntry> {
+    let position: HashMap<Hash, usize> = walked
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.record.id(), index))
+        .collect();
+    let is_publication = |hash: &Hash| {
+        position
+            .get(hash)
+            .is_some_and(|&index| matches!(walked[index].kind, RangeKind::Publication))
+    };
+
+    let self_target = if is_publication(&sk_parent) {
+        nearest_retained_ancestor(sk_parent, walked, &position)
+    } else {
+        sk_parent
+    };
+    let mut skips = vec![SkipEntry::self_skip(self_target)];
+    // Every confirming anchor standing on a publication parent.
+    for entry in walked {
+        if matches!(entry.kind, RangeKind::Anchor)
+            && let Some(parent) = entry.record.parent
+            && is_publication(&parent)
+        {
+            let target = nearest_retained_ancestor(parent, walked, &position);
+            skips.push(SkipEntry::new(entry.record.id(), target));
+        }
+    }
+    skips
+}
+
+/// The nearest retained ancestor below a reclaimed parent: descend
+/// through the contiguous publication run; the first
+/// non-publication record (an anchor, or the walk's boundary below
+/// the last publication) is the target.
+fn nearest_retained_ancestor(
+    mut cursor: Hash,
+    walked: &[WalkedRecord],
+    position: &HashMap<Hash, usize>,
+) -> Hash {
+    while let Some(&index) = position.get(&cursor)
+        && matches!(walked[index].kind, RangeKind::Publication)
+        && let Some(parent) = walked[index].record.parent
+    {
+        cursor = parent;
+    }
+    cursor
 }
