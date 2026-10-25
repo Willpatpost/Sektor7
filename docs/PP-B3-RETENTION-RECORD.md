@@ -430,13 +430,16 @@ physical-rig verification remains the owner's (D-PP-7).
 
 The branch pushed to `origin/production-persistence-b3`; the draft
 PR #3 (`production-persistence-b3` → `stage5`, the CI vehicle only —
-NEVER MERGED; PRs #1 and #2 unchanged, open/draft/never-merged).
-The CI run over the code head: **[THE RUN ID AND THE PER-PLATFORM
-VERDICTS ARE FILLED AT THE DELIVERY VERIFICATION — the
-delivery-verification note below is amended by the docs-only
-verification commit once the run is verified firsthand job-level;
-the docs-only record commit triggers no further run (the
-pull_request path filter is `engine/**`)]**
+NEVER MERGED; PRs #1 and #2 unchanged, open/draft/never-merged):
+https://github.com/Willpatpost/Sektor7/pull/3. The CI run over the
+code head: **40217295238 — GREEN on all three platforms, verified
+firsthand job-level** (ubuntu-latest 3m46s / windows-latest 2m34s /
+macos-15 ARM64 3m28s, over the code head `88e7d81` via the PR #3
+pull_request event; the record's docs-only verification commit
+triggers no further run — the pull_request path filter is
+`engine/**`). The run's annotations (the Node 20 deprecation notice
+and the macOS arm64 capacity note) are runner-infrastructure
+messages, not test or build findings.
 
 ## §12 — The rig instructions (the owner's physical verification)
 
@@ -512,10 +515,11 @@ consumed, never modified.
 
 **PP-B3 IS DELIVERED AND STOPPED FOR THE INDEPENDENT PASS/HOLD
 REVIEW.** The full chain: `093395e` → `7b581db` → `934841a` →
-`f93a101` → this commit. The exact HEAD and the tested SHA are the
-delivery-verification note's (§11). The next entry point: the
-independent reviewer's PASS/HOLD verdict or the owner's rig
-evidence (§12). This record never declares the batch CLOSED — that
-verdict belongs to the review and the owner alone. PP-B4, Stage 6,
-and all further implementation remain unauthorized until separate
-explicit owner GOs.
+`f93a101` → `88e7d81` (the code) → this docs-only verification
+commit. The tested code SHA `88e7d81` (the CI 40217295238 green ×3
+over it; the workspace 588 passed + 1 intentionally ignored at it).
+The next entry point: the independent reviewer's PASS/HOLD verdict
+or the owner's rig evidence (§12). This record never declares the
+batch CLOSED — that verdict belongs to the review and the owner
+alone. PP-B4, Stage 6, and all further implementation remain
+unauthorized until separate explicit owner GOs.
