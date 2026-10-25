@@ -25,13 +25,22 @@ the full workspace suite, every existing regression green):
 | `7b581db` | The compacted walk + the membership universe (both providers) | 572 passed + 1 ignored |
 | `934841a` | The durable T1 journal rotation (§4.4) | 578 passed + 1 ignored |
 | `f93a101` | The audited explicit two-phase reclamation | 587 passed + 1 ignored |
-| (this commit) | The multi-checkpoint example + the benchmark §8 + this record | 588 passed + 1 ignored |
+| `88e7d81` | The multi-checkpoint example + the benchmark §8 + this record | 588 passed + 1 ignored |
+| `b3377fd` | The review corrective — the HOLD's four findings F1–F4 (§16) | 597 passed + 1 ignored |
 
 From the PP-B2 baseline of 550 tests: **38 new tests**, every one of
 them a PP-B3 behavior; no existing test was modified except where a
 delivered behavior legitimately extends an asserted surface (the
 checkpoint composition test's index expectations — SK's own
 retirement entry, below).
+
+**The independent review of the first delivery returned HOLD with
+four bounded corrective findings (F1–F4)**; the corrective
+(`b3377fd`, §16) adds **9 further tests** (the workspace 597
+passed + 1 ignored) and updates the three existing idempotent
+re-run assertions to the corrected F3 semantics — a completed
+reclamation is now distinguished from restartable work by the typed
+`reclaim/nothing-eligible` refusal, never a repeated no-op.
 
 The scope — the GO's eleven deliverables, each mapped to its
 implementation and regression:
@@ -459,10 +468,10 @@ cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
 
-The expected surfaces: the workspace green (the pod count 588 + 1
+The expected surfaces: the workspace green (the pod count 597 + 1
 ignored may differ by platform for the SDL soak, always stated);
 the four PP-B3 suites green (the crash regression's child dying at
-exit 8); the benchmark §8's numbers at release speed (the flat
+exit 8; the reclamation's children dying at exits 9 and 10 — §16); the benchmark §8's numbers at release speed (the flat
 reclaimed steady state is the structural claim — the absolute
 milliseconds are the rig's).
 
@@ -478,14 +487,19 @@ milliseconds are the rig's).
   compaction costs were): ~230-335 ms dev-pod medians for the
   checkpoint/rotation/reclamation — explicit operator operations,
   never gameplay-frame operations.
-- **The §11E process-kill evidence covers the checkpoint's crash
-  boundary (the batch's new window) with a real child kill; the
-  reclamation's mid-Phase-B crash is exercised via the idempotent
-  re-run** (the pre-scan → the installed audit → the idempotent
-  deletes — the identical code path a crash-restart takes, with the
-  audit-first ordering guaranteeing a pre-audit crash deletes
-  nothing). A real child kill at the audit/delete boundary is an
-  identified follow-up, not a claim.
+- **The §11E process-kill evidence, completed by the corrective
+  (§16, F4)**: the first delivery covered the checkpoint's crash
+  boundary with a real child kill and the reclamation's mid-Phase-B
+  restart only via the idempotent re-run; the corrective adds two
+  deterministic real-child kills at the reclamation's own Phase-B
+  boundaries (exit 9 — the audit durably on the chain, Phase B never
+  run; exit 10 — the first unit's record deleted, its objects not)
+  and the audited deletion manifest that makes the interrupted
+  deletes converge onto the cleanly-reclaimed twin's exact storage
+  state. These are process-termination kills (exit-code seams): they
+  establish real-death restartability of the audited protocol, NOT
+  platform-wide power-loss durability — that boundary belongs to the
+  owner's rig (D-PP-7) and is never claimed here.
 - **The re-anchoring choice** (the rotation): the surviving frames
   are re-encoded under the new journal's hash chain rather than
   copied verbatim — verbatim frames would break the record chain
@@ -515,11 +529,191 @@ consumed, never modified.
 
 **PP-B3 IS DELIVERED AND STOPPED FOR THE INDEPENDENT PASS/HOLD
 REVIEW.** The full chain: `093395e` → `7b581db` → `934841a` →
-`f93a101` → `88e7d81` (the code) → this docs-only verification
-commit. The tested code SHA `88e7d81` (the CI 40217295238 green ×3
-over it; the workspace 588 passed + 1 intentionally ignored at it).
-The next entry point: the independent reviewer's PASS/HOLD verdict
-or the owner's rig evidence (§12). This record never declares the
-batch CLOSED — that verdict belongs to the review and the owner
+`f93a101` → `88e7d81` (the code) → the docs-only verification
+commit `129c9bd`. The tested code SHA `88e7d81` (the CI 40217295238
+green ×3 over it; the workspace 588 passed + 1 intentionally ignored
+at it). The next entry point: the independent reviewer's PASS/HOLD
+verdict or the owner's rig evidence (§12). This record never declares
+the batch CLOSED — that verdict belongs to the review and the owner
 alone. PP-B4, Stage 6, and all further implementation remain
 unauthorized until separate explicit owner GOs.
+
+**SUPERSEDED — the verdict arrived: HOLD with four bounded
+corrective findings (F1–F4). The corrective is delivered at
+`b3377fd` and the RENEWED STOP stands in §16.**
+
+## §16 — The independent review's HOLD: the corrective delivery (F1–F4)
+
+The verdict on the first delivery: **HOLD — four bounded corrective
+findings (F1–F4)**, with the authorization to correct autonomously
+on `production-persistence-b3` (correct, add tests, commit, push,
+rerun the verification) and STOP again for the renewed review. The
+corrective code commit **`b3377fd`** (this docs-only verification
+commit amends the record around it; the chain `093395e` →
+`7b581db` → `934841a` → `f93a101` → `88e7d81` → `129c9bd` →
+`b3377fd`).
+
+**F1 — the repeated-rotation active-path root.** The finding: the
+second rotation published its pointer beside the ROTATED file while
+the recovery resolved only the pointer beside the original campaign
+journal — two potential authorities. The fix: `SessionCrossing`
+carries `journal_root` (set at `open_at` from the opened journal,
+overridden at `recover_at` by the caller's journal path — the
+campaign root, never the rotated file), every rotation publishes
+`<root>.active` there, and `reclaimable_journal_files` enumerates
+ALL stale generations beside the root (the root file and every
+`journal-*.t1` except the active one, each retired with its `.lock`
+sidecar under the audited ledger — the prior generations never
+accumulate). Regressions:
+`three_successive_rotations_keep_one_authoritative_active_path`
+(three rotations with outstanding work between them — the survivors
+accumulate and re-anchor whole each time; the pointer at the root
+after each; the restart's recovery following it to the THIRD
+generation with the outstanding plans replayed; the fourth rotation
+through the recovered crossing re-landing the pointer at the root;
+the backup capturing the fourth generation's bytes and verifying)
+and
+`an_interrupted_later_flip_selects_the_previous_authoritative_journal`
+(the hand-reconstructed pre-flip durable state — the root pointer
+still naming the first generation — recovering via the previous
+authoritative superset journal with the plans replayed, the
+orphaned second generation inert, a subsequent rotation re-pointing
+the root).
+
+**F2 — the zero-generation window and the post-delete check.** The
+finding: `generations=0` names no protected checkpoint — it could
+eventually retire the last recovery anchor, and the anchor check
+ran too late (after the destructive operation). The fix: the window
+validation FIRST (`generations < 1` → the typed
+`reclaim/invalid-window` refusal before any audit revision or
+destructive operation) and the pre-deletion anchor invariant (the
+newest checkpoint's SK read and its first content object verified
+to BE a session-snapshot object — a verified recoverable anchor
+remains after the deletion; prerequisites are never post-delete
+checks). Regression:
+`unsafe_retention_windows_are_refused_before_any_audit_or_deletion`
+(generations=0 refused with the canonical and journal state
+unchanged: no audit appended — 8 records — nothing deleted, the
+range record still present, the journal file intact).
+
+**F3 — the reclamation never progressing past the oldest audited
+checkpoint.** The finding: MK records are permanent, so re-selecting
+the same completed MK was a no-op repeat — the reclamation never
+progressed to the next generation. The fix: the target selection
+iterates the checkpoints beyond the window OLDEST-FIRST and
+distinguishes a FULLY reclaimed range (every index member absent —
+skipped, never repeated) from an incomplete one (an interrupted
+Phase B — resumed) from an eligible one (the oldest with any
+present member); a completed re-run now refuses with the typed
+`reclaim/nothing-eligible` (the three existing idempotent re-run
+assertions — the lifecycle, the full-stack, the example — updated
+to these semantics). Regression:
+`four_checkpoints_reclaim_sequentially_across_generations` (the
+19-record chain F ← S1 ← C1 ← S2 ← C2 ← SK1 ← MK1 ← S3 ← C3 ← SK2 ←
+MK2 ← S4 ← C4 ← SK3 ← MK3 ← S5 ← C5 ← SK4 ← MK4; the
+two-generation window reclaims MK1's range — eligible 3, removed 6;
+the minimal window then PROGRESSES to MK2's and MK3's — eligible 2
+and removed 4 each, MK1 skipped and never repeated; the fourth call
+refuses nothing-eligible; the store measurably shrinks across the
+generations — no accumulation of retired publication snapshots; all
+four MKs and their metadata objects permanent; the walk validating
+through the chained skip tables at 15 records with the reclaimed
+accounting 7; a key from MK1's range still rejected and a
+depends_on naming MK2's reclaimed member still resolved after three
+generations; the recovery working from the protected window's
+anchor).
+
+**F4 — the missing real mid-reclamation termination evidence.** The
+finding: a death between a record-file deletion and its
+referenced-object deletions orphans content a re-run could not
+identify from the absent record — and no real-kill evidence existed
+at these boundaries. The fix: `ReclaimUnit {record, objects}` — the
+complete per-unit deletion manifest collected during Phase A's
+digest verification while the range bytes are still present, carried
+in the ledger (the unit-count coherence rule, bounded counts), and
+Phase B deletes from the manifest in BOTH providers (the file
+medium: the record file, the objects, AND the quarantined copies
+the next open's orphan sweep moved — so interrupted deletions
+converge; SQLite: the manifest's rows in ONE transaction,
+all-or-nothing — the two atomicity models verified separately); the
+resume arm verifies the installed audit's bindings AND that its
+manifest covers exactly the permanent index's identities. Two
+deterministic real-child-process seams: `ARM_RECLAIM_AFTER_AUDIT`
+(exit 9 — the audit durably on the chain, Phase B never run) and
+`ARM_RECLAIM_MID_UNIT` (exit 10 — the first unit's record deleted,
+its objects not). Regressions:
+`a_real_death_after_the_audit_resumes_and_completes_to_convergence`
+(a genuine child death at exit 9; the durable state validating at 9
+records with nothing reclaimed; the recovery plus the same retry
+recognizing the installed audit by its deterministic key, deleting
+from the manifest — removed 4 — and converging with NO second audit
+at 7 records; the re-run refusing),
+`a_real_death_mid_unit_converges_from_the_audited_manifest` (a
+genuine child death at exit 10 between the record deletion and its
+object deletions; the post-death walk validating — the
+still-present SK1 walked, only S1 a gap; the same retry resuming
+from the audited manifest — never re-reading the removed record —
+and converging onto the cleanly-reclaimed TWIN's exact storage
+state: identical object sets, byte-identical audit head, empty
+quarantine — the intended storage state, not merely quarantined
+orphans; the re-run refusing), and
+`the_sqlite_provider_reclaims_with_transactional_atomicity` (the
+same two-checkpoint reclamation over `StoreLocation::Database`:
+eligible 2 / removed 4 in one transaction, the validate at
+reclaimed 2 / records 7, the recovery, the nothing-eligible re-run).
+
+**The verification at `b3377fd`:** fmt and `clippy --workspace
+--all-targets -- -D warnings` green; the workspace **597 passed +
+1 intentionally ignored, 0 failed** (the delivery's 588 + the 9
+corrective tests); the two corrected suites green (`pp_b3_reclaim`
+12 — the 5 prior plus 7 new; `pp_b3_rotation` 4 — the 2 prior plus
+2 new); the double release-mode selftest green both runs (597 / 45
+suites, identical results modulo timings — the frozen Stage-0
+fingerprint pins hold, `engine-core` untouched); `cargo build
+--workspace` green. **The CI: run 40222061708 GREEN on all three
+platforms, verified firsthand job-level over the corrected head
+`b3377fd`** (ubuntu-latest 10m41s — the Linux-only Vulkan offscreen
+smoke is the long step; windows-latest 3m39s; macos-15 ARM64
+2m59s; via the PR #3 pull_request event — the CI vehicle, never
+merged; the annotations are the known runner-infrastructure notes).
+The protected branches verified unchanged (main=5dbb377,
+stage5=047faf9, macos-port=ba395d8, design=a47ef10, pp-b1=bfe60b7,
+pp-b2=00109b0); PRs #1/#2 unchanged, open/draft.
+
+**The honest boundaries of the corrective:**
+- The two reclamation seams are PROCESS-TERMINATION kills
+  (deterministic exit-code deaths at the exact durable boundaries):
+  they establish real-death restartability of the audited protocol
+  and the manifest-driven convergence — NOT platform-wide
+  power-loss durability (the OS page cache and the device layers
+  remain the rig's domain, D-PP-7).
+- The "additional journal appends" after the three-rotation restart
+  are realized as the fourth rotation's re-anchoring (real journal
+  content written by the restarted session, the pointer re-landing
+  at the root): post-recovery boundary deactivations are
+  empty-scratch BY THE ACCEPTED B2 DESIGN (a post-crash boundary
+  re-derives the LOD against the snapshot; the region's captured
+  content is already durably protected in the outstanding
+  transactions) — verified empirically in both the confirmed-first
+  and the all-unconfirmed arcs, and asserted as such in the test
+  rather than worked around.
+- The benchmark §8 was not re-extended: the F3 driver test is the
+  sequential multi-generation non-accumulation evidence (the store
+  measurably shrinking across three reclamation generations), and
+  §8a's flat-steady-state claim is unchanged by the corrective.
+
+**The preserved invariants:** D-PP-4's architecture; the D-PP-4a/4b
+rejections (the eligible set is exactly the audited index; the
+confirmations never named); the two-revision SK/MK structure; the
+immutable revision-record bytes; the permanent MK metadata and
+confirming-evidence guarantees; PP-B1/B2 behavior; the fingerprints
+and recovery contracts.
+
+**THE RENEWED STOP.** PP-B3's corrective is delivered and stopped
+for the RENEWED independent PASS/HOLD review. The tested code SHA
+`b3377fd`; the CI 40222061708 green ×3 over it; the workspace 597
+passed + 1 intentionally ignored at it. The next entry point: the
+renewed verdict or the owner's rig evidence (§12). This record
+never declares the batch CLOSED. PP-B4, Stage 6, and all further
+implementation remain unauthorized until separate explicit owner
+GOs.
