@@ -892,6 +892,57 @@ impl CanonicalMedium for SqliteMedium {
     fn durability_tier(&self) -> SyncTier {
         SyncTier::TransactionalWalFull
     }
+
+    fn reclaim(&mut self, records: &[Hash]) -> Result<u64, MediumError> {
+        if self.read_only {
+            return Err(MediumError::Sqlite {
+                op: "reclaim",
+                detail: "the connection is read-only (the audit mode)".to_owned(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| sqlite_err("begin reclaim", e))?;
+        let mut removed = 0u64;
+        for record_id in records {
+            let refs: Vec<Hash> = match load_record_verified(&tx, record_id) {
+                Ok(bytes) => RevisionRecord::decode(&bytes)
+                    .map_err(MediumError::Format)?
+                    .content_refs
+                    .clone(),
+                Err(MediumError::MissingObject { .. }) => Vec::new(),
+                Err(error) => {
+                    let _ = tx.rollback();
+                    return Err(error);
+                }
+            };
+            match tx.execute(
+                "DELETE FROM records WHERE hash = ?1",
+                params![record_id.as_bytes()],
+            ) {
+                Ok(count) => removed += count as u64,
+                Err(error) => {
+                    let _ = tx.rollback();
+                    return Err(sqlite_err("delete record", error));
+                }
+            }
+            for reference in refs {
+                match tx.execute(
+                    "DELETE FROM objects WHERE hash = ?1",
+                    params![reference.as_bytes()],
+                ) {
+                    Ok(count) => removed += count as u64,
+                    Err(error) => {
+                        let _ = tx.rollback();
+                        return Err(sqlite_err("delete object", error));
+                    }
+                }
+            }
+        }
+        tx.commit().map_err(|e| sqlite_err("commit reclaim", e))?;
+        Ok(removed)
+    }
 }
 
 // ------------------------------------------------------------ the inserts

@@ -357,4 +357,16 @@ pub trait CanonicalMedium {
 
     /// What `Accepted` establishes on this platform.
     fn durability_tier(&self) -> SyncTier;
+
+    /// The explicit reclamation delete (PP-B3's Phase B): remove the
+    /// named revisions — the whole-revision units (each record
+    /// object and its content objects) — IDEMPOTENTLY (an absent row
+    /// or file is already reclaimed, never an error; a re-run deletes
+    /// only what remains). The eligibility was verified and audited
+    /// BEFORE this call (Phase A) — the delete trusts the audit and
+    /// never rewrites bytes. A half-deleted unit referenced by a
+    /// RETAINED record fails closed at the next validation (the
+    /// existing MissingObject). Returns the count of objects removed
+    /// by this call.
+    fn reclaim(&mut self, records: &[Hash]) -> Result<u64, MediumError>;
 }

@@ -1133,6 +1133,41 @@ impl LocalFileMedium {
         }
     }
 
+    /// Phase B's delete half (PP-B3): remove each named revision's
+    /// record object and content objects — the whole-revision units.
+    /// Idempotent (absent files are already reclaimed, never errors);
+    /// the eligibility was verified and audited BEFORE this call
+    /// (Phase A); bytes are never rewritten. Returns the count of
+    /// object files removed by this call.
+    fn reclaim_records_locked(&self, records: &[Hash]) -> Result<u64, MediumError> {
+        let mut removed = 0u64;
+        for record_id in records {
+            let refs: Vec<Hash> = match self.load_object(record_id) {
+                Ok(bytes) => RevisionRecord::decode(&bytes)
+                    .map_err(MediumError::Format)?
+                    .content_refs
+                    .clone(),
+                Err(MediumError::MissingObject { .. }) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let record_path = self.object_path(record_id);
+            if record_path.is_file() {
+                fs::remove_file(&record_path)
+                    .map_err(|e| io_err("reclaim record", &record_path, e))?;
+                removed += 1;
+            }
+            for reference in refs {
+                let object_path = self.object_path(&reference);
+                if object_path.is_file() {
+                    fs::remove_file(&object_path)
+                        .map_err(|e| io_err("reclaim object", &object_path, e))?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     // ---------------------------------------------------- orphan protocol
 
     /// Moves an object into quarantine with its bytes and a reason
@@ -1395,6 +1430,13 @@ impl CanonicalMedium for LocalFileMedium {
 
     fn durability_tier(&self) -> SyncTier {
         self.platform_tier
+    }
+
+    fn reclaim(&mut self, records: &[Hash]) -> Result<u64, MediumError> {
+        self.lock()?;
+        let removed = self.reclaim_records_locked(records);
+        let _ = self.unlock();
+        removed
     }
 }
 

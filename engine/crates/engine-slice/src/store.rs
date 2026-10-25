@@ -146,4 +146,11 @@ impl CanonicalMedium for SessionStore {
             SessionStore::Sqlite(medium) => medium.durability_tier(),
         }
     }
+
+    fn reclaim(&mut self, records: &[engine_persist::Hash]) -> Result<u64, MediumError> {
+        match self {
+            SessionStore::Local(medium) => medium.reclaim(records),
+            SessionStore::Sqlite(medium) => medium.reclaim(records),
+        }
+    }
 }

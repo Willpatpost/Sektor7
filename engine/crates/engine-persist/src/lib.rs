@@ -48,6 +48,7 @@ pub mod local;
 pub mod medium;
 pub mod migrate;
 pub mod pipeline;
+pub mod reclaim;
 pub mod record;
 pub mod recovery;
 pub mod rotation;
@@ -95,6 +96,10 @@ pub use pipeline::{
     BatchEntry, CONSEQUENCE_BATCH_DOMAIN, CaptureReceipt, CommitOutcome, CommitPipeline,
     ConfirmationLabel, ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError,
     ReconcileOutcome,
+};
+pub use reclaim::{
+    RECLAMATION_LEDGER_DOMAIN, RECLAMATION_LEDGER_KEY_DOMAIN, RECLAMATION_LEDGER_VERSION,
+    ReclamationLedger, publish_reclamation_ledger, reclamation_ledger_idempotency_key,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{

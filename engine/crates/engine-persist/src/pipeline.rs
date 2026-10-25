@@ -70,6 +70,7 @@ use std::fmt;
 use engine_core::wire::MAX_TAG_LEN;
 use engine_core::{Decoder, Encoder, SaveError};
 
+use crate::checkpoint::{CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata};
 use crate::consequence::ConsequenceId;
 use crate::envelope::{ClassifiedSpan, ConsequenceEnvelope, DurabilityClass, SourcePosition};
 use crate::hash::Hash;
@@ -1290,15 +1291,57 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         };
         let mut chain: Vec<(Hash, RevisionRecord)> = Vec::new();
         let mut cursor = head;
+        // THE COMPACTED MODE (PP-B3): an absent parent is a gap —
+        // legitimate only under the most recent on-chain MK's skip
+        // table (recognized by the record's first content object
+        // carrying the checkpoint-metadata domain); anything else is
+        // hard corruption, fail closed. The gap-aware descent lets
+        // the confirmed-evidence collection reach the batches BELOW
+        // reclaimed ranges through the permanent skips.
+        let mut skip_table: Option<(Hash, CheckpointMetadata)> = None;
         loop {
             if self.verified_head == Some(cursor) {
                 break;
             }
             let record = self.medium.read_record(&cursor)?;
             let parent = record.parent;
+            let current = cursor;
+            if let Some(object) = record.content_refs.first() {
+                let bytes = self.medium.read_object(object)?;
+                if peek_domain(&bytes).as_deref() == Some(CHECKPOINT_METADATA_DOMAIN) {
+                    let metadata =
+                        CheckpointMetadata::decode(&bytes).map_err(PipelineError::Format)?;
+                    skip_table = Some((current, metadata));
+                }
+            }
             chain.push((cursor, record));
             match parent {
-                Some(parent) => cursor = parent,
+                Some(parent) => match self.medium.read_record(&parent) {
+                    Ok(_) => cursor = parent,
+                    Err(MediumError::MissingObject { .. }) => {
+                        let Some((owner, table)) = skip_table.as_ref() else {
+                            return Err(PipelineError::Medium(MediumError::MissingObject {
+                                hash: parent,
+                            }));
+                        };
+                        let target = if current == *owner {
+                            table
+                                .self_skip()
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        } else {
+                            table
+                                .skip_for(&current)
+                                .map(|entry| entry.nearest_retained_ancestor)
+                        };
+                        let Some(target) = target else {
+                            return Err(PipelineError::Medium(MediumError::MissingObject {
+                                hash: parent,
+                            }));
+                        };
+                        cursor = target;
+                    }
+                    Err(other) => return Err(other.into()),
+                },
                 None => break,
             }
         }
