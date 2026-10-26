@@ -384,57 +384,113 @@ workspace selftest 707/0 ×2; the pinned fingerprints ×2).
   clippy -D warnings, the workspace build, the workspace tests with
   both providers and the real-child pairs, the double fingerprint
   self-test with the Stage-0 pins) verified firsthand at the job
-  level. **VERIFIED.**
+  level. **VERIFIED.** The delivered HEAD (`2aede3b` and this
+  corrective) is `b696779`'s documentation-only descendant — no
+  separate CI run exists or is required for documentation-only
+  changes (no executable source or workflow behavior changes).
 
 ## 6. The physical Windows acceptance procedure (PENDING — the owner's run)
 
-Copy-pastable on the physical Windows machine (PowerShell; the
-repository at your usual location):
+Copy-pastable on the physical Windows machine (PowerShell, from the
+repository's root; safe for an existing local checkout). The
+**accepted validation SHA — the source/test commit the three-OS CI
+verified (run 40376559970) — is
+`b6967793039e9556bf14477b8cf343fcbdd0227b`**; every commit after it
+on this branch is documentation-only (this record), which the
+checkout verification below PROVES before anything compiles.
 
-```
-# 0. The exact baseline
-git fetch origin
-git rev-parse origin/production-persistence-b4
-#   MUST print the validation HEAD recorded in this record's §12.
-git switch production-persistence-b4
-git status --short          # MUST be empty
+```powershell
+# 0. THE EXACT CHECKOUT VERIFICATION — PowerShell stops on any failure.
+$ErrorActionPreference = "Stop"
+function Assert-Step([string]$step) {
+    if ($LASTEXITCODE -ne 0) { throw "$step failed (exit $LASTEXITCODE)" }
+}
+git fetch origin;                        Assert-Step "git fetch"
+git switch production-persistence-b4;    Assert-Step "git switch"
+$dirty = git status --porcelain
+if ($dirty) { throw "the worktree is not clean:`n$dirty" }
+# Fast-forward ONLY — any non-fast-forward divergence refuses here.
+git merge --ff-only origin/production-persistence-b4
+Assert-Step "the fast-forward"
+$head   = git rev-parse HEAD
+$remote = git rev-parse origin/production-persistence-b4
+if ($head -ne $remote) { throw "HEAD ($head) != origin ($remote)" }
+# The CI-verified source commit must be present, and everything
+# after it documentation-only (only this record file).
+$verified = "b6967793039e9556bf14477b8cf343fcbdd0227b"
+git merge-base --is-ancestor $verified HEAD
+Assert-Step "the CI-verified commit is an ancestor"
+$delta = @(git diff --name-only $verified..HEAD)
+$expectedDelta = @("docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md")
+if ($delta.Count -eq 0) {
+    Write-Output "HEAD is the CI-verified commit itself: $head"
+} elseif (-not (Compare-Object $delta $expectedDelta)) {
+    Write-Output "HEAD is a documentation-only descendant of the CI-verified commit: $head"
+} else {
+    throw "the delta from the CI-verified commit is not documentation-only: $($delta -join ', ')"
+}
+Write-Output "checkout verified: HEAD == origin == $head (over $verified)"
 
-# 1. The toolchain (the pinned rust-toolchain.toml installs itself)
+# 1. The evidence transcript — everything below is captured.
+Start-Transcript -Path pp-b4-windows-acceptance.txt
 cd engine
-rustc --version
+rustc --version;   Assert-Step "the toolchain"
 
-# 2. The static gates
-cargo fmt --all -- --check
+# 2. The static gates.
+cargo fmt --all -- --check;   Assert-Step "cargo fmt"
+cargo build --workspace;      Assert-Step "cargo build"
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
+Assert-Step "cargo clippy"
 
-# 3. The full test matrix (includes the SQLite provider suites and
-#    the deterministic real-child process-death tests)
-cargo test --workspace
+# 3. THE PHYSICAL RELEASE-MODE TESTS — BOTH runs must complete
+#    successfully; the transcript captures their actual outputs and
+#    counts (the delivered suite total: 707 passed / 0 failed).
+cargo test --release --workspace;   Assert-Step "the first release run"
+cargo test --release --workspace;   Assert-Step "the second release run"
 
-# 4. The focused PP-B4 suites (one filter at a time)
-cargo test -p engine-slice --test pp_b4_maintenance
-cargo test -p engine-slice --test pp_b4_orchestrated
-cargo test -p engine-slice --test pp_b4_worker
-cargo test -p engine-slice --test pp_b4_pending
-cargo test -p engine-slice --test pp_b4_seam
+# 4. The focused PP-B4 suites (release mode, one filter at a time).
+cargo test --release -p engine-slice --test pp_b4_maintenance;  Assert-Step "maintenance"
+cargo test --release -p engine-slice --test pp_b4_orchestrated; Assert-Step "orchestrated"
+cargo test --release -p engine-slice --test pp_b4_worker;       Assert-Step "worker"
+cargo test --release -p engine-slice --test pp_b4_pending;      Assert-Step "pending"
+cargo test --release -p engine-slice --test pp_b4_seam;         Assert-Step "seam"
 
-# 5. The fingerprints (double run, the pinned Stage-0 values)
-$a = cargo run -q -p engine-slice -- --fingerprint-selftest
-$b = cargo run -q -p engine-slice -- --fingerprint-selftest
-#   $a -eq $b must hold; the output must contain
-#   engine=6504123a47cab66f and state=937bd3b6f56f07e0
+# 5. The provider checks (the SQLite suites also run inside the
+#    workspace tests above; the focused release runs).
+cargo test --release -p engine-slice --test pp_b1_sqlite_lifecycle; Assert-Step "sqlite lifecycle"
+cargo test --release -p engine-slice --test pp_b1_backup;           Assert-Step "backup"
+cargo test --release -p engine-slice --test pp_b1_migration;        Assert-Step "migration"
 
-# 6. The benchmark (release mode, output captured for the review)
+# 6. The double frozen-fingerprint verification (release mode).
+$a = cargo run --release -q -p engine-slice -- --fingerprint-selftest
+Assert-Step "the first fingerprint run"
+$b = cargo run --release -q -p engine-slice -- --fingerprint-selftest
+Assert-Step "the second fingerprint run"
+if (Compare-Object $a $b) { throw "the fingerprint runs diverged" }
+if (-not ($a -match "engine=6504123a47cab66f")) { throw "the engine pin changed" }
+if (-not ($a -match "state=937bd3b6f56f07e0"))  { throw "the state pin changed" }
+Write-Output "fingerprints verified: $($a -join ' / ')"
+
+# 7. The benchmark (release mode, captured to its own file).
 cargo run --release -q -p engine-slice -- --benchmark-persistence |
   Out-File -Encoding utf8 pp-b4-windows-benchmark.txt
-Get-Content pp-b4-windows-benchmark.txt
+Assert-Step "the benchmark"
 
-# 7. The evidence package: this transcript plus the benchmark file,
-#    compared against this record's §4 (the pod numbers) and the
-#    PP-B3 record's owner measurements — for the independent final
-#    acceptance review.
+# 8. The final commit SHA into the transcript.
+cd ..
+Write-Output "final commit: $(git rev-parse HEAD)"
+Stop-Transcript
 ```
+
+The evidence package for the independent final acceptance review:
+`pp-b4-windows-acceptance.txt` (the transcript — the verified
+checkout, the actual toolchain, every command's actual output and
+counts, the double fingerprints, the final commit SHA) plus
+`pp-b4-windows-benchmark.txt`, compared against this record's §4
+(the pod numbers — never conflated with the rig's) and the PP-B3
+record's owner measurements. **A development-pod result or a
+GitHub-hosted Windows runner is NEVER the owner's physical hardware
+acceptance** — only this run on the physical machine is.
 
 The accepted Windows-specific durability limitations preserved: the
 journal pointer's directory sync is the ratified no-op (std exposes no
@@ -473,9 +529,15 @@ benchmark's §9i SQLite pass. The `SessionStore` delegation and the
 
 ## 9. Proposed final acceptance criteria
 
-1. The three-OS CI verification dispatch on the validation HEAD green
-   at the job level (§5 — the first dispatch's failure investigated
-   and resolved there; the verdicts verified firsthand).
+1. The three-OS CI verification (run 40376559970) green at the job
+   level — executed at the CI-VERIFIED SOURCE COMMIT
+   `b6967793039e9556bf14477b8cf343fcbdd0227b` (§5; the earlier
+   dispatches' failures investigated and resolved there, the verdicts
+   verified firsthand). The delivered HEAD is that commit's
+   DOCUMENTATION-ONLY descendant (the record commits): no separate
+   CI run exists or is required for documentation-only changes —
+   the Windows checkout procedure (§6) proves the documentation-only
+   descent before anything compiles.
 2. The owner's physical Windows run of §6 succeeds: the gates, the
    full workspace tests (both providers, the real-child pairs), the
    pinned fingerprints, and the release benchmark captured.
@@ -489,11 +551,20 @@ benchmark's §9i SQLite pass. The `SessionStore` delegation and the
 
 ## 10. The delivery state
 
-Recorded at the commit: the exact starting SHA
-(`9a92ef8c1139432efd01f18e371afad5e4da90e5`), the final validation
-SHA, the changed-file inventory, the commands and results, and the
-remote/worktree state — §12 of the delivery report (the commit
-message carries the same).
+The chain: the starting accepted implementation
+`9a92ef8c1139432efd01f18e371afad5e4da90e5` →
+`63d0cfd9db147447021e4d4b8b11408174c4413b` (the validation package:
+7 files, +1207/−20) →
+`b6967793039e9556bf14477b8cf343fcbdd0227b` (the arming-barrier
+corrective: 1 file, +11 — **the CI-verified source/test commit**) →
+`2aede3bba6eafc9c45a2aa1d9286af6acbe57a20` (the first docs-only
+record amend) → this documentation-only corrective (its exact SHA is
+reported in the delivery report and visible on the branch; the §6
+checkout procedure's documentation-only-descent check verifies the
+entire tail over the CI-verified commit). Every commit pushed; HEAD
+== origin verified; the worktree clean; the per-commit changed-file
+inventory in the delivery report; the protected branches and the PR
+discipline unchanged (no PR #4).
 
 **STOP after delivering the validation package.** No PR #4, no
 merges, no CLOSED-PASS ratification, no Stage 6 — the final
