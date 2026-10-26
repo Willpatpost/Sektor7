@@ -26,12 +26,12 @@ use engine_persist::{
     CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
     ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
     JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
-    RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger, Reconciliation,
-    RecordedCancellation, RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry,
-    SourceBaseline, SourcePosition, StoredObject, T1Journal, TailState, TransactionId,
-    active_journal_path, chain_range_digest, compute_digest_seed, publish_checkpoint_mk,
-    publish_reclamation_ledger, read_journal_generations, reconcile, retire_journal_generations,
-    rotate_journal,
+    RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger,
+    ReconcileOutcome, Reconciliation, RecordedCancellation, RecoveryAnchor, RecoveryError,
+    RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal,
+    TailState, TransactionId, active_journal_path, chain_range_digest, compute_digest_seed,
+    publish_checkpoint_mk, publish_reclamation_ledger, read_journal_generations, reconcile,
+    retire_journal_generations, rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -400,6 +400,14 @@ pub enum TransitionError {
     /// Ok-on-coherent-refusal semantics for the pipeline-free
     /// callers.
     ActivationRefused { region: usize },
+    /// The session-phase refusal (PP-B4 checkpoint 4): a maintenance
+    /// compound is active, or the session is Closing — new
+    /// authoritative ticks, scheduling, and optional admissions
+    /// refuse until the phase returns Active. Nothing ran; the
+    /// durable state is untouched. The detail names the phase
+    /// ("maintenance-active" or "closing"). Constructed only by the
+    /// orchestrated session.
+    PhaseRefused { detail: &'static str },
 }
 
 /// The explicit session compaction's report (PP-B2 — the GO's §2/§3
@@ -775,6 +783,23 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// nine-step contract). Typed failures, never swallowed.
     pub fn checkpoint(&mut self) -> Result<(), MediumError> {
         self.source.open_medium()?.checkpoint()
+    }
+
+    /// Reconciles the retained pending canonical attempt (PP-B4
+    /// checkpoint 4's maintenance gate): an uncertain REQUIRED
+    /// confirmation — a possibly-committed consequence batch whose
+    /// reply was lost — resolves against the canonical chain BEFORE
+    /// any maintenance compound. Installed confirms through the
+    /// verified receipt (the slot clears only after it);
+    /// NotInstalled leaves the retained attempt for the coherent
+    /// retry; Unverifiable retains the uncertainty — never a guessed
+    /// confirmation. The pipeline's own exception-safe lifecycle,
+    /// exposed for the orchestrated session's maintenance path.
+    pub fn reconcile_pending(&mut self) -> Result<ReconcileOutcome, TransitionError> {
+        self.assert_journal_authority()?;
+        self.pipeline
+            .reconcile_pending()
+            .map_err(TransitionError::JournalFailed)
     }
 
     /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
@@ -1345,19 +1370,30 @@ impl<S: MediumSource> SessionCrossing<S> {
         // below the verified anchor's boundary.
         let journal = self.pipeline.journal();
         let mut retained: Vec<CommittedTransaction> = Vec::new();
-        let mut retired: Vec<TransactionId> = Vec::new();
+        let mut retired_canceled: Vec<TransactionId> = Vec::new();
+        let mut retired_subsumed: Vec<TransactionId> = Vec::new();
         for transaction in journal.transactions() {
             let canceled = journal.is_canceled(transaction.id);
             let settled = transaction
                 .envelopes
                 .iter()
                 .all(|envelope| self.pipeline.is_confirmed(envelope.id) && subsumed(&envelope.id));
-            if canceled || settled {
-                retired.push(transaction.id);
+            if canceled {
+                retired_canceled.push(transaction.id);
+            } else if settled {
+                retired_subsumed.push(transaction.id);
             } else {
                 retained.push(transaction.clone());
             }
         }
+        // THE RETIREMENT-EVIDENCE DISTINCTION (PP-B4 checkpoint 4's
+        // matrix H): the two classes stay distinct on the report; the
+        // flat retired set the mechanism receives is their union.
+        let retired: Vec<TransactionId> = retired_canceled
+            .iter()
+            .chain(retired_subsumed.iter())
+            .copied()
+            .collect();
         // Cancellations survive while their target survives.
         let retained_ids: BTreeSet<TransactionId> =
             retained.iter().map(|transaction| transaction.id).collect();
@@ -1374,8 +1410,12 @@ impl<S: MediumSource> SessionCrossing<S> {
         // the root's single pointer, never from a pointer published
         // beside a rotated generation).
         let root = self.journal_root.clone();
-        let rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
+        let mut rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
             .map_err(PipelineError::Journal)?;
+        // The classified retirement evidence (the driver-populated
+        // report fields — the mechanism cannot classify).
+        rotation.retired_canceled = retired_canceled;
+        rotation.retired_subsumed = retired_subsumed;
         // THE CAPTURE-VALIDITY GENERATION (PP-B4 checkpoint 3, the F1
         // preflight): the mechanism returned Ok — the pointer FLIPPED —
         // so every snapshot capture taken before this instant is

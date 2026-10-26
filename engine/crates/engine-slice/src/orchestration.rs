@@ -40,11 +40,27 @@
 //! queue bounds ADMISSION, never the accounting — unresolved
 //! obligations are never silently discarded), and
 //! [`OrchestratedSession::join`] harvests the unpolled slots exactly
-//! as Checkpoint 4's maintenance drain will.
+//! as the maintenance drain does.
 //!
-//! NO maintenance entry points (rotation/reclamation orchestration
-//! and the graceful-shutdown final-save belong to Checkpoint 4) and
-//! no new path around the future maintenance admission lease.
+//! THE PROTECTED MAINTENANCE LEASE (PP-B4 checkpoint 4): every
+//! maintenance compound — the SK/MK checkpoint, the journal
+//! rotation, the reclamation — executes behind the EXCLUSIVE lease:
+//! the phase flips first (no new optional admissions, ticks, or
+//! scheduling while the compound is active), a FIFO BARRIER is
+//! enqueued behind every previously admitted canonical job and
+//! waited out, every preceding completion is harvested into the
+//! ledger and every uncertain disposition RECONCILED against the
+//! canonical chain (Installed / NotInstalled / Unverifiable — never
+//! a guessed confirmation), the worker and journal authority are
+//! verified, and only then does the compound run with no optional
+//! interleaving; the lease releases on every exit with the
+//! crossing's own coherent failure semantics. THE GRACEFUL DURABLE
+//! CLOSE: the same drain, then the final snapshot published as a
+//! REQUIRED operation (the blocking admission, never a droppable
+//! optional), its installation verified by readback, the provider
+//! lifecycle checkpoint AFTER the verified durability, and the
+//! honest [`CloseReport`] — never a "safely saved" claim on a bare
+//! enqueue or a clean thread join.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -54,12 +70,14 @@ use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 
 use engine_core::{EventId, EventSpec, LodLevel, PresenceSample, ScheduleError, Spine, Tick};
 use engine_persist::{
-    AppendOutcome, CanonicalMedium, CommitOutcome, Hash, MediumError, PipelineError,
-    RevisionRecord, StoredObject, SyncTier, T1Journal, TransactionId, UnknownReason,
-    active_journal_path,
+    AppendOutcome, CanonicalMedium, CommitOutcome, Hash, JournalRotation, MediumError,
+    PipelineError, ReconcileOutcome, Reconciliation, RevisionRecord, StoredObject, SyncTier,
+    T1Journal, TransactionId, UnknownReason, active_journal_path,
 };
 
-use crate::crossing::{SessionCrossing, TransitionError, save_session};
+use crate::crossing::{
+    CheckpointReport, ReclamationReport, SessionCrossing, TransitionError, save_session,
+};
 use crate::npc::{NPC_COUNT, NpcWorld, REGION_COUNT};
 use crate::region::RegionDirector;
 use crate::store::{MediumSource, StoreLocation};
@@ -167,6 +185,10 @@ pub enum SubmitRefusal {
     /// journal-pointer flip invalidated it; a fresh capture is
     /// required.
     Stale,
+    /// The session is under the maintenance lease or Closing
+    /// (PP-B4 checkpoint 4): optional admissions refuse until the
+    /// phase returns Active — nothing was admitted, no append.
+    Suspended,
 }
 
 /// One publication completion's outcome (the honest dispositions —
@@ -221,6 +243,11 @@ pub enum CompletionDisposition {
     /// accepted or rejected; the unresolved candidate identity is
     /// the record's `revision` field, retained for reconciliation.
     Unknown { reason: UnknownReason },
+    /// The maintenance drain RECONCILED a previously unknown
+    /// disposition against the canonical chain (PP-B4 checkpoint 4):
+    /// `installed` is the VERIFIED result — never a guessed
+    /// confirmation; an unverifiable state stays `Unknown`.
+    Reconciled { revision: Hash, installed: bool },
     /// A definite medium failure — nothing was installed (the
     /// pre-commit class, or a job refused at the worker's execution
     /// boundary); the detail is the error's display and NEVER an
@@ -271,6 +298,16 @@ fn publication_outcome(
         Ok(WorkerReply::Canceled) => PublicationOutcome::Canceled { revision },
         Ok(other) => unreachable!("the publication reply was {other:?}"),
         Err(error) => PublicationOutcome::Failed { revision, error },
+    }
+}
+
+/// The maintenance/close gate's short detail (the established
+/// detail strings pass through; anything else carries its debug
+/// form).
+fn gate_detail(error: &TransitionError) -> String {
+    match error {
+        TransitionError::InstallIncompatible { detail, .. } => (*detail).to_owned(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -338,6 +375,94 @@ pub struct JoinReport {
     pub completions: Vec<CompletionRecord>,
 }
 
+/// The orchestrated session's phase (PP-B4 checkpoint 4): `Active`
+/// admits everything; `Maintenance` — a protected maintenance
+/// compound is executing (or its barrier waiting); `Closing` — the
+/// graceful durable close is in progress. Authoritative ticks,
+/// scheduling, and optional admissions refuse outside `Active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// The ordinary operational phase.
+    Active,
+    /// A protected maintenance compound is active (the exclusive
+    /// lease — the maintenance operations).
+    Maintenance,
+    /// The graceful durable close is in progress (terminal).
+    Closing,
+}
+
+/// The protected maintenance failure surface (PP-B4 checkpoint 4):
+/// the GATE failures (the lease never established — the worker
+/// unavailable, the journal authority lost or unresolved, an
+/// unverifiable canonical disposition) are distinct from the
+/// COMPOUND failures (the maintenance operation itself refused after
+/// the drain — the crossing's own coherent semantics, each effect
+/// individually durable or nothing ran).
+#[derive(Debug)]
+pub enum MaintenanceError {
+    /// The maintenance gate refused: the worker unavailable, the
+    /// journal authority lost or unresolved, or an uncertain
+    /// canonical disposition unverifiable — the compound NEVER began;
+    /// the session state is unchanged (the phase released).
+    Gate(TransitionError),
+    /// The compound itself failed AFTER the drain — the crossing's
+    /// own typed failure with its coherent state semantics; the
+    /// lease released, the retry coherent.
+    Compound(TransitionError),
+}
+
+/// The graceful close's failure classes (PP-B4 checkpoint 4): an
+/// honest FAILED close — never a claimed save on a bare enqueue or a
+/// clean thread join.
+#[derive(Debug)]
+pub enum CloseFailure {
+    /// The worker became unavailable during the close (dead,
+    /// poisoned, or refused at the barrier's execution boundary): no
+    /// final snapshot was published.
+    WorkerUnavailable,
+    /// An uncertain canonical disposition could not be verified
+    /// against the chain — never a guessed confirmation.
+    UnverifiableReconciliation,
+    /// The journal-authority gate refused the close (the R4/R5
+    /// states); the detail names the state.
+    Authority(String),
+    /// The final publication failed definitely (the medium's own
+    /// error, as its display).
+    PublicationFailed(String),
+    /// The final publication's readback verification failed (the
+    /// installed record or its content object did not verify against
+    /// the capture).
+    ReadbackFailed(String),
+    /// The provider lifecycle checkpoint failed (as its display).
+    CheckpointFailed(String),
+    /// The bounded recapture discipline was exhausted (the captured
+    /// parent kept going stale — the bytes were never rebased).
+    RecaptureExhausted,
+}
+
+/// The graceful close's honest report (PP-B4 checkpoint 4): the
+/// final required snapshot's VERIFIED revision and tier (None on a
+/// failed close), the final completion ledger, the worker thread's
+/// join result, and the failure state. A clean thread join is NEVER
+/// a successful durable close — success is the verified final
+/// revision with no failure.
+#[derive(Debug)]
+pub struct CloseReport {
+    /// The final required snapshot's readback-verified revision —
+    /// None on a failed close (never a claimed save).
+    pub final_revision: Option<Hash>,
+    /// The final publication's provider durability tier.
+    pub final_tier: Option<SyncTier>,
+    /// The final completion ledger: every publication this session
+    /// admitted, with its typed disposition (the harvested uncertain
+    /// dispositions included — never silently discarded).
+    pub completions: Vec<CompletionRecord>,
+    /// The worker thread's join result.
+    pub worker: Result<(), MediumError>,
+    /// The failure state — None on the verified successful close.
+    pub failure: Option<CloseFailure>,
+}
+
 // ------------------------------------------------------------- the session
 
 /// The orchestrated authoritative session (PP-B4 checkpoint 3): the
@@ -360,6 +485,12 @@ pub struct OrchestratedSession {
     /// submissions can never indefinitely starve the required
     /// operation under finite worker service.
     required_waiting: AtomicBool,
+    /// The session's phase (PP-B4 checkpoint 4): `Active` admits
+    /// everything; `Maintenance` — a protected compound is executing
+    /// (or its barrier waiting); `Closing` — the graceful close.
+    /// The phase gates the ticks, the scheduling, and the optional
+    /// admissions.
+    phase: SessionPhase,
     /// The pending optional publications (the completion slots the
     /// orchestrator RETAINS — caller cancellation never orphans the
     /// accounting). IN-MEMORY GROWTH HONESTY (C3-F3): the bounded
@@ -414,6 +545,7 @@ impl OrchestratedSession {
             worker,
             journal_root,
             required_waiting: AtomicBool::new(false),
+            phase: SessionPhase::Active,
             pending: Vec::new(),
             completed: Vec::new(),
             next_id: 0,
@@ -448,6 +580,7 @@ impl OrchestratedSession {
             worker,
             journal_root: journal_path.to_path_buf(),
             required_waiting: AtomicBool::new(false),
+            phase: SessionPhase::Active,
             pending: Vec::new(),
             completed: Vec::new(),
             next_id: 0,
@@ -464,6 +597,7 @@ impl OrchestratedSession {
     /// completed stand (each individually durable), and the retry's
     /// level check skips them. NO scheduling inside the tick.
     pub fn tick(&mut self, presence: &[PresenceSample]) -> Result<TickReport, TransitionError> {
+        self.assert_active()?;
         self.crossing.assert_authoritative()?;
         let now = self.spine.clock();
         let mut regions_transitioned = Vec::new();
@@ -518,6 +652,7 @@ impl OrchestratedSession {
     /// dispatch VERBATIM — the spine's own dependency validation,
     /// identity allocation, and the dormant-hold.
     pub fn schedule_event(&mut self, spec: EventSpec) -> Result<EventId, ScheduleOpError> {
+        self.assert_active().map_err(ScheduleOpError::Gate)?;
         self.crossing
             .assert_authoritative()
             .map_err(ScheduleOpError::Gate)?;
@@ -535,6 +670,7 @@ impl OrchestratedSession {
     /// journal writes precede the confirmation on the authority
     /// thread).
     pub fn commit_canonical(&mut self) -> Result<CommitOutcome, TransitionError> {
+        self.assert_active()?;
         self.crossing.assert_authoritative()?;
         self.required_waiting.store(true, Ordering::Relaxed);
         let result = self.crossing.commit_canonical();
@@ -595,6 +731,9 @@ impl OrchestratedSession {
         &mut self,
         capture: SnapshotCapture,
     ) -> Result<PublicationHandle, SubmitRefusal> {
+        if self.phase != SessionPhase::Active {
+            return Err(SubmitRefusal::Suspended);
+        }
         if capture.generation != self.crossing.journal_flip_count() {
             return Err(SubmitRefusal::Stale);
         }
@@ -703,6 +842,13 @@ impl OrchestratedSession {
         self.worker.healthy()
     }
 
+    /// The session's current phase (PP-B4 checkpoint 4): `Active`
+    /// admits everything; `Maintenance` — a protected compound is
+    /// executing; `Closing` — the graceful close (terminal).
+    pub fn phase(&self) -> SessionPhase {
+        self.phase
+    }
+
     /// POISON the session (the worker's terminal lifecycle — the
     /// delegated discipline): every authoritative operation refuses
     /// through the composed gate until a fresh recovery.
@@ -774,6 +920,7 @@ impl OrchestratedSession {
             worker,
             journal_root: _,
             required_waiting: _,
+            phase: _,
             pending,
             completed,
             next_id: _,
@@ -808,6 +955,576 @@ impl OrchestratedSession {
             worker: thread,
             completions,
         }
+    }
+
+    // ------------------------------------------------- protected maintenance
+
+    /// The session-phase gate (PP-B4 checkpoint 4): authoritative
+    /// gameplay and optional admissions refuse outside Active — a
+    /// maintenance compound is executing, or the session is Closing.
+    /// Nothing ran; the durable state is untouched.
+    fn assert_active(&self) -> Result<(), TransitionError> {
+        match self.phase {
+            SessionPhase::Active => Ok(()),
+            SessionPhase::Maintenance => Err(TransitionError::PhaseRefused {
+                detail: "maintenance-active",
+            }),
+            SessionPhase::Closing => Err(TransitionError::PhaseRefused { detail: "closing" }),
+        }
+    }
+
+    /// The SK/MK checkpoint under the EXCLUSIVE maintenance lease
+    /// (PP-B4 checkpoint 4): the drain — the FIFO barrier, the
+    /// completion harvest, the uncertain-disposition reconciliation —
+    /// precedes the compound, so the checkpoint begins from the
+    /// latest verified canonical state with every earlier optional
+    /// publication settled, and NO optional admission can interleave
+    /// between SK and MK. The crossing's own accepted checkpoint
+    /// operation — the eligibility checks, the explicit spine-history
+    /// compaction policy, the SK/MK adjacency and metadata
+    /// commitments, the crash windows and recovery semantics —
+    /// VERBATIM, over the worker-backed CanonicalMedium. An SK-only
+    /// partial checkpoint is never a completed compound (the
+    /// crossing's own typed failure).
+    pub fn publish_checkpoint(
+        &mut self,
+        retain_tail: u64,
+    ) -> Result<CheckpointReport, MaintenanceError> {
+        self.maintenance(|session| {
+            session.crossing.publish_checkpoint(
+                &mut session.spine,
+                &mut session.director,
+                retain_tail,
+            )
+        })
+    }
+
+    /// The journal rotation under the EXCLUSIVE maintenance lease:
+    /// every earlier admitted publication settles BEFORE the
+    /// rotation (the FIFO barrier — nothing of the session's is in
+    /// flight across the generation flip); the accepted
+    /// verified-anchor retirement rule and the
+    /// canceled-vs-confirmed-subsumed classification run VERBATIM;
+    /// the pipeline reopens over the active generation through the
+    /// SAME worker (no independent provider connection); and the
+    /// capture-validity generation increments at the mechanism's
+    /// successful pointer flip — before the R5 durability gate — so
+    /// every pre-flip capture is permanently rejected, even with the
+    /// canonical HEAD unchanged. The fail-closed behavior after an
+    /// unresolved pointer durability or a failed pipeline rebuild,
+    /// and the R5 repair semantics, are the crossing's own.
+    pub fn rotate_journal(&mut self) -> Result<JournalRotation, MaintenanceError> {
+        self.maintenance(|session| session.crossing.rotate_journal())
+    }
+
+    /// The reclamation under the EXCLUSIVE maintenance lease: the
+    /// preceding canonical publications settled and reconciled, then
+    /// the accepted audited reclamation-manifest protocol VERBATIM —
+    /// verify-before-delete, the idempotent restart, the
+    /// whole-manifest completion check, the authoritative journal
+    /// generations — through the worker-backed medium. An optional
+    /// publication's Accepted report is NEVER the reclamation-safety
+    /// inference: the audit's own chain verification governs.
+    pub fn reclaim_checkpoint(
+        &mut self,
+        generations: u64,
+    ) -> Result<ReclamationReport, MaintenanceError> {
+        let root = self.journal_root.clone();
+        self.maintenance(move |session| session.crossing.reclaim_checkpoint(&root, generations))
+    }
+
+    /// THE R5 REPAIR, exposed for the orchestrated path:
+    /// re-establish the pointer's power-loss durability after an
+    /// unresolved rotation — the crossing's own state machine (a
+    /// re-sync failure leaves the fail-closed state intact; a
+    /// rebuild failure escalates to authority-lost; healthy only
+    /// after the verified durability). Not under the maintenance
+    /// envelope: the repair writes nothing canonical (the directory
+    /// re-sync plus the pipeline rebuild over the pointer-resolved
+    /// journal).
+    pub fn reestablish_pointer_durability(&mut self) -> Result<(), TransitionError> {
+        self.crossing.reestablish_pointer_durability()
+    }
+
+    /// THE MAINTENANCE ENVELOPE (the exclusive lease, the GO §2
+    /// sequence): the phase flips FIRST (no new optional admissions,
+    /// ticks, or scheduling while the compound is active); the gate
+    /// drains — the FIFO barrier behind every previously admitted
+    /// canonical job, the completion harvest into the ledger, the
+    /// uncertain-disposition reconciliation against the chain, the
+    /// health verification; the compound then runs with no optional
+    /// interleaving; and the phase releases on EVERY exit (a failed
+    /// compound leaves the crossing's own coherent state — each
+    /// effect individually durable or nothing ran — and the retry is
+    /// coherent). No mutex the worker needs is held while waiting:
+    /// the authority thread is the only submitter and the worker
+    /// never calls back.
+    fn maintenance<T>(
+        &mut self,
+        compound: impl FnOnce(&mut Self) -> Result<T, TransitionError>,
+    ) -> Result<T, MaintenanceError> {
+        self.phase = SessionPhase::Maintenance;
+        let result = match self.enter_maintenance() {
+            Err(error) => Err(error),
+            Ok(()) => compound(self).map_err(MaintenanceError::Compound),
+        };
+        self.phase = SessionPhase::Active;
+        result
+    }
+
+    /// Test-only: the maintenance envelope's PROBE — the full gate
+    /// (the barrier, the harvest, the reconciliation) runs under the
+    /// REAL lease, then the probe observes the exclusivity through
+    /// the real path (the phase, the drained ledger, the refused
+    /// ticks, scheduling, and optional admissions) and its value is
+    /// returned; the lease releases without a compound.
+    #[doc(hidden)]
+    pub fn debug_maintenance_probe_for_test<T>(
+        &mut self,
+        probe: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, MaintenanceError> {
+        self.phase = SessionPhase::Maintenance;
+        let result = match self.enter_maintenance() {
+            Err(error) => Err(error),
+            Ok(()) => Ok(probe(self)),
+        };
+        self.phase = SessionPhase::Active;
+        result
+    }
+
+    /// THE MAINTENANCE GATE: the composed authority gate first (a
+    /// dead or poisoned worker, a lost or unresolved journal
+    /// authority — maintenance fails CLOSED, never a queue bypass
+    /// through a direct provider handle); the FIFO BARRIER enqueued
+    /// behind every previously admitted canonical job and waited
+    /// out; the completion harvest; the uncertain-disposition
+    /// reconciliation; the post-drain health verification.
+    fn enter_maintenance(&mut self) -> Result<(), MaintenanceError> {
+        self.crossing
+            .assert_authoritative()
+            .map_err(MaintenanceError::Gate)?;
+        // THE FIFO BARRIER: a REQUIRED (blocking) admission — it
+        // waits for queue room while the worker drains, so it lands
+        // BEHIND every previously admitted job; its reply proves they
+        // all executed and replied. A poisoned worker refuses the
+        // barrier at its own execution boundary (the definite
+        // unavailable class) — fail closed, never a bypass.
+        let slot = self
+            .worker
+            .submit_required(MediumOp::Barrier)
+            .map_err(|_| {
+                MaintenanceError::Gate(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "worker/unavailable",
+                })
+            })?;
+        match slot.recv() {
+            Ok(Ok(WorkerReply::Barrier)) => {}
+            Ok(Ok(other)) => unreachable!("the barrier reply was {other:?}"),
+            // A refusal at the worker's execution boundary (the
+            // definite unavailable class) or a death before the
+            // barrier: maintenance fails closed.
+            Ok(Err(_)) | Err(_) => {
+                return Err(MaintenanceError::Gate(
+                    TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "worker/unavailable",
+                    },
+                ));
+            }
+        }
+        // THE COMPLETION HARVEST: behind the barrier every admitted
+        // publication has executed and replied — drain the pending
+        // into the ledger (a missing reply is the unresolved class,
+        // reconciled next).
+        self.harvest_pending();
+        // THE RECONCILIATION: every uncertain canonical disposition
+        // resolves against the chain before the compound — never a
+        // guessed confirmation, and never a compound over an
+        // unresolved canonical disposition.
+        self.reconcile_uncertain().map_err(MaintenanceError::Gate)?;
+        // THE POST-DRAIN HEALTH VERIFICATION.
+        if !self.worker.healthy() {
+            return Err(MaintenanceError::Gate(
+                TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "worker/unavailable",
+                },
+            ));
+        }
+        self.crossing
+            .assert_authoritative()
+            .map_err(MaintenanceError::Gate)?;
+        Ok(())
+    }
+
+    /// THE COMPLETION HARVEST: drains every pending publication slot
+    /// into the ledger. Behind the barrier every admitted job has
+    /// executed and replied — a missing reply is the unresolved
+    /// class (a lost reply or a death in flight), retained honestly
+    /// for the reconciliation, never silently discarded.
+    fn harvest_pending(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        for entry in pending {
+            match entry.slot.try_recv() {
+                Ok(reply) => {
+                    let outcome = publication_outcome(entry.revision, reply);
+                    let disposition = CompletionDisposition::of(&outcome);
+                    self.retire_entry(entry, disposition);
+                }
+                Err(_) => {
+                    self.retire_entry(
+                        entry,
+                        CompletionDisposition::Unknown {
+                            reason: UnknownReason::WorkerReplyLost,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE UNCERTAIN-DISPOSITION RECONCILIATION: the crossing's
+    /// retained pending required attempt first (the pipeline's own
+    /// exception-safe lifecycle), then the completion ledger's
+    /// Unknown dispositions — each resolves against the canonical
+    /// chain through the single worker: Installed records the
+    /// VERIFIED acceptance, NotInstalled the VERIFIED absence, and
+    /// Unverifiable FAILS THE GATE (the uncertainty retained — never
+    /// a guessed confirmation; the compounds never run over an
+    /// unresolved canonical disposition).
+    fn reconcile_uncertain(&mut self) -> Result<(), TransitionError> {
+        if let ReconcileOutcome::Unverifiable { .. } = self.crossing.reconcile_pending()? {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "maintenance/unverifiable-attempt",
+            });
+        }
+        let uncertain: Vec<(u64, Hash)> = self
+            .completed
+            .iter()
+            .filter(|record| matches!(record.disposition, CompletionDisposition::Unknown { .. }))
+            .map(|record| (record.id, record.revision))
+            .collect();
+        if uncertain.is_empty() {
+            return Ok(());
+        }
+        let mut medium = self
+            .worker
+            .source()
+            .map_err(PipelineError::Medium)?
+            .open_medium()
+            .map_err(PipelineError::Medium)?;
+        for (id, revision) in uncertain {
+            let installed = match medium
+                .reconcile_unknown(&revision)
+                .map_err(PipelineError::Medium)?
+            {
+                Reconciliation::Installed { .. } => true,
+                Reconciliation::NotInstalled { .. } => false,
+                Reconciliation::Unverifiable { .. } => {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "maintenance/unverifiable-publication",
+                    });
+                }
+            };
+            let Some(record) = self.completed.iter_mut().find(|record| record.id == id) else {
+                continue;
+            };
+            record.disposition = CompletionDisposition::Reconciled {
+                revision,
+                installed,
+            };
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------ the graceful close
+
+    /// THE GRACEFUL DURABLE CLOSE (the GO §6 sequence): mark Closing
+    /// (new ticks, scheduling, and optional admissions refuse); the
+    /// same drain as the maintenance gate (the FIFO barrier, the
+    /// completion harvest, the uncertain reconciliation — an
+    /// unavailable worker or an unverifiable reconciliation is the
+    /// explicit FAILED close, never a claimed save); the final
+    /// snapshot captured from the NEWEST authoritative state and
+    /// published as a REQUIRED operation (the blocking admission,
+    /// never a droppable optional) with its installation verified by
+    /// readback and the bounded recapture on a stale parent (never
+    /// rebased); the provider lifecycle checkpoint ONLY after the
+    /// verified durability obligations; then the teardown — the T1
+    /// journal ownership and the queue senders released in safe
+    /// order (the crossing first, the C3-F1 discipline), the worker
+    /// drained and joined. The honest [`CloseReport`]: a clean
+    /// thread join is NEVER a successful durable close.
+    pub fn close(self) -> CloseReport {
+        self.close_inner(None::<fn(&mut Self)>)
+    }
+
+    /// Test-only: the close with a PROBE invoked after the drain,
+    /// DURING the real Closing phase — the probe observes the
+    /// exclusivity through the real path (the refused ticks,
+    /// scheduling, and optional admissions).
+    #[doc(hidden)]
+    pub fn debug_close_with_probe_for_test<P>(self, probe: P) -> CloseReport
+    where
+        P: FnOnce(&mut Self),
+    {
+        self.close_inner(Some(probe))
+    }
+
+    fn close_inner<P: FnOnce(&mut Self)>(mut self, probe: Option<P>) -> CloseReport {
+        // (1)+(2) CLOSING: the phase gates refuse new authoritative
+        // gameplay and optional admission for the remainder of the
+        // session's life.
+        self.phase = SessionPhase::Closing;
+        // (3)-(6) THE DRAIN: the barrier, the harvest, the
+        // reconciliation — a gate failure here (an unavailable
+        // worker, an unverifiable reconciliation) is the explicit
+        // FAILED close: never a claimed save; the teardown still
+        // runs.
+        let mut failure = self.enter_close_gate().err();
+        // The probe: DURING the real Closing phase, after the drain.
+        if failure.is_none()
+            && let Some(probe) = probe
+        {
+            probe(&mut self);
+        }
+        // (7)-(10) THE FINAL REQUIRED SNAPSHOT — only on a clean gate.
+        let mut final_revision: Option<Hash> = None;
+        let mut final_tier: Option<SyncTier> = None;
+        if failure.is_none() {
+            match self.publish_final_snapshot() {
+                Ok((revision, tier)) => {
+                    final_revision = Some(revision);
+                    final_tier = Some(tier);
+                }
+                Err(close_failure) => failure = Some(close_failure),
+            }
+        }
+        // (11)+(12) THE PROVIDER LIFECYCLE CHECKPOINT — ONLY after
+        // the required durability obligations verified (the ratified
+        // WAL TRUNCATE for SQLite, through the WorkerMedium; the
+        // no-op for the file medium).
+        if failure.is_none()
+            && let Err(error) = self.crossing.checkpoint()
+        {
+            failure = Some(CloseFailure::CheckpointFailed(error.to_string()));
+        }
+        // (13)+(14) THE TEARDOWN: release the T1 journal ownership
+        // and the remaining queue senders in safe order (the
+        // crossing — and its pipeline's proxies — FIRST, the C3-F1
+        // discipline), then drain and join the worker.
+        let Self {
+            spine,
+            director,
+            crossing,
+            worker,
+            journal_root: _,
+            required_waiting: _,
+            phase: _,
+            pending,
+            completed,
+            next_id: _,
+        } = self;
+        drop(spine);
+        drop(director);
+        drop(crossing);
+        let thread = worker.join();
+        // The final ledger: the drain harvested the pending on a
+        // clean gate; a FAILED gate may leave slots pending — they
+        // are harvested here as the honest unresolved class, never
+        // silently discarded.
+        let mut completions = completed;
+        for entry in pending {
+            let disposition = match entry.slot.try_recv() {
+                Ok(reply) => CompletionDisposition::of(&publication_outcome(entry.revision, reply)),
+                Err(_) => CompletionDisposition::Unknown {
+                    reason: UnknownReason::WorkerReplyLost,
+                },
+            };
+            completions.push(CompletionRecord {
+                id: entry.id,
+                revision: entry.revision,
+                disposition,
+                coverage: entry.coverage,
+                journal_frontier: entry.journal_frontier,
+            });
+        }
+        // (15) THE HONEST REPORT.
+        CloseReport {
+            final_revision,
+            final_tier,
+            completions,
+            worker: thread,
+            failure,
+        }
+    }
+
+    /// The close's gate (the §6 steps 3-6): the same drain as the
+    /// maintenance gate, with the failures mapped to the explicit
+    /// close-failure classes.
+    fn enter_close_gate(&mut self) -> Result<(), CloseFailure> {
+        self.crossing
+            .assert_authoritative()
+            .map_err(|error| self.close_gate_failure(error))?;
+        let slot = self
+            .worker
+            .submit_required(MediumOp::Barrier)
+            .map_err(|_| CloseFailure::WorkerUnavailable)?;
+        match slot.recv() {
+            Ok(Ok(WorkerReply::Barrier)) => {}
+            Ok(Ok(other)) => unreachable!("the barrier reply was {other:?}"),
+            Ok(Err(_)) | Err(_) => return Err(CloseFailure::WorkerUnavailable),
+        }
+        self.harvest_pending();
+        if let Err(error) = self.reconcile_uncertain() {
+            return Err(self.close_gate_failure(error));
+        }
+        if !self.worker.healthy() {
+            return Err(CloseFailure::WorkerUnavailable);
+        }
+        self.crossing
+            .assert_authoritative()
+            .map_err(|error| self.close_gate_failure(error))?;
+        Ok(())
+    }
+
+    /// The close gate's failure classification: a dead worker is the
+    /// unavailable class; the two unverifiable-reconciliation details
+    /// the unverify class; every other authority refusal carries its
+    /// detail.
+    fn close_gate_failure(&self, error: TransitionError) -> CloseFailure {
+        if !self.worker.healthy() {
+            return CloseFailure::WorkerUnavailable;
+        }
+        match &error {
+            TransitionError::InstallIncompatible { detail, .. } => {
+                if *detail == "maintenance/unverifiable-attempt"
+                    || *detail == "maintenance/unverifiable-publication"
+                {
+                    CloseFailure::UnverifiableReconciliation
+                } else {
+                    CloseFailure::Authority((*detail).to_owned())
+                }
+            }
+            other => CloseFailure::Authority(gate_detail(other)),
+        }
+    }
+
+    /// THE FINAL REQUIRED SNAPSHOT (the §6 steps 7-10): a FRESH
+    /// capture each attempt (the newest authoritative state — never
+    /// an earlier queued snapshot, never rebased bytes), the
+    /// REQUIRED blocking admission, the verified readback; a stale
+    /// captured parent recaptures and retries under the bounded
+    /// discipline; an uncertain disposition reconciles (Installed →
+    /// the verified acceptance with the readback; NotInstalled →
+    /// the recapture retry; Unverifiable → the failed close).
+    fn publish_final_snapshot(&mut self) -> Result<(Hash, SyncTier), CloseFailure> {
+        const FINAL_CLOSE_ATTEMPTS: usize = 3;
+        for _ in 0..FINAL_CLOSE_ATTEMPTS {
+            let capture = self
+                .capture_snapshot()
+                .map_err(|error| CloseFailure::PublicationFailed(gate_detail(&error)))?;
+            let record =
+                RevisionRecord::regular(capture.parent, capture.parent_epoch, capture.tick)
+                    .with_idempotency_key(capture.content.as_bytes().to_vec())
+                    .with_content_refs(vec![capture.content]);
+            let revision = record.id();
+            let slot = self
+                .worker
+                .submit_required(MediumOp::Append {
+                    record,
+                    objects: vec![capture.object],
+                    expected_parent: Some(capture.parent),
+                })
+                .map_err(|_| CloseFailure::WorkerUnavailable)?;
+            match slot.recv() {
+                Err(_) => return Err(CloseFailure::WorkerUnavailable),
+                Ok(Err(error)) => {
+                    return Err(match error {
+                        MediumError::WorkerUnavailable { .. } => CloseFailure::WorkerUnavailable,
+                        other => CloseFailure::PublicationFailed(other.to_string()),
+                    });
+                }
+                Ok(Ok(WorkerReply::Append(outcome))) => match outcome {
+                    AppendOutcome::Accepted { id, tier } => {
+                        // (9) THE READBACK VERIFICATION.
+                        self.verify_final_publication(&id, &capture.parent, &capture.content)?;
+                        return Ok((id, tier));
+                    }
+                    // (10) THE STALE CAPTURED PARENT: recapture and
+                    // retry — the bytes are never rebased.
+                    AppendOutcome::RejectedStaleParent { .. } => continue,
+                    AppendOutcome::Unknown { .. } => {
+                        let mut medium = self
+                            .worker
+                            .source()
+                            .map_err(|_| CloseFailure::WorkerUnavailable)?
+                            .open_medium()
+                            .map_err(|_| CloseFailure::WorkerUnavailable)?;
+                        match medium
+                            .reconcile_unknown(&revision)
+                            .map_err(|error| CloseFailure::PublicationFailed(error.to_string()))?
+                        {
+                            Reconciliation::Installed { id } => {
+                                self.verify_final_publication(
+                                    &id,
+                                    &capture.parent,
+                                    &capture.content,
+                                )?;
+                                return Ok((id, self.worker.tier()));
+                            }
+                            Reconciliation::NotInstalled { .. } => continue,
+                            Reconciliation::Unverifiable { .. } => {
+                                return Err(CloseFailure::UnverifiableReconciliation);
+                            }
+                        }
+                    }
+                },
+                Ok(Ok(other)) => unreachable!("the final publication reply was {other:?}"),
+            }
+        }
+        Err(CloseFailure::RecaptureExhausted)
+    }
+
+    /// The final publication's READBACK VERIFICATION (§6.9): the
+    /// installed record and its content object are read back through
+    /// the single worker and verified against the capture — the
+    /// record's parent and content reference, and the object's
+    /// content identity.
+    fn verify_final_publication(
+        &mut self,
+        revision: &Hash,
+        parent: &Hash,
+        content: &Hash,
+    ) -> Result<(), CloseFailure> {
+        let mut medium = self
+            .worker
+            .source()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?
+            .open_medium()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?;
+        let record = medium
+            .read_record(revision)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        if record.parent != Some(*parent) || record.content_refs != vec![*content] {
+            return Err(CloseFailure::ReadbackFailed(
+                "the installed record does not bind the captured parent and content".to_owned(),
+            ));
+        }
+        let bytes = medium
+            .read_object(content)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        let object = StoredObject::new(bytes)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        if object.hash() != *content {
+            return Err(CloseFailure::ReadbackFailed(
+                "the content object's identity does not verify".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     // ----------------------------------------------------------- internals
@@ -856,6 +1573,19 @@ impl OrchestratedSession {
         }
     }
 
+    /// Retires one pending entry into the completion ledger (the
+    /// shared record construction — the poll/wait completions, the
+    /// maintenance harvest, and the join/close harvests).
+    fn retire_entry(&mut self, entry: PendingPublication, disposition: CompletionDisposition) {
+        self.completed.push(CompletionRecord {
+            id: entry.id,
+            revision: entry.revision,
+            disposition,
+            coverage: entry.coverage,
+            journal_frontier: entry.journal_frontier,
+        });
+    }
+
     /// Completes the pending entry at `index` with the worker's reply,
     /// retaining the completion record (the candidate identity, the
     /// TYPED DISPOSITION, and the captured frontier — the record
@@ -868,13 +1598,8 @@ impl OrchestratedSession {
     ) -> PublicationOutcome {
         let entry = self.pending.remove(index);
         let outcome = publication_outcome(entry.revision, reply);
-        self.completed.push(CompletionRecord {
-            id: entry.id,
-            revision: entry.revision,
-            disposition: CompletionDisposition::of(&outcome),
-            coverage: entry.coverage,
-            journal_frontier: entry.journal_frontier,
-        });
+        let disposition = CompletionDisposition::of(&outcome);
+        self.retire_entry(entry, disposition);
         outcome
     }
 
@@ -883,19 +1608,16 @@ impl OrchestratedSession {
     /// UNKNOWN (never interpreted), the candidate identity retained.
     fn unknown_at(&mut self, index: usize) -> PublicationOutcome {
         let entry = self.pending.remove(index);
-        let outcome = PublicationOutcome::Unknown {
-            revision: entry.revision,
-            reason: UnknownReason::WorkerReplyLost,
-        };
-        self.completed.push(CompletionRecord {
-            id: entry.id,
-            revision: entry.revision,
-            disposition: CompletionDisposition::Unknown {
+        let revision = entry.revision;
+        self.retire_entry(
+            entry,
+            CompletionDisposition::Unknown {
                 reason: UnknownReason::WorkerReplyLost,
             },
-            coverage: entry.coverage,
-            journal_frontier: entry.journal_frontier,
-        });
-        outcome
+        );
+        PublicationOutcome::Unknown {
+            revision,
+            reason: UnknownReason::WorkerReplyLost,
+        }
     }
 }

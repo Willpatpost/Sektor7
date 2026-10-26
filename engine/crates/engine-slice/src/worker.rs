@@ -74,6 +74,11 @@ pub enum MediumOp {
         units: Vec<ReclaimUnit>,
     },
     Checkpoint,
+    /// The maintenance FIFO barrier (PP-B4 checkpoint 4): a no-op
+    /// job whose reply, by FIFO position, proves every previously
+    /// admitted canonical job executed AND replied — the maintenance
+    /// lease's settlement evidence.
+    Barrier,
 }
 
 /// The worker's reply for one executed operation.
@@ -92,6 +97,9 @@ pub enum WorkerReply {
     /// publication token, PP-B4 checkpoint 3) — a definite non-event:
     /// nothing was executed.
     Canceled,
+    /// The maintenance barrier's no-op reply (PP-B4 checkpoint 4):
+    /// every previously admitted job has executed and replied.
+    Barrier,
 }
 
 /// One queued job with its private bounded completion slot: exactly
@@ -385,6 +393,7 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
             .reclaim_pending(&units)
             .map(WorkerReply::ReclaimPending),
         MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
+        MediumOp::Barrier => Ok(WorkerReply::Barrier),
     }
 }
 
@@ -759,6 +768,44 @@ impl IoWorker {
                 Err(TrySendError::Disconnected(_)) => Err(TrySubmitError::Unavailable),
             },
             None => Err(TrySubmitError::Unavailable),
+        }
+    }
+
+    /// The REQUIRED-operation admission (PP-B4 checkpoint 4): a
+    /// health-checked BLOCKING send — required work WAITS for queue
+    /// room (the worker keeps draining, so admission terminates) and
+    /// is never dropped, unlike the optional `try_submit`. The
+    /// maintenance FIFO barrier and the graceful close's final
+    /// snapshot publication ride this path; a full queue is waited
+    /// out, an unavailable worker the typed refusal. The job is
+    /// never cancelable (no token).
+    pub fn submit_required(
+        &self,
+        op: MediumOp,
+    ) -> Result<Receiver<Result<WorkerReply, MediumError>>, MediumError> {
+        if !self.healthy() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — required \
+                         admission refused"
+                    .to_owned(),
+            });
+        }
+        let (reply, slot) = completion_slot();
+        let job = Job {
+            op,
+            cancel: None,
+            reply,
+        };
+        match &self.tx {
+            Some(tx) => tx
+                .send(job)
+                .map(|()| slot)
+                .map_err(|_| MediumError::WorkerUnavailable {
+                    detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+                }),
+            None => Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is stopped".to_owned(),
+            }),
         }
     }
 

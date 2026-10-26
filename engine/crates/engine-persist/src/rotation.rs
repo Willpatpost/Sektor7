@@ -86,6 +86,20 @@ pub struct JournalRotation {
     /// dropped from the active set; their frames remain in the
     /// retained legacy file as evidence).
     pub retired: Vec<TransactionId>,
+    /// The retired-by-CANCELLATION identities (PP-B4 checkpoint 4):
+    /// the durably canceled transactions — inert by construction,
+    /// their cancellation frames the surviving evidence. Populated
+    /// by the DRIVER's classifier (the mechanism itself cannot
+    /// classify); the flat `retired` set is this list unioned with
+    /// [`Self::retired_subsumed`].
+    pub retired_canceled: Vec<TransactionId>,
+    /// The retired-by-CONFIRMED-AND-SUBSUMED identities: every
+    /// consequential identity canonically confirmed AND materialized
+    /// below the verified anchor's lane boundary. Populated by the
+    /// DRIVER's classifier; the two retirement classes stay DISTINCT
+    /// evidence (a canceled retirement needs no anchor; a subsumed
+    /// retirement is anchor-verified).
+    pub retired_subsumed: Vec<TransactionId>,
     /// The cancellation records carried over (each surviving only
     /// while its target survives).
     pub retained_cancellations: u64,
@@ -507,6 +521,10 @@ pub fn rotate_journal(
         legacy_path: legacy_path.to_path_buf(),
         retained: retained.iter().map(|transaction| transaction.id).collect(),
         retired: retired.to_vec(),
+        // The classified retirement evidence is DRIVER-populated (the
+        // mechanism cannot classify) — see the field docs.
+        retired_canceled: Vec::new(),
+        retired_subsumed: Vec::new(),
         retained_cancellations: retained_cancellations.len() as u64,
         pointer_durability,
     })
