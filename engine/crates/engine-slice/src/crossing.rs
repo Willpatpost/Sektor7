@@ -39,7 +39,7 @@ use crate::region::{
     CaptureStatus, LaneSummaryError, RegionCheckpoint, RegionDirector, RegionEntry,
     gather_region_entries, lod_byte, read_flag, read_lod_level,
 };
-use crate::store::{SessionStore, StoreLocation};
+use crate::store::{MediumSource, StoreLocation};
 
 /// One collected obligation — the owned form of a collected
 /// [`ObligationView`] (the plan is journalable, so it carries owned
@@ -507,14 +507,19 @@ fn capture_envelope(
 /// Batch 3 pipeline. One instance owns the pipeline for the session;
 /// the pipeline-free Stage 4 path never constructs one, so its
 /// behavior and every frozen fingerprint are mechanically untouched.
-pub struct SessionCrossing {
-    pipeline: CommitPipeline<SessionStore>,
-    /// The campaign's canonical store location — fresh medium handles
-    /// for the snapshot publications and the recovery's chain walk
-    /// (each provider's own coordination is per-operation, so
+pub struct SessionCrossing<S: MediumSource = StoreLocation> {
+    pipeline: CommitPipeline<S::Medium>,
+    /// The campaign's canonical-medium SOURCE (PP-B4 checkpoint 1's
+    /// ownership seam): fresh medium handles for the snapshot
+    /// publications, the maintenance walks, and the lifecycle
+    /// checkpoint (each handle's coordination is per-operation, so
     /// additional handles serialize safely alongside the pipeline's
-    /// own).
-    store: StoreLocation,
+    /// own). The legacy instantiation is the store location itself —
+    /// fresh direct provider handles, exactly the accepted behavior;
+    /// a future orchestrated instantiation supplies the single
+    /// I/O worker's proxy source so every in-session canonical
+    /// access routes through the one injected medium.
+    source: S,
     /// The campaign's journal ROOT — the single authoritative
     /// active-path location (the review corrective F1): every
     /// rotation publishes its pointer at `<root>.active`, and the
@@ -552,7 +557,11 @@ enum JournalAuthority {
     DurabilityUnresolved,
 }
 
-impl SessionCrossing {
+/// The legacy directory conveniences, pinned to the store-location
+/// instantiation (PP-B4 checkpoint 1): every other constructor and
+/// method is source-generic — these two exist so the accepted
+/// directory-based call sites compile unchanged.
+impl SessionCrossing<StoreLocation> {
     /// Opens (or joins) the campaign store: the file medium over
     /// `store_dir` — founded with a standalone authority record on
     /// first open, so every confirmation carries the honest
@@ -573,19 +582,75 @@ impl SessionCrossing {
         )
     }
 
-    /// The provider-aware constructor (PP-B1's integration seam): the
-    /// same founding-and-joining semantics over the explicit store
-    /// location — the legacy file root or the SQLite campaign
-    /// database. **No silent selection ever occurs**: a database at a
+    /// The crash recovery: reconstruct the session from the durable
+    /// state alone — the latest chain snapshot plus the journal — and
+    /// re-open the crossing for the continuation (the pending T1
+    /// re-drive available through [`Self::commit_canonical`]).
+    ///
+    /// The composition (§5.4/§5.5.2):
+    /// 1. **The snapshot** — the latest chain-reachable session
+    ///    snapshot, restored through both codecs' gates. A
+    ///    recognizable-but-invalid NEWEST session object fails closed
+    ///    (corruption of the newest authoritative state — never a
+    ///    silent fallback to an older snapshot, which would resurrect
+    ///    stale state).
+    /// 2. **The journal scan + the actionability filter** — a durably
+    ///    CANCELED transaction is never replayed: its plan never
+    ///    installs, its captures never restore.
+    /// 3. **The interleaved crossing restore + plan install** — per
+    ///    ACTIONABLE transaction in journal-sequence order, only the
+    ///    deactivations that POSTDATE the snapshot (the plan's episode
+    ///    above the SNAPSHOT's director episode — the snapshot-origin
+    ///    discriminator, never a journal-constructed counter): the
+    ///    claimed crossings the snapshot had NOT already materialized
+    ///    (the claimed delta minus the snapshot's scratch for each
+    ///    NPC's first post-snapshot capture, the full delta after —
+    ///    the prior install's capture zeroed the scratch exactly as
+    ///    the live sequence did) restore into the world, then the plan
+    ///    installs through the standard phase-5 bundle; an IMPLICIT
+    ///    reactivation between episodes is derived from the next
+    ///    plan's own from-level (the durable evidence the region was
+    ///    live) and replayed through the real activation path — the
+    ///    legacy install plus the live application of the prior
+    ///    episode's captures, nothing new journaled. A PRE-snapshot
+    ///    deactivation is already materialized in the snapshot's
+    ///    ledger and world — never re-applied.
+    /// 4. **The coherence verification** — the B3 reconcile with the
+    ///    REAL canonical-chain confirmation evidence (the re-opened
+    ///    pipeline's chain walk, never an empty map) over the anchor
+    ///    built from the RECOVERED SESSION STATE (the ledger's own
+    ///    captured amounts; the applied claims admitted only under the
+    ///    per-NPC credits conservation): every actionable journal
+    ///    envelope suppressed by the session's materialization or the
+    ///    canonical evidence — anything else is a claim the verified
+    ///    state cannot account for, the halt.
+    /// 5. **The re-opened crossing** — a fresh pipeline over the same
+    ///    journal (the captured keys seeded from the journal).
+    pub fn recover(
+        store_dir: &Path,
+        journal_path: &Path,
+        campaign: &str,
+    ) -> Result<(Spine<NpcWorld>, RegionDirector, Self), TransitionError> {
+        Self::recover_at(
+            &StoreLocation::Directory(store_dir.to_path_buf()),
+            journal_path,
+            campaign,
+        )
+    }
+}
+
+impl<S: MediumSource> SessionCrossing<S> {
+    /// The provider-aware constructor (PP-B1's integration seam,
+    /// source-generalized at PP-B4 checkpoint 1): the same
+    /// founding-and-joining semantics over the explicit medium
+    /// source — the legacy store location (the file root or the
+    /// SQLite campaign database) or a future injected source.
+    /// **No silent selection ever occurs**: a database at a
     /// fresh path is unfounded until the founding append runs (the
     /// same first-open semantics as the file medium); an existing
     /// campaign at the location is joined, never re-founded.
-    pub fn open_at(
-        location: &StoreLocation,
-        journal: T1Journal,
-        campaign: &str,
-    ) -> Result<Self, PipelineError> {
-        let mut medium = SessionStore::open(location)?;
+    pub fn open_at(source: &S, journal: T1Journal, campaign: &str) -> Result<Self, PipelineError> {
+        let mut medium = source.open_medium()?;
         if medium.head()?.is_none() {
             // The founding record is the application's setup act; on a
             // fresh single-writer session the append must accept —
@@ -598,9 +663,9 @@ impl SessionCrossing {
         }
         let journal_root = journal.path().to_path_buf();
         let pipeline = CommitPipeline::open(medium, journal)?;
-        Ok(SessionCrossing {
+        Ok(Self {
             pipeline,
-            store: location.clone(),
+            source: source.clone(),
             journal_root,
             journal_authority: JournalAuthority::Healthy,
         })
@@ -638,7 +703,7 @@ impl SessionCrossing {
     /// medium (its every publication already fsyncs through the
     /// nine-step contract). Typed failures, never swallowed.
     pub fn checkpoint(&mut self) -> Result<(), MediumError> {
-        SessionStore::open(&self.store)?.checkpoint()
+        self.source.open_medium()?.checkpoint()
     }
 
     /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
@@ -858,7 +923,7 @@ impl SessionCrossing {
         // A fresh medium handle (each provider's coordination is
         // per-operation; the pipeline's own handle is idle between its
         // operations).
-        let mut medium = SessionStore::open(&self.store)?;
+        let mut medium = self.source.open_medium()?;
         let head = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
         let parent_epoch = medium.read_record(&head)?.epoch;
         let record = RevisionRecord::regular(head, parent_epoch, spine.clock().as_u64())
@@ -1069,7 +1134,7 @@ impl SessionCrossing {
         after_sk_seam();
         // Phase 3 — the range walk + the metadata computation (a
         // fresh medium handle; the crossing's established pattern).
-        let mut medium = SessionStore::open(&self.store)?;
+        let mut medium = self.source.open_medium()?;
         let sk_record = medium.read_record(&sk).map_err(PipelineError::Medium)?;
         let sk_epoch = sk_record.epoch;
         let Some(sk_parent) = sk_record.parent else {
@@ -1191,7 +1256,7 @@ impl SessionCrossing {
         // THE CHAIN-VERIFIED ANCHOR: the newest session snapshot's
         // director state (a compaction the operator has not published
         // is not subsumption evidence — the anchor on the chain is).
-        let Some((_anchor_spine, anchor_director)) = latest_snapshot_at(&self.store)? else {
+        let Some((_anchor_spine, anchor_director)) = latest_snapshot_at(&self.source)? else {
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "journal-rotation/no-anchor",
@@ -1320,7 +1385,7 @@ impl SessionCrossing {
             )));
         }
         let journal = T1Journal::open(new_path).map_err(PipelineError::Journal)?;
-        let medium = SessionStore::open(&self.store).map_err(PipelineError::Medium)?;
+        let medium = self.source.open_medium().map_err(PipelineError::Medium)?;
         self.pipeline = CommitPipeline::open(medium, journal)?;
         Ok(())
     }
@@ -1405,7 +1470,7 @@ impl SessionCrossing {
                 detail: "reclaim/invalid-window",
             });
         }
-        let mut medium = SessionStore::open(&self.store).map_err(PipelineError::Medium)?;
+        let mut medium = self.source.open_medium().map_err(PipelineError::Medium)?;
         let summary = medium.validate().map_err(PipelineError::Medium)?;
         // The retention window: the recovery works from the newest
         // SK — the `generations` newest checkpoints must remain.
@@ -1769,7 +1834,7 @@ impl SessionCrossing {
                 detail: "reclaim/post-walk",
             });
         }
-        if latest_snapshot_at(&self.store)?.is_none() {
+        if latest_snapshot_at(&self.source)?.is_none() {
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "reclaim/anchor-lost",
@@ -1794,74 +1859,19 @@ impl SessionCrossing {
         Ok(self.pipeline.commit_canonical()?)
     }
 
-    /// The crash recovery: reconstruct the session from the durable
-    /// state alone — the latest chain snapshot plus the journal — and
-    /// re-open the crossing for the continuation (the pending T1
-    /// re-drive available through [`Self::commit_canonical`]).
-    ///
-    /// The composition (§5.4/§5.5.2):
-    /// 1. **The snapshot** — the latest chain-reachable session
-    ///    snapshot, restored through both codecs' gates. A
-    ///    recognizable-but-invalid NEWEST session object fails closed
-    ///    (corruption of the newest authoritative state — never a
-    ///    silent fallback to an older snapshot, which would resurrect
-    ///    stale state).
-    /// 2. **The journal scan + the actionability filter** — a durably
-    ///    CANCELED transaction is never replayed: its plan never
-    ///    installs, its captures never restore.
-    /// 3. **The interleaved crossing restore + plan install** — per
-    ///    ACTIONABLE transaction in journal-sequence order, only the
-    ///    deactivations that POSTDATE the snapshot (the plan's episode
-    ///    above the SNAPSHOT's director episode — the snapshot-origin
-    ///    discriminator, never a journal-constructed counter): the
-    ///    claimed crossings the snapshot had NOT already materialized
-    ///    (the claimed delta minus the snapshot's scratch for each
-    ///    NPC's first post-snapshot capture, the full delta after —
-    ///    the prior install's capture zeroed the scratch exactly as
-    ///    the live sequence did) restore into the world, then the plan
-    ///    installs through the standard phase-5 bundle; an IMPLICIT
-    ///    reactivation between episodes is derived from the next
-    ///    plan's own from-level (the durable evidence the region was
-    ///    live) and replayed through the real activation path — the
-    ///    legacy install plus the live application of the prior
-    ///    episode's captures, nothing new journaled. A PRE-snapshot
-    ///    deactivation is already materialized in the snapshot's
-    ///    ledger and world — never re-applied.
-    /// 4. **The coherence verification** — the B3 reconcile with the
-    ///    REAL canonical-chain confirmation evidence (the re-opened
-    ///    pipeline's chain walk, never an empty map) over the anchor
-    ///    built from the RECOVERED SESSION STATE (the ledger's own
-    ///    captured amounts; the applied claims admitted only under the
-    ///    per-NPC credits conservation): every actionable journal
-    ///    envelope suppressed by the session's materialization or the
-    ///    canonical evidence — anything else is a claim the verified
-    ///    state cannot account for, the halt.
-    /// 5. **The re-opened crossing** — a fresh pipeline over the same
-    ///    journal (the captured keys seeded from the journal).
-    pub fn recover(
-        store_dir: &Path,
-        journal_path: &Path,
-        campaign: &str,
-    ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
-        Self::recover_at(
-            &StoreLocation::Directory(store_dir.to_path_buf()),
-            journal_path,
-            campaign,
-        )
-    }
-
-    /// The provider-aware recovery (PP-B1): the same reconstruction
-    /// over the explicit store location — the same composition, the
-    /// same contracts, the same fail-closed behavior.
+    /// The provider-aware recovery (PP-B1, source-generalized at
+    /// PP-B4 checkpoint 1): the same reconstruction over the explicit
+    /// medium source — the same composition, the same contracts, the
+    /// same fail-closed behavior.
     pub fn recover_at(
-        location: &StoreLocation,
+        source: &S,
         journal_path: &Path,
         campaign: &str,
-    ) -> Result<(Spine<NpcWorld>, RegionDirector, SessionCrossing), TransitionError> {
+    ) -> Result<(Spine<NpcWorld>, RegionDirector, Self), TransitionError> {
         // 1. The snapshot — fail closed on a recognizable-but-invalid
         //    newest session object (corruption of the newest
         //    authoritative state is never walked past).
-        let Some((mut spine, mut director)) = latest_snapshot_at(location)? else {
+        let Some((mut spine, mut director)) = latest_snapshot_at(source)? else {
             return Err(TransitionError::NoSnapshot);
         };
         // The snapshot-origin materialization evidence, captured
@@ -1921,7 +1931,7 @@ impl SessionCrossing {
         //    prior install's capture zeroed the scratch exactly as
         //    the live sequence did.
         let journal = T1Journal::open(&active_journal).map_err(PipelineError::Journal)?;
-        let mut crossing = SessionCrossing::open_at(location, journal, campaign)?;
+        let mut crossing = Self::open_at(source, journal, campaign)?;
         // The campaign journal ROOT (the review corrective F1): the
         // pointer's authoritative location — NOT the resolved active
         // journal the pipeline holds. Repeated rotations and the
@@ -2336,10 +2346,10 @@ pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector)
 /// never walked past to an older snapshot, which would resurrect
 /// stale authoritative state). The founding record carries no
 /// content; the walk is bounded by the chain length.
-fn latest_snapshot_at(
-    location: &StoreLocation,
+fn latest_snapshot_at<S: MediumSource>(
+    source: &S,
 ) -> Result<Option<(Spine<NpcWorld>, RegionDirector)>, TransitionError> {
-    let mut medium = SessionStore::open(location)?;
+    let mut medium = source.open_medium()?;
     let mut cursor = medium.head()?;
     while let Some(id) = cursor {
         let record = medium.read_record(&id)?;
@@ -2538,7 +2548,7 @@ fn peek_object_domain(bytes: &[u8]) -> Option<String> {
 /// unknown content domain, or a regular record carrying no content
 /// reference) refuses the checkpoint — the walk never guesses.
 fn walk_checkpoint_range(
-    medium: &mut SessionStore,
+    medium: &mut dyn CanonicalMedium,
     sk_parent: Hash,
 ) -> Result<(Vec<WalkedRecord>, Hash, [u8; 32]), TransitionError> {
     let mut walked = Vec::new();
@@ -2696,7 +2706,7 @@ type ReclaimTarget = (
 /// reclamation-ledger/1 first content object decodes and binds by
 /// its mk.
 fn find_installed_reclamation(
-    medium: &mut SessionStore,
+    medium: &mut dyn CanonicalMedium,
     target_mk: &Hash,
 ) -> Result<Option<(Hash, ReclamationLedger)>, TransitionError> {
     let Some(mut current) = medium.head().map_err(PipelineError::Medium)? else {

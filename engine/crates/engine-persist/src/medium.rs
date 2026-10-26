@@ -386,4 +386,16 @@ pub trait CanonicalMedium {
         &mut self,
         units: &[crate::reclaim::ReclaimUnit],
     ) -> Result<bool, MediumError>;
+
+    /// The graceful lifecycle boundary (PP-B1's ratified provider
+    /// policy, joined to the trait at PP-B4 checkpoint 1 so the
+    /// crossing's medium-level checkpoint routes through the same
+    /// injected medium as every other canonical access): the SQLite
+    /// provider's WAL `TRUNCATE` checkpoint — a NO-OP by default for
+    /// every medium whose acknowledged publications already fsync
+    /// through their own append contract (the file medium's
+    /// nine-step). Failures are typed, never swallowed.
+    fn checkpoint(&mut self) -> Result<(), MediumError> {
+        Ok(())
+    }
 }

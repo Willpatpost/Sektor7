@@ -43,6 +43,38 @@ impl StoreLocation {
     }
 }
 
+/// The canonical-medium SOURCE — PP-B4 checkpoint 1's ownership seam:
+/// what the crossing opens its per-operation medium handles FROM. The
+/// legacy instantiation is the [`StoreLocation`] itself (fresh direct
+/// provider handles — exactly the accepted behavior); a future
+/// orchestrated instantiation supplies the single I/O worker's proxy
+/// source, so every in-session canonical access — the snapshot
+/// publications, the checkpoint SK/MK walks, the reclamation, the
+/// rotation rebuild, and the lifecycle checkpoint — routes through
+/// the one injected medium instead of reopening independent provider
+/// handles. `Clone` because the crossing owns its source from a
+/// borrowed constructor argument, exactly as it cloned the store
+/// location before.
+pub trait MediumSource: Clone {
+    /// The medium type this source opens.
+    type Medium: CanonicalMedium;
+
+    /// Opens one per-operation medium handle. Each provider's own
+    /// coordination is per-operation, so additional handles serialize
+    /// safely alongside one another (the accepted discipline); the
+    /// future worker instantiation's "handles" are queue proxies to
+    /// the one serialization point.
+    fn open_medium(&self) -> Result<Self::Medium, MediumError>;
+}
+
+impl MediumSource for StoreLocation {
+    type Medium = SessionStore;
+
+    fn open_medium(&self) -> Result<SessionStore, MediumError> {
+        SessionStore::open(self)
+    }
+}
+
 /// The medium union: the `CanonicalMedium` contract over either
 /// provider, by direct delegation. The pipeline and the crossing
 /// operate on this type unchanged — the provider choice is made once,
@@ -162,5 +194,9 @@ impl CanonicalMedium for SessionStore {
             SessionStore::Local(medium) => medium.reclaim_pending(units),
             SessionStore::Sqlite(medium) => medium.reclaim_pending(units),
         }
+    }
+
+    fn checkpoint(&mut self) -> Result<(), MediumError> {
+        SessionStore::checkpoint(self)
     }
 }

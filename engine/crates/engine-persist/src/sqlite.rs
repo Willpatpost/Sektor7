@@ -607,6 +607,10 @@ impl SqliteMedium {
 // --------------------------------------------------- the CanonicalMedium impl
 
 impl CanonicalMedium for SqliteMedium {
+    fn checkpoint(&mut self) -> Result<(), MediumError> {
+        self.checkpoint_truncate()
+    }
+
     fn head(&mut self) -> Result<Option<Hash>, MediumError> {
         let tx = self
             .conn
