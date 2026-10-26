@@ -482,12 +482,24 @@ cd engine
 cargo build --release
 cargo test --release --workspace
 cargo test --release -p engine-slice --test pp_b3_checkpoint -- --nocapture
-cargo test --release -p engine-slice --test pp_b3_membership -- --nocapture
+cargo test --release -p engine-persist --test pp_b3_membership -- --nocapture
 cargo test --release -p engine-slice --test pp_b3_rotation -- --nocapture
 cargo test --release -p engine-slice --test pp_b3_reclaim -- --nocapture
 cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
+
+**The acceptance-script correction (the owner's physical run,
+§21):** the membership suite's target lives in `engine-persist`,
+not `engine-slice` — the initial acceptance script's first
+invocation (`-p engine-slice --test pp_b3_membership`) failed
+with EXIT 101 because that target does not exist in that
+package. The owner corrected the command to `-p engine-persist`
+(the corrected form above), resumed the same acceptance
+transcript, and obtained EXIT 0 with all four membership tests
+passing. This was an acceptance-script error, not an engine
+failure; the first invocation is recorded as the failed command
+it was, never misrepresented as passing.
 
 The expected surfaces: the workspace green (the pod count 617 + 1
 ignored may differ by platform for the SDL soak, always stated;
@@ -1376,3 +1388,114 @@ next entry point: the renewed verdict or the owner's rig evidence
 Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
 further implementation remain unauthorized until separate
 explicit owner GOs.
+
+**SUPERSEDED — the owner's CLOSED-PASS ratification arrived: the
+independent review issued IMPLEMENTATION PASS, the owner completed
+the physical Windows acceptance, and the reviewer recommended
+CLOSED-PASS. The final closure stands in §21.**
+
+## §21 — The owner's CLOSED-PASS ratification: the final closure
+
+**OWNER DECISION: PP-B3 IS APPROVED FOR CLOSED-PASS.** The
+independent source-level review of the corrected implementation
+issued **IMPLEMENTATION PASS**; the owner completed the physical
+Windows release-mode acceptance; the independent reviewer examined
+the resulting transcript and recommended **CLOSED-PASS**. This
+section records the owner's explicit authorization to finalize
+PP-B3's documentation-only closure. **There is no authorization
+for further implementation work.**
+
+**The authoritative baseline.** The accepted implementation SHA
+`965aa5bcf93500c230a77449150227bd614c3a5e` (the R5 corrective
+head); the physical Windows acceptance and documentation baseline
+`cc056d07141c82145137148ca9f21834ea9bff97` (this branch's HEAD at
+the acceptance); the independently verified three-platform CI run
+**40247187364** (Ubuntu PASS / Windows PASS / macOS ARM64 PASS;
+the workspace 617 passing reports — including the nested
+child-process harness reports, NOT 617 distinct tests — with 1
+intentionally ignored and 0 failures). All previously identified
+implementation findings **F1–F4 and R1–R5 are CLOSED**. The
+closure commit (this documentation-only commit) sits directly
+above the unchanged accepted implementation in the ancestry.
+
+**The physical Windows acceptance — owner verified.** The
+evidence transcript
+`PP-B3-Windows-Acceptance-20261025-212731.txt` (the owner's
+machine, `C:\Users\Willp\AppData\Local\Temp\PP-B3-Windows-Acceptance-20261025-212731.txt`),
+produced on Windows NT 10.0.26300.0 with Rust 1.99.1 / Cargo
+1.99.1 at the branch HEAD `cc056d0`. All eight required
+acceptance steps passed (EXIT 0): the release build; the full
+release workspace run; the focused pp_b3_checkpoint (4 passed),
+pp_b3_membership (4 passed), pp_b3_rotation (10 passed), and
+pp_b3_reclaim (22 passed) suites; the persistence benchmark; and
+the second full workspace run (the double selftest — the frozen
+fingerprint pins), with the single previously documented
+intentionally ignored SDL soak test.
+
+**The acceptance-script correction (honest, preserved).** The
+initial acceptance script's membership invocation targeted
+`-p engine-slice --test pp_b3_membership`; cargo returned EXIT
+101 because that target does not exist in that package. The owner
+corrected the command to `-p engine-persist` (§12 above carries
+the corrected form), resumed the same acceptance transcript, and
+obtained EXIT 0 with all four membership tests passing. **This
+was an acceptance-script error, not an engine failure** — the
+first invocation is recorded here as the failed command it was,
+never misrepresented as passing.
+
+**The physical release performance and storage measurements (the
+owner's transcript).** The storage sweep (the fixed-cadence
+campaign at 150/600/1,200/2,400 ticks): before reclamation
+1,021,074 / 1,655,458 / 2,493,357 / 4,184,159 B; after
+reclamation 413,262 / 417,974 / 411,743 / 413,262 B — reductions
+of 59.5% / 74.8% / 83.5% / 90.1%. The publication-cadence
+sensitivity: 2 publications per range 1,655,458 → 417,974 B with
+6 objects removed; 8 publications per range 6,534,373 →
+1,605,054 B with 18 objects removed. The tested fixed-cadence
+sweep demonstrates the intended bounded post-reclamation
+footprint — NOT a constant-storage claim under arbitrary
+checkpoint intervals or retention settings. The operation
+latencies (milliseconds, n=5): the checkpoint publication min
+16.869 / median 17.097 / p95 20.248 / max 20.248; the journal
+rotation 22.568 / 22.878 / 23.280 / 23.280; the reclamation
+15.536 / 15.825 / 15.841 / 15.841.
+
+**The maintenance-operation interpretation (explicit).** These
+are synchronous, explicit maintenance operations. Their latency
+does not establish suitability for execution within gameplay
+frames — the 60 FPS budget is approximately 16.667 ms, and the
+checkpoint (17.097 ms median) and the rotation (22.878 ms
+median) EXCEED it on this rig. PP-B4's scheduling/orchestration
+work remains separately gated and unauthorized; the benchmark is
+not an instruction to change the implementation.
+
+**The benchmark-label clarification (honest, preserved).** The
+executable contains a static benchmark description identifying
+its measurements as "pod results, not physical-rig evidence" —
+stale for this invocation. The acceptance transcript was produced
+on the owner's physical Windows PC; the measurements above are
+the owner's transcript's values, recorded by the owner and
+examined by the independent review — not the implementer's own
+execution. The benchmark source was NOT changed merely to fix
+that wording (this closure is documentation-only).
+
+**The remaining limitations (final).** The Windows durability
+tier: the pointer directory sync is the ratified no-op (std
+exposes no Windows directory flush) — no Windows
+directory-fsync guarantee is claimed, and the physical
+power-loss tier was NOT tested (the process-crash exits 8–12 and
+the deterministic fault-injection evidence are distinct from
+genuine power-loss guarantees — §19–§20). The rejected design
+alternatives D-PP-4a and D-PP-4b remain rejected; the ratified
+architecture unchanged.
+
+**The final authorization boundaries and the freeze.** After the
+closure commit: `production-persistence-b3` is FROZEN — no more
+code or documentation commits without fresh owner authorization
+(this does not authorize changing GitHub branch protection or
+repository settings). PRs #1, #2, and #3 remain open, draft, and
+unmerged (PR #3 is not marked ready). PP-B4, Stage 6, merges,
+and all further implementation require separate explicit owner
+authorization. This section is the authoritative current status;
+every earlier HOLD, corrective, and renewed-STOP entry remains
+historically accurate, superseded by this closure.
