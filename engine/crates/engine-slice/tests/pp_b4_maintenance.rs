@@ -21,7 +21,8 @@ use engine_persist::{
     AuthorityMode, AwardCheckpoint, CancellationReason, CanonicalMedium, ClassifiedSpan,
     CommitOutcome, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
     FrontierEntry, OccurrenceSpan, POINTER_DIR_SYNC_FAULT, RevisionRecord, SignalLane,
-    SourceBaseline, SourcePosition, SyncTier, T1Journal, TransactionInput, active_journal_path,
+    SourceBaseline, SourcePosition, StoredObject, SyncTier, T1Journal, TransactionInput,
+    active_journal_path,
 };
 use engine_slice::crossing::{ARM_AFTER_SK_EXIT, ARM_RECLAIM_AFTER_MEDIUM, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
@@ -1003,7 +1004,7 @@ fn the_sqlite_close_truncates_the_wal_with_file_parity() {
 #[test]
 fn the_closing_phase_refuses_gameplay_and_admission() {
     let dir = TestDir::new("closing-refuses");
-    found_location(&dir, false);
+    let location = found_location(&dir, false);
     let mut session = orchestrated(&dir);
     session.tick(&far_presence()).unwrap();
     let report = session.debug_close_with_probe_for_test(|closing| {
@@ -1031,6 +1032,21 @@ fn the_closing_phase_refuses_gameplay_and_admission() {
     });
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert!(report.final_revision.is_some());
+    // THE CONSEQUENTIAL-SETTLEMENT RESULT (C4-R3's strengthening):
+    // the journaled far-boundary consequence — never committed in
+    // the live session — is settled canonically BY THE CLOSE (the
+    // never-submitted actionable keys submitted and verified under
+    // the Closing gate), and a fresh recovery finds nothing left to
+    // re-drive.
+    assert!(
+        report.required_settled,
+        "the never-committed journaled consequence settled at close"
+    );
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
 }
 
 /// O (the maintenance half) — the worker panic DURING a compound
@@ -1555,4 +1571,359 @@ fn an_identical_snapshot_behind_a_confirmation_still_satisfies_the_close() {
         LodLevel::Dormant,
         "S is the restored state"
     );
+}
+
+// ------------------------------------------- the C4-R3/R4 corrective regressions
+
+/// A (C4-R3) — the close settles NEVER-SUBMITTED actionable T1
+/// consequences: a genuine durable far-region deactivation journaled
+/// WITHOUT any `commit_canonical` call (no append candidate ever
+/// created — `reconcile_pending` reports `NothingPending`), then the
+/// close. The settlement must NOT read that `NothingPending` as
+/// settlement proof: the accepted canonical commit pipeline submits
+/// and verifies the remaining obligations under the Closing gate
+/// BEFORE full success — the confirmation is ON THE CHAIN — and the
+/// fresh recovery is exactly-once (NothingPending, no unconfirmed
+/// actionable keys, never a re-drive of a live-session close's
+/// obligation).
+#[test]
+fn the_close_settles_never_submitted_actionable_consequences() {
+    let dir = TestDir::new("close-never-submitted");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // THE GENUINE DURABLE FAR-REGION DEACTIVATION — journaled, never
+    // committed.
+    session.tick(&far_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert!(
+        report.required_settled,
+        "the never-submitted obligation settled canonically before the full success"
+    );
+    assert!(report.final_revision.is_some());
+    assert!(report.lifecycle_checkpoint);
+    // THE CONFIRMATION IS ON THE CHAIN: the consequence batch AND the
+    // final snapshot (never the snapshot alone).
+    assert_eq!(
+        oracle_records_at(&location),
+        records_before + 2,
+        "the settlement's batch and the final snapshot"
+    );
+    // THE EXACTLY-ONCE RECOVERY: nothing actionable remains — the
+    // confirmed identities suppress the re-drive.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// B (C4-R3) — the same never-submitted settlement over the SQLITE
+/// provider, including the verified final lifecycle checkpoint (the
+/// ratified WAL TRUNCATE) — the provider parity of the close's
+/// phase-2 settlement.
+#[test]
+fn the_sqlite_close_settles_never_submitted_actionable_consequences() {
+    let dir = TestDir::new("close-never-submitted-sqlite");
+    let location = found_location(&dir, true);
+    let mut session = orchestrated_at(&dir, true);
+    session.tick(&far_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert!(report.required_settled);
+    assert!(report.final_revision.is_some());
+    assert!(
+        report.lifecycle_checkpoint,
+        "the SQLite WAL truncation verified"
+    );
+    assert_eq!(oracle_records_at(&location), records_before + 2);
+    // THE WAL boundary: the checkpoint left no un-truncated frames.
+    let wal_len = std::fs::metadata(dir.wal())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    assert_eq!(wal_len, 0, "the ratified TRUNCATE emptied the WAL");
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// C (C4-R3) — settling a RETAINED candidate must not overlook NEWER
+/// actionable keys: the retained required candidate A (its append
+/// CAS-rejected against the session's own earlier optional
+/// publication — the twin-free construction — with its reply lost)
+/// covers only its own attempt's keys; a SECOND durable deactivation
+/// afterwards journals T1 consequences NO attempt ever covered. The
+/// close's settlement confirms A through the accepted retry, THEN
+/// submits the newer obligations through the canonical pipeline —
+/// full success only with BOTH confirmed — and the fresh recovery is
+/// exactly-once over both.
+#[test]
+fn settling_a_retained_candidate_does_not_overlook_newer_actionable_keys() {
+    let dir = TestDir::new("close-newer-actionable");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // THE FIRST DEACTIVATION journals {k1} (episode 1).
+    session.tick(&far_presence()).unwrap();
+    // THE HEAD ADVANCE past the pipeline's stale verified parent: the
+    // session's OWN optional publication (worker-direct — the
+    // publication path never touches the pipeline).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(s).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // THE CAS-REJECTED, REPLY-LOST required commit A (the retained
+    // Unknown candidate over {k1}).
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    match session.commit_canonical().unwrap() {
+        CommitOutcome::Unknown { .. } => {}
+        other => {
+            panic!("the stale-parent append with the lost reply is the uncertain class: {other:?}")
+        }
+    }
+    // THE SECOND DURABLE DEACTIVATION journals {k2} (episode 2 — the
+    // reactivation applies {k1} to live pending, the near accrual
+    // rebuilds the scratch, the far boundary deactivates again): NO
+    // attempt ever covers these keys.
+    session.tick(&near_presence()).unwrap();
+    for _ in 0..100 {
+        session.tick(&near_presence()).unwrap();
+    }
+    session.tick(&far_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    // THE CLOSE: phase 1 confirms the retained A (the rebase at the
+    // advanced head, identical identities), phase 2 submits the newer
+    // {k2} — BOTH settled.
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert!(report.required_settled, "both obligations settled");
+    assert!(report.final_revision.is_some());
+    // {k1}'s batch (the phase-1 retry), {k2}'s batch (phase 2), and
+    // the final snapshot.
+    assert_eq!(oracle_records_at(&location), records_before + 3);
+    // THE EXACTLY-ONCE RECOVERY over BOTH key sets.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// D (C4-R3, the lost-reply half) — a deterministic LOST REPLY on
+/// the close's FIRST required submission (the never-submitted
+/// actionable keys): the append EXECUTES and installs, its reply is
+/// lost, the worker stays healthy — the bounded reconciliation
+/// proves the installation and the close confirms canonically (never
+/// a false unavailability, never a duplicate submission), full
+/// success with the exactly-once recovery.
+#[test]
+fn the_first_required_submission_reconciles_a_lost_reply() {
+    let dir = TestDir::new("close-first-required-lost");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    // THE LOST REPLY armed for the close's first required submission —
+    // the settlement's canonical append (the drain's jobs are reads
+    // and the barrier; no candidate exists for phase 1 to submit).
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert!(
+        report.required_settled,
+        "the reconciliation proved the installation"
+    );
+    assert!(report.final_revision.is_some());
+    // EXACTLY ONE batch (the settlement's append installed; the
+    // reconciliation confirmed it — never re-submitted) plus the
+    // final snapshot.
+    assert_eq!(oracle_records_at(&location), records_before + 2);
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// D (C4-R3, the unfinishable half) — the settlement CANNOT finish:
+/// the close's first required submission AND its bounded retry are
+/// both skipped with their replies dropped (the multi-shot
+/// definite-not-installed seam, the worker healthy). The bounded
+/// discipline reconciles each to the VERIFIED absence, retains the
+/// T1-durable obligation, and reports the honest unsettled close —
+/// NEVER full success — while the final-snapshot evidence stands
+/// separately (the fault disarms before the final publication); the
+/// fresh recovery re-drives the obligation exactly once.
+#[test]
+fn an_unfinishable_settlement_reports_the_honest_unsettled_close() {
+    let dir = TestDir::new("close-unfinishable-settlement");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    // BOTH settlement attempts skipped (the submission and the bounded
+    // retry); the count disarms after the second — the final snapshot
+    // publication runs normally.
+    session
+        .fault_control()
+        .set(WorkerFault::DropNextAppends { count: 2 });
+    let report = session.close();
+    assert!(
+        !report.required_settled,
+        "the obligation is explicitly unsettled"
+    );
+    match &report.failure {
+        Some(CloseFailure::UnsettledRequired) => {}
+        other => panic!("the unfinishable settlement is the explicit overall failure: {other:?}"),
+    }
+    // THE VERIFIED SNAPSHOT EVIDENCE stands separately.
+    assert!(report.final_revision.is_some());
+    assert!(report.lifecycle_checkpoint);
+    assert_eq!(
+        oracle_records_at(&location),
+        records_before + 1,
+        "only the final snapshot — both settlement appends skipped"
+    );
+    // THE FRESH RECOVERY: the retained T1 obligation is re-driven and
+    // CONFIRMED exactly once, then NothingPending.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// E (C4-R4) — a recognizable NEWER-VERSION session snapshot (the
+/// family domain, a version this build cannot restore) appended
+/// above the session's own published S: the close's walk must treat
+/// it as SUPERSEDING (the accepted recovery recognizer's family
+/// class — recovery FAILS CLOSED on the newer snapshot), so the
+/// close NEVER reports full success by falling back to the older S,
+/// and a fresh recovery fails closed exactly as the
+/// forward-compatibility rule demands.
+#[test]
+fn a_future_version_snapshot_supersedes_and_recovery_fails_closed() {
+    let dir = TestDir::new("close-future-version");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // S of the session's current state (region 4 LIVE).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    // THE NEWER-VERSION SNAPSHOT: a content object carrying the
+    // session-snapshot domain FAMILY with a future version —
+    // recognizable (the tag peeks), unrestorable by this build.
+    let future_domain = "engine-slice/session-snapshot/2";
+    let mut future_bytes = Vec::new();
+    future_bytes.extend_from_slice(&(future_domain.len() as u64).to_le_bytes());
+    future_bytes.extend_from_slice(future_domain.as_bytes());
+    future_bytes.extend_from_slice(b"future-version payload");
+    let future_object = StoredObject::new(future_bytes).unwrap();
+    let future_hash = future_object.hash();
+    let s_epoch = SessionStore::open(&location)
+        .unwrap()
+        .read_record(&s_revision)
+        .unwrap()
+        .epoch;
+    let future_record = RevisionRecord::regular(s_revision, s_epoch, 999)
+        .with_idempotency_key(future_hash.as_bytes().to_vec())
+        .with_content_refs(vec![future_hash]);
+    let future_revision = future_record.id();
+    let mut store = SessionStore::open(&location).unwrap();
+    store
+        .append(&future_record, &[future_object], Some(s_revision))
+        .unwrap();
+    drop(store);
+    // THE CLOSE of the unchanged-S session: the future-version
+    // snapshot supersedes — the typed conflict, never a success.
+    let report = session.close();
+    match &report.failure {
+        Some(CloseFailure::SupersededSnapshot) => {}
+        other => panic!("the future-version snapshot is the typed conflict: {other:?}"),
+    }
+    assert_eq!(report.final_revision, None);
+    // The chain stands: the future-version revision at HEAD — no
+    // rebase, no new append.
+    assert_eq!(oracle_head_at(&location), future_revision);
+    // THE RECOVERY ORACLE: a fresh recovery FAILS CLOSED on the newer
+    // snapshot (the forward-compatibility rule) — never silently
+    // selecting the older S.
+    match OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m") {
+        Err(TransitionError::CorruptSnapshot(_)) => {}
+        Err(other) => panic!("the recovery fails closed on the future version: {other:?}"),
+        Ok(_) => panic!("the recovery must fail closed on the future version, never select S"),
+    }
+}
+
+/// G (C4-R4) — the successful unchanged-state close when only NON-
+/// SNAPSHOT canonical revisions intervene: the checkpoint metadata
+/// (MK) above its own SK, and the reclamation AUDIT above that. The
+/// walk passes both (neither is a session snapshot under the family
+/// recognizer) and satisfies the close via the unchanged state's own
+/// SK — no new canonical record, the obligations settled, the
+/// recovery coherent and exactly-once.
+#[test]
+fn an_unchanged_snapshot_behind_checkpoint_metadata_and_an_audit_still_satisfies_the_close() {
+    let dir = TestDir::new("close-behind-mk-audit");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    checkpoint_prelude(&mut session);
+    // CHECKPOINT 1 (SK1 + MK1).
+    session
+        .publish_checkpoint(10)
+        .expect("the first checkpoint");
+    // A state-advancing tick (SK2's content must differ — the content
+    // key is unique per installation) + THE RANGE PUBLICATION (the
+    // matrix-I shape: the second checkpoint's range must be
+    // non-empty — the prior MK is the range boundary).
+    session.tick(&near_presence()).unwrap();
+    let s2 = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(s2).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // CHECKPOINT 2 (SK2 + MK2 — the newest recovery anchor; SK2's
+    // parent the range publication S2).
+    let second = session
+        .publish_checkpoint(10)
+        .expect("the second checkpoint");
+    // THE RECLAMATION (the audit revision at HEAD above MK2).
+    session.reclaim_checkpoint(1).expect("the reclamation");
+    let records_before = oracle_records_at(&location);
+    // THE CLOSE of the unchanged state: the audit and MK2 pass (non-
+    // snapshot), SK2 (the unchanged state's own representation)
+    // satisfies.
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert_eq!(report.final_revision, Some(second.sk));
+    assert!(report.required_settled);
+    assert!(report.lifecycle_checkpoint);
+    assert_eq!(
+        oracle_records_at(&location),
+        records_before,
+        "no new canonical record"
+    );
+    // THE RECOVERY: coherent from SK2 through the compacted walk, the
+    // confirmed obligations suppressed.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
 }

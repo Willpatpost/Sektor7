@@ -186,6 +186,14 @@ pub enum WorkerFault {
     /// the close's required final publication (C4-F2's regression D:
     /// the reconciliation must prove the absence, never guess).
     DropAppendWithoutExecution,
+    /// The next `count` append jobs are SKIPPED (they never touch the
+    /// store) with their replies dropped, the worker staying healthy
+    /// — the MULTI-SHOT definite-not-installed seam (each skipped
+    /// append decrements the count; zero disarms): the close's
+    /// bounded settlement discipline proven at its honest failure
+    /// boundary (C4-R3's regression D — the first required submission
+    /// AND its bounded retry both verified-absent).
+    DropNextAppends { count: u32 },
     /// The next Checkpoint job PANICS before execution (the thread
     /// dies; the request fails with the worker-dead error) — the
     /// death lands between the verified final publication and the
@@ -311,6 +319,7 @@ fn worker_loop(
             | WorkerFault::FailAppendPreCommit
             | WorkerFault::LoseAppendReply
             | WorkerFault::DropAppendWithoutExecution
+            | WorkerFault::DropNextAppends { .. }
             | WorkerFault::ExitAfterAppendPreReply => {}
             WorkerFault::PanicNext => {
                 panic!("canonical-io-worker: injected fault (PanicNext)")
@@ -376,6 +385,19 @@ fn worker_loop(
                     // reply is dropped, the worker staying healthy — the
                     // caller must reconcile the uncertain class to the
                     // VERIFIED absence (C4-F2's regression D).
+                    drop(job.reply);
+                    continue;
+                }
+                WorkerFault::DropNextAppends { count } => {
+                    if count <= 1 {
+                        fault.clear();
+                    } else {
+                        fault.set(WorkerFault::DropNextAppends { count: count - 1 });
+                    }
+                    // Each armed append NEVER EXECUTES (nothing installed)
+                    // and its reply is dropped, the worker staying healthy —
+                    // the caller must reconcile the uncertain class to the
+                    // VERIFIED absence (the count disarms at zero).
                     drop(job.reply);
                     continue;
                 }

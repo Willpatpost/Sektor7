@@ -2510,8 +2510,12 @@ fn latest_snapshot_at<S: MediumSource>(
 /// Recognition peeks the tag only, never committing to the body: a
 /// future version's snapshot is still recognizable, so this build
 /// fails closed on its restore rather than silently using older
-/// state.
-fn is_session_object(bytes: &[u8]) -> bool {
+/// state. The close's idempotence walk shares this recognizer
+/// (C4-R4): its supersession classification must match the recovery
+/// selection class exactly — a recognizable future-version snapshot
+/// intervenes exactly like a different supported one, never silently
+/// passed as a non-snapshot.
+pub(crate) fn is_session_object(bytes: &[u8]) -> bool {
     const FAMILY: &[u8] = b"engine-slice/session-snapshot";
     if bytes.len() < 8 {
         return false;

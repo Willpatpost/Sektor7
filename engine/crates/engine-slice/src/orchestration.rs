@@ -78,7 +78,7 @@ use engine_persist::{
 
 use crate::crossing::{
     CheckpointReport, ReclamationReport, SESSION_SNAPSHOT_DOMAIN, SessionCrossing, TransitionError,
-    save_session,
+    is_session_object, save_session,
 };
 use crate::npc::{NPC_COUNT, NpcWorld, REGION_COUNT};
 use crate::region::RegionDirector;
@@ -1472,26 +1472,66 @@ impl OrchestratedSession {
         Ok(required_settled)
     }
 
-    /// THE REQUIRED-ATTEMPT SETTLEMENT (C4-F3): the close's honest
-    /// policy for a retained pending canonical attempt. A verified
-    /// NotInstalled attempt is RETRIED through the accepted
-    /// exception-safe path (the re-walk determines keys another
-    /// writer may have confirmed — never re-submitted; the re-submit
-    /// carries the same identities — no duplicate consequential
-    /// identity); an uncertain retry reconciles once more (bounded);
-    /// whatever remains verified-absent after the bounded discipline
-    /// is EXPLICITLY left for the crash-recovery re-drive — reported
-    /// as unsettled, never silently dropped, never a claim that all
-    /// consequential progression is canonically durably saved. The
-    /// live-session policy (authorized gameplay during pending
-    /// confirmations) is untouched: this concerns only the claims at
-    /// the final close boundary.
+    /// THE REQUIRED-ATTEMPT SETTLEMENT (C4-F3 + C4-R3): the close's
+    /// honest settlement procedure, in two phases. PHASE 1 — the
+    /// retained pending canonical attempt: a verified NotInstalled
+    /// attempt is RETRIED through the accepted exception-safe path
+    /// (the re-walk determines keys another writer may have
+    /// confirmed — never re-submitted; the re-submit carries the
+    /// same identities — no duplicate consequential identity); an
+    /// uncertain retry reconciles once more (bounded); whatever
+    /// remains verified-absent after the bounded discipline is
+    /// EXPLICITLY left for the crash-recovery re-drive. Its
+    /// resolution alone is NOT settlement proof (C4-R3):
+    /// `reconcile_pending`'s `NothingPending` speaks only about a
+    /// RETAINED append candidate. PHASE 2 — the never-submitted
+    /// actionable consequences: a journaled T1 consequence with no
+    /// attempt ever created (`commit_canonical` never called) is
+    /// invisible to phase 1, so the accepted canonical commit
+    /// pipeline itself decides — its actionable-keys collection
+    /// submits and verifies every remaining obligation under the
+    /// already-established Closing gate, with the same bounded
+    /// discipline governing the uncertain outcome. `Ok(true)`
+    /// therefore means NO actionable consequential confirmation
+    /// remains outstanding; whatever remains verified-absent (or
+    /// stale-rejected) is reported as unsettled — never silently
+    /// dropped, never a claim that all consequential progression is
+    /// canonically durably saved. The live-session policy
+    /// (authorized gameplay during pending confirmations) is
+    /// untouched: this concerns only the claims at the final close
+    /// boundary.
     fn settle_required_attempt(&mut self) -> Result<bool, TransitionError> {
+        // PHASE 1 — the retained uncertain attempt.
         match self.crossing.reconcile_pending()? {
-            ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => {
-                return Ok(true);
+            ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => {}
+            ReconcileOutcome::NotInstalled => {
+                // THE RETRY (the accepted exception-safe path).
+                match self.crossing.retry_pending()? {
+                    CommitOutcome::Confirmed(_) | CommitOutcome::NothingPending => {}
+                    CommitOutcome::Unknown { .. } => {
+                        // ONE bounded reconciliation round.
+                        match self.crossing.reconcile_pending()? {
+                            ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => {}
+                            // The retry's append genuinely did not
+                            // land: the T1-durable obligation is
+                            // EXPLICITLY left for the crash-recovery
+                            // re-drive.
+                            ReconcileOutcome::NotInstalled => return Ok(false),
+                            ReconcileOutcome::Unverifiable { .. } => {
+                                return Err(TransitionError::InstallIncompatible {
+                                    region: 0,
+                                    detail: "maintenance/unverifiable-attempt",
+                                });
+                            }
+                        }
+                    }
+                    // The rebase-and-retry was rejected stale again —
+                    // the attempt is retained for a future retry; the
+                    // bounded close discipline leaves it EXPLICITLY
+                    // for the crash-recovery re-drive.
+                    CommitOutcome::StaleParent { .. } => return Ok(false),
+                }
             }
-            ReconcileOutcome::NotInstalled => {}
             ReconcileOutcome::Unverifiable { .. } => {
                 return Err(TransitionError::InstallIncompatible {
                     region: 0,
@@ -1499,17 +1539,46 @@ impl OrchestratedSession {
                 });
             }
         }
-        // THE RETRY (the accepted exception-safe path).
-        match self.crossing.retry_pending()? {
+        // PHASE 2 — THE NEVER-SUBMITTED ACTIONABLE CONSEQUENCES
+        // (C4-R3): the accepted canonical commit pipeline under the
+        // Closing gate — its actionable-keys collection decides
+        // whether any journaled obligation remains unconfirmed
+        // (submitting and verifying the remainder through the single
+        // worker with the exact per-key provenance), and the same
+        // bounded discipline as phase 1 governs the uncertain
+        // outcome: one reconciliation round, one retry, then the
+        // honest unsettled report.
+        match self.crossing.commit_canonical()? {
             CommitOutcome::Confirmed(_) | CommitOutcome::NothingPending => Ok(true),
             CommitOutcome::Unknown { .. } => {
                 // ONE bounded reconciliation round.
                 match self.crossing.reconcile_pending()? {
                     ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => Ok(true),
-                    // The retry's append genuinely did not land: the
-                    // T1-durable obligation is EXPLICITLY left for
-                    // the crash-recovery re-drive.
-                    ReconcileOutcome::NotInstalled => Ok(false),
+                    ReconcileOutcome::NotInstalled => {
+                        // ONE bounded retry (the accepted
+                        // exception-safe path).
+                        match self.crossing.retry_pending()? {
+                            CommitOutcome::Confirmed(_) | CommitOutcome::NothingPending => Ok(true),
+                            CommitOutcome::Unknown { .. } => {
+                                match self.crossing.reconcile_pending()? {
+                                    ReconcileOutcome::Confirmed(_)
+                                    | ReconcileOutcome::NothingPending => Ok(true),
+                                    // The settlement cannot finish:
+                                    // the T1-durable obligation is
+                                    // EXPLICITLY left for the
+                                    // crash-recovery re-drive.
+                                    ReconcileOutcome::NotInstalled => Ok(false),
+                                    ReconcileOutcome::Unverifiable { .. } => {
+                                        Err(TransitionError::InstallIncompatible {
+                                            region: 0,
+                                            detail: "maintenance/unverifiable-attempt",
+                                        })
+                                    }
+                                }
+                            }
+                            CommitOutcome::StaleParent { .. } => Ok(false),
+                        }
+                    }
                     ReconcileOutcome::Unverifiable { .. } => {
                         Err(TransitionError::InstallIncompatible {
                             region: 0,
@@ -1518,10 +1587,6 @@ impl OrchestratedSession {
                     }
                 }
             }
-            // The rebase-and-retry was rejected stale again — the
-            // attempt is retained for a future retry; the bounded
-            // close discipline leaves it EXPLICITLY for the
-            // crash-recovery re-drive.
             CommitOutcome::StaleParent { .. } => Ok(false),
         }
     }
@@ -1714,20 +1779,25 @@ impl OrchestratedSession {
         Ok(())
     }
 
-    /// THE IDEMPOTENCE WALK (C4-F1 + C4-R2): searches the RECENT
-    /// chain window for the NEWEST revision already carrying the
-    /// exact current snapshot content — satisfying the idempotent
+    /// THE IDEMPOTENCE WALK (C4-F1 + C4-R2 + C4-R4): searches the
+    /// RECENT chain window for the NEWEST revision already carrying
+    /// the exact current snapshot content — satisfying the idempotent
     /// close ONLY if it remains the LATEST recoverable session
     /// snapshot under the accepted recovery contract
     /// (`latest_snapshot_at` selects the newest recognizable session
-    /// snapshot): an intervening DIFFERENT session snapshot
-    /// supersedes the older match (the typed conflict — the current
-    /// state cannot be made authoritative without violating the
-    /// chain-wide idempotency rule), while an intervening
-    /// NON-SNAPSHOT canonical revision (a confirmation batch, an MK,
-    /// an audit) does not. The walk descends from the canonical
-    /// head; a reclamation gap ends the window (the check falls
-    /// through to the publication path, which handles its own
+    /// snapshot): an intervening DIFFERENT session snapshot — of ANY
+    /// recognizable version, determined by the ACCEPTED recovery
+    /// recognizer `is_session_object` (the domain family: a newer
+    /// version this build cannot restore supersedes exactly like a
+    /// different supported one, because recovery fails closed on the
+    /// newer snapshot — never a success claimed from an older
+    /// revision below it) — supersedes the older match (the typed
+    /// conflict — the current state cannot be made authoritative
+    /// without violating the chain-wide idempotency rule), while an
+    /// intervening NON-SNAPSHOT canonical revision (a confirmation
+    /// batch, an MK, an audit) does not. The walk descends from the
+    /// canonical head; a reclamation gap ends the window (the check
+    /// falls through to the publication path, which handles its own
     /// outcomes honestly — the residual bounded-search case where a
     /// match lies beyond the window surfaces there as the provider's
     /// duplicate-key refusal, never a false success); the founding
@@ -1759,19 +1829,27 @@ impl OrchestratedSession {
                 Err(MediumError::MissingObject { .. }) => return Ok(None),
                 Err(other) => return Err(CloseFailure::ReadbackFailed(other.to_string())),
             };
-            // THE RECOVERY-ANCHOR CLASSIFICATION (C4-R2): an
-            // intervening record is either a session snapshot (the
-            // recovery-selection class — a different one supersedes
-            // any older match) or a non-snapshot canonical revision
-            // (a batch, an MK, an audit — no supersession).
+            // THE RECOVERY-ANCHOR CLASSIFICATION (C4-R2 + C4-R4): an
+            // intervening record is either a session snapshot —
+            // recognized by the ACCEPTED recovery recognizer's
+            // domain FAMILY (`is_session_object`, any version: a
+            // different supported snapshot AND a recognizable
+            // future version this build cannot restore both
+            // supersede any older match, because recovery fails
+            // closed on the newer one) — or a non-snapshot canonical
+            // revision (a batch, an MK, an audit — no supersession).
+            // Only the exact supported `/1` domain can carry the
+            // current content (the capture is a `/1` serialization
+            // by construction — the hash equality proves the bytes).
             if let Some(content_hash) = record.content_refs.first() {
                 let bytes = medium
                     .read_object(content_hash)
                     .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
-                if let Ok(domain) = peek_object_domain(&bytes)
-                    && domain == SESSION_SNAPSHOT_DOMAIN
-                {
-                    if record.content_refs == vec![capture.content] {
+                if is_session_object(&bytes) {
+                    if let Ok(domain) = peek_object_domain(&bytes)
+                        && domain == SESSION_SNAPSHOT_DOMAIN
+                        && record.content_refs == vec![capture.content]
+                    {
                         // The newest revision carrying the exact
                         // current content — satisfying the close ONLY
                         // if it is also the latest recoverable
