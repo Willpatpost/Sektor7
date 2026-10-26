@@ -875,3 +875,57 @@ fn pp_b3_compacted_walk_parity_over_simulated_reclamation() {
     );
     cleanup_db(&path);
 }
+
+/// The Windows-observed open-path contention (the physical
+/// acceptance failure of 2026-10-26, at fd9ca7f): the open's write
+/// statements — the schema batch, the unfounded head-row seed —
+/// under a concurrent writer holding the write lock past the busy
+/// timeout, the SAME ratified contention condition as the append's
+/// `BEGIN IMMEDIATE` (the §3.2 contract: the busy-timeout expiry is
+/// a typed abort). Deterministically forced by holding an actual
+/// SQLite write lock from a second connection while the medium opens
+/// (the existing busy-timeout test works around this surface by
+/// opening BEFORE the foreign lock — its own comment names it; this
+/// regression targets the surface directly). The release restores
+/// the normal open with the database and the canonical chain intact.
+#[test]
+fn pp_b4_an_open_under_a_held_write_lock_is_the_typed_contention() {
+    let path = temp_db("open-contention");
+    // Initialized and founded, uncontended.
+    let founding = founding("open-contention");
+    let founding_id = founding.id();
+    {
+        let mut medium = SqliteMedium::open(&path).unwrap();
+        medium.append(&founding, &[], None).unwrap();
+    }
+    // A foreign connection holds the SQLite write lock (BEGIN
+    // IMMEDIATE acquires it immediately in WAL mode), retained
+    // across the whole contended open — an actual lock, never a
+    // fault simulation.
+    let foreign = Connection::open(&path).unwrap();
+    foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // The contended open with a short, controlled busy timeout (the
+    // default 5-second expiry shortened only for the test's
+    // duration; the expiry itself is the tested condition).
+    let quick = SqliteMediumConfig {
+        busy_timeout: Duration::from_millis(150),
+    };
+    match SqliteMedium::open_with(&path, &quick, None) {
+        Err(MediumError::Contention { .. }) => {}
+        Err(other) => panic!(
+            "the held write lock surfaces the typed contention, never the generic class: {other:?}"
+        ),
+        Ok(_) => panic!("the held write lock must refuse the open's write statements"),
+    }
+    // The release: a subsequent normal open succeeds with the
+    // database and the canonical chain intact.
+    foreign.execute_batch("ROLLBACK").unwrap();
+    drop(foreign);
+    {
+        let mut medium = SqliteMedium::open(&path).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.records, 1, "the founding record stands");
+        assert_eq!(summary.head, founding_id, "the founded head stands");
+    }
+    cleanup_db(&path);
+}

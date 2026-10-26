@@ -294,13 +294,13 @@ impl SqliteMedium {
         let conn = Connection::open(&db_path).map_err(|e| sqlite_err("open", e))?;
         configure_writable(&conn, config)?;
         conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| sqlite_err("create schema", e))?;
+            .map_err(|e| sqlite_err_or_contention("create schema", e))?;
         // The unfounded sentinel: an empty head row, seeded once.
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('head', x'')",
             [],
         )
-        .map_err(|e| sqlite_err("seed head row", e))?;
+        .map_err(|e| sqlite_err_or_contention("seed head row", e))?;
         // §6.1's target lifecycle (the review corrective): a
         // migration-pending database is not a live campaign — the
         // normal open refuses it; only `open_migration_target`
@@ -374,12 +374,12 @@ impl SqliteMedium {
         let conn = Connection::open(&db_path).map_err(|e| sqlite_err("open", e))?;
         configure_writable(&conn, &SqliteMediumConfig::default())?;
         conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| sqlite_err("create schema", e))?;
+            .map_err(|e| sqlite_err_or_contention("create schema", e))?;
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('head', x'')",
             [],
         )
-        .map_err(|e| sqlite_err("seed head row", e))?;
+        .map_err(|e| sqlite_err_or_contention("seed head row", e))?;
         match read_meta_row(&conn, META_MIGRATION_PENDING)? {
             None => {
                 if read_meta_row(&conn, META_PROVENANCE)?.is_some() {
@@ -1932,6 +1932,26 @@ fn is_busy(error: &rusqlite::Error) -> bool {
             _
         )
     )
+}
+
+/// The open-path write statements (the schema batch, the unfounded
+/// head-row seed) take the same SQLite write lock the append's
+/// `BEGIN IMMEDIATE` acquires: a busy-timeout expiry under a
+/// concurrent writer is the SAME ratified contention condition —
+/// the typed abort, never the generic surface. Every other error
+/// keeps the generic `Sqlite` mapping (never a blanket acceptance;
+/// the discrimination is exactly `is_busy`).
+fn sqlite_err_or_contention(op: &'static str, error: rusqlite::Error) -> MediumError {
+    if is_busy(&error) {
+        MediumError::Contention {
+            detail: format!(
+                "the write lock was unavailable within the busy timeout \
+                 while {op} — a concurrent writer holds the database"
+            ),
+        }
+    } else {
+        sqlite_err(op, error)
+    }
 }
 
 fn is_constraint(error: &rusqlite::Error) -> bool {
