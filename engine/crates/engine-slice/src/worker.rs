@@ -186,6 +186,13 @@ pub enum WorkerFault {
     /// the close's required final publication (C4-F2's regression D:
     /// the reconciliation must prove the absence, never guess).
     DropAppendWithoutExecution,
+    /// The next Checkpoint job PANICS before execution (the thread
+    /// dies; the request fails with the worker-dead error) — the
+    /// death lands between the verified final publication and the
+    /// lifecycle checkpoint: the checkpoint-failure report-contract
+    /// seam (the C4-R2 walk's content-object reads invalidated the
+    /// earlier ReadObject-timing construction).
+    PanicBeforeCheckpoint,
 }
 
 /// The shared per-instance fault setter/getter, plus the one-shot park
@@ -312,6 +319,12 @@ fn worker_loop(
             WorkerFault::StallEach { ms } => thread::sleep(Duration::from_millis(ms)),
             WorkerFault::ParkNext => fault.park_until_released(),
             WorkerFault::ParkExecutingAppend => {}
+            WorkerFault::PanicBeforeCheckpoint => {
+                if let MediumOp::Checkpoint = job.op {
+                    fault.clear();
+                    panic!("canonical-io-worker: injected fault (PanicBeforeCheckpoint)");
+                }
+            }
         }
         // THE POISON EXECUTION BOUNDARY (C2-F2): a job admitted before the
         // poison but not yet started is refused HERE with the DEFINITE typed

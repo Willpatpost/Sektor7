@@ -1144,8 +1144,15 @@ fn the_close_is_idempotent_after_an_identical_published_snapshot() {
     // No new canonical record: the head and the record count stand.
     assert_eq!(oracle_head_at(&location), s_revision);
     assert_eq!(oracle_records_at(&location), records_before + 1);
-    // THE COHERENT FRESH RECOVERY.
+    // THE COHERENT FRESH RECOVERY — the oracle: S is exactly what a
+    // fresh recovery restores (region 4 LIVE — the 150-near
+    // scenario's state), never anything else.
     let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert_ne!(
+        recovered.region_level(4),
+        LodLevel::Dormant,
+        "the recovery restores S's state"
+    );
     recovered.tick(&near_presence()).unwrap();
     assert_ne!(recovered.region_level(4), LodLevel::Dormant);
 
@@ -1170,21 +1177,25 @@ fn the_close_is_idempotent_after_an_identical_published_snapshot() {
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     assert_eq!(wal_len, 0);
+    let db_recovered =
+        OrchestratedSession::recover(&db_location, &db_dir.journal(), "pp-b4-m").unwrap();
+    assert_ne!(db_recovered.region_level(4), LodLevel::Dormant);
 }
 
-// B (C4-F1) — an older snapshot shares the current content identity
-// but the canonical HEAD has advanced through another required
-// revision (a second session's publication over the same store, its
-// own journal — the sidecar-lock discipline): the close's final-save
-// handling stays COHERENT — the obligation is satisfied by the
-// VERIFIED older snapshot, the advanced canonical authority is
-// untouched, and the two are never silently confused.
+// B (C4-R2) — an older matching snapshot is SUPERSEDED by a newer
+// DIFFERENT session snapshot (the second session's publication —
+// now the authoritative recovery anchor): the close must NOT claim
+// fully successful durable final state — it fails closed with the
+// typed SupersededSnapshot conflict (the current state cannot be
+// made authoritative without violating the chain-wide idempotency
+// rule), and a fresh recovery explicitly selects the NEWER snapshot.
 #[test]
-fn the_close_after_a_head_advance_past_an_identical_snapshot_stays_coherent() {
-    let dir = TestDir::new("idempotent-close-advanced");
+fn a_superseded_snapshot_fails_the_close_closed() {
+    let dir = TestDir::new("superseded-snapshot");
     let location = found_location(&dir, false);
     let mut session = orchestrated(&dir);
-    // The optional snapshot S of the session's current state.
+    // The optional snapshot S of the session's current state (region
+    // 4 LIVE — the 150-near scenario).
     let s = session
         .submit_publication(session.capture_snapshot().unwrap())
         .unwrap();
@@ -1192,10 +1203,10 @@ fn the_close_after_a_head_advance_past_an_identical_snapshot_stays_coherent() {
         PublicationOutcome::Accepted { revision, .. } => revision,
         other => panic!("{other:?}"),
     };
-    // THE HEAD ADVANCE: a second session's publication (a DIFFERENT
-    // content — its own scenario at a different tick count), with
-    // no change to the first session's state.
-    let (twin_spine, twin_director) = scenario_pair(120, &near_region_4());
+    // THE NEWER DIFFERENT SNAPSHOT T: a second session (its own
+    // journal, a FAR-presence scenario — region 4 DORMANT, the
+    // distinguishable recovery oracle) publishes at HEAD.
+    let (twin_spine, twin_director) = scenario_pair(120, &far_from_region_4());
     let twin_journal = T1Journal::open(dir.0.join("journal-twin.t1")).unwrap();
     let mut twin = OrchestratedSession::open(
         twin_spine,
@@ -1213,19 +1224,29 @@ fn the_close_after_a_head_advance_past_an_identical_snapshot_stays_coherent() {
         other => panic!("{other:?}"),
     };
     drop(twin);
-    // THE CLOSE (the first session's state unchanged).
+    // THE CLOSE of the unchanged S session: the older match is
+    // superseded — the typed conflict, never a success.
     let report = session.close();
-    assert!(report.failure.is_none(), "{:?}", report.failure);
-    // The obligation satisfied by the VERIFIED older snapshot; the
-    // advanced canonical authority untouched — never silently
-    // confused.
-    assert_eq!(report.final_revision, Some(s_revision));
-    assert_ne!(
-        oracle_head_at(&location),
-        s_revision,
-        "the head stays the twin's — no rebase, no new append"
+    match &report.failure {
+        Some(CloseFailure::SupersededSnapshot) => {}
+        other => panic!("the superseded snapshot is the typed conflict: {other:?}"),
+    }
+    assert_eq!(
+        report.final_revision, None,
+        "no snapshot verified this close"
     );
+    // The chain stands: S below T at HEAD — no rebase, no new append.
+    assert_ne!(oracle_head_at(&location), s_revision);
     assert_eq!(oracle_head_at(&location), twin_revision);
+    // THE RECOVERY ORACLE: a fresh recovery selects the NEWER
+    // snapshot T (the twin's FAR-scenario state — region 4
+    // DORMANT), never the superseded S (region 4 live).
+    let recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert_eq!(
+        recovered.region_level(4),
+        LodLevel::Dormant,
+        "the recovery selects T (region 4 dormant), never S (region 4 live)"
+    );
 }
 
 // C (C4-F2) — the lost reply on the REQUIRED final append: the
@@ -1363,10 +1384,11 @@ fn the_close_settles_the_unconfirmed_required_attempt() {
 // verification evidence (final_revision Some, the honest
 // lifecycle_checkpoint false) while the OVERALL outcome is the
 // explicit CheckpointFailed — the distinctions unambiguous. The
-// death lands between the final readback's content-object read and
-// the lifecycle-checkpoint job (the first ReadObject job after the
-// probe's arming is the readback's; the panic fires after it, before
-// the checkpoint).
+// dedicated PanicBeforeCheckpoint seam lands the death between the
+// verified final publication (the readback complete) and the
+// lifecycle-checkpoint job — the C4-R2 walk's content-object reads
+// invalidated the earlier ReadObject-timing construction (the first
+// ReadObject after the probe is now the WALK's).
 #[test]
 fn the_checkpoint_failure_close_report_contract() {
     let dir = TestDir::new("close-checkpoint-failure");
@@ -1381,7 +1403,7 @@ fn the_checkpoint_failure_close_report_contract() {
     let report = session.debug_close_with_probe_for_test(|closing| {
         closing
             .fault_control()
-            .set(WorkerFault::PanicAfter(JobKind::ReadObject));
+            .set(WorkerFault::PanicBeforeCheckpoint);
     });
     match &report.failure {
         Some(CloseFailure::CheckpointFailed(_)) => {}
@@ -1396,8 +1418,141 @@ fn the_checkpoint_failure_close_report_contract() {
         !report.lifecycle_checkpoint,
         "the checkpoint did not complete"
     );
+    assert!(
+        report.worker.is_err(),
+        "the panicked join coexists with the failure — never a fully successful close"
+    );
     assert_eq!(oracle_head_at(&location), final_revision);
     // A fresh recovery works from the verified snapshot.
     let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
     recovered.tick(&near_presence()).unwrap();
+}
+
+// ------------------------------------------- the C4-R1/R2 corrective regressions
+
+/// C4-R1 — the overall-success contract ENFORCED: a retained required
+/// candidate A (its append CAS-rejected against the session's own
+/// earlier optional publication — the publication path bypasses the
+/// pipeline, so the pipeline's verified head is stale — with its
+/// reply lost) is reconciled NotInstalled
+/// at close; its retry B is skipped with its reply lost
+/// (DropAppendWithoutExecution) and reconciled NotInstalled — the
+/// T1-durable obligation retained for the crash-recovery re-drive.
+/// The close reports required_settled == false and the explicit
+/// UnsettledRequired overall failure — NEVER a fully successful
+/// close — while the verified final-snapshot evidence stands
+/// separately; the fresh recovery is coherent and exactly-once (the
+/// recovered commit CONFIRMS the unsettled obligation, then
+/// NothingPending).
+#[test]
+fn an_unsettle_required_attempt_close_reports_not_full_success() {
+    let dir = TestDir::new("close-unsettled-required");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    // THE HEAD ADVANCE past the pipeline's stale verified parent:
+    // the session's OWN optional publication (worker-direct — the
+    // publication path never touches the pipeline, so its verified
+    // head still names the founding while HEAD names S).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    // THE CAS-REJECTED, REPLY-LOST required commit A (the retained
+    // Unknown candidate).
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    match session.commit_canonical().unwrap() {
+        CommitOutcome::Unknown { .. } => {}
+        other => {
+            panic!("the stale-parent append with the lost reply is the uncertain class: {other:?}")
+        }
+    }
+    // THE RETRY B armed to be SKIPPED (its reply lost, the worker
+    // healthy — the one-shot fault).
+    session
+        .fault_control()
+        .set(WorkerFault::DropAppendWithoutExecution);
+    // THE CLOSE: the drain reconciles A NotInstalled, retries B,
+    // observes B's lost reply, reconciles B NotInstalled, and
+    // retains the unconfirmed T1 obligation.
+    let report = session.close();
+    assert!(
+        !report.required_settled,
+        "the obligation is explicitly unsettled"
+    );
+    match &report.failure {
+        Some(CloseFailure::UnsettledRequired) => {}
+        other => panic!("the unsettled obligation is the explicit overall failure: {other:?}"),
+    }
+    // THE VERIFIED SNAPSHOT EVIDENCE stands separately — the
+    // idempotent close via the existing publication (no new
+    // canonical record).
+    assert_eq!(report.final_revision, Some(s_revision));
+    assert!(report.lifecycle_checkpoint);
+    assert_eq!(oracle_head_at(&location), s_revision);
+    // THE FRESH RECOVERY: coherent and exactly-once — the unsettled
+    // obligation is re-driven and CONFIRMED (the first canonical
+    // confirmation of those identities), never duplicated.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// A (C4-R2) — an identical snapshot behind an intervening
+/// NON-SNAPSHOT canonical revision (the session's own required
+/// confirmation batch): the batch does NOT supersede the snapshot —
+/// S remains the latest recoverable session state and satisfies the
+/// idempotent close, with the consequential obligations settled and
+/// the recovery oracle verifying S is what a fresh recovery
+/// restores.
+#[test]
+fn an_identical_snapshot_behind_a_confirmation_still_satisfies_the_close() {
+    let dir = TestDir::new("idempotent-behind-batch");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    // S of the post-boundary state (region 4 dormant).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    let records_after_s = oracle_records_at(&location);
+    // THE NON-SNAPSHOT HEAD ADVANCE: the required confirmation (the
+    // consequence batch at HEAD — the state unchanged).
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert_eq!(oracle_records_at(&location), records_after_s + 1);
+    // THE CLOSE: S (the latest recoverable snapshot) satisfies.
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert_eq!(report.final_revision, Some(s_revision));
+    assert!(report.required_settled, "the obligations settled");
+    assert!(report.lifecycle_checkpoint);
+    assert_eq!(
+        oracle_records_at(&location),
+        records_after_s + 1,
+        "no new canonical record"
+    );
+    // THE RECOVERY ORACLE: a fresh recovery restores S (region 4
+    // dormant — the post-boundary state), never anything else.
+    let recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert_eq!(
+        recovered.region_level(4),
+        LodLevel::Dormant,
+        "S is the restored state"
+    );
 }

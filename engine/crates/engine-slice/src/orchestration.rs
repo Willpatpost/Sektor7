@@ -69,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 
 use engine_core::{EventId, EventSpec, LodLevel, PresenceSample, ScheduleError, Spine, Tick};
+use engine_persist::checkpoint::peek_object_domain;
 use engine_persist::{
     AppendOutcome, CanonicalMedium, CommitOutcome, Hash, JournalRotation, MediumError,
     PipelineError, ReconcileOutcome, Reconciliation, RevisionRecord, StoredObject, SyncTier,
@@ -76,7 +77,8 @@ use engine_persist::{
 };
 
 use crate::crossing::{
-    CheckpointReport, ReclamationReport, SessionCrossing, TransitionError, save_session,
+    CheckpointReport, ReclamationReport, SESSION_SNAPSHOT_DOMAIN, SessionCrossing, TransitionError,
+    save_session,
 };
 use crate::npc::{NPC_COUNT, NpcWorld, REGION_COUNT};
 use crate::region::RegionDirector;
@@ -438,6 +440,25 @@ pub enum CloseFailure {
     /// The bounded recapture discipline was exhausted (the captured
     /// parent kept going stale — the bytes were never rebased).
     RecaptureExhausted,
+    /// A T1-durable required consequential confirmation remains
+    /// UNSETTLED after the bounded retry discipline (C4-R1): the
+    /// obligation is explicitly left for the crash-recovery
+    /// re-drive — the T1 evidence is preserved and a fresh recovery
+    /// re-drives it exactly-once — but the close is NEVER a fully
+    /// successful one; any verified snapshot evidence stands in
+    /// `final_revision` and `required_settled` is false.
+    UnsettledRequired,
+    /// A NEWER DIFFERENT session snapshot is the authoritative
+    /// recovery anchor (C4-R2): the current state cannot be made
+    /// authoritative without violating the chain-wide idempotency
+    /// rule (its content hash is already committed below the
+    /// superseding snapshot). The close fails closed — never a
+    /// success claimed from the superseded older revision.
+    SupersededSnapshot,
+    /// The worker thread did not join cleanly (a panic during the
+    /// drain/teardown — the join detail is carried in `worker`):
+    /// never a fully successful close.
+    WorkerJoinFailed,
 }
 
 /// The graceful close's honest report (PP-B4 checkpoint 4): the
@@ -1339,6 +1360,14 @@ impl OrchestratedSession {
                 Err(error) => failure = Some(CloseFailure::CheckpointFailed(error.to_string())),
             }
         }
+        // THE OVERALL-SUCCESS CONTRACT (C4-R1): `failure == None`
+        // means EVERY documented success condition holds — an
+        // unresolved required confirmation is an explicit INCOMPLETE
+        // close (the evidence fields stand; the obligation remains
+        // T1-durable for the crash-recovery re-drive).
+        if failure.is_none() && !required_settled {
+            failure = Some(CloseFailure::UnsettledRequired);
+        }
         // (13)+(14) THE TEARDOWN: release the T1 journal ownership
         // and the remaining queue senders in safe order (the
         // crossing — and its pipeline's proxies — FIRST, the C3-F1
@@ -1359,6 +1388,12 @@ impl OrchestratedSession {
         drop(director);
         drop(crossing);
         let thread = worker.join();
+        // A non-OK join can never coexist with a fully successful
+        // overall close (C4-R1) — the join detail itself is carried
+        // in `worker`.
+        if thread.is_err() && failure.is_none() {
+            failure = Some(CloseFailure::WorkerJoinFailed);
+        }
         // The final ledger: the drain harvested the pending on a
         // clean gate; a FAILED gate may leave slots pending — they
         // are harvested here as the honest unresolved class, never
@@ -1679,17 +1714,25 @@ impl OrchestratedSession {
         Ok(())
     }
 
-    /// THE IDEMPOTENCE WALK (C4-F1): searches the RECENT chain
-    /// window (depth-bounded — the recent records are never
-    /// reclamation-eligible, and any canonical progression between
-    /// the snapshot and the close requires state changes and hence a
-    /// different content) for the NEWEST revision already carrying
-    /// the exact current snapshot content. The walk descends from
-    /// the canonical head; a reclamation gap ends the window (the
-    /// check falls through to the publication path, which handles
-    /// its own outcomes honestly); the founding ends it; read
-    /// failures other than the gap class fail the close closed —
-    /// never a guessed satisfaction.
+    /// THE IDEMPOTENCE WALK (C4-F1 + C4-R2): searches the RECENT
+    /// chain window for the NEWEST revision already carrying the
+    /// exact current snapshot content — satisfying the idempotent
+    /// close ONLY if it remains the LATEST recoverable session
+    /// snapshot under the accepted recovery contract
+    /// (`latest_snapshot_at` selects the newest recognizable session
+    /// snapshot): an intervening DIFFERENT session snapshot
+    /// supersedes the older match (the typed conflict — the current
+    /// state cannot be made authoritative without violating the
+    /// chain-wide idempotency rule), while an intervening
+    /// NON-SNAPSHOT canonical revision (a confirmation batch, an MK,
+    /// an audit) does not. The walk descends from the canonical
+    /// head; a reclamation gap ends the window (the check falls
+    /// through to the publication path, which handles its own
+    /// outcomes honestly — the residual bounded-search case where a
+    /// match lies beyond the window surfaces there as the provider's
+    /// duplicate-key refusal, never a false success); the founding
+    /// ends it; read failures other than the gap class fail the
+    /// close closed — never a guessed satisfaction.
     fn find_representing_snapshot(
         &self,
         capture: &SnapshotCapture,
@@ -1707,6 +1750,7 @@ impl OrchestratedSession {
         else {
             return Ok(None);
         };
+        let mut superseded = false;
         for _ in 0..REPRESENTATION_WINDOW {
             let record = match medium.read_record(&cursor) {
                 Ok(record) => record,
@@ -1715,11 +1759,30 @@ impl OrchestratedSession {
                 Err(MediumError::MissingObject { .. }) => return Ok(None),
                 Err(other) => return Err(CloseFailure::ReadbackFailed(other.to_string())),
             };
-            if record.content_refs == vec![capture.content] {
-                // The newest revision carrying the exact current
-                // content — the walk descends from the head, so the
-                // first match is the newest.
-                return Ok(Some(cursor));
+            // THE RECOVERY-ANCHOR CLASSIFICATION (C4-R2): an
+            // intervening record is either a session snapshot (the
+            // recovery-selection class — a different one supersedes
+            // any older match) or a non-snapshot canonical revision
+            // (a batch, an MK, an audit — no supersession).
+            if let Some(content_hash) = record.content_refs.first() {
+                let bytes = medium
+                    .read_object(content_hash)
+                    .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+                if let Ok(domain) = peek_object_domain(&bytes)
+                    && domain == SESSION_SNAPSHOT_DOMAIN
+                {
+                    if record.content_refs == vec![capture.content] {
+                        // The newest revision carrying the exact
+                        // current content — satisfying the close ONLY
+                        // if it is also the latest recoverable
+                        // session snapshot.
+                        if superseded {
+                            return Err(CloseFailure::SupersededSnapshot);
+                        }
+                        return Ok(Some(cursor));
+                    }
+                    superseded = true;
+                }
             }
             let Some(parent) = record.parent else {
                 return Ok(None);
