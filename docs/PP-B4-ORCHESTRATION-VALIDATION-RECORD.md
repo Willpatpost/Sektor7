@@ -392,105 +392,153 @@ workspace selftest 707/0 ×2; the pinned fingerprints ×2).
 ## 6. The physical Windows acceptance procedure (PENDING — the owner's run)
 
 Copy-pastable on the physical Windows machine (PowerShell, from the
-repository's root; safe for an existing local checkout). The
-**accepted validation SHA — the source/test commit the three-OS CI
-verified (run 40376559970) — is
-`b6967793039e9556bf14477b8cf343fcbdd0227b`**; every commit after it
-on this branch is documentation-only (this record), which the
-checkout verification below PROVES before anything compiles.
+repository's root; safe for an existing local checkout). TWO pinned
+revisions, both stated in the transcript: the **CI-verified
+source/test commit — where the three-OS run 40376559970 executed
+green — is `b6967793039e9556bf14477b8cf343fcbdd0227b`**, and the
+**reviewed documentation-delivery HEAD is
+`cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a`**. The branch tip may
+carry this record's own later documentation-only correctives (a
+commit cannot contain its own SHA; each corrective's exact SHA is
+reported at delivery and visible on the branch) — the procedure
+below verifies the tip is the reviewed HEAD exactly, or its
+DOCUMENTATION-ONLY descendant touching only this record file, so the
+executable content is IDENTICAL to the reviewed revision; any other
+state fails BEFORE compilation. All evidence artifacts are written
+OUTSIDE the tracked repository.
 
 ```powershell
-# 0. THE EXACT CHECKOUT VERIFICATION — PowerShell stops on any failure.
+# 0. THE EVIDENCE DIRECTORY — outside the tracked repository; the
+#    transcript starts BEFORE the first Git command and Stop-Transcript
+#    runs even on a failure (try/finally).
 $ErrorActionPreference = "Stop"
+$evidence = Join-Path $env:USERPROFILE "pp-b4-acceptance-evidence"
+New-Item -ItemType Directory -Force -Path $evidence | Out-Null
 function Assert-Step([string]$step) {
     if ($LASTEXITCODE -ne 0) { throw "$step failed (exit $LASTEXITCODE)" }
 }
-git fetch origin;                        Assert-Step "git fetch"
-git switch production-persistence-b4;    Assert-Step "git switch"
-$dirty = git status --porcelain
-if ($dirty) { throw "the worktree is not clean:`n$dirty" }
-# Fast-forward ONLY — any non-fast-forward divergence refuses here.
-git merge --ff-only origin/production-persistence-b4
-Assert-Step "the fast-forward"
-$head   = git rev-parse HEAD
-$remote = git rev-parse origin/production-persistence-b4
-if ($head -ne $remote) { throw "HEAD ($head) != origin ($remote)" }
-# The CI-verified source commit must be present, and everything
-# after it documentation-only (only this record file).
-$verified = "b6967793039e9556bf14477b8cf343fcbdd0227b"
-git merge-base --is-ancestor $verified HEAD
-Assert-Step "the CI-verified commit is an ancestor"
-$delta = @(git diff --name-only $verified..HEAD)
-$expectedDelta = @("docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md")
-if ($delta.Count -eq 0) {
-    Write-Output "HEAD is the CI-verified commit itself: $head"
-} elseif (-not (Compare-Object $delta $expectedDelta)) {
-    Write-Output "HEAD is a documentation-only descendant of the CI-verified commit: $head"
-} else {
-    throw "the delta from the CI-verified commit is not documentation-only: $($delta -join ', ')"
+try {
+    Start-Transcript -Path (Join-Path $evidence "pp-b4-windows-acceptance.txt")
+
+    # 1. THE EXACT CHECKOUT VERIFICATION — every native command's exit
+    #    code is checked IMMEDIATELY, before its result is used (a
+    #    failed diff is NEVER interpreted as an empty diff).
+    $reviewed = "cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a"  # the reviewed documentation-delivery HEAD
+    $verified = "b6967793039e9556bf14477b8cf343fcbdd0227b"  # the CI-verified source/test commit
+    Write-Output "reviewed documentation-delivery HEAD: $reviewed"
+    Write-Output "CI-verified source/test commit:      $verified"
+
+    git fetch origin;                        Assert-Step "git fetch"
+    git switch production-persistence-b4;    Assert-Step "git switch"
+    $dirty = git status --porcelain
+    if ($LASTEXITCODE -ne 0) { throw "git status failed (exit $LASTEXITCODE)" }
+    if ($dirty) { throw "the worktree is not clean:`n$dirty" }
+    # Fast-forward ONLY — any non-fast-forward divergence refuses here.
+    git merge --ff-only origin/production-persistence-b4
+    Assert-Step "the fast-forward"
+    $head   = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed (exit $LASTEXITCODE)" }
+    $remote = git rev-parse origin/production-persistence-b4
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse origin failed (exit $LASTEXITCODE)" }
+    if ($head -ne $remote) { throw "HEAD ($head) != origin ($remote)" }
+
+    # The reviewed HEAD: the checkout either IS it exactly, or is its
+    # verified DOCUMENTATION-ONLY descendant (this record's own later
+    # correctives — the executable content identical).
+    if ($head -eq $reviewed) {
+        Write-Output "HEAD is the reviewed documentation-delivery HEAD exactly"
+    } else {
+        git merge-base --is-ancestor $reviewed HEAD
+        Assert-Step "the reviewed HEAD is an ancestor"
+        $since = @(git diff --name-only $reviewed..HEAD)
+        if ($LASTEXITCODE -ne 0) { throw "git diff (reviewed..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
+        if ($since.Count -eq 0 -or (Compare-Object $since @("docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md"))) {
+            throw "the delta from the reviewed HEAD is not documentation-only: $($since -join ', ')"
+        }
+        Write-Output "HEAD ($head) is a documentation-only descendant of the reviewed HEAD (only the validation record changed)"
+    }
+
+    # The CI-verified source commit must be present, with everything
+    # after it documentation-only (only this record file).
+    git merge-base --is-ancestor $verified HEAD
+    Assert-Step "the CI-verified commit is an ancestor"
+    $delta = @(git diff --name-only $verified..HEAD)
+    if ($LASTEXITCODE -ne 0) { throw "git diff (verified..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
+    if ($delta.Count -eq 0) {
+        Write-Output "HEAD is the CI-verified commit itself: $head"
+    } elseif (-not (Compare-Object $delta @("docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md"))) {
+        Write-Output "HEAD is a documentation-only descendant of the CI-verified commit: $head"
+    } else {
+        throw "the delta from the CI-verified commit is not documentation-only: $($delta -join ', ')"
+    }
+    Write-Output "checkout verified: HEAD == origin == $head; the reviewed HEAD $reviewed and the CI source $verified present; the executable content identical to the CI-verified revision"
+
+    # 2. The toolchain.
+    cd engine
+    rustc --version;   Assert-Step "the toolchain"
+
+    # 3. The static gates.
+    cargo fmt --all -- --check;   Assert-Step "cargo fmt"
+    cargo build --workspace;      Assert-Step "cargo build"
+    cargo clippy --workspace --all-targets -- -D warnings
+    Assert-Step "cargo clippy"
+
+    # 4. THE PHYSICAL RELEASE-MODE TESTS — BOTH runs must complete
+    #    successfully; the transcript captures their actual outputs and
+    #    counts (the delivered suite total: 707 passed / 0 failed).
+    cargo test --release --workspace;   Assert-Step "the first release run"
+    cargo test --release --workspace;   Assert-Step "the second release run"
+
+    # 5. The focused PP-B4 suites (release mode, one filter at a time).
+    cargo test --release -p engine-slice --test pp_b4_maintenance;  Assert-Step "maintenance"
+    cargo test --release -p engine-slice --test pp_b4_orchestrated; Assert-Step "orchestrated"
+    cargo test --release -p engine-slice --test pp_b4_worker;       Assert-Step "worker"
+    cargo test --release -p engine-slice --test pp_b4_pending;      Assert-Step "pending"
+    cargo test --release -p engine-slice --test pp_b4_seam;         Assert-Step "seam"
+
+    # 6. The provider checks (the SQLite suites also run inside the
+    #    workspace tests above; the focused release runs).
+    cargo test --release -p engine-slice --test pp_b1_sqlite_lifecycle; Assert-Step "sqlite lifecycle"
+    cargo test --release -p engine-slice --test pp_b1_backup;           Assert-Step "backup"
+    cargo test --release -p engine-slice --test pp_b1_migration;        Assert-Step "migration"
+
+    # 7. The double frozen-fingerprint verification (release mode).
+    $a = cargo run --release -q -p engine-slice -- --fingerprint-selftest
+    Assert-Step "the first fingerprint run"
+    $b = cargo run --release -q -p engine-slice -- --fingerprint-selftest
+    Assert-Step "the second fingerprint run"
+    if (Compare-Object $a $b) { throw "the fingerprint runs diverged" }
+    if (-not ($a -match "engine=6504123a47cab66f")) { throw "the engine pin changed" }
+    if (-not ($a -match "state=937bd3b6f56f07e0"))  { throw "the state pin changed" }
+    Write-Output "fingerprints verified: $($a -join ' / ')"
+
+    # 8. The benchmark (release mode, captured to the EVIDENCE
+    #    directory — outside the tracked repository).
+    cargo run --release -q -p engine-slice -- --benchmark-persistence |
+      Out-File -Encoding utf8 (Join-Path $evidence "pp-b4-windows-benchmark.txt")
+    Assert-Step "the benchmark"
+
+    # 9. The final commit SHA into the transcript.
+    cd ..
+    $final = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "the final git rev-parse failed (exit $LASTEXITCODE)" }
+    Write-Output "final commit: $final (reviewed $reviewed; CI source $verified)"
+} finally {
+    Stop-Transcript
 }
-Write-Output "checkout verified: HEAD == origin == $head (over $verified)"
-
-# 1. The evidence transcript — everything below is captured.
-Start-Transcript -Path pp-b4-windows-acceptance.txt
-cd engine
-rustc --version;   Assert-Step "the toolchain"
-
-# 2. The static gates.
-cargo fmt --all -- --check;   Assert-Step "cargo fmt"
-cargo build --workspace;      Assert-Step "cargo build"
-cargo clippy --workspace --all-targets -- -D warnings
-Assert-Step "cargo clippy"
-
-# 3. THE PHYSICAL RELEASE-MODE TESTS — BOTH runs must complete
-#    successfully; the transcript captures their actual outputs and
-#    counts (the delivered suite total: 707 passed / 0 failed).
-cargo test --release --workspace;   Assert-Step "the first release run"
-cargo test --release --workspace;   Assert-Step "the second release run"
-
-# 4. The focused PP-B4 suites (release mode, one filter at a time).
-cargo test --release -p engine-slice --test pp_b4_maintenance;  Assert-Step "maintenance"
-cargo test --release -p engine-slice --test pp_b4_orchestrated; Assert-Step "orchestrated"
-cargo test --release -p engine-slice --test pp_b4_worker;       Assert-Step "worker"
-cargo test --release -p engine-slice --test pp_b4_pending;      Assert-Step "pending"
-cargo test --release -p engine-slice --test pp_b4_seam;         Assert-Step "seam"
-
-# 5. The provider checks (the SQLite suites also run inside the
-#    workspace tests above; the focused release runs).
-cargo test --release -p engine-slice --test pp_b1_sqlite_lifecycle; Assert-Step "sqlite lifecycle"
-cargo test --release -p engine-slice --test pp_b1_backup;           Assert-Step "backup"
-cargo test --release -p engine-slice --test pp_b1_migration;        Assert-Step "migration"
-
-# 6. The double frozen-fingerprint verification (release mode).
-$a = cargo run --release -q -p engine-slice -- --fingerprint-selftest
-Assert-Step "the first fingerprint run"
-$b = cargo run --release -q -p engine-slice -- --fingerprint-selftest
-Assert-Step "the second fingerprint run"
-if (Compare-Object $a $b) { throw "the fingerprint runs diverged" }
-if (-not ($a -match "engine=6504123a47cab66f")) { throw "the engine pin changed" }
-if (-not ($a -match "state=937bd3b6f56f07e0"))  { throw "the state pin changed" }
-Write-Output "fingerprints verified: $($a -join ' / ')"
-
-# 7. The benchmark (release mode, captured to its own file).
-cargo run --release -q -p engine-slice -- --benchmark-persistence |
-  Out-File -Encoding utf8 pp-b4-windows-benchmark.txt
-Assert-Step "the benchmark"
-
-# 8. The final commit SHA into the transcript.
-cd ..
-Write-Output "final commit: $(git rev-parse HEAD)"
-Stop-Transcript
 ```
 
-The evidence package for the independent final acceptance review:
+The evidence package for the independent final acceptance review
+lives OUTSIDE the tracked repository, under
+`%USERPROFILE%\pp-b4-acceptance-evidence`:
 `pp-b4-windows-acceptance.txt` (the transcript — the verified
-checkout, the actual toolchain, every command's actual output and
-counts, the double fingerprints, the final commit SHA) plus
-`pp-b4-windows-benchmark.txt`, compared against this record's §4
-(the pod numbers — never conflated with the rig's) and the PP-B3
-record's owner measurements. **A development-pod result or a
-GitHub-hosted Windows runner is NEVER the owner's physical hardware
-acceptance** — only this run on the physical machine is.
+checkout with BOTH exact SHAs stated, the actual toolchain, every
+command's output and counts, the double fingerprints, the final
+commit SHA) and `pp-b4-windows-benchmark.txt`, compared against this
+record's §4 (the pod numbers — never conflated with the rig's) and
+the PP-B3 record's owner measurements. **A development-pod result or
+a GitHub-hosted Windows runner is NEVER the owner's physical
+hardware acceptance** — only this run on the physical machine is.
 
 The accepted Windows-specific durability limitations preserved: the
 journal pointer's directory sync is the ratified no-op (std exposes no
