@@ -357,10 +357,34 @@ precede the observation). The affected suites re-verified green
 (35/24/17/13), the full gates re-run (the double release-mode
 workspace selftest 707/0 ×2; the pinned fingerprints ×2).
 
-**THE VERIFICATION DISPATCH on this validation HEAD** (the commit
-this record travels with): the run id and the job-level verdicts are
-stated in the delivery report, verified firsthand — a dispatch run is
-NOT described as green until its jobs completed green.
+**THE VERIFICATION DISPATCHES on this validation HEAD:**
+- Dispatch 2 — run **40375410378** on the first validation commit
+  `63d0cfd` (the health-flip and read-placement fixes in): macos-15
+  ARM64 green, **windows-latest green** (the pre-submission head-read
+  fix holding), ubuntu-latest **FAILED** — the O test again, a
+  DIFFERENT interleaving: the maintenance gate failed
+  `Err(Gate(worker/unavailable))` instead of the expected
+  `Err(Compound)`. The second investigation: the `PanicAfter` check
+  runs in the worker loop AFTER the reply is sent — arming the fault
+  immediately after the prelude's wait can land BEFORE that check,
+  firing it on the PRELUDE'S OWN append and killing the maintenance
+  BARRIER (the next job) instead of the compound. The engine is
+  correct in both interleavings (an honest failure either way — the
+  gate refuses worker-class, nothing falsely succeeds); the fixture
+  fix: one worker round-trip (the capture's head observation)
+  between the prelude and the arming proves the loop advanced past
+  the check — the armed Append then applies only to the compound's
+  SK append, deterministically. The three pending-suite
+  `PanicAfter` sites audited SAFE (their armed kinds never match the
+  just-completed job). The corrective commit `b696779` (test-only,
+  +11 lines, one file).
+- Dispatch 3 — run **40376559970** on the corrective HEAD
+  `b696779`: **ubuntu-latest green, windows-latest green, macos-15
+  ARM64 green** — the full matrix (the pinned toolchain, fmt --check,
+  clippy -D warnings, the workspace build, the workspace tests with
+  both providers and the real-child pairs, the double fingerprint
+  self-test with the Stage-0 pins) verified firsthand at the job
+  level. **VERIFIED.**
 
 ## 6. The physical Windows acceptance procedure (PENDING — the owner's run)
 
