@@ -1060,6 +1060,17 @@ fn a_worker_panic_during_a_compound_fails_explicitly() {
     found_location(&dir, false);
     let mut session = orchestrated(&dir);
     checkpoint_prelude(&mut session);
+    // THE ARMING BARRIER (the CI investigation's second race): the
+    // PanicAfter check runs in the worker loop AFTER the reply is
+    // sent — arming immediately after the prelude's wait can land
+    // BEFORE that check, firing the fault on the PRELUDE'S OWN
+    // append (the next job — the maintenance barrier — then dies:
+    // the Gate failure class, not the Compound). One worker
+    // round-trip (the capture's head observation) proves the loop
+    // advanced past the check before the fault is armed — the armed
+    // Append then applies only to the compound's SK append,
+    // deterministically.
+    let _ = session.capture_snapshot().unwrap();
     // The panic lands AFTER the SK append executes normally — inside
     // the compound (the range-walk reads that follow SK).
     session
