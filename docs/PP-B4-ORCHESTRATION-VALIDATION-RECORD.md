@@ -5,12 +5,25 @@ This is an evidence and acceptance-preparation record (the owner's final
 validation checkpoint GO). PP-B4 is NOT marked CLOSED-PASS here — that
 ratification belongs to the independent final acceptance review.
 
+**The first physical Windows acceptance run (2026-10-26, at `fd9ca7f`)
+FAILED at the racing-writer backup boundary** — not on the invariant
+(the backup refused BEFORE any capture; the manifest is written last)
+but on the error CLASS: the open path's seed-head-row write under the
+test's continuous canonical writer surfaced the generic
+`MediumError::Sqlite` where every other write surface maps the busy
+timeout's expiry to the typed contention. The owner-authorized
+corrective `2e20414` (§5, dispatch 4) types the open-path busy expiry
+as `MediumError::Contention` at exactly the four schema/seed sites and
+adds the deterministic held-lock regression; it is CI-verified green
+on all three OSes — **the physical Windows re-run against `2e20414`
+remains PENDING (§6), the acceptance authority.**
+
 Every status below uses the explicit vocabulary the GO mandated:
 **VERIFIED** (evidence observed firsthand in this delivery),
 **REPORTED** (a measurement or claim with its provenance stated),
 **PENDING** (authorized but not yet executed), **NOT TESTED** (no
-evidence exists), **FAILED** (evidence contradicts the claim — none in
-this record).
+evidence exists), **FAILED** (evidence contradicts the claim — the
+first physical Windows run above; otherwise none in this record).
 
 ---
 
@@ -27,9 +40,14 @@ this record).
   (checkpoint 4 — protected maintenance + the graceful close) →
   `c0b6553` (the C4 corrective) → `573327a` (the C4-R1/R2 corrective) →
   `9a92ef8` (the C4-R3/R4 corrective — **the accepted implementation
-  HEAD at the final-validation GO**) → the validation commit at the
-  tip (tests, test-only fault controls, benchmark instrumentation, and
-  this record ONLY — §8's scope).
+  HEAD at the final-validation GO**) → the validation package
+  (`63d0cfd` + the `b696779` test corrective) → the documentation-only
+  record correctives (`2aede3b`, `cfcf271`, `fd9ca7f`) → `2e20414`
+  (the Windows contention corrective — the owner-directed four-site
+  class fix after the first physical acceptance run; CI-verified ×3)
+  → this documentation-only record amend (the scope held throughout:
+  tests, test-only fault controls, benchmark instrumentation,
+  documentation, and the authorized contention correction ONLY).
 - The independent review history: checkpoint 1 PASS; checkpoint 2
   HOLD→corrected→CLOSED-PASS; checkpoint 3 HOLD→corrected→CLOSED-PASS;
   checkpoint 4 GO→HOLD (C4-F1/F2/F3)→corrected→HOLD (C4-R1/R2)→
@@ -384,28 +402,76 @@ workspace selftest 707/0 ×2; the pinned fingerprints ×2).
   clippy -D warnings, the workspace build, the workspace tests with
   both providers and the real-child pairs, the double fingerprint
   self-test with the Stage-0 pins) verified firsthand at the job
-  level. **VERIFIED.** The delivered HEAD (`2aede3b` and this
-  corrective) is `b696779`'s documentation-only descendant — no
-  separate CI run exists or is required for documentation-only
-  changes (no executable source or workflow behavior changes).
+  level. **VERIFIED.** The then-delivered HEAD (`2aede3b` and the
+  later record correctives) was `b696779`'s documentation-only
+  descendant — no separate CI run existed or was required for
+  documentation-only changes (no executable source or workflow
+  behavior changes).
+- Dispatch 4 — run **40402249372** on the Windows contention
+  corrective HEAD `2e20414` (the owner-directed fix after the first
+  physical Windows acceptance run failed at the racing-writer backup
+  boundary with the generic `MediumError::Sqlite` — §6's preamble):
+  **ubuntu-latest green, windows-latest green, macos-15 ARM64
+  green**, the run's headSha verified equal to
+  `2e20414fe1d33870081f32e8676cca126434f5e7`. Verified firsthand at
+  the job level (the actual test and fingerprint results, not just
+  the conclusions): every suite `test result: ok` with **0 failed**
+  on all three OSes — engine-persist's lib suite **268 passed** (the
+  net-new held-lock open-contention regression included, green on
+  every OS), the PP-B4 suites 35/24/13/17, the remaining workspace
+  suites at their accepted counts — and the double fingerprint
+  self-test printed the pinned `engine=6504123a47cab66f` /
+  `state=937bd3b6f56f07e0` on every OS (the pin checks would have
+  failed the job otherwise). **VERIFIED.** `2e20414` supersedes
+  `b696779` as the CI-verified source/test commit the physical
+  Windows acceptance runs against (§6); the delivered HEAD is
+  `2e20414`'s documentation-only descendant (this record's amend —
+  no executable source after the corrective).
 
-## 6. The physical Windows acceptance procedure (PENDING — the owner's run)
+## 6. The physical Windows acceptance procedure (PENDING — the owner's re-run against the corrective)
 
 Copy-pastable on the physical Windows machine (PowerShell, from the
 repository's root; safe for an existing local checkout). TWO pinned
 revisions, both stated in the transcript: the **CI-verified
-source/test commit — where the three-OS run 40376559970 executed
-green — is `b6967793039e9556bf14477b8cf343fcbdd0227b`**, and the
-**reviewed documentation-delivery HEAD is
+source/test commit — where the three-OS run 40402249372 executed
+green — is `2e20414fe1d33870081f32e8676cca126434f5e7`** (the Windows
+contention corrective: the open-path schema/seed writes' busy expiry
+typed as `MediumError::Contention`, the deterministic held-lock
+regression added — the fix for this procedure's own first-run
+failure, below), and the **reviewed pre-corrective
+documentation-delivery HEAD is
 `cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a`**. The branch tip may
 carry this record's own later documentation-only correctives (a
 commit cannot contain its own SHA; each corrective's exact SHA is
-reported at delivery and visible on the branch) — the procedure
-below verifies the tip is the reviewed HEAD exactly, or its
-DOCUMENTATION-ONLY descendant touching only this record file, so the
-executable content is IDENTICAL to the reviewed revision; any other
-state fails BEFORE compilation. All evidence artifacts are written
-OUTSIDE the tracked repository.
+reported at delivery and visible on the branch). The procedure below
+verifies, failing BEFORE compilation on any mismatch: HEAD == origin
+exactly; the CI-verified corrective `2e20414` an ancestor with
+everything after it DOCUMENTATION-ONLY (only this record file — the
+executable content IDENTICAL to the CI-verified revision); and the
+delta from the reviewed pre-corrective HEAD `cfcf271` EXACTLY the
+authorized corrective's two engine files plus this record (never any
+other executable change between the reviewed state and the
+corrective). All evidence artifacts are written OUTSIDE the tracked
+repository.
+
+**The first run's failure (why this procedure pins the corrective):**
+executed 2026-10-26 at `fd9ca7f`, the `pp_b1_backup` racing-writer
+test (`concurrent_canonical_writer_never_yields_a_coherent_backup`)
+failed with `BackupError::Medium(MediumError::Sqlite { op: "seed
+head row", detail: "database is locked" })` — the backup's first
+database touch (`SqliteMedium::open`, backup.rs:395 — a full
+WRITABLE open, the TRUNCATE checkpoint needing write access)
+executes the schema batch and the unfounded head-row seed, both
+WRITE statements on the same SQLite write lock as the append's
+`BEGIN IMMEDIATE`; under the test's continuous canonical writer the
+physical machine held the lock past the 5-second busy timeout. The
+INVARIANT held (the backup refused BEFORE any capture — the manifest
+is written last; no falsely coherent backup); the error CLASS was
+wrong. The corrective `2e20414` fixes exactly that class — **the
+re-run must show the previously observed error no longer surfacing
+as the generic `MediumError::Sqlite`** (the typed `Contention`
+refusal or the clean backup paths only); the focused regression and
+the racing-writer test in step 5a below are the direct checks.
 
 ```powershell
 # 0. THE EVIDENCE DIRECTORY — outside the tracked repository; the
@@ -423,8 +489,8 @@ try {
     # 1. THE EXACT CHECKOUT VERIFICATION — every native command's exit
     #    code is checked IMMEDIATELY, before its result is used (a
     #    failed diff is NEVER interpreted as an empty diff).
-    $reviewed = "cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a"  # the reviewed documentation-delivery HEAD
-    $verified = "b6967793039e9556bf14477b8cf343fcbdd0227b"  # the CI-verified source/test commit
+    $reviewed = "cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a"  # the reviewed pre-corrective documentation-delivery HEAD
+    $verified = "2e20414fe1d33870081f32e8676cca126434f5e7"  # the CI-verified source/test commit (the contention corrective; run 40402249372)
     Write-Output "reviewed documentation-delivery HEAD: $reviewed"
     Write-Output "CI-verified source/test commit:      $verified"
 
@@ -442,21 +508,23 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git rev-parse origin failed (exit $LASTEXITCODE)" }
     if ($head -ne $remote) { throw "HEAD ($head) != origin ($remote)" }
 
-    # The reviewed HEAD: the checkout either IS it exactly, or is its
-    # verified DOCUMENTATION-ONLY descendant (this record's own later
-    # correctives — the executable content identical).
-    if ($head -eq $reviewed) {
-        Write-Output "HEAD is the reviewed documentation-delivery HEAD exactly"
-    } else {
-        git merge-base --is-ancestor $reviewed HEAD
-        Assert-Step "the reviewed HEAD is an ancestor"
-        $since = @(git diff --name-only $reviewed..HEAD)
-        if ($LASTEXITCODE -ne 0) { throw "git diff (reviewed..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
-        if ($since.Count -eq 0 -or (Compare-Object $since @("docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md"))) {
-            throw "the delta from the reviewed HEAD is not documentation-only: $($since -join ', ')"
-        }
-        Write-Output "HEAD ($head) is a documentation-only descendant of the reviewed HEAD (only the validation record changed)"
+    # The reviewed pre-corrective HEAD: the delta from it is EXACTLY
+    # the authorized corrective (the two engine files) plus this
+    # record — never any other executable change between the
+    # reviewed state and the tip.
+    git merge-base --is-ancestor $reviewed HEAD
+    Assert-Step "the reviewed pre-corrective HEAD is an ancestor"
+    $since = @(git diff --name-only $reviewed..HEAD)
+    if ($LASTEXITCODE -ne 0) { throw "git diff (reviewed..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
+    $authorized = @(
+        "engine/crates/engine-persist/src/sqlite.rs",
+        "engine/crates/engine-persist/src/sqlite_tests.rs",
+        "docs/PP-B4-ORCHESTRATION-VALIDATION-RECORD.md"
+    )
+    if ($since.Count -eq 0 -or (Compare-Object $since $authorized)) {
+        throw "the delta from the reviewed pre-corrective HEAD is not the authorized corrective plus the record: $($since -join ', ')"
     }
+    Write-Output "the delta from the reviewed pre-corrective HEAD is exactly the authorized contention corrective (sqlite.rs, sqlite_tests.rs) plus this record"
 
     # The CI-verified source commit must be present, with everything
     # after it documentation-only (only this record file).
@@ -485,7 +553,8 @@ try {
 
     # 4. THE PHYSICAL RELEASE-MODE TESTS — BOTH runs must complete
     #    successfully; the transcript captures their actual outputs and
-    #    counts (the delivered suite total: 707 passed / 0 failed).
+    #    counts (the delivered suite total: 708 passed / 0 failed —
+    #    the corrective's net-new held-lock regression included).
     cargo test --release --workspace;   Assert-Step "the first release run"
     cargo test --release --workspace;   Assert-Step "the second release run"
 
@@ -495,6 +564,15 @@ try {
     cargo test --release -p engine-slice --test pp_b4_worker;       Assert-Step "worker"
     cargo test --release -p engine-slice --test pp_b4_pending;      Assert-Step "pending"
     cargo test --release -p engine-slice --test pp_b4_seam;         Assert-Step "seam"
+
+    # 5a. The first physical run's exact failure boundary — the focused
+    #     held-lock contention regression and the racing-writer backup
+    #     test (the previously observed error must NOT surface as the
+    #     generic MediumError::Sqlite again).
+    cargo test --release -p engine-persist pp_b4_an_open_under_a_held_write_lock_is_the_typed_contention
+    Assert-Step "the held-lock open-contention regression"
+    cargo test --release -p engine-slice --test pp_b1_backup concurrent_canonical_writer_never_yields_a_coherent_backup
+    Assert-Step "the racing-writer backup test"
 
     # 6. The provider checks (the SQLite suites also run inside the
     #    workspace tests above; the focused release runs).
@@ -559,7 +637,12 @@ benchmark's §9i SQLite pass. The `SessionStore` delegation and the
 ## 8. Known limitations, uncertainties, open risks
 
 - **Physical Windows evidence: PENDING** (§6) — the acceptance
-  authority; no pod number substitutes for it (D-PP-7).
+  authority; no pod number substitutes for it (D-PP-7). The FIRST
+  run (2026-10-26, at `fd9ca7f`) FAILED on the error class at the
+  racing-writer backup boundary (§6's preamble) — the invariant
+  held, the class was wrong; the owner-authorized corrective
+  `2e20414` (CI-verified ×3, dispatch 4) fixes the class, and the
+  re-run against it is the remaining acceptance.
 - **Physical power-loss durability: NOT TESTED** (every batch; the
   process-crash tier is the honest Windows claim).
 - **The 64-revision idempotence window: VERIFIED honest** (§3B) —
@@ -577,18 +660,26 @@ benchmark's §9i SQLite pass. The `SessionStore` delegation and the
 
 ## 9. Proposed final acceptance criteria
 
-1. The three-OS CI verification (run 40376559970) green at the job
+1. The three-OS CI verification (run 40402249372) green at the job
    level — executed at the CI-VERIFIED SOURCE COMMIT
-   `b6967793039e9556bf14477b8cf343fcbdd0227b` (§5; the earlier
-   dispatches' failures investigated and resolved there, the verdicts
-   verified firsthand). The delivered HEAD is that commit's
-   DOCUMENTATION-ONLY descendant (the record commits): no separate
-   CI run exists or is required for documentation-only changes —
-   the Windows checkout procedure (§6) proves the documentation-only
-   descent before anything compiles.
-2. The owner's physical Windows run of §6 succeeds: the gates, the
-   full workspace tests (both providers, the real-child pairs), the
-   pinned fingerprints, and the release benchmark captured.
+   `2e20414fe1d33870081f32e8676cca126434f5e7` (§5, dispatch 4; the
+   earlier dispatches' failures investigated and resolved — the
+   dispatch-1/2 races, then run 40376559970 green at `b696779` —
+   and the first physical Windows run's error-class failure
+   corrected by this commit; the verdicts verified firsthand). The
+   delivered HEAD is that commit's DOCUMENTATION-ONLY descendant
+   (the record commits): no separate CI run exists or is required
+   for documentation-only changes — the Windows checkout procedure
+   (§6) proves the documentation-only descent before anything
+   compiles.
+2. The owner's physical Windows RE-run of §6 against the corrective
+   `2e20414` succeeds: the gates, the full workspace tests (both
+   providers, the real-child pairs — 708 passed / 0 failed), the
+   pinned fingerprints, the release benchmark captured, and the
+   first run's failure boundary green — the held-lock regression
+   passing and the racing-writer backup test passing with the
+   previously observed error no longer surfacing as the generic
+   `MediumError::Sqlite`.
 3. The benchmark comparison against the PP-B3 owner measurements
    shows no unexplained regression in the operation classes
    (tick/confirmation/compounds) — pod-vs-rig differences attributed,
@@ -604,15 +695,23 @@ The chain: the starting accepted implementation
 `63d0cfd9db147447021e4d4b8b11408174c4413b` (the validation package:
 7 files, +1207/−20) →
 `b6967793039e9556bf14477b8cf343fcbdd0227b` (the arming-barrier
-corrective: 1 file, +11 — **the CI-verified source/test commit**) →
-`2aede3bba6eafc9c45a2aa1d9286af6acbe57a20` (the first docs-only
-record amend) → this documentation-only corrective (its exact SHA is
-reported in the delivery report and visible on the branch; the §6
-checkout procedure's documentation-only-descent check verifies the
-entire tail over the CI-verified commit). Every commit pushed; HEAD
-== origin verified; the worktree clean; the per-commit changed-file
-inventory in the delivery report; the protected branches and the PR
-discipline unchanged (no PR #4).
+corrective: 1 file, +11 — the CI-verified source commit of run
+40376559970) → `2aede3bba6eafc9c45a2aa1d9286af6acbe57a20` (the
+first docs-only record amend) →
+`cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a` (the V-F1..F4 docs
+corrective) → `fd9ca7f78675f4a087e43e6c9ca82997b173dfa9` (the
+V-R1/R2 docs corrective — the HEAD the first physical Windows run
+checked out) → `2e20414fe1d33870081f32e8676cca126434f5e7` (the
+Windows contention corrective: 2 files, +78/−4 — **the CI-verified
+source/test commit**, run 40402249372 green ×3) → this
+documentation-only record amend (its exact SHA is reported in the
+delivery report and visible on the branch; the §6 checkout
+procedure verifies the tail: everything after `2e20414`
+documentation-only, the delta from `cfcf271` exactly the authorized
+corrective plus this record). Every commit pushed; HEAD == origin
+verified; the worktree clean; the per-commit changed-file inventory
+in the delivery report; the protected branches and the PR discipline
+unchanged (no PR #4).
 
 **STOP after delivering the validation package.** No PR #4, no
 merges, no CLOSED-PASS ratification, no Stage 6 — the final
