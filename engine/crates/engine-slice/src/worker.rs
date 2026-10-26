@@ -136,6 +136,7 @@ fn completion_slot() -> ReplySlot {
 pub enum JobKind {
     Append,
     Reconcile,
+    ReadObject,
 }
 
 /// Test-only deterministic fault control — PER WORKER INSTANCE (the
@@ -179,6 +180,12 @@ pub enum WorkerFault {
     /// boundaries — the job is already executing (the
     /// poison-during-executing-append case).
     ParkExecutingAppend,
+    /// The next append job is SKIPPED (it never touches the store)
+    /// and its reply dropped, the worker staying healthy — the
+    /// lost-reply-with-a-genuinely-not-installed-candidate case for
+    /// the close's required final publication (C4-F2's regression D:
+    /// the reconciliation must prove the absence, never guess).
+    DropAppendWithoutExecution,
 }
 
 /// The shared per-instance fault setter/getter, plus the one-shot park
@@ -296,6 +303,7 @@ fn worker_loop(
             | WorkerFault::PanicAfter(_)
             | WorkerFault::FailAppendPreCommit
             | WorkerFault::LoseAppendReply
+            | WorkerFault::DropAppendWithoutExecution
             | WorkerFault::ExitAfterAppendPreReply => {}
             WorkerFault::PanicNext => {
                 panic!("canonical-io-worker: injected fault (PanicNext)")
@@ -346,6 +354,15 @@ fn worker_loop(
                     // The append EXECUTES (it may commit); the reply is never
                     // sent — the caller must reconcile the uncertain class.
                     let _ = execute(&mut store, job.op);
+                    drop(job.reply);
+                    continue;
+                }
+                WorkerFault::DropAppendWithoutExecution => {
+                    fault.clear();
+                    // The append NEVER EXECUTES (nothing installed) and the
+                    // reply is dropped, the worker staying healthy — the
+                    // caller must reconcile the uncertain class to the
+                    // VERIFIED absence (C4-F2's regression D).
                     drop(job.reply);
                     continue;
                 }
@@ -401,6 +418,7 @@ fn job_kind(op: &MediumOp) -> Option<JobKind> {
     match op {
         MediumOp::Append { .. } => Some(JobKind::Append),
         MediumOp::ReconcileUnknown { .. } => Some(JobKind::Reconcile),
+        MediumOp::ReadObject { .. } => Some(JobKind::ReadObject),
         _ => None,
     }
 }

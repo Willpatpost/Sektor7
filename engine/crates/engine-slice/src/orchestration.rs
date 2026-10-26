@@ -441,25 +441,46 @@ pub enum CloseFailure {
 }
 
 /// The graceful close's honest report (PP-B4 checkpoint 4): the
-/// final required snapshot's VERIFIED revision and tier (None on a
-/// failed close), the final completion ledger, the worker thread's
-/// join result, and the failure state. A clean thread join is NEVER
-/// a successful durable close — success is the verified final
-/// revision with no failure.
+/// final required snapshot's VERIFIED revision and tier (the
+/// legitimate verification EVIDENCE — retained even when a later
+/// close step failed, since the snapshot itself stands verified on
+/// the chain; None only when no final snapshot was verified), the
+/// lifecycle-checkpoint and required-confirmation outcomes, the
+/// final completion ledger, the worker thread's join result, and
+/// the overall failure state. THE OVERALL OUTCOME: `failure == None`
+/// is the COMPLETE successful close — the verified final snapshot +
+/// the completed provider lifecycle checkpoint + the settled
+/// required consequential confirmations + the clean join; a failure
+/// never erases the verification evidence already earned. A clean
+/// thread join is NEVER a successful durable close.
 #[derive(Debug)]
 pub struct CloseReport {
     /// The final required snapshot's readback-verified revision —
-    /// None on a failed close (never a claimed save).
+    /// the verification EVIDENCE (retained even when a later close
+    /// step failed: a `CheckpointFailed` close still carries its
+    /// verified snapshot). None only when no final snapshot was
+    /// verified — never a claimed save.
     pub final_revision: Option<Hash>,
     /// The final publication's provider durability tier.
     pub final_tier: Option<SyncTier>,
+    /// Whether the provider lifecycle checkpoint completed (the
+    /// ratified SQLite WAL TRUNCATE; the file medium's no-op).
+    pub lifecycle_checkpoint: bool,
+    /// Whether every required consequential confirmation settled
+    /// canonically before the teardown. False means an unconfirmed
+    /// T1-durable obligation was EXPLICITLY left for the
+    /// crash-recovery re-drive — reported, never a claim that all
+    /// consequential progression is canonically durably saved.
+    pub required_settled: bool,
     /// The final completion ledger: every publication this session
     /// admitted, with its typed disposition (the harvested uncertain
     /// dispositions included — never silently discarded).
     pub completions: Vec<CompletionRecord>,
     /// The worker thread's join result.
     pub worker: Result<(), MediumError>,
-    /// The failure state — None on the verified successful close.
+    /// The overall close outcome — None ONLY on the complete
+    /// successful close (the verified snapshot + the lifecycle
+    /// checkpoint + the settled confirmations + the clean join).
     pub failure: Option<CloseFailure>,
 }
 
@@ -1284,7 +1305,11 @@ impl OrchestratedSession {
         // worker, an unverifiable reconciliation) is the explicit
         // FAILED close: never a claimed save; the teardown still
         // runs.
-        let mut failure = self.enter_close_gate().err();
+        let (required_settled, gate_failure) = match self.enter_close_gate() {
+            Ok(settled) => (settled, None),
+            Err(failure) => (false, Some(failure)),
+        };
+        let mut failure = gate_failure;
         // The probe: DURING the real Closing phase, after the drain.
         if failure.is_none()
             && let Some(probe) = probe
@@ -1307,10 +1332,12 @@ impl OrchestratedSession {
         // the required durability obligations verified (the ratified
         // WAL TRUNCATE for SQLite, through the WorkerMedium; the
         // no-op for the file medium).
-        if failure.is_none()
-            && let Err(error) = self.crossing.checkpoint()
-        {
-            failure = Some(CloseFailure::CheckpointFailed(error.to_string()));
+        let mut lifecycle_checkpoint = false;
+        if failure.is_none() {
+            match self.crossing.checkpoint() {
+                Ok(()) => lifecycle_checkpoint = true,
+                Err(error) => failure = Some(CloseFailure::CheckpointFailed(error.to_string())),
+            }
         }
         // (13)+(14) THE TEARDOWN: release the T1 journal ownership
         // and the remaining queue senders in safe order (the
@@ -1352,10 +1379,16 @@ impl OrchestratedSession {
                 journal_frontier: entry.journal_frontier,
             });
         }
-        // (15) THE HONEST REPORT.
+        // (15) THE HONEST REPORT — the four distinctions explicit:
+        // the verified final snapshot, the lifecycle checkpoint, the
+        // settled required confirmations, the worker join — and the
+        // overall outcome (failure None ONLY on the complete
+        // successful close).
         CloseReport {
             final_revision,
             final_tier,
+            lifecycle_checkpoint,
+            required_settled,
             completions,
             worker: thread,
             failure,
@@ -1363,9 +1396,11 @@ impl OrchestratedSession {
     }
 
     /// The close's gate (the §6 steps 3-6): the same drain as the
-    /// maintenance gate, with the failures mapped to the explicit
-    /// close-failure classes.
-    fn enter_close_gate(&mut self) -> Result<(), CloseFailure> {
+    /// maintenance gate — plus the required-attempt settlement
+    /// (C4-F3) — with the failures mapped to the explicit
+    /// close-failure classes; the Ok payload is whether every
+    /// required consequential confirmation settled canonically.
+    fn enter_close_gate(&mut self) -> Result<bool, CloseFailure> {
         self.crossing
             .assert_authoritative()
             .map_err(|error| self.close_gate_failure(error))?;
@@ -1382,13 +1417,78 @@ impl OrchestratedSession {
         if let Err(error) = self.reconcile_uncertain() {
             return Err(self.close_gate_failure(error));
         }
+        // THE REQUIRED-ATTEMPT SETTLEMENT (C4-F3): a T1-durable but
+        // canonically unconfirmed consequential batch must not
+        // silently persist through a successful close — retry it
+        // through the accepted exception-safe path (no duplicate
+        // consequential identity); whatever remains verified-absent
+        // is EXPLICITLY reported as left for the crash-recovery
+        // re-drive — never a claim that all consequential
+        // progression is canonically durably saved.
+        let required_settled = self
+            .settle_required_attempt()
+            .map_err(|error| self.close_gate_failure(error))?;
         if !self.worker.healthy() {
             return Err(CloseFailure::WorkerUnavailable);
         }
         self.crossing
             .assert_authoritative()
             .map_err(|error| self.close_gate_failure(error))?;
-        Ok(())
+        Ok(required_settled)
+    }
+
+    /// THE REQUIRED-ATTEMPT SETTLEMENT (C4-F3): the close's honest
+    /// policy for a retained pending canonical attempt. A verified
+    /// NotInstalled attempt is RETRIED through the accepted
+    /// exception-safe path (the re-walk determines keys another
+    /// writer may have confirmed — never re-submitted; the re-submit
+    /// carries the same identities — no duplicate consequential
+    /// identity); an uncertain retry reconciles once more (bounded);
+    /// whatever remains verified-absent after the bounded discipline
+    /// is EXPLICITLY left for the crash-recovery re-drive — reported
+    /// as unsettled, never silently dropped, never a claim that all
+    /// consequential progression is canonically durably saved. The
+    /// live-session policy (authorized gameplay during pending
+    /// confirmations) is untouched: this concerns only the claims at
+    /// the final close boundary.
+    fn settle_required_attempt(&mut self) -> Result<bool, TransitionError> {
+        match self.crossing.reconcile_pending()? {
+            ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => {
+                return Ok(true);
+            }
+            ReconcileOutcome::NotInstalled => {}
+            ReconcileOutcome::Unverifiable { .. } => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "maintenance/unverifiable-attempt",
+                });
+            }
+        }
+        // THE RETRY (the accepted exception-safe path).
+        match self.crossing.retry_pending()? {
+            CommitOutcome::Confirmed(_) | CommitOutcome::NothingPending => Ok(true),
+            CommitOutcome::Unknown { .. } => {
+                // ONE bounded reconciliation round.
+                match self.crossing.reconcile_pending()? {
+                    ReconcileOutcome::Confirmed(_) | ReconcileOutcome::NothingPending => Ok(true),
+                    // The retry's append genuinely did not land: the
+                    // T1-durable obligation is EXPLICITLY left for
+                    // the crash-recovery re-drive.
+                    ReconcileOutcome::NotInstalled => Ok(false),
+                    ReconcileOutcome::Unverifiable { .. } => {
+                        Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "maintenance/unverifiable-attempt",
+                        })
+                    }
+                }
+            }
+            // The rebase-and-retry was rejected stale again — the
+            // attempt is retained for a future retry; the bounded
+            // close discipline leaves it EXPLICITLY for the
+            // crash-recovery re-drive.
+            CommitOutcome::StaleParent { .. } => Ok(false),
+        }
     }
 
     /// The close gate's failure classification: a dead worker is the
@@ -1427,6 +1527,23 @@ impl OrchestratedSession {
             let capture = self
                 .capture_snapshot()
                 .map_err(|error| CloseFailure::PublicationFailed(gate_detail(&error)))?;
+            // THE IDEMPOTENT FINAL SAVE (C4-F1): the exact current
+            // serialized state may already be represented by an
+            // eligible chain-reachable revision (an accepted optional
+            // snapshot of this unchanged state — real sessions close
+            // immediately after a save). A genuinely-required new
+            // publication of equivalent bytes is IMPOSSIBLE under the
+            // ratified idempotency contract (the key IS the content
+            // hash, unique across the chain for the store's
+            // lifetime): the obligation is therefore satisfied by the
+            // existing representation, INDEPENDENTLY VERIFIED —
+            // never a duplicate-key failure for a state already
+            // durably represented, never rebased bytes, no artificial
+            // clock advance, no persistent-format change.
+            if let Some(existing) = self.find_representing_snapshot(&capture)? {
+                self.verify_representing_snapshot(&existing, &capture.content)?;
+                return Ok((existing, self.worker.tier()));
+            }
             let record =
                 RevisionRecord::regular(capture.parent, capture.parent_epoch, capture.tick)
                     .with_idempotency_key(capture.content.as_bytes().to_vec())
@@ -1441,7 +1558,42 @@ impl OrchestratedSession {
                 })
                 .map_err(|_| CloseFailure::WorkerUnavailable)?;
             match slot.recv() {
-                Err(_) => return Err(CloseFailure::WorkerUnavailable),
+                // C4-F2: a lost reply on an ADMITTED final append is
+                // an UNCERTAIN candidate, never proof of failure —
+                // the append may have committed with the worker still
+                // healthy (the accepted lost-reply class), or the
+                // worker may be dead (the fail-closed class). The
+                // candidate's exact revision, parent, content, and
+                // capture provenance are all in scope here.
+                Err(_) => {
+                    if !self.worker.healthy() {
+                        return Err(CloseFailure::WorkerUnavailable);
+                    }
+                    let mut medium = self
+                        .worker
+                        .source()
+                        .map_err(|_| CloseFailure::WorkerUnavailable)?
+                        .open_medium()
+                        .map_err(|_| CloseFailure::WorkerUnavailable)?;
+                    match medium
+                        .reconcile_unknown(&revision)
+                        .map_err(|error| CloseFailure::PublicationFailed(error.to_string()))?
+                    {
+                        Reconciliation::Installed { id } => {
+                            // The full final-publication readback on
+                            // the VERIFIED installation.
+                            self.verify_final_publication(&id, &capture.parent, &capture.content)?;
+                            return Ok((id, self.worker.tier()));
+                        }
+                        // The candidate genuinely did not install:
+                        // the fresh recapture/retry (no duplicate
+                        // installation).
+                        Reconciliation::NotInstalled { .. } => continue,
+                        Reconciliation::Unverifiable { .. } => {
+                            return Err(CloseFailure::UnverifiableReconciliation);
+                        }
+                    }
+                }
                 Ok(Err(error)) => {
                     return Err(match error {
                         MediumError::WorkerUnavailable { .. } => CloseFailure::WorkerUnavailable,
@@ -1512,6 +1664,99 @@ impl OrchestratedSession {
         if record.parent != Some(*parent) || record.content_refs != vec![*content] {
             return Err(CloseFailure::ReadbackFailed(
                 "the installed record does not bind the captured parent and content".to_owned(),
+            ));
+        }
+        let bytes = medium
+            .read_object(content)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        let object = StoredObject::new(bytes)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        if object.hash() != *content {
+            return Err(CloseFailure::ReadbackFailed(
+                "the content object's identity does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// THE IDEMPOTENCE WALK (C4-F1): searches the RECENT chain
+    /// window (depth-bounded — the recent records are never
+    /// reclamation-eligible, and any canonical progression between
+    /// the snapshot and the close requires state changes and hence a
+    /// different content) for the NEWEST revision already carrying
+    /// the exact current snapshot content. The walk descends from
+    /// the canonical head; a reclamation gap ends the window (the
+    /// check falls through to the publication path, which handles
+    /// its own outcomes honestly); the founding ends it; read
+    /// failures other than the gap class fail the close closed —
+    /// never a guessed satisfaction.
+    fn find_representing_snapshot(
+        &self,
+        capture: &SnapshotCapture,
+    ) -> Result<Option<Hash>, CloseFailure> {
+        const REPRESENTATION_WINDOW: usize = 64;
+        let mut medium = self
+            .worker
+            .source()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?
+            .open_medium()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?;
+        let Some(mut cursor) = medium
+            .head()
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        for _ in 0..REPRESENTATION_WINDOW {
+            let record = match medium.read_record(&cursor) {
+                Ok(record) => record,
+                // A reclamation gap ends the recent window — the
+                // check falls through to the publication path.
+                Err(MediumError::MissingObject { .. }) => return Ok(None),
+                Err(other) => return Err(CloseFailure::ReadbackFailed(other.to_string())),
+            };
+            if record.content_refs == vec![capture.content] {
+                // The newest revision carrying the exact current
+                // content — the walk descends from the head, so the
+                // first match is the newest.
+                return Ok(Some(cursor));
+            }
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            cursor = parent;
+        }
+        Ok(None)
+    }
+
+    /// The idempotent final save's VERIFICATION (C4-F1): the found
+    /// revision is read back and verified — its content reference
+    /// binds the exact current content, the content object IS a
+    /// session snapshot (the ratified domain), and the object's
+    /// identity verifies — before the existing representation
+    /// satisfies the final-save obligation. Under the
+    /// single-submitter discipline an unchanged serialized state
+    /// implies an unchanged journal frontier (only deactivations
+    /// grow the committed set, and every deactivation changes the
+    /// state), so the content equality carries the frontier
+    /// applicability.
+    fn verify_representing_snapshot(
+        &self,
+        revision: &Hash,
+        content: &Hash,
+    ) -> Result<(), CloseFailure> {
+        let mut medium = self
+            .worker
+            .source()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?
+            .open_medium()
+            .map_err(|_| CloseFailure::WorkerUnavailable)?;
+        let record = medium
+            .read_record(revision)
+            .map_err(|error| CloseFailure::ReadbackFailed(error.to_string()))?;
+        if record.content_refs != vec![*content] {
+            return Err(CloseFailure::ReadbackFailed(
+                "the representing revision does not bind the current content".to_owned(),
             ));
         }
         let bytes = medium

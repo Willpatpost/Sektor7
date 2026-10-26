@@ -802,6 +802,22 @@ impl<S: MediumSource> SessionCrossing<S> {
             .map_err(TransitionError::JournalFailed)
     }
 
+    /// Retries the retained pending canonical attempt (PP-B4
+    /// checkpoint 4's close settlement, C4-F3): after a verified
+    /// NotInstalled — or a stale parent — the accepted
+    /// exception-safe retry path re-walks the chain (determining
+    /// keys another writer may have confirmed — never re-submitted),
+    /// then re-submits the remaining per-key identities at the
+    /// verified head — no duplicate consequential identity. The
+    /// pipeline's own lifecycle, exposed for the orchestrated
+    /// session's graceful close.
+    pub fn retry_pending(&mut self) -> Result<CommitOutcome, TransitionError> {
+        self.assert_journal_authority()?;
+        self.pipeline
+            .retry_pending()
+            .map_err(TransitionError::JournalFailed)
+    }
+
     /// The six-phase transactional deactivation (§5.5.1/§5.5.2), over
     /// the real simulation state:
     ///

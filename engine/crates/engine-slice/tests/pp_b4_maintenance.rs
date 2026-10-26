@@ -152,6 +152,14 @@ fn oracle_head_at(location: &StoreLocation) -> engine_persist::Hash {
         .unwrap()
 }
 
+fn oracle_records_at(location: &StoreLocation) -> u64 {
+    SessionStore::open(location)
+        .unwrap()
+        .validate()
+        .unwrap()
+        .records
+}
+
 /// The child-side session over the parent-provided directory (the
 /// real-child pattern: the env names the root, the child founds and
 /// runs in its own process).
@@ -1097,4 +1105,299 @@ fn a_real_child_close_death_at_the_final_append() {
     assert!(report.failure.is_none(), "{:?}", report.failure);
     let final_revision = report.final_revision.expect("the verified final revision");
     assert_eq!(oracle_head_at(&location), final_revision);
+}
+
+// --------------------------------------------- the C4 corrective regressions
+
+// A (C4-F1) — the close is IDEMPOTENT after an already-published
+// identical snapshot: an optional snapshot accepted, no gameplay
+// state or clock change, then close — the final-save obligation is
+// satisfied by the EXISTING verified representation (never a
+// duplicate-key failure for a state already durably represented,
+// never rebased bytes), and a fresh recovery is coherent. BOTH
+// PROVIDERS.
+#[test]
+fn the_close_is_idempotent_after_an_identical_published_snapshot() {
+    // THE FILE PROVIDER.
+    let dir = TestDir::new("idempotent-close-file");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let records_before = oracle_records_at(&location);
+    // The optional snapshot S accepted (the current state).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    // NO gameplay change. THE CLOSE.
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert_eq!(
+        report.final_revision,
+        Some(s_revision),
+        "the existing verified representation satisfies the obligation"
+    );
+    assert!(report.lifecycle_checkpoint, "the no-op file checkpoint");
+    assert!(report.required_settled);
+    // No new canonical record: the head and the record count stand.
+    assert_eq!(oracle_head_at(&location), s_revision);
+    assert_eq!(oracle_records_at(&location), records_before + 1);
+    // THE COHERENT FRESH RECOVERY.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    recovered.tick(&near_presence()).unwrap();
+    assert_ne!(recovered.region_level(4), LodLevel::Dormant);
+
+    // THE SQLITE PROVIDER.
+    let db_dir = TestDir::new("idempotent-close-sqlite");
+    let db_location = found_location(&db_dir, true);
+    let mut db_session = orchestrated_at(&db_dir, true);
+    let s = db_session
+        .submit_publication(db_session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match db_session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    let report = db_session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert_eq!(report.final_revision, Some(s_revision));
+    assert!(report.lifecycle_checkpoint, "the WAL TRUNCATE");
+    assert!(report.required_settled);
+    assert_eq!(oracle_head_at(&db_location), s_revision);
+    let wal_len = std::fs::metadata(db_dir.wal())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    assert_eq!(wal_len, 0);
+}
+
+// B (C4-F1) — an older snapshot shares the current content identity
+// but the canonical HEAD has advanced through another required
+// revision (a second session's publication over the same store, its
+// own journal — the sidecar-lock discipline): the close's final-save
+// handling stays COHERENT — the obligation is satisfied by the
+// VERIFIED older snapshot, the advanced canonical authority is
+// untouched, and the two are never silently confused.
+#[test]
+fn the_close_after_a_head_advance_past_an_identical_snapshot_stays_coherent() {
+    let dir = TestDir::new("idempotent-close-advanced");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // The optional snapshot S of the session's current state.
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    // THE HEAD ADVANCE: a second session's publication (a DIFFERENT
+    // content — its own scenario at a different tick count), with
+    // no change to the first session's state.
+    let (twin_spine, twin_director) = scenario_pair(120, &near_region_4());
+    let twin_journal = T1Journal::open(dir.0.join("journal-twin.t1")).unwrap();
+    let mut twin = OrchestratedSession::open(
+        twin_spine,
+        twin_director,
+        &location,
+        twin_journal,
+        "pp-b4-m",
+    )
+    .unwrap();
+    let twin_handle = twin
+        .submit_publication(twin.capture_snapshot().unwrap())
+        .unwrap();
+    let twin_revision = match twin.wait_publication(twin_handle).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    drop(twin);
+    // THE CLOSE (the first session's state unchanged).
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    // The obligation satisfied by the VERIFIED older snapshot; the
+    // advanced canonical authority untouched — never silently
+    // confused.
+    assert_eq!(report.final_revision, Some(s_revision));
+    assert_ne!(
+        oracle_head_at(&location),
+        s_revision,
+        "the head stays the twin's — no rebase, no new append"
+    );
+    assert_eq!(oracle_head_at(&location), twin_revision);
+}
+
+// C (C4-F2) — the lost reply on the REQUIRED final append: the
+// append EXECUTES and installs, its reply is lost, the worker
+// remains healthy — the reconciliation proves the installation, the
+// full final-content readback succeeds, and the close returns the
+// verified revision (never a false unavailability).
+#[test]
+fn the_close_reconciles_a_lost_reply_on_the_final_append() {
+    let dir = TestDir::new("close-lost-reply");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // A tick so the current state's content is FRESH (never
+    // published — the idempotence walk must not find it).
+    session.tick(&near_presence()).unwrap();
+    // THE LOST REPLY armed for the close's required append (the
+    // drain's jobs are reads and the barrier — the first append is
+    // the final publication).
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    let final_revision = report.final_revision.expect("the verified final revision");
+    // The append INSTALLED (the reconciliation proved it) and the
+    // readback verified the exact snapshot.
+    assert_eq!(oracle_head_at(&location), final_revision);
+    assert!(report.required_settled);
+    assert!(report.lifecycle_checkpoint);
+}
+
+// D (C4-F2) — the lost reply where the final candidate was GENUINELY
+// NOT INSTALLED (the append skipped, the reply dropped, the worker
+// healthy): the reconciliation proves the VERIFIED absence, the
+// fresh recapture/retry lands, and the close succeeds WITHOUT
+// duplicate installation.
+#[test]
+fn the_close_recaptures_after_a_lost_reply_without_installation() {
+    let dir = TestDir::new("close-lost-reply-absent");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    session.tick(&near_presence()).unwrap();
+    let records_before = oracle_records_at(&location);
+    // THE SKIPPED-AND-LOST final append (attempt 1 never touches the
+    // store; the fault is one-shot).
+    session
+        .fault_control()
+        .set(WorkerFault::DropAppendWithoutExecution);
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    let final_revision = report.final_revision.expect("the verified final revision");
+    // EXACTLY ONE installation of the snapshot content (attempt 1
+    // skipped; attempt 2's fresh capture landed).
+    assert_eq!(oracle_head_at(&location), final_revision);
+    assert_eq!(
+        oracle_records_at(&location),
+        records_before + 1,
+        "no duplicate installation"
+    );
+}
+
+// E (C4-F3) — the required pending attempt classified NotInstalled
+// at close: a required commit whose append is CAS-rejected (a second
+// session's publication advanced the head past the stale verified
+// parent) with its reply lost — the retained Unknown candidate. The
+// close's settlement reconciles it as NotInstalled, RETRIES through
+// the accepted exception-safe path (the re-walk at the advanced
+// head, the rebase with identical identities — no duplicate
+// consequential identity), the confirmation completes canonically
+// BEFORE the successful close, and the fresh recovery retains
+// exactly-once consequence semantics.
+#[test]
+fn the_close_settles_the_unconfirmed_required_attempt() {
+    let dir = TestDir::new("close-unconfirmed-attempt");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    // THE HEAD ADVANCE past the session's stale verified parent: the
+    // second session's publication (its own journal).
+    let (twin_spine, twin_director) = scenario_pair(120, &near_region_4());
+    let twin_journal = T1Journal::open(dir.0.join("journal-twin.t1")).unwrap();
+    let mut twin = OrchestratedSession::open(
+        twin_spine,
+        twin_director,
+        &location,
+        twin_journal,
+        "pp-b4-m",
+    )
+    .unwrap();
+    let twin_handle = twin
+        .submit_publication(twin.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        twin.wait_publication(twin_handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    drop(twin);
+    // THE CAS-REJECTED, REPLY-LOST required commit: the retained
+    // Unknown candidate.
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    match session.commit_canonical().unwrap() {
+        CommitOutcome::Unknown { .. } => {}
+        other => {
+            panic!("the stale-parent append with the lost reply is the uncertain class: {other:?}")
+        }
+    }
+    // THE CLOSE: the settlement reconciles NotInstalled and RETRIES.
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert!(
+        report.required_settled,
+        "the required confirmation settled canonically before the close"
+    );
+    assert!(report.final_revision.is_some());
+    // THE EXACTLY-ONCE RECOVERY: a fresh session re-derives — the
+    // confirmed keys are suppressed (NothingPending), never
+    // re-confirmed.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+// The CloseReport CONTRACT (the review's consistency section): a
+// checkpoint failure AFTER a verified final snapshot retains the
+// verification evidence (final_revision Some, the honest
+// lifecycle_checkpoint false) while the OVERALL outcome is the
+// explicit CheckpointFailed — the distinctions unambiguous. The
+// death lands between the final readback's content-object read and
+// the lifecycle-checkpoint job (the first ReadObject job after the
+// probe's arming is the readback's; the panic fires after it, before
+// the checkpoint).
+#[test]
+fn the_checkpoint_failure_close_report_contract() {
+    let dir = TestDir::new("close-checkpoint-failure");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    session.tick(&near_presence()).unwrap();
+    let report = session.debug_close_with_probe_for_test(|closing| {
+        closing
+            .fault_control()
+            .set(WorkerFault::PanicAfter(JobKind::ReadObject));
+    });
+    match &report.failure {
+        Some(CloseFailure::CheckpointFailed(_)) => {}
+        other => panic!("the checkpoint failure is the explicit overall outcome: {other:?}"),
+    }
+    // THE RETAINED EVIDENCE: the final snapshot IS verified and
+    // installed (the head) — the failure never erases it.
+    let final_revision = report
+        .final_revision
+        .expect("the verified evidence retained");
+    assert!(
+        !report.lifecycle_checkpoint,
+        "the checkpoint did not complete"
+    );
+    assert_eq!(oracle_head_at(&location), final_revision);
+    // A fresh recovery works from the verified snapshot.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    recovered.tick(&near_presence()).unwrap();
 }
