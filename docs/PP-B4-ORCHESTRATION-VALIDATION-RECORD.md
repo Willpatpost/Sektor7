@@ -1,9 +1,10 @@
 # PP-B4 ORCHESTRATION — VALIDATION RECORD
 
-**Status: VALIDATION DELIVERED — PENDING INDEPENDENT FINAL ACCEPTANCE.**
-This is an evidence and acceptance-preparation record (the owner's final
-validation checkpoint GO). PP-B4 is NOT marked CLOSED-PASS here — that
-ratification belongs to the independent final acceptance review.
+**Status: CLOSED-PASS — OWNER-RATIFIED, October 26, 2026.**
+The independent final acceptance review concluded PASS and the owner
+ratified the closure (§11). PP-B4 is CLOSED and FROZEN; the complete
+checkpoint, correction, and validation history below is preserved
+verbatim — never rewritten, never erased.
 
 **The first physical Windows acceptance run (2026-10-26, at `fd9ca7f`)
 FAILED at the racing-writer backup boundary** — not on the invariant
@@ -16,7 +17,7 @@ corrective `2e20414` (§5, dispatch 4) types the open-path busy expiry
 as `MediumError::Contention` at exactly the four schema/seed sites and
 adds the deterministic held-lock regression; it is CI-verified green
 on all three OSes — **the physical Windows re-run against `2e20414`
-remains PENDING (§6), the acceptance authority.**
+COMPLETED SUCCESSFULLY (the owner's run; §11 — the ratification).**
 
 Every status below uses the explicit vocabulary the GO mandated:
 **VERIFIED** (evidence observed firsthand in this delivery),
@@ -721,3 +722,94 @@ unchanged (no PR #4).
 merges, no CLOSED-PASS ratification, no Stage 6 — the final
 acceptance and every subsequent action require the separate
 independent review and the explicit owner authorization.
+
+## 11. The owner ratification — the final CLOSED-PASS closure
+
+**OWNER DECISION (2026-10-26): PP-B4 IS APPROVED FOR CLOSED-PASS.**
+The independent final acceptance review concluded PASS; the owner
+completed the physical Windows acceptance run against the corrected
+baseline; the three-OS CI verification stands green; every required
+implementation, correction, validation, and performance evidence
+item has been accepted; no unresolved implementation or acceptance
+blockers remain. This section supersedes the earlier STOP/PENDING
+statements (§6's pending re-run, §8's remaining acceptance, §10's
+delivery STOP) — the history that produced them is preserved
+verbatim above, never rewritten, never erased.
+
+**The authoritative accepted baselines:**
+- The final accepted branch HEAD:
+  `45e6b79712d7967023be9708dfb024405447f511` (the script-regression
+  corrective of the Windows acceptance procedure — the ratification's
+  reviewed state).
+- The CI-verified executable-source commit:
+  `2e20414fe1d33870081f32e8676cca126434f5e7` (the Windows SQLite
+  contention corrective) — every commit above it documentation-only
+  (the record amends `cf8f3ce` → `45e6b79` → this closure; a commit
+  cannot contain its own SHA).
+- The accepted implementation ancestry: the CLOSED-PASS checkpoint-4
+  implementation `9a92ef8` → the validation package `63d0cfd` /
+  `b696779` → the documentation-only record correctives `2aede3b` /
+  `cfcf271` / `fd9ca7f` → the contention corrective `2e20414` → the
+  record amends → this closure.
+
+**The final three-OS CI verification:** run `40402249372` —
+ubuntu-latest, windows-latest, and macos-15 ARM64 ALL PASS at the
+exact CI-verified source commit `2e20414` (the run's headSha
+verified equal; the verdicts verified firsthand at the job level;
+the Stage-0 fingerprint pins printed on every OS).
+
+**The physical Windows acceptance — COMPLETED SUCCESSFULLY (the
+owner's run against the corrected baseline):** the exact checkout
+verification (the two-argument revision-diff form; the authorized
+delta and the documentation-only tail both verified), the full
+release-mode workspace verification TWICE, the focused PP-B4
+regression suites, the deterministic SQLite held-lock regression,
+the previously failing concurrent-writer backup regression (GREEN —
+the SQLite BUSY misclassification corrected and accepted), the
+SQLite provider, backup, and migration tests, the formatting,
+build, and strict Clippy checks, the frozen engine fingerprint
+`6504123a47cab66f`, the frozen state fingerprint `937bd3b6f56f07e0`,
+the persistence benchmark completed successfully, and the exact
+final commit and branch ancestry verified.
+
+**The accepted physical Windows performance results (the owner's
+measurements, independently reviewed):**
+
+| Operation | Median |
+|---|---:|
+| Normal authoritative tick | 0.009 ms |
+| Tick with canonical worker parked | 0.006 ms |
+| Snapshot capture | 0.639 ms |
+| Optional publication admission | 0.001 ms |
+| T1 deactivation tick | 1.977 ms |
+| Required canonical confirmation | 8.185 ms |
+| Orchestrated checkpoint | 13.192 ms |
+| Journal rotation | 18.319 ms |
+| Reclamation | 15.305 ms |
+
+The measurements support the accepted responsiveness design — the
+authoritative tick far inside every frame budget including while a
+canonical publication executes on the worker (the optional path
+asynchronous for the authority thread; T1 durability and protected
+maintenance synchronous) — WITHOUT changing the synchronous
+durability boundaries (the standing interpretation, never an
+all-nonblocking claim).
+
+**The remaining durability limitations (unchanged, binding):**
+physical power-loss durability is **NOT TESTED** — no stronger
+durability claim is authorized; the Windows tier remains
+process-crash durability with the ratified directory-sync no-op (no
+Windows dir-fsync claim); the maintenance compounds and the graceful
+close remain explicit operator operations, never gameplay-frame.
+
+**The frozen baseline and governance restrictions:** PP-B4 is CLOSED
+and FROZEN — no further PP-B4 implementation or documentation
+changes without a new explicit owner authorization; no PR #4; no
+merges of any branch or PR; `main` (`5dbb377`), `stage5` (`047faf9`),
+`macos-port` (`ba395d8`), and the frozen PP branches
+(`production-persistence-b1` = `bfe60b7`, `-b2` = `00109b0`, `-b3` =
+`92b057a`) remain untouched; no Stage 6; no further
+production-persistence batch; no architectural planning or
+speculative implementation for subsequent stages; no unrelated
+cleanup or refactoring. All development activity is paused pending a
+separate, explicit owner directive.
