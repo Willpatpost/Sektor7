@@ -194,6 +194,14 @@ pub enum WorkerFault {
     /// boundary (C4-R3's regression D — the first required submission
     /// AND its bounded retry both verified-absent).
     DropNextAppends { count: u32 },
+    /// The next ReconcileUnknown job is NOT executed against the
+    /// store — the worker synthesizes the typed `Unverifiable`
+    /// outcome as its reply (one-shot, the worker healthy): the
+    /// deterministic end-to-end seam for the maintenance/close
+    /// gates' unverifiable-reconciliation refusals (the final
+    /// validation checkpoint's evidence-limitation A — no production
+    /// API widened, the provider's own fault machinery untouched).
+    UnverifiableNextReconcile,
     /// The next Checkpoint job PANICS before execution (the thread
     /// dies; the request fails with the worker-dead error) — the
     /// death lands between the verified final publication and the
@@ -214,10 +222,15 @@ pub struct WorkerFaultControl {
 
 /// The park latch (the deterministic synchronization barrier): parks
 /// until released — one-shot (each test uses a fresh control; the
-/// release is never re-armed).
+/// release is never re-armed). The ENTRY flag flips when the worker
+/// parks (before waiting) — the deterministic replacement for
+/// timing-based "the worker holds the job" assumptions (the
+/// final-validation checkpoint's determinism audit: the tests wait on
+/// the actual event, never a guessed duration).
 #[doc(hidden)]
 #[derive(Default)]
 struct ParkLatch {
+    entered: AtomicBool,
     released: Mutex<bool>,
     notified: Condvar,
 }
@@ -243,11 +256,20 @@ impl WorkerFaultControl {
         self.park.notified.notify_all();
     }
 
+    /// Whether the worker has ENTERED the park — the deterministic
+    /// "the job has started" barrier (wait on this instead of sleeping
+    /// a guessed duration; the flag flips before the parked wait).
+    #[doc(hidden)]
+    pub fn park_entered(&self) -> bool {
+        self.park.entered.load(Ordering::Acquire)
+    }
+
     fn current(&self) -> WorkerFault {
         self.fault.lock().expect("the worker fault lock").clone()
     }
 
     fn park_until_released(&self) {
+        self.park.entered.store(true, Ordering::Release);
         let mut released = self.park.released.lock().expect("the worker park latch");
         while !*released {
             released = self
@@ -320,6 +342,7 @@ fn worker_loop(
             | WorkerFault::LoseAppendReply
             | WorkerFault::DropAppendWithoutExecution
             | WorkerFault::DropNextAppends { .. }
+            | WorkerFault::UnverifiableNextReconcile
             | WorkerFault::ExitAfterAppendPreReply => {}
             WorkerFault::PanicNext => {
                 panic!("canonical-io-worker: injected fault (PanicNext)")
@@ -410,6 +433,26 @@ fn worker_loop(
                 WorkerFault::ParkExecutingAppend => fault.park_until_released(),
                 _ => {}
             }
+        }
+        // THE UNVERIFIABLE RECONCILIATION SEAM (the final-validation
+        // checkpoint's evidence limitation A): the next
+        // ReconcileUnknown job is NOT executed — the typed
+        // `Unverifiable` outcome is synthesized as the reply, exactly
+        // what a provider could not establish. The caller's gate must
+        // refuse on it, never converting the uncertainty into a
+        // confirmation (Installed) or a verified absence
+        // (NotInstalled) — the isolated per-worker test-only
+        // passthrough, no production API widened.
+        if let MediumOp::ReconcileUnknown { .. } = job.op
+            && matches!(fault.current(), WorkerFault::UnverifiableNextReconcile)
+        {
+            fault.clear();
+            let _ = job
+                .reply
+                .send(Ok(WorkerReply::Reconcile(Reconciliation::Unverifiable {
+                    reason: "injected test fault (UnverifiableNextReconcile)".to_owned(),
+                })));
+            continue;
         }
         let executed_kind = job_kind(&job.op);
         let reply = execute(&mut store, job.op);

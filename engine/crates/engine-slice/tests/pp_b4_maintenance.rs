@@ -1069,6 +1069,17 @@ fn a_worker_panic_during_a_compound_fails_explicitly() {
         Err(MaintenanceError::Compound(_)) => {}
         other => panic!("the compound fails explicitly: {other:?}"),
     }
+    // The compound's failure signal (the in-flight job's reply
+    // channel dropping mid-unwind) can PRECEDE the worker thread's
+    // completion (the DeathGuard's health flip at thread exit) — the
+    // death is guaranteed by the panic, never synchronous with the
+    // failure return. Wait for the GUARANTEED event, bounded — the
+    // race this suite's first three-OS dispatch exposed on the
+    // slower CI runners.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while session.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!session.healthy(), "the worker died in the compound");
     assert_eq!(
         session.phase(),
@@ -1926,4 +1937,267 @@ fn an_unchanged_snapshot_behind_checkpoint_metadata_and_an_audit_still_satisfies
         recovered.commit_canonical().unwrap(),
         CommitOutcome::NothingPending
     ));
+}
+
+// ---------------------------- the final-validation evidence regressions
+
+/// §3A (the evidence limitation) — THE UNVERIFIABLE RECONCILIATION,
+/// exercised end to end through the orchestrated worker path (the
+/// isolated per-worker test-only passthrough `UnverifiableNextReconcile`
+/// — the next ReconcileUnknown job synthesizes the typed Unverifiable
+/// outcome, the worker healthy, no production API widened): an
+/// uncertain optional publication (its append executed, its reply
+/// lost — Unknown in the completion ledger) meets the synthesized
+/// Unverifiable at the maintenance gate. The gate REFUSES with the
+/// typed unverifiable detail — never converting the uncertainty into
+/// a confirmation or a verified absence — and the uncertainty is
+/// RETAINED: a subsequent clean close reconciles the same completion
+/// to the VERIFIED installation (the append had executed), exactly
+/// once, with the disposition proving the earlier refusal classified
+/// nothing.
+#[test]
+fn the_maintenance_gate_refuses_an_unverifiable_reconciliation() {
+    let dir = TestDir::new("unverifiable-maintenance");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // THE UNCERTAIN PUBLICATION: the append executes, its reply is
+    // lost — the completion ledger holds the honest Unknown.
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Unknown { .. }
+    ));
+    // THE SYNTHESIZED UNVERIFIABLE at the maintenance gate's
+    // reconciliation — the refusal, never a guessed classification.
+    session
+        .fault_control()
+        .set(WorkerFault::UnverifiableNextReconcile);
+    match session.debug_maintenance_probe_for_test(|_| ()) {
+        Err(MaintenanceError::Gate(TransitionError::InstallIncompatible {
+            detail: "maintenance/unverifiable-publication",
+            ..
+        })) => {}
+        other => panic!("the unverifiable reconciliation refuses maintenance: {other:?}"),
+    }
+    assert_eq!(
+        session.phase(),
+        SessionPhase::Active,
+        "the lease released on the refusal"
+    );
+    assert!(session.healthy(), "the worker stayed healthy");
+    // THE RETAINED UNCERTAINTY: the fault consumed, a clean close
+    // reconciles the SAME completion to the VERIFIED installation —
+    // the append had executed — proving the refusal classified
+    // nothing (a false NotInstalled would surface as installed:
+    // false here).
+    let report = session.close();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    let final_revision = report.final_revision.expect("the verified final revision");
+    assert_eq!(oracle_head_at(&location), final_revision);
+    match &report
+        .completions
+        .iter()
+        .find(|record| record.id == handle.id)
+        .unwrap()
+        .disposition
+    {
+        CompletionDisposition::Reconciled {
+            installed: true, ..
+        } => {}
+        other => {
+            panic!("the retained uncertainty resolved to the verified installation: {other:?}")
+        }
+    }
+}
+
+/// §3A — the same synthesized Unverifiable at the CLOSE gate: the
+/// drain's uncertain-disposition reconciliation meets it and the
+/// close FAILS with the explicit UnverifiableReconciliation class —
+/// never a claimed save (no final revision), the completion's
+/// disposition still the honest Unknown (never classified), the
+/// worker joining cleanly, and a fresh recovery coherent (the
+/// uncertain append HAD executed — the chain carries it).
+#[test]
+fn the_close_refuses_an_unverifiable_publication_reconciliation() {
+    let dir = TestDir::new("unverifiable-close-publication");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Unknown { .. }
+    ));
+    session
+        .fault_control()
+        .set(WorkerFault::UnverifiableNextReconcile);
+    let report = session.close();
+    match &report.failure {
+        Some(CloseFailure::UnverifiableReconciliation) => {}
+        other => panic!("the unverifiable reconciliation is the explicit close failure: {other:?}"),
+    }
+    assert_eq!(report.final_revision, None, "never a claimed save");
+    assert!(report.worker.is_ok(), "the healthy worker joins cleanly");
+    // THE UNCLASSIFIED UNCERTAINTY: the completion's disposition is
+    // still the honest Unknown — never Accepted, NotInstalled, or a
+    // guessed Reconciled.
+    assert!(matches!(
+        report
+            .completions
+            .iter()
+            .find(|record| record.id == handle.id)
+            .unwrap()
+            .disposition,
+        CompletionDisposition::Unknown { .. }
+    ));
+    // A FRESH RECOVERY is coherent: the uncertain append had
+    // executed — the chain carries it, the far-boundary state
+    // restored.
+    let recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert_eq!(recovered.region_level(4), LodLevel::Dormant);
+}
+
+/// §3A — the ATTEMPT arm: a retained pending canonical candidate (its
+/// append CAS-rejected against the session's own optional
+/// publication, its reply lost — the twin-free construction) meets
+/// the synthesized Unverifiable at the close gate's settlement. The
+/// settlement REFUSES (the typed unverifiable-attempt detail → the
+/// explicit UnverifiableReconciliation close failure), the T1-durable
+/// obligation RETAINED — a fresh recovery re-drives it exactly once
+/// (Confirmed, then NothingPending) — never a false classification,
+/// never a claimed save.
+#[test]
+fn the_close_refuses_an_unverifiable_attempt_reconciliation() {
+    let dir = TestDir::new("unverifiable-close-attempt");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    // THE HEAD ADVANCE past the pipeline's stale verified parent (the
+    // session's OWN optional publication — worker-direct).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(s).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // THE CAS-REJECTED, REPLY-LOST required commit (the retained
+    // Unknown candidate).
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    match session.commit_canonical().unwrap() {
+        CommitOutcome::Unknown { .. } => {}
+        other => {
+            panic!("the stale-parent append with the lost reply is the uncertain class: {other:?}")
+        }
+    }
+    // THE SYNTHESIZED UNVERIFIABLE at the settlement's
+    // reconciliation — the refusal.
+    session
+        .fault_control()
+        .set(WorkerFault::UnverifiableNextReconcile);
+    let report = session.close();
+    match &report.failure {
+        Some(CloseFailure::UnverifiableReconciliation) => {}
+        other => panic!("the unverifiable attempt is the explicit close failure: {other:?}"),
+    }
+    assert_eq!(report.final_revision, None, "never a claimed save");
+    assert!(report.worker.is_ok(), "the healthy worker joins cleanly");
+    // THE RETAINED OBLIGATION: the fresh recovery re-drives it exactly
+    // once.
+    let mut recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        recovered.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+}
+
+/// §3B (the bounded idempotence lookup) — an identical authoritative
+/// snapshot separated from the close by MORE than the documented
+/// 64-revision lookup window (65 non-snapshot canonical revisions —
+/// the realistic members of this class are confirmation batches, MKs,
+/// and audits): the walk exhausts its window, falls through to the
+/// publication path, and the provider's duplicate-idempotency-key
+/// refusal surfaces there — the close reports the HONEST publication
+/// failure, never a false success — and a fresh recovery is
+/// UNAFFECTED (the recovery's discovery walk is bounded by the chain
+/// length, never the close's window): it restores the identical S.
+#[test]
+fn an_identical_snapshot_beyond_the_lookup_window_fails_honestly_and_recovers() {
+    let dir = TestDir::new("close-beyond-window");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // S of the session's current state (region 4 LIVE).
+    let s = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let s_revision = match session.wait_publication(s).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    // 65 NON-SNAPSHOT canonical revisions above S (each a unique
+    // content object under a benign domain): S now lies BEYOND the
+    // close's 64-revision lookup window.
+    let noise_domain = "engine-slice/validation-noise/1";
+    let mut store = SessionStore::open(&location).unwrap();
+    let mut parent = s_revision;
+    let mut parent_epoch = store.read_record(&s_revision).unwrap().epoch;
+    for index in 0..65u64 {
+        let mut noise_bytes = Vec::new();
+        noise_bytes.extend_from_slice(&(noise_domain.len() as u64).to_le_bytes());
+        noise_bytes.extend_from_slice(noise_domain.as_bytes());
+        noise_bytes.extend_from_slice(&index.to_le_bytes());
+        let object = StoredObject::new(noise_bytes).unwrap();
+        let hash = object.hash();
+        // The regular constructor derives the record's OWN epoch as
+        // parent_epoch + 1 — pass the parent's actual epoch (the
+        // observed-parent convention every accepted writer uses).
+        let record = RevisionRecord::regular(parent, parent_epoch, 500 + index)
+            .with_idempotency_key(hash.as_bytes().to_vec())
+            .with_content_refs(vec![hash]);
+        store.append(&record, &[object], Some(parent)).unwrap();
+        parent = record.id();
+        parent_epoch = record.epoch;
+    }
+    drop(store);
+    // THE CLOSE of the unchanged-S session: the window exhausts
+    // through the noise, the publication path appends the identical
+    // content, and the provider's duplicate-key refusal surfaces —
+    // the HONEST failure, never a false success.
+    let report = session.close();
+    match &report.failure {
+        Some(CloseFailure::PublicationFailed(_)) => {}
+        other => panic!("the beyond-window close fails honestly: {other:?}"),
+    }
+    assert_eq!(report.final_revision, None, "never a claimed save");
+    // The chain stands: the head is the LAST noise revision — the
+    // failed publication installed nothing.
+    assert_eq!(oracle_head_at(&location), parent);
+    // THE RECOVERY ORACLE: a fresh recovery walks the FULL chain (its
+    // discovery is bounded by the chain length, never the close's
+    // window) and restores the identical S — recoverable, coherent.
+    let recovered = OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m").unwrap();
+    assert_ne!(
+        recovered.region_level(4),
+        LodLevel::Dormant,
+        "S (the live-state snapshot) is the restored state"
+    );
 }

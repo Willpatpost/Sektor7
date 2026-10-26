@@ -587,7 +587,13 @@ fn cancellation_after_start_cannot_erase_the_outcome() {
         .fault_control()
         .set(WorkerFault::ParkExecutingAppend);
     let handle = session.submit_publication(capture).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // THE DETERMINISTIC PARK-ENTRY BARRIER (the final-validation
+    // determinism audit): wait for the worker to actually enter the
+    // executing-append park — the real event, never a guessed
+    // duration.
+    while !session.fault_control().park_entered() {
+        std::hint::spin_loop();
+    }
     // The cancellation is too late: the job already started.
     assert!(session.cancel_publication(handle));
     session.fault_control().release_park();
@@ -614,6 +620,15 @@ fn worker_death_without_polling_refuses_progression() {
     match session.commit_canonical().unwrap() {
         CommitOutcome::Unknown { .. } => {}
         other => panic!("the death surfaces the uncertain class: {other:?}"),
+    }
+    // The failure signal (the reply channel dropping mid-unwind)
+    // precedes the DeathGuard's thread-exit health flip — the death
+    // is guaranteed, never synchronous with the failure return
+    // (bounded wait; the CI-runner race the first three-OS dispatch
+    // exposed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while session.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
     }
     assert!(!session.healthy());
     // NO completion was polled anywhere — the next tick and the
@@ -727,10 +742,13 @@ fn completion_accounting_distinguishes_the_outcomes() {
     // Unknown: the append EXECUTES (it may commit) but its reply is
     // lost — the honest uncertain class, the head advanced.
     session.fault_control().set(WorkerFault::LoseAppendReply);
+    // The PRE-SUBMISSION head (the append executes asynchronously —
+    // reading the head after the submission races its landing, the
+    // windows-CI failure of the first three-OS dispatch).
+    let head_before_unknown = oracle_head_at(&location);
     let handle = session
         .submit_publication(session.capture_snapshot().unwrap())
         .unwrap();
-    let head_before_unknown = oracle_head_at(&location);
     match session.wait_publication(handle).unwrap() {
         PublicationOutcome::Unknown { revision, .. } => {
             assert_ne!(revision, head_before_unknown);
@@ -846,7 +864,13 @@ fn poisoning_during_an_executing_append_completes_honestly() {
         .fault_control()
         .set(WorkerFault::ParkExecutingAppend);
     let handle = session.submit_publication(capture).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // THE DETERMINISTIC PARK-ENTRY BARRIER (the final-validation
+    // determinism audit): wait for the worker to actually enter the
+    // executing-append park — the real event, never a guessed
+    // duration.
+    while !session.fault_control().park_entered() {
+        std::hint::spin_loop();
+    }
     session.poison();
     session.fault_control().release_park();
     match session.wait_publication(handle).unwrap() {

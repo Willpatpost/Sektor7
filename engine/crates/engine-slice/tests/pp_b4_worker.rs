@@ -329,8 +329,16 @@ fn panic_detection_without_completion_polling() {
     worker.fault_control().set(WorkerFault::PanicNext);
     let result = medium.head();
     assert!(matches!(result, Err(MediumError::WorkerUnavailable { .. })));
-    // THE CELL: no completion was polled anywhere — the health flipped
-    // through the panicking thread's drop guard.
+    // THE CELL: no completion was polled anywhere — the health flips
+    // through the panicking thread's drop guard. The failure signal
+    // (the reply channel dropping mid-unwind) precedes the thread's
+    // completion — the death is guaranteed, never synchronous with
+    // the failure return (bounded wait; the CI-runner race the first
+    // three-OS dispatch exposed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worker.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!worker.healthy());
     assert!(matches!(
         medium.head(),
@@ -712,14 +720,12 @@ fn work_admitted_before_poison_gets_an_honest_refusal() {
     let source = worker.source().unwrap();
     let mut medium = source.open_medium().unwrap();
     let (founding, epoch) = founding_head(&found_location(&dir.store(), false));
-    // Stall the worker so the append is admitted (in the queue or in the
-    // loop's hands, pre-execution) but not started. The stall outlives the
-    // 200ms setup window below; clearing the fault cannot interrupt the
-    // already-entered sleep, so the poison lands mid-stall and the
-    // boundary refusal fires when the sleep ends.
-    worker
-        .fault_control()
-        .set(WorkerFault::StallEach { ms: 2_000 });
+    // Park the worker so the append is admitted (in the queue or in the
+    // loop's hands, pre-execution) but not started. The park-entry
+    // barrier below proves the worker HOLDS the job before the poison
+    // lands, so the boundary refusal fires deterministically when the
+    // park releases.
+    worker.fault_control().set(WorkerFault::ParkNext);
     let object = sequence_object(22);
     let record = RevisionRecord::regular(founding, epoch, 122)
         .with_idempotency_key(b"pp-b4-poison-22".to_vec())
@@ -727,11 +733,15 @@ fn work_admitted_before_poison_gets_an_honest_refusal() {
     let append_call = std::thread::spawn(move || {
         medium.append(&record, std::slice::from_ref(&object), Some(founding))
     });
-    // Let the worker take the job and enter the stall, then poison and
+    // THE DETERMINISTIC PARK-ENTRY BARRIER (the final-validation
+    // determinism audit): the worker takes the job and parks — the
+    // real event, never a guessed stall duration — then poison and
     // release: the execution-boundary check refuses the admitted job.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    while !worker.fault_control().park_entered() {
+        std::hint::spin_loop();
+    }
     worker.poison();
-    worker.fault_control().clear();
+    worker.fault_control().release_park();
     let result = append_call.join().unwrap();
     assert!(matches!(result, Err(MediumError::WorkerUnavailable { .. })));
     // The append never ran: the HEAD unchanged.

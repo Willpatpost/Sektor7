@@ -313,6 +313,14 @@ fn worker_death_during_initial_readback_retains_the_attempt() {
     else {
         panic!("the readback death must surface the uncertain class, never a confirmation");
     };
+    // The failure signal (the reply channel dropping mid-unwind)
+    // precedes the DeathGuard's thread-exit flip — the death is
+    // guaranteed, never synchronous with the failure return (bounded
+    // wait; the CI-runner race the first three-OS dispatch exposed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worker.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!worker.healthy());
     // The attempt is RETAINED: the dead worker's reconciliation fails
     // worker-class — it is NOT NothingPending (which would mean an empty
@@ -365,6 +373,12 @@ fn worker_death_during_reconcile_readback_retains_the_candidate() {
         result,
         Err(PipelineError::Medium(MediumError::WorkerUnavailable { .. }))
     ));
+    // The same guaranteed-death bounded wait (the failure signal
+    // precedes the thread's completion).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worker.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!worker.healthy());
     // The retention: a second reconcile is refused worker-class (the slot
     // is still occupied — not NothingPending).
@@ -400,6 +414,12 @@ fn worker_death_during_retry_preliminary_walk_preserves_the_original() {
     let CommitOutcome::Unknown { revision, .. } = pipeline.commit_canonical().unwrap() else {
         panic!("the pre-execution death must surface the uncertain class");
     };
+    // The same guaranteed-death bounded wait (the failure signal
+    // precedes the thread's completion).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worker.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!worker.healthy());
     // The retry's preliminary walk fails worker-class — and the ORIGINAL
     // candidate survives: a second retry is refused (not NothingPending —
@@ -472,6 +492,12 @@ fn retry_candidate_b_replaces_a_never_restored() {
     assert_ne!(a, b, "B is the reconciliation identity, never A");
     // B landed (its accepted disposition stands).
     assert_eq!(oracle_head(&dir).0, b);
+    // The same guaranteed-death bounded wait (the failure signal
+    // precedes the thread's completion).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while worker.healthy() && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
     assert!(!worker.healthy());
     // The slot holds B: the dead-worker reconciliation is refused (not
     // NothingPending), and the fresh recovery confirms the key from B's

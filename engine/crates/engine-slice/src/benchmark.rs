@@ -34,12 +34,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engine_core::{HistoryKind, PresenceSample, Spine};
-use engine_persist::{CommitOutcome, LocalFileMedium, SqliteMedium, T1Journal};
+use engine_persist::{
+    AuthorityMode, CanonicalMedium, CommitOutcome, LocalFileMedium, RevisionRecord, SqliteMedium,
+    T1Journal,
+};
 
 use crate::crossing::{SessionCrossing, restore_session, save_session};
 use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+use crate::orchestration::{OrchestratedSession, SubmitRefusal};
 use crate::region::{RegionConfig, RegionDirector};
-use crate::store::StoreLocation;
+use crate::store::{SessionStore, StoreLocation};
+use crate::worker::WorkerFault;
 
 /// One measured operation's distribution, printed as one line.
 fn report(name: &str, samples: &mut [Duration]) {
@@ -51,9 +56,13 @@ fn report(name: &str, samples: &mut [Duration]) {
         .saturating_sub(1)
         .min(n - 1);
     let p95 = samples[p95_index].as_secs_f64() * 1e3;
+    let p99_index = (((n as f64) * 0.99).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    let p99 = samples[p99_index].as_secs_f64() * 1e3;
     let max = samples[n - 1].as_secs_f64() * 1e3;
     println!(
-        "  {name}: min {min:.3} / median {median:.3} / p95 {p95:.3} / max {max:.3} ms (n={n})"
+        "  {name}: min {min:.3} / median {median:.3} / p95 {p95:.3} / p99 {p99:.3} / max {max:.3} ms (n={n})"
     );
 }
 
@@ -103,6 +112,28 @@ fn campaign_dir(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+/// The pre-founded campaign store for the ORCHESTRATED measurements
+/// (the worker discipline: the store founded BEFORE the worker spawns
+/// — the same pre-founding every orchestrated test uses).
+fn found_benchmark_store(dir: &Path, database: bool) -> StoreLocation {
+    let location = if database {
+        StoreLocation::Database(dir.join("campaign.db"))
+    } else {
+        StoreLocation::Directory(dir.join("store"))
+    };
+    let mut store = SessionStore::open(&location).unwrap();
+    if store.head().unwrap().is_none() {
+        store
+            .append(
+                &RevisionRecord::founding(AuthorityMode::Standalone, "b5-bench", 0),
+                &[],
+                None,
+            )
+            .unwrap();
+    }
+    location
 }
 
 /// One retention-measurement campaign (the PP-B3 benchmark's local
@@ -749,6 +780,308 @@ pub fn run() {
     );
     println!(
         "  interpretation: docs/PP-B3-RETENTION-RECORD.md (the measured-vs-budget analysis; pod results, not physical-rig evidence)"
+    );
+
+    // ------------------------------------------------------------------
+    // 9. PP-B4 ORCHESTRATION (the worker-backed authoritative session)
+    //
+    // The PP-B3 measurements that motivated PP-B4 are section 8 above
+    // (the crossing-level maintenance compounds); this section
+    // measures the WORKER-BACKED implementation under equivalent
+    // workloads. HONESTY (the final-validation GO's rule): the
+    // optional publication path is asynchronous for the AUTHORITY
+    // THREAD (a bounded enqueue, a typed Busy at the boundary); T1
+    // durability and protected maintenance retain their accepted
+    // SYNCHRONOUS boundaries — never a claim that all persistence is
+    // nonblocking. The 16.667 ms frame budget is the comparison
+    // reference, never an invented guaranteed maximum. Pod
+    // dev-profile evidence only — never the owner's physical rig.
+    println!(
+        "9. PP-B4 orchestration (the worker-backed session — pod results, not physical-rig evidence)"
+    );
+    {
+        let far = PresenceSample {
+            position: (100.0, 0.0),
+            velocity: (0.0, 0.0),
+        };
+        let near_presence = [near];
+        let far_presence = [far];
+
+        // 9a — THE AUTHORITATIVE TICK (the idle worker; warmup
+        // separated from measurement).
+        let dir = campaign_dir("orchestration-tick");
+        let location = found_benchmark_store(&dir, false);
+        let (spine, director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut session =
+            OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
+        for _ in 0..50 {
+            session.tick(&near_presence).unwrap();
+        }
+        let mut tick_samples = Vec::new();
+        for _ in 0..300 {
+            let start = Instant::now();
+            session.tick(&near_presence).unwrap();
+            tick_samples.push(start.elapsed());
+        }
+        report("the authoritative tick (idle worker)", &mut tick_samples);
+
+        // 9b — THE TICK DURING AN EXECUTING (PARKED) OPTIONAL
+        // PUBLICATION: the worker holds the append in its hands; the
+        // authority thread continues — the tick's T1 durability is
+        // journal-side, never through the worker (the responsiveness
+        // proof, deterministically parked through the entry barrier).
+        session
+            .fault_control()
+            .set(WorkerFault::ParkExecutingAppend);
+        let parked_handle = session
+            .submit_publication(session.capture_snapshot().unwrap())
+            .unwrap();
+        while !session.fault_control().park_entered() {
+            std::hint::spin_loop();
+        }
+        let mut parked_tick_samples = Vec::new();
+        for _ in 0..100 {
+            let start = Instant::now();
+            session.tick(&near_presence).unwrap();
+            parked_tick_samples.push(start.elapsed());
+        }
+        session.fault_control().release_park();
+        let _ = session.wait_publication(parked_handle).unwrap();
+        report(
+            "the tick during an executing publication (parked worker)",
+            &mut parked_tick_samples,
+        );
+
+        // 9c — THE SNAPSHOT CAPTURE (the serialization + the observed
+        // head + the frontier scan — read-only, on the authority
+        // thread).
+        let mut capture_samples = Vec::new();
+        for _ in 0..50 {
+            let start = Instant::now();
+            session.capture_snapshot().unwrap();
+            capture_samples.push(start.elapsed());
+        }
+        report("the snapshot capture", &mut capture_samples);
+
+        // 9d — THE OPTIONAL ADMISSION LATENCY + THE SATURATION
+        // BOUNDARY: a state-advancing tick (the fresh content), every
+        // capture BEFORE the first submission (the observe-head FIFO
+        // discipline), submit until the typed Busy, then drain.
+        session.tick(&near_presence).unwrap();
+        let captures: Vec<_> = (0..70)
+            .map(|_| session.capture_snapshot().unwrap())
+            .collect();
+        let mut admission_samples = Vec::new();
+        let mut handles = Vec::new();
+        let mut busy = 0usize;
+        for capture in captures {
+            let start = Instant::now();
+            match session.submit_publication(capture) {
+                Ok(handle) => {
+                    admission_samples.push(start.elapsed());
+                    handles.push(handle);
+                }
+                Err(SubmitRefusal::Busy) => busy += 1,
+                Err(other) => panic!("the admission refusal: {other:?}"),
+            }
+        }
+        for handle in handles {
+            let _ = session.wait_publication(handle).unwrap();
+        }
+        println!(
+            "  the saturation boundary: {} admitted / {busy} Busy (the bounded queue; the depth at the boundary is the admitted count)",
+            admission_samples.len()
+        );
+        report(
+            "the optional admission (the enqueue)",
+            &mut admission_samples,
+        );
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 9e — THE T1 DEACTIVATION TICK + THE REQUIRED CANONICAL
+        // CONFIRMATION: the far-boundary cycle (the deactivation's
+        // journal fsync lands INSIDE the tick; the confirmation is
+        // the worker-backed canonical commit with its readback).
+        let dir = campaign_dir("orchestration-commit");
+        let location = found_benchmark_store(&dir, false);
+        let (spine, director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut session =
+            OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
+        let mut deactivation_tick_samples = Vec::new();
+        let mut commit_samples = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            session.tick(&far_presence).unwrap();
+            deactivation_tick_samples.push(start.elapsed());
+            let start = Instant::now();
+            session.commit_canonical().unwrap();
+            commit_samples.push(start.elapsed());
+            // The reactivation + the accrual (the next cycle's
+            // scratch — the C3-F2-proven cadence).
+            session.tick(&near_presence).unwrap();
+            for _ in 0..100 {
+                session.tick(&near_presence).unwrap();
+            }
+        }
+        report(
+            "the T1 deactivation tick (the journal fsync inside the tick)",
+            &mut deactivation_tick_samples,
+        );
+        report(
+            "the required canonical confirmation (the worker-backed commit)",
+            &mut commit_samples,
+        );
+
+        // 9f — THE MAINTENANCE BARRIER/DRAIN (the full gate under the
+        // real lease — the probe path, no compound).
+        let mut barrier_samples = Vec::new();
+        for _ in 0..10 {
+            let start = Instant::now();
+            session.debug_maintenance_probe_for_test(|_| ()).unwrap();
+            barrier_samples.push(start.elapsed());
+        }
+        report("the maintenance barrier/drain", &mut barrier_samples);
+
+        // 9g — THE GRACEFUL CLOSE on this campaign (the full drain +
+        // the settlement + the final publication + the lifecycle
+        // checkpoint + the join).
+        let start = Instant::now();
+        let close_report = session.close();
+        let close_elapsed = start.elapsed();
+        assert!(close_report.failure.is_none(), "{:?}", close_report.failure);
+        println!(
+            "  the graceful close: {:.3} ms (n=1 — the full close sequence)",
+            close_elapsed.as_secs_f64() * 1e3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 9h — THE ORCHESTRATED MAINTENANCE COMPOUNDS (the worker-
+        // backed equivalents of section 8's crossing-level numbers:
+        // the two-checkpoint + rotation + reclamation campaign, fresh
+        // per sample).
+        let mut checkpoint_samples = Vec::new();
+        let mut rotation_samples = Vec::new();
+        let mut reclamation_samples = Vec::new();
+        for _ in 0..5u64 {
+            let dir = campaign_dir("orchestration-retention");
+            let location = found_benchmark_store(&dir, false);
+            let (spine, director) = scenario_pair(150, &near);
+            let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+            let mut session =
+                OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
+            // The prelude: the deactivation + the confirmation + the
+            // reactivation + the accrual (the orchestrated path's
+            // eligibility requirement — the applied identities must
+            // be confirmed for the compaction).
+            session.tick(&far_presence).unwrap();
+            session.commit_canonical().unwrap();
+            session.tick(&near_presence).unwrap();
+            for _ in 0..100 {
+                session.tick(&near_presence).unwrap();
+            }
+            // RANGE 1 — TWO publications (the section-8 timing loop's
+            // workload shape, for the workload-equivalent comparison;
+            // the prelude's confirmed cycle is the orchestrated
+            // fixture's inherent extra).
+            for _ in 0..2 {
+                session.tick(&near_presence).unwrap();
+                for _ in 0..20 {
+                    session.tick(&near_presence).unwrap();
+                }
+                let handle = session
+                    .submit_publication(session.capture_snapshot().unwrap())
+                    .unwrap();
+                let _ = session.wait_publication(handle).unwrap();
+            }
+            let start = Instant::now();
+            session.publish_checkpoint(10).unwrap();
+            checkpoint_samples.push(start.elapsed());
+            // RANGE 2 — two publications (the prior MK is the range
+            // boundary — the range publications are required).
+            for _ in 0..2 {
+                session.tick(&near_presence).unwrap();
+                for _ in 0..20 {
+                    session.tick(&near_presence).unwrap();
+                }
+                let handle = session
+                    .submit_publication(session.capture_snapshot().unwrap())
+                    .unwrap();
+                let _ = session.wait_publication(handle).unwrap();
+            }
+            session.publish_checkpoint(10).unwrap();
+            // One outstanding journal transaction — the rotation's
+            // survivor set.
+            session.tick(&far_presence).unwrap();
+            let start = Instant::now();
+            session.rotate_journal().unwrap();
+            rotation_samples.push(start.elapsed());
+            let start = Instant::now();
+            session.reclaim_checkpoint(1).unwrap();
+            reclamation_samples.push(start.elapsed());
+            drop(session);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        report(
+            "the orchestrated checkpoint (the lease + compact + SK + MK)",
+            &mut checkpoint_samples,
+        );
+        report(
+            "the orchestrated rotation (the lease + the survivor re-anchor + the flip)",
+            &mut rotation_samples,
+        );
+        report(
+            "the orchestrated reclamation (the lease + the audit + the deletes)",
+            &mut reclamation_samples,
+        );
+
+        // 9i — THE SQLITE PARITY (the tick, the deactivation tick, the
+        // required confirmation, and the close over the Database
+        // provider).
+        let dir = campaign_dir("orchestration-sqlite");
+        let location = found_benchmark_store(&dir, true);
+        let (spine, director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(dir.join("journal.t1")).unwrap();
+        let mut session =
+            OrchestratedSession::open(spine, director, &location, journal, "b5-bench").unwrap();
+        for _ in 0..50 {
+            session.tick(&near_presence).unwrap();
+        }
+        let mut sqlite_ticks = Vec::new();
+        for _ in 0..100 {
+            let start = Instant::now();
+            session.tick(&near_presence).unwrap();
+            sqlite_ticks.push(start.elapsed());
+        }
+        report(
+            "the SQLite authoritative tick (idle worker)",
+            &mut sqlite_ticks,
+        );
+        let start = Instant::now();
+        session.tick(&far_presence).unwrap();
+        let sqlite_deactivation = start.elapsed();
+        let start = Instant::now();
+        session.commit_canonical().unwrap();
+        let sqlite_commit = start.elapsed();
+        println!(
+            "  the SQLite T1 deactivation tick: {:.3} ms; the SQLite required confirmation: {:.3} ms (n=1 each)",
+            sqlite_deactivation.as_secs_f64() * 1e3,
+            sqlite_commit.as_secs_f64() * 1e3
+        );
+        let start = Instant::now();
+        let close_report = session.close();
+        let sqlite_close = start.elapsed();
+        assert!(close_report.failure.is_none(), "{:?}", close_report.failure);
+        println!(
+            "  the SQLite graceful close: {:.3} ms (n=1)",
+            sqlite_close.as_secs_f64() * 1e3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    println!(
+        "  PP-B4 boundaries: the optional publication path is asynchronous for the authority thread (a bounded enqueue; a typed Busy at the boundary); T1 durability and protected maintenance retain their accepted SYNCHRONOUS boundaries — never a claim that all persistence is nonblocking; the 16.667 ms frame budget is the comparison reference, never a guaranteed maximum"
     );
 
     // The storage summary.
