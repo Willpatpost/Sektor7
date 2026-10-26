@@ -488,7 +488,11 @@ try {
 
     # 1. THE EXACT CHECKOUT VERIFICATION — every native command's exit
     #    code is checked IMMEDIATELY, before its result is used (a
-    #    failed diff is NEVER interpreted as an empty diff).
+    #    failed diff is NEVER interpreted as an empty diff). The
+    #    revision diffs use the two-argument form with the explicit
+    #    path separator — NEVER the A..B range token, which the
+    #    physical Windows PowerShell tokenizer splits into separate
+    #    arguments (the observed script regression).
     $reviewed = "cfcf2713b3b4bab87a30d10afaec5e9fbcc7ee6a"  # the reviewed pre-corrective documentation-delivery HEAD
     $verified = "2e20414fe1d33870081f32e8676cca126434f5e7"  # the CI-verified source/test commit (the contention corrective; run 40402249372)
     Write-Output "reviewed documentation-delivery HEAD: $reviewed"
@@ -514,7 +518,7 @@ try {
     # reviewed state and the tip.
     git merge-base --is-ancestor $reviewed HEAD
     Assert-Step "the reviewed pre-corrective HEAD is an ancestor"
-    $since = @(git diff --name-only $reviewed..HEAD)
+    $since = @(git diff --name-only $reviewed HEAD --)
     if ($LASTEXITCODE -ne 0) { throw "git diff (reviewed..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
     $authorized = @(
         "engine/crates/engine-persist/src/sqlite.rs",
@@ -530,7 +534,7 @@ try {
     # after it documentation-only (only this record file).
     git merge-base --is-ancestor $verified HEAD
     Assert-Step "the CI-verified commit is an ancestor"
-    $delta = @(git diff --name-only $verified..HEAD)
+    $delta = @(git diff --name-only $verified HEAD --)
     if ($LASTEXITCODE -ne 0) { throw "git diff (verified..HEAD) failed (exit $LASTEXITCODE) — never interpreted as an empty diff" }
     if ($delta.Count -eq 0) {
         Write-Output "HEAD is the CI-verified commit itself: $head"
