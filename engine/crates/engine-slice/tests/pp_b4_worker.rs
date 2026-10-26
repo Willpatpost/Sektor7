@@ -658,3 +658,87 @@ fn the_crossing_composes_over_the_worker_source_and_poisons_closed() {
     drop(recovered);
     worker.join().unwrap();
 }
+
+/// C2-F2 — explicit poisoning prevents new canonical submissions: an
+/// EXISTING proxy handle refuses the typed admission error (never the
+/// uncertain Unknown class — nothing was admitted), the canonical HEAD
+/// is unchanged, a proxy acquired AFTER the poison is equally refused,
+/// and the poisoned worker still drains and joins cleanly (no restart,
+/// no reauthorization).
+#[test]
+fn explicit_poison_prevents_new_canonical_submissions() {
+    let dir = TestDir::new("poison");
+    let worker = found_worker(&dir.store(), false);
+    let source = worker.source().unwrap();
+    let mut medium = source.open_medium().unwrap();
+    let (founding, epoch) = founding_head(&found_location(&dir.store(), false));
+    let object = sequence_object(21);
+    let record = RevisionRecord::regular(founding, epoch, 121)
+        .with_idempotency_key(b"pp-b4-poison-21".to_vec())
+        .with_content_refs(vec![object.hash()]);
+    // POISON — the terminal admission contract.
+    worker.poison();
+    // The EXISTING proxy refuses: the definite admission error.
+    let result = medium.append(&record, std::slice::from_ref(&object), Some(founding));
+    assert!(matches!(result, Err(MediumError::WorkerUnavailable { .. })));
+    // The canonical HEAD is unchanged.
+    assert_eq!(
+        founding_head(&found_location(&dir.store(), false)).0,
+        founding
+    );
+    // A proxy acquired AFTER the poison is equally refused.
+    let mut medium2 = source.open_medium().unwrap();
+    assert!(matches!(
+        medium2.head(),
+        Err(MediumError::WorkerUnavailable { .. })
+    ));
+    // The poisoned worker still drains and joins cleanly (poisoned, not
+    // dead — the crossing-level guard remains the additional protection).
+    drop(medium);
+    drop(medium2);
+    drop(source);
+    worker.join().unwrap();
+}
+
+/// C2-F2's queued/in-flight boundary: work admitted BEFORE the poison
+/// but not yet started is refused at the execution boundary with the
+/// DEFINITE typed error (the refusal is deterministic — the append
+/// never ran; never falsely classified as the uncertain Unknown class),
+/// and the worker continues to drain and join.
+#[test]
+fn work_admitted_before_poison_gets_an_honest_refusal() {
+    let dir = TestDir::new("poison-boundary");
+    let worker = found_worker(&dir.store(), false);
+    let source = worker.source().unwrap();
+    let mut medium = source.open_medium().unwrap();
+    let (founding, epoch) = founding_head(&found_location(&dir.store(), false));
+    // Stall the worker so the append is admitted (in the queue or in the
+    // loop's hands, pre-execution) but not started. The stall outlives the
+    // 200ms setup window below; clearing the fault cannot interrupt the
+    // already-entered sleep, so the poison lands mid-stall and the
+    // boundary refusal fires when the sleep ends.
+    worker
+        .fault_control()
+        .set(WorkerFault::StallEach { ms: 2_000 });
+    let object = sequence_object(22);
+    let record = RevisionRecord::regular(founding, epoch, 122)
+        .with_idempotency_key(b"pp-b4-poison-22".to_vec())
+        .with_content_refs(vec![object.hash()]);
+    let append_call = std::thread::spawn(move || {
+        medium.append(&record, std::slice::from_ref(&object), Some(founding))
+    });
+    // Let the worker take the job and enter the stall, then poison and
+    // release: the execution-boundary check refuses the admitted job.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    worker.poison();
+    worker.fault_control().clear();
+    let result = append_call.join().unwrap();
+    assert!(matches!(result, Err(MediumError::WorkerUnavailable { .. })));
+    // The append never ran: the HEAD unchanged.
+    assert_eq!(
+        founding_head(&found_location(&dir.store(), false)).0,
+        founding
+    );
+    drop(source);
+    worker.join().unwrap();
+}

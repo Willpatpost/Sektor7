@@ -47,6 +47,16 @@ impl TestDir {
     fn journal(&self) -> PathBuf {
         self.0.join("journal.t1")
     }
+
+    /// A per-view journal path (the C2-F1 two-view fixture: independent
+    /// journals over the one store).
+    fn journal_at(&self, suffix: &str) -> PathBuf {
+        self.0.join(format!("journal-{suffix}.t1"))
+    }
+
+    fn db(&self) -> PathBuf {
+        self.0.join("campaign.db")
+    }
 }
 
 impl Drop for TestDir {
@@ -81,8 +91,7 @@ fn envelope(region: u32, episode: u64, npc: u32, delta: u64, tick: u64) -> Conse
 /// The campaign location, FOUNDED pre-worker (the discipline: the
 /// founding is the pre-worker session-open act) — one direct provider
 /// handle, dropped before the worker spawns.
-fn found_location(dir: &TestDir) -> StoreLocation {
-    let location = StoreLocation::Directory(dir.store());
+fn found_at(location: StoreLocation) -> StoreLocation {
     let mut store = SessionStore::open(&location).unwrap();
     if store.head().unwrap().is_none() {
         store
@@ -94,6 +103,14 @@ fn found_location(dir: &TestDir) -> StoreLocation {
             .unwrap();
     }
     location
+}
+
+fn found_location(dir: &TestDir) -> StoreLocation {
+    found_at(StoreLocation::Directory(dir.store()))
+}
+
+fn found_db_location(dir: &TestDir) -> StoreLocation {
+    found_at(StoreLocation::Database(dir.db()))
 }
 
 /// The worker over the founded location.
@@ -110,6 +127,18 @@ fn open_pipeline(
     worker: &IoWorker,
 ) -> CommitPipeline<engine_slice::worker::WorkerMedium> {
     let journal = T1Journal::open(dir.journal()).unwrap();
+    let medium = worker.source().unwrap().open_medium().unwrap();
+    CommitPipeline::open(medium, journal).unwrap()
+}
+
+/// The C2-F1 two-view fixture's pipeline: an independent journal per
+/// view over the one store.
+fn open_pipeline_at(
+    dir: &TestDir,
+    worker: &IoWorker,
+    suffix: &str,
+) -> CommitPipeline<engine_slice::worker::WorkerMedium> {
+    let journal = T1Journal::open(dir.journal_at(suffix)).unwrap();
     let medium = worker.source().unwrap().open_medium().unwrap();
     CommitPipeline::open(medium, journal).unwrap()
 }
@@ -151,12 +180,16 @@ fn oracle_head(dir: &TestDir) -> (Hash, u64) {
     (head, epoch)
 }
 
-fn oracle_records(dir: &TestDir) -> u64 {
-    SessionStore::open(&found_location(dir))
+fn oracle_records_at(location: &StoreLocation) -> u64 {
+    SessionStore::open(location)
         .unwrap()
         .validate()
         .unwrap()
         .records
+}
+
+fn oracle_records(dir: &TestDir) -> u64 {
+    oracle_records_at(&found_location(dir))
 }
 
 /// One foreign revision on the current head (the competing-writer
@@ -603,5 +636,123 @@ fn the_reconcile_forwarding_matches_the_accepted_classification() {
         Reconciliation::NotInstalled { .. }
     ));
     drop(medium);
+    worker.join().unwrap();
+}
+
+// ------------------------------------------- the C2-F1 corrective regressions
+
+/// C2-F1 (worker-backed, file medium): a verified foreign confirmation
+/// clears the pending slot — two independent pipeline views over the one
+/// store, each with its OWN journal, hold the SAME attempted
+/// consequential claim (byte-identical envelopes → the same
+/// content-derived TransactionId — exactly equivalent provenance); the
+/// first confirms, advancing HEAD; the second's append is CAS-rejected,
+/// its walk finds every attempted key already confirmed with the exact
+/// provenance, the foreign receipt verifies — Confirmed WITH the slot
+/// cleared, and the next commit_canonical/reconcile_pending are both
+/// NothingPending (never AttemptUnresolved). Exactly ONE canonical
+/// confirmation of the identity exists.
+#[test]
+fn foreign_confirmation_clears_the_pending_slot_worker_file() {
+    let dir = TestDir::new("c2f1-worker-file");
+    let worker = found_worker(&dir);
+    // Both views open while HEAD is the founding — the second's append
+    // will meet the advanced head.
+    let mut pipeline_a = open_pipeline_at(&dir, &worker, "a");
+    stage_and_capture(&mut pipeline_a, 400);
+    let mut pipeline_b = open_pipeline_at(&dir, &worker, "b");
+    stage_and_capture(&mut pipeline_b, 400);
+    // The first view confirms.
+    assert!(matches!(
+        pipeline_a.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // The second: the stale parent → the walk → every attempted key
+    // confirmed with the exact provenance → the foreign receipt.
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // THE FIX'S PROOF: the slot cleared — NothingPending, never
+    // AttemptUnresolved.
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+    assert!(matches!(
+        pipeline_b.reconcile_pending().unwrap(),
+        ReconcileOutcome::NothingPending
+    ));
+    // Exactly ONE canonical confirmation: the founding + the first view's
+    // batch — the second view published nothing.
+    assert_eq!(oracle_records(&dir), 2);
+    drop(pipeline_a);
+    drop(pipeline_b);
+    worker.join().unwrap();
+}
+
+/// C2-F1 (legacy synchronous, file medium): the same two-view scenario
+/// over direct `SessionStore` handles — the per-operation locking
+/// serializes the competing appends.
+#[test]
+fn foreign_confirmation_clears_the_pending_slot_legacy_file() {
+    let dir = TestDir::new("c2f1-legacy-file");
+    let location = found_location(&dir);
+    let store_a = SessionStore::open(&location).unwrap();
+    let store_b = SessionStore::open(&location).unwrap();
+    let mut pipeline_a =
+        CommitPipeline::open(store_a, T1Journal::open(dir.journal_at("a")).unwrap()).unwrap();
+    stage_and_capture_legacy(&mut pipeline_a, 400);
+    let mut pipeline_b =
+        CommitPipeline::open(store_b, T1Journal::open(dir.journal_at("b")).unwrap()).unwrap();
+    stage_and_capture_legacy(&mut pipeline_b, 400);
+    assert!(matches!(
+        pipeline_a.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+    assert!(matches!(
+        pipeline_b.reconcile_pending().unwrap(),
+        ReconcileOutcome::NothingPending
+    ));
+    assert_eq!(oracle_records(&dir), 2);
+}
+
+/// C2-F1 (worker-backed, SQLite): the same two-view scenario over the
+/// database provider.
+#[test]
+fn foreign_confirmation_clears_the_pending_slot_worker_sqlite() {
+    let dir = TestDir::new("c2f1-worker-sqlite");
+    let worker = IoWorker::spawn(&found_db_location(&dir)).unwrap();
+    let mut pipeline_a = open_pipeline_at(&dir, &worker, "a");
+    stage_and_capture(&mut pipeline_a, 400);
+    let mut pipeline_b = open_pipeline_at(&dir, &worker, "b");
+    stage_and_capture(&mut pipeline_b, 400);
+    assert!(matches!(
+        pipeline_a.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(matches!(
+        pipeline_b.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+    assert!(matches!(
+        pipeline_b.reconcile_pending().unwrap(),
+        ReconcileOutcome::NothingPending
+    ));
+    assert_eq!(oracle_records_at(&found_db_location(&dir)), 2);
+    drop(pipeline_a);
+    drop(pipeline_b);
     worker.join().unwrap();
 }

@@ -219,7 +219,7 @@ fn worker_loop(
     health: Health,
     fault: WorkerFaultControl,
 ) {
-    let _guard = DeathGuard(health);
+    let _guard = DeathGuard(health.clone());
     for job in rx {
         match fault.current() {
             WorkerFault::None
@@ -232,6 +232,20 @@ fn worker_loop(
             }
             WorkerFault::ExitBeforeNextJob => std::process::exit(14),
             WorkerFault::StallEach { ms } => thread::sleep(Duration::from_millis(ms)),
+        }
+        // THE POISON EXECUTION BOUNDARY (C2-F2): a job admitted before the
+        // poison but not yet started is refused HERE with the DEFINITE typed
+        // error (the refusal is deterministic — the job never ran, never the
+        // uncertain Unknown class), while a job that already began executing
+        // completes normally. The poisoned worker keeps draining — refuse
+        // and reply — so stop/join remain clean.
+        if !health.alive() {
+            let _ = job.reply.send(Err(MediumError::WorkerUnavailable {
+                detail:
+                    "the I/O worker is poisoned — the job was refused at the execution boundary"
+                        .to_owned(),
+            }));
+            continue;
         }
         if let MediumOp::Append { .. } = job.op {
             match fault.current() {
@@ -310,14 +324,28 @@ fn job_kind(op: &MediumOp) -> Option<JobKind> {
 /// the campaign's single queue; the handle is a channel sender, NEVER
 /// a provider connection. The cached [`SyncTier`] was read from the
 /// actual provider at spawn and is reported synchronously, truthfully,
-/// with no worker round trip.
+/// with no worker round trip. The shared health cell enforces the
+/// terminal-poison admission contract (C2-F2): a poisoned or exited
+/// worker refuses every NEW operation at the handle itself — EXISTING
+/// proxy handles included, not only newly created ones.
 pub struct WorkerMedium {
     tx: SyncSender<Job>,
     tier: SyncTier,
+    health: Health,
 }
 
 impl WorkerMedium {
     fn request(&mut self, op: MediumOp) -> Result<WorkerReply, MediumError> {
+        // THE TERMINAL-POISON ADMISSION CONTRACT (C2-F2): a poisoned (or
+        // exited) worker refuses every NEW operation at the handle itself —
+        // existing proxy handles included. Nothing is admitted, so this is
+        // a definite non-event, never the uncertain Unknown class.
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
         let (reply, slot) = completion_slot();
         if self.tx.send(Job { op, reply }).is_err() {
             return Err(MediumError::WorkerUnavailable {
@@ -345,6 +373,15 @@ impl CanonicalMedium for WorkerMedium {
         objects: &[StoredObject],
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
+        // The same terminal-poison admission gate (C2-F2): a definite
+        // refusal BEFORE anything is admitted — the job never started, so
+        // this is never the uncertain Unknown class.
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
         let op = MediumOp::Append {
             record: record.clone(),
             objects: objects.to_vec(),
@@ -459,6 +496,7 @@ impl MediumSource for WorkerSource {
         Ok(WorkerMedium {
             tx: self.tx.clone(),
             tier: self.tier,
+            health: self.health.clone(),
         })
     }
 

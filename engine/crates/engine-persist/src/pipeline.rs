@@ -1083,7 +1083,17 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 let attempted: Vec<ConsequenceId> = keys.keys().copied().collect();
                 let remaining = self.remaining_keys(keys)?;
                 if remaining.is_empty() {
-                    return Ok(CommitOutcome::Confirmed(self.foreign_receipt(attempted)?));
+                    // Every attempted key is now chain-confirmed (another
+                    // writer's batch) — confirmed without our revision. The
+                    // exact foreign provenance verifies FIRST; the pending
+                    // slot clears only after the receipt succeeds (C2-F1: a
+                    // verified foreign confirmation must clear the retained
+                    // candidate — never leave the caller's next
+                    // commit_canonical refusing AttemptUnresolved; a
+                    // fallible verification failure preserves it).
+                    let receipt = self.foreign_receipt(attempted)?;
+                    self.pending = None;
+                    return Ok(CommitOutcome::Confirmed(receipt));
                 }
                 let observed_parent = observed
                     .or(self.verified_head)
