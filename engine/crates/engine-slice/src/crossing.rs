@@ -541,6 +541,15 @@ pub struct SessionCrossing<S: MediumSource = StoreLocation> {
     /// re-established (the repair method) or a verified recovery
     /// repairs it.
     journal_authority: JournalAuthority,
+    /// The capture-validity generation (PP-B4 checkpoint 3, the F1
+    /// preflight): the journal-pointer flip count. Incremented ONLY by
+    /// a successful pointer flip (the rotation mechanism's Ok) —
+    /// BEFORE the R5 durability gate, so a flip followed by an
+    /// unresolved durability or a failed rebuild still invalidates
+    /// every earlier capture (the R5 repair never un-flips the
+    /// pointer). Private mutation; the read-only accessor is
+    /// [`Self::journal_flip_count`].
+    journal_flips: u64,
 }
 
 /// The crossing's journal-authority state (the review correctives
@@ -668,6 +677,7 @@ impl<S: MediumSource> SessionCrossing<S> {
             source: source.clone(),
             journal_root,
             journal_authority: JournalAuthority::Healthy,
+            journal_flips: 0,
         })
     }
 
@@ -716,6 +726,32 @@ impl<S: MediumSource> SessionCrossing<S> {
             });
         }
         Ok(())
+    }
+
+    /// The journal-pointer flip count — the capture-validity
+    /// generation (PP-B4 checkpoint 3): read-only, the mutation
+    /// authority is the rotation's own (private). A snapshot capture
+    /// recording this value is admissible only while the crossing
+    /// still reports the same value.
+    pub fn journal_flip_count(&self) -> u64 {
+        self.journal_flips
+    }
+
+    /// Sets the campaign journal ROOT (crate-trusted — the
+    /// orchestrated session's recovery path re-derives the crossing
+    /// over the pointer-resolved ACTIVE journal, then restores the
+    /// root so future rotations publish the pointer at the one
+    /// authoritative location).
+    pub(crate) fn set_journal_root(&mut self, root: PathBuf) {
+        self.journal_root = root;
+    }
+
+    /// The composed authority gate, exposed for the orchestrated
+    /// session (PP-B4 checkpoint 3): the R4/R5 journal-authority
+    /// states AND the worker-health admission — exactly the check
+    /// every authoritative crossing operation performs.
+    pub fn assert_authoritative(&self) -> Result<(), TransitionError> {
+        self.assert_journal_authority()
     }
 
     /// The graceful lifecycle boundary (PP-B1): the ratified `TRUNCATE`
@@ -1325,6 +1361,15 @@ impl<S: MediumSource> SessionCrossing<S> {
         let root = self.journal_root.clone();
         let rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
             .map_err(PipelineError::Journal)?;
+        // THE CAPTURE-VALIDITY GENERATION (PP-B4 checkpoint 3, the F1
+        // preflight): the mechanism returned Ok — the pointer FLIPPED —
+        // so every snapshot capture taken before this instant is
+        // invalidated, EVEN IF the durability is unresolved or the
+        // rebuild fails (the R5 repair never un-flips the pointer; a
+        // pre-flip capture must never become admissible again). A
+        // pre-flip mechanism failure leaves the counter untouched (the
+        // pointer never moved; earlier captures remain valid).
+        self.journal_flips += 1;
         // THE DURABILITY GATE (the review corrective R5): the
         // pointer flip succeeded (the live authority IS the new
         // journal), but an UNRESOLVED durability is never a durably

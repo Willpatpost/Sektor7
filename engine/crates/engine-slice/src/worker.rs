@@ -28,9 +28,9 @@
 //! The queue capacity is a PROVISIONAL engineering default (64), not a
 //! ratified performance target.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, RecvError, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, RecvError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -88,6 +88,10 @@ pub enum WorkerReply {
     Reclaim(u64),
     ReclaimPending(bool),
     Checkpoint,
+    /// A queued job was canceled before it started (the optional-
+    /// publication token, PP-B4 checkpoint 3) — a definite non-event:
+    /// nothing was executed.
+    Canceled,
 }
 
 /// One queued job with its private bounded completion slot: exactly
@@ -96,6 +100,11 @@ pub enum WorkerReply {
 /// the worker ignores.
 struct Job {
     op: MediumOp,
+    /// The optional-publication cancellation token (PP-B4 checkpoint 3):
+    /// checked ONCE before execution — a canceled queued job is skipped
+    /// (a definite non-event); a job already executing runs to its
+    /// completion boundary regardless.
+    cancel: Option<Arc<AtomicBool>>,
     reply: SyncSender<Result<WorkerReply, MediumError>>,
 }
 
@@ -154,29 +163,82 @@ pub enum WorkerFault {
     /// The process hard-exits (exit 14) before executing the next job
     /// — the real-child definite never-started arm.
     ExitBeforeNextJob,
+    /// Park the worker BEFORE executing the next job until
+    /// `release_park` — the deterministic synchronization barrier (the
+    /// timed stall's replacement).
+    ParkNext,
+    /// Park INSIDE the append path, AFTER the poison and cancellation
+    /// boundaries — the job is already executing (the
+    /// poison-during-executing-append case).
+    ParkExecutingAppend,
 }
 
-/// The shared per-instance fault setter/getter.
+/// The shared per-instance fault setter/getter, plus the one-shot park
+/// latch the park faults wait on.
 #[doc(hidden)]
 #[derive(Clone, Default)]
-pub struct WorkerFaultControl(Arc<Mutex<WorkerFault>>);
+pub struct WorkerFaultControl {
+    fault: Arc<Mutex<WorkerFault>>,
+    park: Arc<ParkLatch>,
+}
+
+/// The park latch (the deterministic synchronization barrier): parks
+/// until released — one-shot (each test uses a fresh control; the
+/// release is never re-armed).
+#[doc(hidden)]
+#[derive(Default)]
+struct ParkLatch {
+    released: Mutex<bool>,
+    notified: Condvar,
+}
 
 impl WorkerFaultControl {
     pub fn new() -> Self {
-        WorkerFaultControl(Arc::new(Mutex::new(WorkerFault::None)))
+        Self::default()
     }
 
     pub fn set(&self, fault: WorkerFault) {
-        *self.0.lock().expect("the worker fault lock") = fault;
+        *self.fault.lock().expect("the worker fault lock") = fault;
     }
 
     pub fn clear(&self) {
-        *self.0.lock().expect("the worker fault lock") = WorkerFault::None;
+        *self.fault.lock().expect("the worker fault lock") = WorkerFault::None;
+    }
+
+    /// Releases the park latch — the barrier's open signal (every
+    /// parked worker wakes).
+    pub fn release_park(&self) {
+        let mut released = self.park.released.lock().expect("the worker park latch");
+        *released = true;
+        self.park.notified.notify_all();
     }
 
     fn current(&self) -> WorkerFault {
-        self.0.lock().expect("the worker fault lock").clone()
+        self.fault.lock().expect("the worker fault lock").clone()
     }
+
+    fn park_until_released(&self) {
+        let mut released = self.park.released.lock().expect("the worker park latch");
+        while !*released {
+            released = self
+                .park
+                .notified
+                .wait(released)
+                .expect("the worker park latch");
+        }
+    }
+}
+
+/// The typed nonblocking-admission refusal for an optional operation
+/// (PP-B4 checkpoint 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySubmitError {
+    /// The bounded queue is at capacity — nothing was admitted (no
+    /// append); retry or regenerate at the next boundary.
+    QueueFull,
+    /// The worker is unavailable (poisoned or exited) — nothing was
+    /// admitted.
+    Unavailable,
 }
 
 // ------------------------------------------------------------- the health
@@ -232,6 +294,8 @@ fn worker_loop(
             }
             WorkerFault::ExitBeforeNextJob => std::process::exit(14),
             WorkerFault::StallEach { ms } => thread::sleep(Duration::from_millis(ms)),
+            WorkerFault::ParkNext => fault.park_until_released(),
+            WorkerFault::ParkExecutingAppend => {}
         }
         // THE POISON EXECUTION BOUNDARY (C2-F2): a job admitted before the
         // poison but not yet started is refused HERE with the DEFINITE typed
@@ -245,6 +309,17 @@ fn worker_loop(
                     "the I/O worker is poisoned — the job was refused at the execution boundary"
                         .to_owned(),
             }));
+            continue;
+        }
+        // THE CANCELLATION BOUNDARY (PP-B4 checkpoint 3): a queued
+        // publication canceled before start is skipped — a DEFINITE
+        // non-event (no append); a job already past this point runs to
+        // its completion boundary regardless (a possibly committed
+        // outcome is never erased).
+        if let Some(cancel) = job.cancel.as_ref()
+            && cancel.load(Ordering::Relaxed)
+        {
+            let _ = job.reply.send(Ok(WorkerReply::Canceled));
             continue;
         }
         if let MediumOp::Append { .. } = job.op {
@@ -270,6 +345,9 @@ fn worker_loop(
                     let _ = execute(&mut store, job.op);
                     std::process::exit(13);
                 }
+                // Park INSIDE the executing append — past the poison and
+                // cancellation boundaries (the job has started).
+                WorkerFault::ParkExecutingAppend => fault.park_until_released(),
                 _ => {}
             }
         }
@@ -347,7 +425,15 @@ impl WorkerMedium {
             });
         }
         let (reply, slot) = completion_slot();
-        if self.tx.send(Job { op, reply }).is_err() {
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
             return Err(MediumError::WorkerUnavailable {
                 detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
             });
@@ -388,7 +474,15 @@ impl CanonicalMedium for WorkerMedium {
             expected_parent,
         };
         let (reply, slot) = completion_slot();
-        if self.tx.send(Job { op, reply }).is_err() {
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
             // Admission failed: the queue's receiver is gone — THIS job
             // never started (definite for it; the session is dead).
             return Err(MediumError::WorkerUnavailable {
@@ -627,14 +721,44 @@ impl IoWorker {
     ) -> Result<Receiver<Result<WorkerReply, MediumError>>, MediumError> {
         let (reply, slot) = completion_slot();
         match &self.tx {
-            Some(tx) => tx.send(Job { op, reply }).map(|()| slot).map_err(|_| {
-                MediumError::WorkerUnavailable {
+            Some(tx) => tx
+                .send(Job {
+                    op,
+                    cancel: None,
+                    reply,
+                })
+                .map(|()| slot)
+                .map_err(|_| MediumError::WorkerUnavailable {
                     detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
-                }
-            }),
+                }),
             None => Err(MediumError::WorkerUnavailable {
                 detail: "the I/O worker is stopped".to_owned(),
             }),
+        }
+    }
+
+    /// The OPTIONAL-operation admission (PP-B4 checkpoint 3): a
+    /// health-checked NONBLOCKING try-send — a full or unavailable
+    /// queue returns the typed refusal WITHOUT any canonical action
+    /// (nothing was admitted, nothing appended). The cancellation
+    /// token is checked once by the worker before execution starts.
+    pub fn try_submit(
+        &self,
+        op: MediumOp,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Receiver<Result<WorkerReply, MediumError>>, TrySubmitError> {
+        if !self.healthy() {
+            return Err(TrySubmitError::Unavailable);
+        }
+        let (reply, slot) = completion_slot();
+        let job = Job { op, cancel, reply };
+        match &self.tx {
+            Some(tx) => match tx.try_send(job) {
+                Ok(()) => Ok(slot),
+                Err(TrySendError::Full(_)) => Err(TrySubmitError::QueueFull),
+                Err(TrySendError::Disconnected(_)) => Err(TrySubmitError::Unavailable),
+            },
+            None => Err(TrySubmitError::Unavailable),
         }
     }
 

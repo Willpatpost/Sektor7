@@ -1,0 +1,855 @@
+//! PP-B4 checkpoint 3 — the orchestrated session's acceptance suite
+//! (the GO's fifteen regressions plus the flip-count generation): the
+//! presence-driven authoritative tick with its exclusive transition
+//! routing, the separate schedule_event, the capture/submit
+//! publication discipline (stale-never-rebased, Busy, cancellation,
+//! the honest unknowns), the worker-death gate without completion
+//! polling, both providers, the completion accounting, and the
+//! legacy-path preservation.
+
+use std::path::PathBuf;
+
+use engine_core::{
+    EventClass, EventId, EventSpec, LodLevel, PresenceSample, Schedule, Spine, Tick,
+};
+use engine_persist::{
+    AuthorityMode, CanonicalMedium, CommitOutcome, FaultAction, JournalFaultControl,
+    JournalFaultPoint, RevisionRecord, SyncTier, T1Journal,
+};
+use engine_slice::crossing::{SessionCrossing, TransitionError};
+use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+use engine_slice::orchestration::{OrchestratedSession, PublicationOutcome, SubmitRefusal};
+use engine_slice::region::{RegionConfig, RegionDirector};
+use engine_slice::store::{SessionStore, StoreLocation};
+use engine_slice::worker::{IoWorker, WorkerFault};
+
+// ------------------------------------------------------------- fixtures
+
+/// A temporary campaign directory (the established suite pattern).
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "s7-pp-b4-orchestrated-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(path)
+    }
+
+    fn store(&self) -> PathBuf {
+        self.0.join("store")
+    }
+
+    fn journal(&self) -> PathBuf {
+        self.0.join("journal.t1")
+    }
+
+    fn db(&self) -> PathBuf {
+        self.0.join("campaign.db")
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The campaign location, FOUNDED pre-worker (the discipline).
+fn found_location(dir: &TestDir, database: bool) -> StoreLocation {
+    let location = if database {
+        StoreLocation::Database(dir.db())
+    } else {
+        StoreLocation::Directory(dir.store())
+    };
+    let mut store = SessionStore::open(&location).unwrap();
+    if store.head().unwrap().is_none() {
+        store
+            .append(
+                &RevisionRecord::founding(AuthorityMode::Standalone, "pp-b4-orch", 0),
+                &[],
+                None,
+            )
+            .unwrap();
+    }
+    location
+}
+
+fn near_region_4() -> PresenceSample {
+    PresenceSample {
+        position: (-100.0, 0.0),
+        velocity: (0.0, 0.0),
+    }
+}
+
+fn far_from_region_4() -> PresenceSample {
+    PresenceSample {
+        position: (100.0, 0.0),
+        velocity: (0.0, 0.0),
+    }
+}
+
+/// The single-sample presence slices the orchestrated tick takes.
+fn far_presence() -> [PresenceSample; 1] {
+    [far_from_region_4()]
+}
+
+fn near_presence() -> [PresenceSample; 1] {
+    [near_region_4()]
+}
+
+/// The B2 fixture: 150 ticks under the near presence — region 4 live
+/// and accruing, the far regions dormant since tick 0.
+fn scenario_pair(ticks: u64, presence: &PresenceSample) -> (Spine<NpcWorld>, RegionDirector) {
+    let config = NpcConfig {
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let mut spine = Spine::with_reservation(NpcWorld::new(config.clone()), 200, 60);
+    install_initial_schedules(&mut spine, &config);
+    let mut director = RegionDirector::new(RegionConfig::default()).unwrap();
+    for _ in 0..ticks {
+        director.apply(&mut spine, std::slice::from_ref(presence));
+        spine.run_tick();
+    }
+    (spine, director)
+}
+
+fn orchestrated_at(dir: &TestDir, database: bool) -> OrchestratedSession {
+    let location = found_location(dir, database);
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    OrchestratedSession::open(spine, director, &location, journal, "pp-b4-orch").unwrap()
+}
+
+fn orchestrated(dir: &TestDir) -> OrchestratedSession {
+    orchestrated_at(dir, false)
+}
+
+fn oracle_head_at(location: &StoreLocation) -> engine_persist::Hash {
+    SessionStore::open(location)
+        .unwrap()
+        .head()
+        .unwrap()
+        .unwrap()
+}
+
+fn oracle_records_at(location: &StoreLocation) -> u64 {
+    SessionStore::open(location)
+        .unwrap()
+        .validate()
+        .unwrap()
+        .records
+}
+
+fn is_worker_refusal(error: &TransitionError) -> bool {
+    matches!(
+        error,
+        TransitionError::InstallIncompatible { detail, .. } if *detail == "worker/unavailable"
+    )
+}
+
+// ------------------------------------------------------- the tick regressions
+
+/// 1 — the healthy orchestrated tick matches the accepted
+/// durable-crossing behavior: the far boundary deactivates region 4
+/// (T1 journaled BEFORE the install), the confirmation lands, the
+/// near boundary reactivates, and the recovery is coherent.
+#[test]
+fn the_healthy_tick_matches_the_durable_crossing_behavior() {
+    let dir = TestDir::new("tick-healthy");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // The far boundary: region 4's live-to-dormant transition.
+    let report = session.tick(&far_presence()).unwrap();
+    // The far boundary transitions both sides (the fixture's far
+    // presence sits at region 0's center, so the far side activates
+    // while the near side deactivates) — region 4 is the
+    // capture-bearing deactivation under test.
+    assert!(report.regions_transitioned.contains(&4));
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    // The T1 evidence exists (the journaling preceded the install).
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(scan.committed.len(), 1);
+    // The confirmation lands through the single worker.
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // The near boundary: the durable reactivation.
+    session.tick(&near_presence()).unwrap();
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    // Publish the reactivated state — the recovery anchor (the
+    // activation itself journals nothing by the accepted design, so
+    // the recovery restores the last PUBLISHED state).
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // The recovery is coherent.
+    drop(session);
+    let mut recovered =
+        OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-orch").unwrap();
+    assert_ne!(recovered.region_level(4), LodLevel::Dormant);
+    recovered.tick(&far_presence()).unwrap();
+    assert_eq!(recovered.region_level(4), LodLevel::Dormant);
+}
+
+/// 2 — the deactivation persists T1 BEFORE the simulation discards:
+/// the journal carries the region-4 transaction (with the plan), the
+/// region is dormant, and the store's chain still validates.
+#[test]
+fn deactivation_persists_t1_before_the_simulation_discards() {
+    let dir = TestDir::new("t1-before-discard");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    session.tick(&far_presence()).unwrap();
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(scan.committed.len(), 1);
+    assert!(!scan.committed[0].plan.is_empty(), "the plan is journaled");
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    assert!(oracle_records_at(&location) >= 1);
+}
+
+/// 3 — a required journal failure prevents the authoritative clock
+/// from advancing: the pre-window fault refuses the deactivation's
+/// journal append, the tick aborts BEFORE run_tick, the region stays
+/// live, and a fresh recovery retries coherently.
+#[test]
+fn a_journal_failure_prevents_the_clock_advance() {
+    let dir = TestDir::new("journal-failure");
+    let location = found_location(&dir, false);
+    let control =
+        JournalFaultControl::new().arm(JournalFaultPoint::BeforeCaptures, FaultAction::InjectError);
+    let journal = T1Journal::open_with(dir.journal(), Some(control)).unwrap();
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "pp-b4-orch").unwrap();
+    // A snapshot first (the recovery's anchor).
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    let clock_before = session.clock();
+    // The far boundary: the journal append refuses; the tick aborts.
+    let refusal = session.tick(&far_presence());
+    assert!(refusal.is_err());
+    assert_eq!(session.clock(), clock_before, "the clock did not advance");
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    // Nothing was journaled (the pre-window fault writes nothing).
+    assert_eq!(
+        T1Journal::scan_file(dir.journal()).unwrap().committed.len(),
+        0
+    );
+    // The coherent retry: a fresh recovery (its own fault-free journal).
+    drop(session);
+    let mut recovered =
+        OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-orch").unwrap();
+    recovered.tick(&far_presence()).unwrap();
+    assert_eq!(recovered.region_level(4), LodLevel::Dormant);
+}
+
+/// 4 — partial completion preserves already-durable transitions and
+/// permits coherent retry: the far boundary's deactivation is durable
+/// and confirmed, the near boundary's reactivation completes, then a
+/// poisoned worker refuses the next far tick (the clock unadvanced,
+/// the durable work preserved) and the fresh recovery retries to
+/// completion.
+#[test]
+fn partial_completion_preserves_durable_transitions_and_permits_coherent_retry() {
+    let dir = TestDir::new("partial-completion");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // The durable work: the deactivation + the confirmation + a
+    // published snapshot (the recovery anchor).
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // A second completed transition: the reactivation.
+    session.tick(&near_presence()).unwrap();
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    // Publish the reactivated state — the recovery anchor (the
+    // activation journals nothing by the accepted design, so the
+    // recovery restores the last PUBLISHED state; without this
+    // publication the recovery correctly returns region 4 to the
+    // pre-reactivation snapshot).
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    let clock_before = session.clock();
+    // The failing tick: the poisoned worker refuses at the gate —
+    // BEFORE any progression; the clock and the durable state stand.
+    session.poison();
+    let refusal = session.tick(&far_presence());
+    assert!(refusal.is_err());
+    assert_eq!(session.clock(), clock_before);
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    // The durable T1 evidence is preserved on the journal.
+    assert_eq!(
+        T1Journal::scan_file(dir.journal()).unwrap().committed.len(),
+        1
+    );
+    // The coherent retry: the fresh recovery completes the transition.
+    drop(session);
+    let mut recovered =
+        OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-orch").unwrap();
+    assert_ne!(recovered.region_level(4), LodLevel::Dormant);
+    recovered.tick(&far_presence()).unwrap();
+    assert_eq!(recovered.region_level(4), LodLevel::Dormant);
+}
+
+/// 5 — schedule_event preserves the ordinary and dormant-region
+/// scheduling semantics: the spine's own dependency validation (the
+/// unknown-id rejection), the identity allocation, and the
+/// director's dormant-hold dispatch — never a reimplementation.
+#[test]
+fn schedule_event_preserves_the_scheduling_semantics() {
+    let dir = TestDir::new("schedule");
+    let mut session = orchestrated(&dir);
+    let region4 = EventClass::new(4);
+    // The unknown-dependency rejection (the spine's own validation).
+    let bogus = EventSpec::new(region4, Schedule::AtLogicalTime { due: Tick(1000) }, 1)
+        .with_dependencies(vec![EventId { seq: 4_000_000 }]);
+    assert!(session.schedule_event(bogus).is_err());
+    // The ordinary (live-region) scheduling allocates an identity.
+    let first = session
+        .schedule_event(EventSpec::new(
+            region4,
+            Schedule::AtLogicalTime { due: Tick(1000) },
+            2,
+        ))
+        .unwrap();
+    // A valid dependency schedules.
+    let second = session
+        .schedule_event(
+            EventSpec::new(region4, Schedule::AtLogicalTime { due: Tick(1001) }, 3)
+                .with_dependencies(vec![first]),
+        )
+        .unwrap();
+    assert_ne!(first, second);
+    // The dormant-hold: after the far boundary, scheduling into the
+    // dormant region still succeeds (the held path — the director's
+    // own dispatch).
+    session.tick(&far_presence()).unwrap();
+    let held = session
+        .schedule_event(EventSpec::new(
+            region4,
+            Schedule::AtLogicalTime { due: Tick(1002) },
+            4,
+        ))
+        .unwrap();
+    assert_ne!(held, second);
+}
+
+/// 6 — a pending optional snapshot does not stall authorized gameplay
+/// ticks: with the worker parked on the publication job, the far
+/// boundary's tick completes (the tick's durability is journal-side,
+/// never worker-side); the release completes the publication.
+#[test]
+fn a_pending_optional_snapshot_does_not_stall_ticks() {
+    let dir = TestDir::new("pending-no-stall");
+    let mut session = orchestrated(&dir);
+    let capture = session.capture_snapshot().unwrap();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let handle = session.submit_publication(capture).unwrap();
+    assert_eq!(session.pending_publications(), 1);
+    // The tick runs while the publication is parked in the queue.
+    let report = session.tick(&far_presence()).unwrap();
+    assert!(report.regions_transitioned.contains(&4));
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    // The release completes the publication.
+    session.fault_control().release_park();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+}
+
+// ---------------------------------------------- the publication regressions
+
+/// 7 — a capture at H0 submitted after a confirmation advanced the
+/// head to H1 is REJECTED stale, never rebased: the CAS rejects the
+/// captured parent, the chain holds no A-content revision, and the
+/// head remains H1.
+#[test]
+fn capture_a_stale_after_confirmation_never_rebased() {
+    let dir = TestDir::new("stale-capture");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let capture = session.capture_snapshot().unwrap();
+    let captured_parent = capture.captured_parent();
+    // The confirmation advances the head.
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let advanced = oracle_head_at(&location);
+    assert_ne!(advanced, captured_parent);
+    // The stale submission: rejected, never rebased.
+    let handle = session.submit_publication(capture).unwrap();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Stale { revision, observed } => {
+            assert_eq!(observed, Some(advanced));
+            assert_ne!(revision, advanced);
+        }
+        other => panic!("the stale capture must reject: {other:?}"),
+    }
+    // The chain holds no A-content revision: the head is still the
+    // confirmation's, and only the founding + the batch exist.
+    assert_eq!(oracle_head_at(&location), advanced);
+    assert_eq!(oracle_records_at(&location), 2);
+}
+
+/// 8 — a fresh capture at H1 publishes successfully.
+#[test]
+fn a_fresh_capture_publishes_successfully() {
+    let dir = TestDir::new("fresh-capture");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let stale = session.capture_snapshot().unwrap();
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let handle = session.submit_publication(stale).unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Stale { .. }
+    ));
+    // The fresh capture at the advanced head publishes.
+    let fresh = session.capture_snapshot().unwrap();
+    let handle = session.submit_publication(fresh).unwrap();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => {
+            assert_eq!(oracle_head_at(&location), revision);
+        }
+        other => panic!("the fresh capture must publish: {other:?}"),
+    }
+    assert_eq!(oracle_records_at(&location), 3);
+}
+
+/// 9 — T1 advancing while the canonical HEAD is unchanged: the
+/// earlier capture still publishes (the CAS passes — the head did not
+/// move), and the newer T1 progress is honestly pending (absent from
+/// the capture's journal frontier, confirmed only by the subsequent
+/// commit).
+#[test]
+fn t1_advances_head_unchanged_the_earlier_capture_stays_coherent() {
+    let dir = TestDir::new("t1-advances");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let capture = session.capture_snapshot().unwrap();
+    assert!(capture.journal_frontier().is_empty());
+    let captured_parent = capture.captured_parent();
+    // The far boundary journals T1 — the canonical HEAD is unchanged.
+    session.tick(&far_presence()).unwrap();
+    assert_eq!(oracle_head_at(&location), captured_parent);
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(scan.committed.len(), 1);
+    // The earlier capture publishes (the CAS passes).
+    let handle = session.submit_publication(capture).unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    // The newer T1 progress was honestly pending: the capture's
+    // frontier predates it, and the commit confirms it NOW.
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+}
+
+/// 10 — queue saturation produces the typed optional Busy without an
+/// append, and the fairness gate (a waiting required operation)
+/// refuses optional admissions the same way; the release drains every
+/// admitted job through the single worker.
+#[test]
+fn queue_saturation_produces_busy_without_append() {
+    let dir = TestDir::new("saturation");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // The fairness gate alone (a non-full queue): the armed
+    // required-waiting flag refuses the optional admission.
+    session.set_required_waiting_for_test(true);
+    let refusal = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap_err();
+    assert_eq!(refusal, SubmitRefusal::Busy);
+    session.set_required_waiting_for_test(false);
+    // The bounded queue: 66 captures (the read jobs complete before
+    // the park), then the park, then the submissions — 64 admitted,
+    // the 65th and 66th refused Busy, nothing appended.
+    let captures: Vec<_> = (0..66)
+        .map(|_| session.capture_snapshot().unwrap())
+        .collect();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let mut handles = Vec::new();
+    let mut refusals = 0;
+    for capture in captures {
+        match session.submit_publication(capture) {
+            Ok(handle) => handles.push(handle),
+            Err(refusal) => {
+                assert_eq!(refusal, SubmitRefusal::Busy);
+                refusals += 1;
+            }
+        }
+    }
+    // The capacity is 64 — plus the one job the parked worker already
+    // holds in hand — so the admission count is 64 or 65 depending on
+    // the take timing; every submission is accounted and at least one
+    // refused.
+    assert_eq!(handles.len() + refusals, 66);
+    assert!(refusals >= 1);
+    assert_eq!(session.pending_publications(), handles.len());
+    // Nothing appended while the worker is parked.
+    let head_before = oracle_head_at(&location);
+    // The release drains: the first publication accepts, the rest are
+    // stale (the identical content, the advanced parent) — every
+    // admitted job executes through the single worker.
+    session.fault_control().release_park();
+    let mut accepted = 0;
+    let mut stale = 0;
+    for handle in &handles {
+        match session.wait_publication(*handle).unwrap() {
+            PublicationOutcome::Accepted { .. } => accepted += 1,
+            PublicationOutcome::Stale { .. } => stale += 1,
+            other => panic!("the drained publication: {other:?}"),
+        }
+    }
+    assert_eq!(accepted, 1);
+    assert_eq!(stale, handles.len() - 1);
+    assert_ne!(oracle_head_at(&location), head_before);
+}
+
+/// 11 — cancellation: before the job starts it prevents the
+/// publication (a definite non-event, the head unchanged); after the
+/// job has started it cannot erase a possibly committed outcome (the
+/// append executes and reports Accepted).
+#[test]
+fn cancellation_before_start_prevents_publication() {
+    let dir = TestDir::new("cancel-before");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let head_before = oracle_head_at(&location);
+    let capture = session.capture_snapshot().unwrap();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let handle = session.submit_publication(capture).unwrap();
+    assert!(session.cancel_publication(handle));
+    session.fault_control().release_park();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Canceled { .. }
+    ));
+    assert_eq!(oracle_head_at(&location), head_before, "no append");
+}
+
+#[test]
+fn cancellation_after_start_cannot_erase_the_outcome() {
+    let dir = TestDir::new("cancel-after");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let capture = session.capture_snapshot().unwrap();
+    // The park lands INSIDE the executing append — past the
+    // cancellation boundary (the job has started).
+    session
+        .fault_control()
+        .set(WorkerFault::ParkExecutingAppend);
+    let handle = session.submit_publication(capture).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The cancellation is too late: the job already started.
+    assert!(session.cancel_publication(handle));
+    session.fault_control().release_park();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => {
+            assert_eq!(oracle_head_at(&location), revision, "the append ran");
+        }
+        other => panic!("the started job completes: {other:?}"),
+    }
+}
+
+/// 12 — worker death without polling any completion: the next
+/// authoritative tick AND the scheduling operation refuse through the
+/// composed gate (the health cell — never a completion poll).
+#[test]
+fn worker_death_without_polling_refuses_progression() {
+    let dir = TestDir::new("death-unpolled");
+    let mut session = orchestrated(&dir);
+    // The T1 evidence for the confirmation that triggers the death.
+    session.tick(&far_presence()).unwrap();
+    session.fault_control().set(WorkerFault::PanicNext);
+    // The confirmation's append job kills the worker (its outcome is
+    // the honest Unknown class — the pipeline's retained candidate).
+    match session.commit_canonical().unwrap() {
+        CommitOutcome::Unknown { .. } => {}
+        other => panic!("the death surfaces the uncertain class: {other:?}"),
+    }
+    assert!(!session.healthy());
+    // NO completion was polled anywhere — the next tick and the
+    // scheduling refuse through the gate.
+    let refusal = session.tick(&far_presence());
+    assert!(refusal.is_err());
+    assert!(refusal.is_err_and(|error| is_worker_refusal(&error)));
+    let schedule_refusal = session.schedule_event(EventSpec::new(
+        EventClass::new(4),
+        Schedule::AtLogicalTime { due: Tick(1000) },
+        1,
+    ));
+    assert!(schedule_refusal.is_err());
+}
+
+/// 13 — both providers preserve chain integrity and the correct
+/// durability labeling: the orchestrated lifecycle over the file and
+/// the SQLite providers, the accepted publication's tier equal to the
+/// provider's own truthful label.
+#[test]
+fn both_providers_chain_integrity_and_tier_labeling() {
+    let file_dir = TestDir::new("provider-file");
+    let file_location = found_location(&file_dir, false);
+    let mut file_session = orchestrated_at(&file_dir, false);
+    assert_eq!(
+        file_session.worker_tier(),
+        SessionStore::open(&file_location)
+            .unwrap()
+            .durability_tier()
+    );
+    let handle = file_session
+        .submit_publication(file_session.capture_snapshot().unwrap())
+        .unwrap();
+    match file_session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { tier, .. } => {
+            assert_eq!(tier, file_session.worker_tier());
+        }
+        other => panic!("the file publication: {other:?}"),
+    }
+    file_session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        file_session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(oracle_records_at(&file_location) >= 3);
+
+    let db_dir = TestDir::new("provider-sqlite");
+    let db_location = found_location(&db_dir, true);
+    let mut db_session = orchestrated_at(&db_dir, true);
+    assert_eq!(db_session.worker_tier(), SyncTier::TransactionalWalFull);
+    let handle = db_session
+        .submit_publication(db_session.capture_snapshot().unwrap())
+        .unwrap();
+    match db_session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { tier, .. } => {
+            assert_eq!(tier, SyncTier::TransactionalWalFull);
+        }
+        other => panic!("the sqlite publication: {other:?}"),
+    }
+    db_session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        db_session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    assert!(oracle_records_at(&db_location) >= 3);
+}
+
+/// 14 — the completion accounting distinguishes the outcomes (the
+/// accepted, the stale, the canceled, the unknown) and retains the
+/// candidate identity and the captured frontier on every completion
+/// record.
+#[test]
+fn completion_accounting_distinguishes_the_outcomes() {
+    let dir = TestDir::new("accounting");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // Accepted.
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let accepted_revision = match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => revision,
+        other => panic!("{other:?}"),
+    };
+    let record = session.completion_record(handle).unwrap();
+    assert_eq!(record.revision, accepted_revision);
+    assert!(!record.coverage.materialized.is_empty());
+    // Stale.
+    let stale_capture = session.capture_snapshot().unwrap();
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let handle = session.submit_publication(stale_capture).unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Stale { .. }
+    ));
+    assert!(session.completion_record(handle).is_some());
+    // Canceled.
+    let capture = session.capture_snapshot().unwrap();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let handle = session.submit_publication(capture).unwrap();
+    session.cancel_publication(handle);
+    session.fault_control().release_park();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Canceled { .. }
+    ));
+    // Unknown: the append EXECUTES (it may commit) but its reply is
+    // lost — the honest uncertain class, the head advanced.
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let head_before_unknown = oracle_head_at(&location);
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Unknown { revision, .. } => {
+            assert_ne!(revision, head_before_unknown);
+        }
+        other => panic!("the lost reply is the uncertain class: {other:?}"),
+    }
+    // The append actually landed (never a definite failure claim).
+    assert_ne!(oracle_head_at(&location), head_before_unknown);
+}
+
+/// 15 — the legacy synchronous paths remain operational and unchanged
+/// (the full fingerprint preservation is the double release-mode
+/// selftest — the frozen Stage-0 pins over the untouched engine-core).
+#[test]
+fn legacy_synchronous_paths_remain_operational() {
+    let dir = TestDir::new("legacy");
+    let location = found_location(&dir, false);
+    let (mut spine, mut director) = scenario_pair(150, &near_region_4());
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "legacy").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .unwrap()
+        .expect("the legacy deactivation journals");
+    assert!(matches!(
+        crossing.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    drop(crossing);
+    let (_spine, _director, recovered) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "legacy").unwrap();
+    drop(recovered);
+    assert!(oracle_records_at(&location) >= 3);
+}
+
+// ------------------------------------------------------ the generation groundwork
+
+/// 16 — the capture-validity generation (the journal flip count):
+/// zero at open, incremented by each successful pointer flip — the
+/// counter the orchestrated captures record and the submissions
+/// compare (the orchestrator-level end-to-end capture→flip→submit
+/// stale path lands with Checkpoint 4's maintenance integration,
+/// where the orchestrator gains its rotation entry points under the
+/// lease; here the crossing-level counter is proven over the
+/// worker-backed instantiation).
+#[test]
+fn the_journal_flip_count_generation() {
+    let dir = TestDir::new("flip-count");
+    let location = found_location(&dir, false);
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let worker = IoWorker::spawn(&location).unwrap();
+    let source = worker.source().unwrap();
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(&source, journal, "pp-b4-flip").unwrap();
+    assert_eq!(crossing.journal_flip_count(), 0);
+    // The rotation requires a verified anchor: publish one first.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    crossing.rotate_journal().unwrap();
+    assert_eq!(crossing.journal_flip_count(), 1);
+    crossing.rotate_journal().unwrap();
+    assert_eq!(crossing.journal_flip_count(), 2);
+    drop(crossing);
+    drop(source);
+    worker.join().unwrap();
+}
+
+/// The barrier-based queued-poison supplement (the GO's replacement
+/// for the timed queued-poison test): a publication admitted before
+/// the poison but NOT YET STARTED is refused at the worker's
+/// execution boundary with the DEFINITE typed error — the
+/// deterministic synchronization barrier, no timing.
+#[test]
+fn the_barrier_queued_poison_refuses_admitted_work() {
+    let dir = TestDir::new("barrier-queued-poison");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let head_before = oracle_head_at(&location);
+    let capture = session.capture_snapshot().unwrap();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let handle = session.submit_publication(capture).unwrap();
+    // The poison lands while the job is parked in the worker's hands
+    // (admitted, not started).
+    session.poison();
+    session.fault_control().release_park();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Failed { error, .. } => {
+            assert!(matches!(
+                error,
+                engine_persist::MediumError::WorkerUnavailable { .. }
+            ));
+        }
+        other => panic!("the queued job is refused at the boundary: {other:?}"),
+    }
+    // No append: the head is unchanged, and the poisoned session
+    // refuses further authoritative progression.
+    assert_eq!(oracle_head_at(&location), head_before);
+    assert!(session.tick(&far_presence()).is_err());
+}
+
+/// Poisoning during an ALREADY EXECUTING append: the job passed the
+/// poison boundary and parks inside the append; the poison lands; the
+/// release lets the append COMPLETE — the honest in-flight outcome
+/// (Accepted, the head advanced), never a false refusal.
+#[test]
+fn poisoning_during_an_executing_append_completes_honestly() {
+    let dir = TestDir::new("poison-in-flight");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let capture = session.capture_snapshot().unwrap();
+    session
+        .fault_control()
+        .set(WorkerFault::ParkExecutingAppend);
+    let handle = session.submit_publication(capture).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    session.poison();
+    session.fault_control().release_park();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { revision, .. } => {
+            assert_eq!(oracle_head_at(&location), revision, "the append ran");
+        }
+        other => panic!("the in-flight job completes: {other:?}"),
+    }
+    // The poisoned session refuses further progression.
+    assert!(session.tick(&far_presence()).is_err());
+}
