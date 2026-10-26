@@ -30,6 +30,7 @@ the full workspace suite, every existing regression green):
 | `d721620` | The renewed-review corrective — R1, the whole-manifest completion (§17) | 601 passed + 1 ignored |
 | `1927e2b` | The renewed-review correctives — R2 and R3 (§18) | 605 passed + 1 ignored |
 | `8fc9632` | The renewed-review corrective — R4, the safe publication ordering (§19) | 614 passed + 1 ignored |
+| `965aa5b` | The renewed-review corrective — R5, the pointer-durability distinction (§20) | 617 passed + 1 ignored |
 
 From the PP-B2 baseline of 550 tests: **38 new tests**, every one of
 them a PP-B3 behavior; no existing test was modified except where a
@@ -55,7 +56,12 @@ R2/R3-corrected branch closed R2 and R3 and returned HOLD with
 one bounded finding (R4)**; the corrective (`8fc9632`, §19) adds
 **6 further test functions** (the workspace 614 passed + 1
 ignored — the 611 distinct tests plus the three child processes'
-own nested single-test reports in the harness output).
+own nested single-test reports in the harness output). **The
+review of the R4-corrected branch found R4 substantially closed
+and returned HOLD with one bounded durability finding (R5)**;
+the corrective (`965aa5b`, §20) adds **2 further test functions**
+(the workspace 617 passed + 1 ignored — the 613 distinct tests
+plus the four child processes' own nested single-test reports).
 
 The scope — the GO's eleven deliverables, each mapped to its
 implementation and regression:
@@ -483,10 +489,10 @@ cargo run --release -p engine-slice -- --benchmark-persistence
 cargo test --release --workspace  # the double selftest: the frozen fingerprint pins
 ```
 
-The expected surfaces: the workspace green (the pod count 614 + 1
+The expected surfaces: the workspace green (the pod count 617 + 1
 ignored may differ by platform for the SDL soak, always stated;
-the count includes the three R4 child processes' own nested
-single-test reports — §19);
+the count includes the four R4/R5 child processes' own nested
+single-test reports — §19–§20);
 the four PP-B3 suites green (the crash regression's child dying at
 exit 8; the reclamation's children dying at exits 9 and 10 — §16;
 the R1 windows' children dying at exits 11 and 12 — §17); the benchmark §8's numbers at release speed (the flat
@@ -1208,3 +1214,165 @@ next entry point: the renewed verdict or the owner's rig evidence
 Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
 further implementation remain unauthorized until separate explicit
 owner GOs.
+
+**SUPERSEDED — the renewed verdict arrived: R4 substantially
+CLOSED in substance (the manifest ordering and post-flip
+pipeline-poison fixes accepted, preserved); HOLD with one bounded
+durability finding (R5). The corrective is delivered at `965aa5b`
+and the FINAL RENEWED STOP stands in §20.**
+
+## §20 — The renewed review's HOLD: the R5 corrective (the pointer-durability distinction)
+
+The renewed verdict on `8fc9632`/`aeb7fdd`: **R4 substantially
+CLOSED** (the manifest ordering and the post-flip pipeline-poison
+fixes accepted in substance — preserved) — **HOLD with one
+bounded durability finding (R5)**, authorized as a bounded PP-B3
+corrective on `production-persistence-b3`. The corrective code
+commit **`965aa5b`** (this docs-only verification commit amends
+the record around it; the chain `aeb7fdd` → `965aa5b`).
+
+**THE FINDING (R5) — an unsynced active-journal pointer cannot
+safely precede new durable T1 writes.** The counterexample:
+journal A is the currently authoritative journal; the rotation
+writes and verifies journal B; the root active pointer is renamed
+to B; the directory synchronization FAILS; the R4 design returned
+success with a warning; the crossing rebound to B and permitted
+further T1 captures; a new durable T1 transaction was appended
+ONLY to B; a power loss caused the unsynced pointer to recover at
+its previous value, A; the recovery read A and could not
+reconstruct the newer transaction from B. **The pre-rotation
+journal is a superset only of the evidence existing when the
+rotation occurred — it is NOT a superset of future writes to B.**
+A warning does not make this safe if the caller is still allowed
+to progress authoritatively.
+
+**THE CORRECTIVE — the pointer-durability distinction, with the
+R4 ordering and authority rules preserved (the manifest-before-
+flip publication ordering; the pre-flip errors leaving the old
+journal usable and authoritative; the post-flip pipeline-rebuild
+failures fail-closed; no asynchronous worker, queue, or
+persistence-architecture redesign).** (1) **THE OUTCOME
+DISTINCTION** (rotation.rs): `PointerDurability { Established,
+Unresolved { detail } }` replaces the R4 `durability_warning` on
+`JournalRotation` — an `Unresolved` outcome is NEVER a durably
+completed transition. (2) **THE FAIL-CLOSED DURABILITY GATE**
+(crossing.rs): on `Unresolved` the rotation returns the typed
+`rotation/pointer-durability` refusal and the crossing enters the
+`DurabilityUnresolved` state — the R4 authority guard generalized
+to `JournalAuthority { Healthy, Lost, DurabilityUnresolved }` —
+and EVERY authoritative operation (publish_snapshot, deactivate,
+activate, commit_canonical, compact_session, publish_checkpoint,
+rotate_journal, reclaim_checkpoint) refuses: no new authoritative
+T1 transaction may commit while the pointer durability remains
+unresolved. (3) **THE REPAIR PATH**:
+`SessionCrossing::reestablish_pointer_durability` — the directory
+sync re-established on demand
+(`engine_persist::reestablish_pointer_durability` over the root's
+pointer), then the pipeline rebuilt over the pointer-resolved
+authoritative journal; a re-sync failure leaves the fail-closed
+state intact; a rebuild failure escalates to the R4 `Lost` state;
+the crossing re-opens (`Healthy`) only after the verified
+durability. (4) **THE RECOVERY'S DURABILITY VERIFICATION**
+(recover_at): immediately after the pointer resolution the
+recovery completes the directory sync — a fresh recovery cannot
+silently clear an unresolved durability-uncertain condition
+merely by reading the currently visible pointer; a sync failure
+fails the recovery closed before any progression. (5) **THE
+OLD-JOURNAL ELIGIBILITY**: the fail-closed reclamation refusal
+enforces it — no journal retirement while the prior journal may
+still be selected after a power loss; only the post-recovery
+(durability-verified) reclamation retires the old journals. (6)
+**THE PLATFORM HONESTY**: `sync_parent_dir` is the Unix-real
+directory fsync and the ratified Windows no-op (std exposes no
+Windows directory flush) — the natural `Unresolved` failure is a
+Unix-only phenomenon, the deterministic injection exercises the
+fail-closed and repair machinery on ALL platforms, and NO Windows
+directory-fsync guarantee is claimed.
+
+**THE REGRESSIONS (the dir-sync pair rewritten to the R5
+semantics + one new full-stack pair; every fault-armed scenario
+in its own spawned child process):**
+`a_pointer_dir_sync_failure_after_the_flip_fails_closed_until_reestablished`
+(the child: the refused rotation with the typed
+pointer-durability detail; the live-authority-changed assert; the
+fail-closed publication/commit/deactivation refusals — no
+authoritative T1 write while unresolved; the FAILING repair under
+the still-armed fault with the state intact; the ARMED-FAULT
+RECOVERY REFUSAL — a fresh recovery cannot silently clear the
+unresolved condition; the disarmed repair re-opening the crossing
+with the post-repair T1 evidence in the new authoritative
+generation. The parent: the durable state — the new generation
+carrying the post-repair evidence while the stale journal
+receives nothing — the recovery verifying the durability and
+resolving the same journal with the plans replayed exactly once;
+the repeat rotation durably established);
+`the_old_journals_retire_only_after_the_durability_is_recovered`
+(the child over the two-checkpoint campaign: the refused rotation
+under the armed fault; the CLOSED RECLAMATION refusing — the
+prior journal may still be selected after a power loss, its
+retirement waits; the repair and the new T1 evidence. The parent:
+the prior root journal retained while the durability was
+unresolved; the verified recovery with the plans replayed exactly
+once; the reclamation retiring MK1's range AND the old root
+journal; the active generation standing; the walk validating; the
+nothing-eligible re-run). The R4 pre-flip manifest-failure and
+post-flip swap-failure pairs PRESERVED unchanged in behavior (the
+manifest pair's retry assertion updated to the
+`PointerDurability::Established` form).
+
+**The verification at `965aa5b`:** fmt and `clippy --workspace
+--all-targets -- -D warnings` green; `cargo build --workspace`
+green; the workspace **617 passed + 1 intentionally ignored, 0
+failed** (the R4 corrective's 614 plus the 2 new test functions
+plus the 4 child processes' own nested single-test reports in the
+harness output — 613 distinct tests); the `pp_b3_rotation` matrix
+10 passed 0 failed; the `pp_b3_reclaim` matrix 22 passed 0
+failed; the checkpoint and membership matrices green unchanged;
+the double release-mode selftest green both runs (identical
+results modulo timings — the frozen Stage-0 fingerprint pins
+hold, `engine-core` untouched). **The CI: run 40247187364 GREEN
+on all three platforms, verified firsthand job-level over the
+corrected head `965aa5b`** (ubuntu-latest 3m19s; macos-15 ARM64
+4m2s; windows-latest 3m51s; via the PR #3 pull_request event —
+the CI vehicle, never merged; the annotations are the known
+runner-infrastructure notes). The protected branches verified
+unchanged (main=5dbb377, stage5=047faf9, macos-port=ba395d8,
+design=a47ef10, pp-b1=bfe60b7, pp-b2=00109b0); PRs #1/#2
+unchanged, open/draft.
+
+**The honest remaining limitations (stated exactly):**
+- **The evidence distinction**: the deterministic directory-sync
+  failure injection exercises the fail-closed and repair
+  machinery on all three platforms; the natural `Unresolved`
+  failure is a Unix-only phenomenon (the Windows sync is the
+  ratified no-op — std exposes no Windows directory flush); NO
+  physical power-loss test was performed or claimed. The
+  process-crash evidence (exits 8–12) and this injection evidence
+  are distinct from genuine power-loss guarantees.
+- **The recovery-verification semantics**: the recovery's re-sync
+  establishes the durability of whatever the pointer CURRENTLY
+  names. If a power loss already reverted the pointer to the
+  prior journal, the recovery establishes the reverted state and
+  proceeds on the prior journal — the safe direction, because the
+  fail-closed rule guarantees no new T1 writes were made to the
+  new journal while the durability was unresolved (the only
+  writes at risk never happened).
+- The fault-injection statics are test-only (`#[doc(hidden)]`,
+  process-local, never armed by engine code); the production
+  paths carry no seams.
+
+**The preserved invariants:** the R4 ordering and authority
+rules; the R3 campaign isolation and conservative orphan
+retention; the fully corrected F1–F4 and R1–R4 behaviors;
+PP-B1/B2 behavior; the fingerprints and recovery contracts; the
+ratified Windows durability-tier limitations.
+
+**THE FINAL RENEWED STOP.** PP-B3's R5 corrective is delivered
+and stopped for the renewed independent PASS/HOLD review. The
+tested code SHA `965aa5b`; the CI 40247187364 green ×3 over it;
+the workspace 617 passed + 1 intentionally ignored at it. The
+next entry point: the renewed verdict or the owner's rig evidence
+(§12). This record never declares the batch CLOSED. The physical
+Windows acceptance is NOT yet requested. PP-B4, Stage 6, and all
+further implementation remain unauthorized until separate
+explicit owner GOs.
