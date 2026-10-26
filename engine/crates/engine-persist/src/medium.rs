@@ -68,6 +68,14 @@ pub enum UnknownReason {
     /// A failed SQLite transaction's `ROLLBACK` could not be
     /// completed — the disposition is genuinely unknown (PP-B1).
     RollbackUncertain,
+    /// The canonical I/O worker's transport was lost around an
+    /// append — the worker exited (or its reply was lost) after the
+    /// job may have executed (PP-B4 checkpoint 2). The candidate's
+    /// installation is uncertain: never a definite failure; the
+    /// candidate's identity is retained for reconciliation under the
+    /// lock (the pipeline's pending attempt, or a fresh recovery's
+    /// chain walk).
+    WorkerReplyLost,
 }
 
 /// The result of a conditional append (§5.3.1's exact semantics).
@@ -186,6 +194,21 @@ pub enum MediumError {
         /// The refusing database's context.
         detail: String,
     },
+    /// The canonical I/O worker is unavailable (PP-B4 checkpoint 2):
+    /// the queue's receiver is gone (the worker thread exited —
+    /// normally, poisoned, or panicked) so the request was never
+    /// admitted, or a side-effect-free read's reply was lost to the
+    /// worker's death. DEFINITE for the request it names (an
+    /// unadmitted job never ran; a read never installed anything) —
+    /// and the session is poisoned: every authoritative operation
+    /// refuses until a fresh recovery reestablishes trustworthy
+    /// state. A possibly-executed APPEND never surfaces this error:
+    /// it arrives as `AppendOutcome::Unknown` with
+    /// `UnknownReason::WorkerReplyLost`.
+    WorkerUnavailable {
+        /// What failed and where.
+        detail: String,
+    },
 }
 
 impl fmt::Display for MediumError {
@@ -228,6 +251,9 @@ impl fmt::Display for MediumError {
                     f,
                     "the database is an unactivated migration target: {detail}"
                 )
+            }
+            MediumError::WorkerUnavailable { detail } => {
+                write!(f, "the canonical I/O worker is unavailable: {detail}")
             }
         }
     }

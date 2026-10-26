@@ -611,6 +611,7 @@ type AttemptedKey = (Vec<ClassifiedSpan>, TransactionId, Hash);
 /// content identity, and the per-key identities (the batch bytes
 /// re-derive deterministically from the keys; never rebuilt from
 /// guesswork).
+#[derive(Clone)]
 struct PendingAttempt {
     record: RevisionRecord,
     batch_hash: Hash,
@@ -854,17 +855,22 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// individual per-key validation before confirmation; otherwise
     /// the attempt is retained (retry-safe or unverifiable — never
     /// falsely confirmed).
+    ///
+    /// PP-B4 checkpoint 2's exception safety: the verification runs on
+    /// a CLONE — the slot keeps the candidate until confirmation
+    /// succeeds, so a readback failure (worker death included) retains
+    /// it, never a discarded unresolved obligation.
     pub fn reconcile_pending(&mut self) -> Result<ReconcileOutcome, PipelineError> {
-        let Some(pending) = &self.pending else {
+        let Some(attempt) = self.pending.clone() else {
             return Ok(ReconcileOutcome::NothingPending);
         };
-        let candidate = pending.record.id();
+        let candidate = attempt.record.id();
         match self.medium.reconcile_unknown(&candidate)? {
             Reconciliation::Installed { .. } => {
-                let attempt = self.pending.take().expect("checked above");
                 let CommitOutcome::Confirmed(receipt) = self.confirm(attempt)? else {
                     unreachable!("confirm returns Confirmed or errors");
                 };
+                self.pending = None;
                 Ok(ReconcileOutcome::Confirmed(receipt))
             }
             Reconciliation::NotInstalled { .. } => Ok(ReconcileOutcome::NotInstalled),
@@ -880,8 +886,19 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// re-submits the remaining per-key identities — the same record
     /// bytes when the parent still matches, the rebase (identical
     /// identities and coverages, new parent) when it does not.
+    ///
+    /// PP-B4 checkpoint 2's exception safety: the ORIGINAL candidate
+    /// stays in the slot through every pre-submission fallible step
+    /// (the walk, the remaining-keys derivation, the foreign receipt —
+    /// the slot clears only after that receipt verifies); the
+    /// re-submission then owns the transition — a definite pre-commit
+    /// failure of candidate B leaves the original A (its
+    /// `NotInstalled` disposition stands; a later retry re-derives),
+    /// while any possibly-installed B REPLACES A (append_for's
+    /// write-at-uncertainty-or-acceptance) and is never overwritten
+    /// back.
     pub fn retry_pending(&mut self) -> Result<CommitOutcome, PipelineError> {
-        let Some(attempt) = self.pending.take() else {
+        let Some(attempt) = self.pending.clone() else {
             return Ok(CommitOutcome::NothingPending);
         };
         self.walk_chain()?;
@@ -889,8 +906,11 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         let remaining = self.remaining_keys(attempt.keys)?;
         if remaining.is_empty() {
             // Every attempted key is now chain-confirmed (another
-            // writer's batch) — confirmed without our revision.
-            return Ok(CommitOutcome::Confirmed(self.foreign_receipt(attempted)?));
+            // writer's batch) — confirmed without our revision. The
+            // slot clears ONLY after the receipt's verification.
+            let receipt = self.foreign_receipt(attempted)?;
+            self.pending = None;
+            return Ok(CommitOutcome::Confirmed(receipt));
         }
         let parent = self.verified_head.ok_or(PipelineError::UnfoundedMedium)?;
         self.submit_keys(remaining, parent)
@@ -1048,13 +1068,12 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         let (attempt, outcome) = self.append_for(keys.clone(), parent)?;
         match outcome {
             AppendOutcome::Accepted { id, tier: _ } => {
-                let attempt = attempt.expect("accepted carries the attempt");
                 if id != attempt.record.id() {
                     return Err(PipelineError::ConfirmationInvalid {
                         detail: "accepted-revision-identity-mismatch",
                     });
                 }
-                self.confirm(attempt)
+                self.confirm_retained(attempt)
             }
             AppendOutcome::RejectedStaleParent { observed } => {
                 // Revalidate: the observed chain was validated by the
@@ -1072,44 +1091,59 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 let (attempt, outcome) = self.append_for(remaining, observed_parent)?;
                 match outcome {
                     AppendOutcome::Accepted { id, tier: _ } => {
-                        let attempt = attempt.expect("accepted carries the attempt");
                         if id != attempt.record.id() {
                             return Err(PipelineError::ConfirmationInvalid {
                                 detail: "accepted-revision-identity-mismatch",
                             });
                         }
-                        self.confirm(attempt)
+                        self.confirm_retained(attempt)
                     }
+                    // The rebase was rejected again — append_for already
+                    // retains the last built attempt for retry_pending.
                     AppendOutcome::RejectedStaleParent { observed } => {
-                        // The rebase was rejected again — retain the
-                        // last built attempt for retry_pending.
-                        if let Some(attempt) = attempt {
-                            self.pending = Some(attempt);
-                        }
                         Ok(CommitOutcome::StaleParent { observed })
                     }
-                    AppendOutcome::Unknown { reason } => {
-                        let revision = attempt
-                            .as_ref()
-                            .map(|attempt| attempt.record.id())
-                            .ok_or(PipelineError::UnfoundedMedium)?;
-                        if let Some(attempt) = attempt {
-                            self.pending = Some(attempt);
-                        }
-                        Ok(CommitOutcome::Unknown { revision, reason })
-                    }
+                    AppendOutcome::Unknown { reason } => Ok(CommitOutcome::Unknown {
+                        revision: attempt.record.id(),
+                        reason,
+                    }),
                 }
             }
-            AppendOutcome::Unknown { reason } => {
-                let revision = attempt
-                    .as_ref()
-                    .map(|attempt| attempt.record.id())
-                    .ok_or(PipelineError::UnfoundedMedium)?;
-                if let Some(attempt) = attempt {
-                    self.pending = Some(attempt);
-                }
-                Ok(CommitOutcome::Unknown { revision, reason })
+            AppendOutcome::Unknown { reason } => Ok(CommitOutcome::Unknown {
+                revision: attempt.record.id(),
+                reason,
+            }),
+        }
+    }
+
+    /// The confirmation procedure's exception-safe entry (PP-B4
+    /// checkpoint 2): `confirm` runs on the retained clone — the
+    /// pending slot already holds the candidate (append_for's
+    /// write-at-uncertainty-or-acceptance) and is cleared ONLY on
+    /// verified confirmation. A worker-transport failure during the
+    /// readback returns `CommitOutcome::Unknown` with
+    /// `WorkerReplyLost` — the append was accepted (its disposition
+    /// stands) while the verification could not complete: never a
+    /// definite failure, never a false confirmation. Any other
+    /// readback error propagates with the candidate retained for
+    /// reconciliation.
+    fn confirm_retained(
+        &mut self,
+        attempt: PendingAttempt,
+    ) -> Result<CommitOutcome, PipelineError> {
+        let revision = attempt.record.id();
+        match self.confirm(attempt) {
+            Ok(outcome) => {
+                self.pending = None;
+                Ok(outcome)
             }
+            Err(PipelineError::Medium(MediumError::WorkerUnavailable { .. })) => {
+                Ok(CommitOutcome::Unknown {
+                    revision,
+                    reason: UnknownReason::WorkerReplyLost,
+                })
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1117,11 +1151,23 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// `keys` on `parent`, and appends. The tick derives
     /// deterministically from the batched transactions (retry
     /// stability).
+    ///
+    /// THE CANDIDATE-STATE RULE (PP-B4 checkpoint 2, the preflight's
+    /// four-state lifecycle): a DEFINITE pre-commit failure (the
+    /// medium's own contract — and the worker proxy's discipline:
+    /// uncertain dispositions arrive as `Unknown` outcomes, never
+    /// errors) returns WITHOUT writing the pending slot, preserving
+    /// the accepted direct-retry behavior; every outcome that leaves
+    /// the candidate possibly installed (`Accepted`, `Unknown`, or a
+    /// stale-parent rebase target) writes the slot BEFORE the caller
+    /// takes any further fallible step, so the reconciliation
+    /// identity can never be lost to a readback failure. The slot is
+    /// cleared only by verified confirmation.
     fn append_for(
         &mut self,
         keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
-    ) -> Result<(Option<PendingAttempt>, AppendOutcome), PipelineError> {
+    ) -> Result<(PendingAttempt, AppendOutcome), PipelineError> {
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(keys.len());
         let mut tick: u64 = 0;
         for (id, (coverage, transaction, effect)) in &keys {
@@ -1153,7 +1199,11 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             batch_hash,
             keys,
         };
-        Ok((Some(attempt), outcome))
+        // Write-at-uncertainty-or-acceptance: the retained candidate
+        // precedes every further fallible step (the readback included);
+        // cleared only by verified confirmation.
+        self.pending = Some(attempt.clone());
+        Ok((attempt, outcome))
     }
 
     /// The position tick of one journal transaction (retry-stable

@@ -671,31 +671,51 @@ impl<S: MediumSource> SessionCrossing<S> {
         })
     }
 
-    /// THE AUTHORITY GUARD (the review correctives R4 + R5): a
-    /// crossing whose rotation failed after the authoritative
-    /// pointer changed — or whose pointer flip's power-loss
-    /// durability remains unresolved — is explicitly unusable for
-    /// further authoritative progression: no T1 write may silently
-    /// continue through a journal the campaign root no longer
-    /// selects, and none may precede a durably established pointer
-    /// (the pre-rotation journal is a superset only of the evidence
-    /// at rotation time, never of future writes to the new journal).
-    /// Every mutation refuses until the durability is re-established
-    /// (the R5 repair) or a fresh recovery re-derives the crossing
-    /// from the pointer. The medium-level `checkpoint` boundary
-    /// stays usable (it never writes through the journal).
+    /// THE AUTHORITY GUARD (the review correctives R4 + R5, composed
+    /// with PP-B4 checkpoint 2's worker gate): a crossing whose
+    /// rotation failed after the authoritative pointer changed — or
+    /// whose pointer flip's power-loss durability remains unresolved
+    /// — is explicitly unusable for further authoritative
+    /// progression: no T1 write may silently continue through a
+    /// journal the campaign root no longer selects, and none may
+    /// precede a durably established pointer (the pre-rotation
+    /// journal is a superset only of the evidence at rotation time,
+    /// never of future writes to the new journal). Every mutation
+    /// refuses until the durability is re-established (the R5
+    /// repair) or a fresh recovery re-derives the crossing from the
+    /// pointer. The medium-level `checkpoint` boundary stays usable
+    /// (it never writes through the journal). And a dead or poisoned
+    /// canonical-medium source (the worker instantiation's health
+    /// cell, PP-B4 checkpoint 2) refuses everything closed — never a
+    /// silent continuation against an uncertain canonical state.
     fn assert_journal_authority(&self) -> Result<(), TransitionError> {
         match self.journal_authority {
-            JournalAuthority::Healthy => Ok(()),
-            JournalAuthority::Lost => Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "rotation/authority-lost",
-            }),
-            JournalAuthority::DurabilityUnresolved => Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "rotation/pointer-durability",
-            }),
+            JournalAuthority::Healthy => {}
+            JournalAuthority::Lost => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "rotation/authority-lost",
+                });
+            }
+            JournalAuthority::DurabilityUnresolved => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "rotation/pointer-durability",
+                });
+            }
         }
+        // THE WORKER POISON GATE (PP-B4 checkpoint 2): a dead or
+        // poisoned canonical-medium worker fails every authoritative
+        // operation closed — journal-only deactivations included. The
+        // legacy store-location instantiation is always alive (the
+        // default), so its behavior is unchanged.
+        if !self.source.alive() {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "worker/unavailable",
+            });
+        }
+        Ok(())
     }
 
     /// The graceful lifecycle boundary (PP-B1): the ratified `TRUNCATE`

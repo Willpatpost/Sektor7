@@ -1,0 +1,608 @@
+//! PP-B4 checkpoint 2: the campaign's single canonical I/O worker.
+//!
+//! One dedicated thread per active campaign owns the ONE `SessionStore`
+//! connection (the only provider open — opened at spawn, moved into the
+//! thread; the proxies never open another) and executes jobs FIFO from
+//! one bounded queue. The [`WorkerMedium`] proxy implements
+//! [`CanonicalMedium`] by sending each operation as a job and blocking
+//! on its private one-slot reply channel: a reply is deposited without
+//! a reader, so an abandoned receiver is a typed send failure the
+//! worker ignores — it never blocks on a dead caller. The
+//! [`WorkerSource`] is the worker-backed [`MediumSource`]: every handle
+//! it opens is a queue proxy, never a provider connection.
+//!
+//! THE FAILURE DISCIPLINE (the preflight's accepted outcome table):
+//! an admission failure (the queue's receiver is gone) and any
+//! side-effect-free read's transport loss are DEFINITE for the request
+//! they name, typed [`MediumError::WorkerUnavailable`], and poison the
+//! session; but a lost reply on an APPEND is never a definite failure
+//! — the append may have committed, so the proxy synthesizes
+//! `AppendOutcome::Unknown { reason: WorkerReplyLost }`, preserving the
+//! candidate's identity for reconciliation. Worker death (any exit
+//! path, including a panic unwind) flips the shared health cell
+//! instantly — readable without a blocking request — and every
+//! authoritative crossing operation refuses through the source's
+//! `alive` gate: the session is poisoned, never silently restarted;
+//! fresh recovery reestablishes trustworthy state.
+//!
+//! The queue capacity is a PROVISIONAL engineering default (64), not a
+//! ratified performance target.
+
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, RecvError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use engine_persist::{
+    AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ReclaimUnit, Reconciliation,
+    RevisionRecord, StoredObject, SyncTier, UnknownReason,
+};
+
+use crate::store::{MediumSource, SessionStore, StoreLocation};
+
+/// The provisional queue-capacity default (an engineering default per
+/// the GO, not a ratified performance target).
+pub const DEFAULT_QUEUE_CAPACITY: usize = 64;
+
+// ------------------------------------------------------------ the protocol
+
+/// One queued canonical-medium operation. `Send` by construction —
+/// the payload types are the engine's plain value types (the
+/// checkpoint-1 portability record).
+pub enum MediumOp {
+    Head,
+    Append {
+        record: RevisionRecord,
+        objects: Vec<StoredObject>,
+        expected_parent: Option<Hash>,
+    },
+    ReadRecord {
+        id: Hash,
+    },
+    ReadObject {
+        hash: Hash,
+    },
+    Validate,
+    ReconcileUnknown {
+        candidate: Hash,
+    },
+    Reclaim {
+        units: Vec<ReclaimUnit>,
+    },
+    ReclaimPending {
+        units: Vec<ReclaimUnit>,
+    },
+    Checkpoint,
+}
+
+/// The worker's reply for one executed operation.
+#[derive(Debug)]
+pub enum WorkerReply {
+    Head(Option<Hash>),
+    Append(AppendOutcome),
+    ReadRecord(RevisionRecord),
+    ReadObject(Vec<u8>),
+    Validate(ChainSummary),
+    Reconcile(Reconciliation),
+    Reclaim(u64),
+    ReclaimPending(bool),
+    Checkpoint,
+}
+
+/// One queued job with its private bounded completion slot: exactly
+/// one reply is deposited per slot (capacity 1 — the worker's send
+/// never blocks); an abandoned receiver makes that send fail, which
+/// the worker ignores.
+struct Job {
+    op: MediumOp,
+    reply: SyncSender<Result<WorkerReply, MediumError>>,
+}
+
+/// One job's reply channel (the bounded completion slot): the worker
+/// deposits exactly one result (capacity 1 — the send never blocks;
+/// an abandoned receiver is a typed send failure the worker ignores).
+type ReplySlot = (
+    SyncSender<Result<WorkerReply, MediumError>>,
+    Receiver<Result<WorkerReply, MediumError>>,
+);
+
+fn completion_slot() -> ReplySlot {
+    sync_channel(1)
+}
+
+// -------------------------------------------------------- the fault control
+
+/// The job kinds the after-faults key on.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Append,
+    Reconcile,
+}
+
+/// Test-only deterministic fault control — PER WORKER INSTANCE (the
+/// established per-instance seam pattern of `JournalFaultControl`; no
+/// process-global statics, so parallel tests never collide).
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WorkerFault {
+    /// No fault armed.
+    #[default]
+    None,
+    /// Panic before executing the next job (the thread dies; the
+    /// health cell flips through the drop guard).
+    PanicNext,
+    /// Execute the next job of this kind NORMALLY, then panic before
+    /// the job that follows it (the death lands inside the caller's
+    /// readback phase).
+    PanicAfter(JobKind),
+    /// Sleep before each job while armed (the stall used to observe
+    /// serialization and bounded-queue behavior).
+    StallEach { ms: u64 },
+    /// The next append returns a DEFINITE pre-commit error without
+    /// touching the store (the medium's own pre-commit class, relayed
+    /// — nothing installed; the direct-retry contract applies).
+    FailAppendPreCommit,
+    /// The next append EXECUTES against the store (it may commit) but
+    /// its reply is never sent — the proxy must surface
+    /// `Unknown { WorkerReplyLost }`.
+    LoseAppendReply,
+    /// The next append executes, then the process hard-exits (exit
+    /// 13) before the reply — the real-child after-commit arm.
+    ExitAfterAppendPreReply,
+    /// The process hard-exits (exit 14) before executing the next job
+    /// — the real-child definite never-started arm.
+    ExitBeforeNextJob,
+}
+
+/// The shared per-instance fault setter/getter.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct WorkerFaultControl(Arc<Mutex<WorkerFault>>);
+
+impl WorkerFaultControl {
+    pub fn new() -> Self {
+        WorkerFaultControl(Arc::new(Mutex::new(WorkerFault::None)))
+    }
+
+    pub fn set(&self, fault: WorkerFault) {
+        *self.0.lock().expect("the worker fault lock") = fault;
+    }
+
+    pub fn clear(&self) {
+        *self.0.lock().expect("the worker fault lock") = WorkerFault::None;
+    }
+
+    fn current(&self) -> WorkerFault {
+        self.0.lock().expect("the worker fault lock").clone()
+    }
+}
+
+// ------------------------------------------------------------- the health
+
+const HEALTH_ALIVE: u8 = 0;
+const HEALTH_DEAD: u8 = 1;
+
+/// The health cell shared between the worker thread, the handle, the
+/// source, and the crossing's authority gate: `ALIVE` until any exit
+/// path — normal drain, or a panic unwind — flips `DEAD` through the
+/// thread's drop guard. Readable without a blocking request.
+#[derive(Clone)]
+struct Health(Arc<AtomicU8>);
+
+impl Health {
+    fn alive(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == HEALTH_ALIVE
+    }
+
+    fn dead(&self) {
+        self.0.store(HEALTH_DEAD, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------- the worker loop
+
+/// Flips the shared health cell to DEAD on ANY exit path — including
+/// a panic unwind (the guard drops during unwinding).
+struct DeathGuard(Health);
+
+impl Drop for DeathGuard {
+    fn drop(&mut self) {
+        self.0.dead();
+    }
+}
+
+fn worker_loop(
+    rx: Receiver<Job>,
+    mut store: SessionStore,
+    health: Health,
+    fault: WorkerFaultControl,
+) {
+    let _guard = DeathGuard(health);
+    for job in rx {
+        match fault.current() {
+            WorkerFault::None
+            | WorkerFault::PanicAfter(_)
+            | WorkerFault::FailAppendPreCommit
+            | WorkerFault::LoseAppendReply
+            | WorkerFault::ExitAfterAppendPreReply => {}
+            WorkerFault::PanicNext => {
+                panic!("canonical-io-worker: injected fault (PanicNext)")
+            }
+            WorkerFault::ExitBeforeNextJob => std::process::exit(14),
+            WorkerFault::StallEach { ms } => thread::sleep(Duration::from_millis(ms)),
+        }
+        if let MediumOp::Append { .. } = job.op {
+            match fault.current() {
+                WorkerFault::FailAppendPreCommit => {
+                    fault.clear();
+                    let _ = job.reply.send(Err(MediumError::Io {
+                        op: "io-worker append (injected pre-commit fault)",
+                        path: String::new(),
+                        source: std::io::Error::other("injected pre-commit failure"),
+                    }));
+                    continue;
+                }
+                WorkerFault::LoseAppendReply => {
+                    fault.clear();
+                    // The append EXECUTES (it may commit); the reply is never
+                    // sent — the caller must reconcile the uncertain class.
+                    let _ = execute(&mut store, job.op);
+                    drop(job.reply);
+                    continue;
+                }
+                WorkerFault::ExitAfterAppendPreReply => {
+                    let _ = execute(&mut store, job.op);
+                    std::process::exit(13);
+                }
+                _ => {}
+            }
+        }
+        let executed_kind = job_kind(&job.op);
+        let reply = execute(&mut store, job.op);
+        // An abandoned receiver fails this send; the worker ignores it and
+        // never blocks (one reply per one-slot channel).
+        let _ = job.reply.send(reply);
+        if let Some(kind) = executed_kind
+            && matches!(fault.current(), WorkerFault::PanicAfter(armed) if armed == kind)
+        {
+            fault.set(WorkerFault::PanicNext);
+        }
+    }
+}
+
+fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, MediumError> {
+    match op {
+        MediumOp::Head => store.head().map(WorkerReply::Head),
+        MediumOp::Append {
+            record,
+            objects,
+            expected_parent,
+        } => store
+            .append(&record, &objects, expected_parent)
+            .map(WorkerReply::Append),
+        MediumOp::ReadRecord { id } => store.read_record(&id).map(WorkerReply::ReadRecord),
+        MediumOp::ReadObject { hash } => store.read_object(&hash).map(WorkerReply::ReadObject),
+        MediumOp::Validate => store.validate().map(WorkerReply::Validate),
+        MediumOp::ReconcileUnknown { candidate } => store
+            .reconcile_unknown(&candidate)
+            .map(WorkerReply::Reconcile),
+        MediumOp::Reclaim { units } => store.reclaim(&units).map(WorkerReply::Reclaim),
+        MediumOp::ReclaimPending { units } => store
+            .reclaim_pending(&units)
+            .map(WorkerReply::ReclaimPending),
+        MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
+    }
+}
+
+fn job_kind(op: &MediumOp) -> Option<JobKind> {
+    match op {
+        MediumOp::Append { .. } => Some(JobKind::Append),
+        MediumOp::ReconcileUnknown { .. } => Some(JobKind::Reconcile),
+        _ => None,
+    }
+}
+
+// ----------------------------------------------------------- the proxy
+
+/// The queue-proxy [`CanonicalMedium`]: every operation is one job on
+/// the campaign's single queue; the handle is a channel sender, NEVER
+/// a provider connection. The cached [`SyncTier`] was read from the
+/// actual provider at spawn and is reported synchronously, truthfully,
+/// with no worker round trip.
+pub struct WorkerMedium {
+    tx: SyncSender<Job>,
+    tier: SyncTier,
+}
+
+impl WorkerMedium {
+    fn request(&mut self, op: MediumOp) -> Result<WorkerReply, MediumError> {
+        let (reply, slot) = completion_slot();
+        if self.tx.send(Job { op, reply }).is_err() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        slot.recv()
+            .map_err(|RecvError| MediumError::WorkerUnavailable {
+                detail: "the I/O worker died before replying".to_owned(),
+            })?
+    }
+}
+
+impl CanonicalMedium for WorkerMedium {
+    fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+        match self.request(MediumOp::Head)? {
+            WorkerReply::Head(head) => Ok(head),
+            other => unreachable!("the head request returned {other:?}"),
+        }
+    }
+
+    fn append(
+        &mut self,
+        record: &RevisionRecord,
+        objects: &[StoredObject],
+        expected_parent: Option<Hash>,
+    ) -> Result<AppendOutcome, MediumError> {
+        let op = MediumOp::Append {
+            record: record.clone(),
+            objects: objects.to_vec(),
+            expected_parent,
+        };
+        let (reply, slot) = completion_slot();
+        if self.tx.send(Job { op, reply }).is_err() {
+            // Admission failed: the queue's receiver is gone — THIS job
+            // never started (definite for it; the session is dead).
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::Append(outcome)) => Ok(outcome),
+                Ok(other) => unreachable!("the append request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            // THE UNCERTAIN CLASS: the job was admitted; the worker died (or
+            // its reply was lost) after the append MAY have executed. Never
+            // a definite failure — the candidate's identity is preserved
+            // upstream by the pipeline's retained pending attempt.
+            Err(_) => Ok(AppendOutcome::Unknown {
+                reason: UnknownReason::WorkerReplyLost,
+            }),
+        }
+    }
+
+    fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+        match self.request(MediumOp::ReadRecord { id: *id })? {
+            WorkerReply::ReadRecord(record) => Ok(record),
+            other => unreachable!("the read-record request returned {other:?}"),
+        }
+    }
+
+    fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+        match self.request(MediumOp::ReadObject { hash: *hash })? {
+            WorkerReply::ReadObject(bytes) => Ok(bytes),
+            other => unreachable!("the read-object request returned {other:?}"),
+        }
+    }
+
+    fn validate(&mut self) -> Result<ChainSummary, MediumError> {
+        match self.request(MediumOp::Validate)? {
+            WorkerReply::Validate(summary) => Ok(summary),
+            other => unreachable!("the validate request returned {other:?}"),
+        }
+    }
+
+    fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
+        match self.request(MediumOp::ReconcileUnknown {
+            candidate: *candidate,
+        })? {
+            WorkerReply::Reconcile(reconciliation) => Ok(reconciliation),
+            other => unreachable!("the reconcile request returned {other:?}"),
+        }
+    }
+
+    fn durability_tier(&self) -> SyncTier {
+        self.tier
+    }
+
+    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
+        match self.request(MediumOp::Reclaim {
+            units: units.to_vec(),
+        })? {
+            WorkerReply::Reclaim(count) => Ok(count),
+            other => unreachable!("the reclaim request returned {other:?}"),
+        }
+    }
+
+    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
+        match self.request(MediumOp::ReclaimPending {
+            units: units.to_vec(),
+        })? {
+            WorkerReply::ReclaimPending(pending) => Ok(pending),
+            other => unreachable!("the reclaim-pending request returned {other:?}"),
+        }
+    }
+
+    /// The lifecycle boundary is EXPLICITLY routed through the worker
+    /// (never the trait's default no-op): the worker's provider applies
+    /// its own policy — the ratified WAL `TRUNCATE` for SQLite, the
+    /// no-op for the file medium (whose publications already fsync).
+    fn checkpoint(&mut self) -> Result<(), MediumError> {
+        match self.request(MediumOp::Checkpoint)? {
+            WorkerReply::Checkpoint => Ok(()),
+            other => unreachable!("the checkpoint request returned {other:?}"),
+        }
+    }
+}
+
+// ----------------------------------------------------------- the source
+
+/// The worker-backed [`MediumSource`] (PP-B4 checkpoint 2): cloneable;
+/// every handle it opens is a queue proxy — never an independent
+/// provider connection. `alive` reports the shared health cell, so a
+/// dead or poisoned worker fails every authoritative crossing
+/// operation closed through the source gate.
+#[derive(Clone)]
+pub struct WorkerSource {
+    tx: SyncSender<Job>,
+    tier: SyncTier,
+    health: Health,
+}
+
+impl MediumSource for WorkerSource {
+    type Medium = WorkerMedium;
+
+    fn open_medium(&self) -> Result<WorkerMedium, MediumError> {
+        Ok(WorkerMedium {
+            tx: self.tx.clone(),
+            tier: self.tier,
+        })
+    }
+
+    fn alive(&self) -> bool {
+        self.health.alive()
+    }
+}
+
+// ------------------------------------------------------------- the handle
+
+/// The campaign's single canonical I/O worker: the handle owns the
+/// thread's join, its queue admission, its health cell, and the test
+/// fault control. Spawn opens the ONE provider connection (moved into
+/// the thread) and reads the truthful [`SyncTier`] from it.
+pub struct IoWorker {
+    tx: Option<SyncSender<Job>>,
+    health: Health,
+    tier: SyncTier,
+    fault: WorkerFaultControl,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl IoWorker {
+    /// Spawns the worker over the campaign location with the
+    /// provisional default queue capacity.
+    pub fn spawn(location: &StoreLocation) -> Result<Self, MediumError> {
+        Self::spawn_with_faults(location, DEFAULT_QUEUE_CAPACITY, WorkerFaultControl::new())
+    }
+
+    /// The fault-controlled spawn (test-only surface).
+    #[doc(hidden)]
+    pub fn spawn_with_faults(
+        location: &StoreLocation,
+        capacity: usize,
+        fault: WorkerFaultControl,
+    ) -> Result<Self, MediumError> {
+        // The ONE provider connection — opened here, moved into the thread;
+        // the proxies never open another.
+        let store = SessionStore::open(location)?;
+        let tier = store.durability_tier();
+        let (tx, rx) = sync_channel(capacity);
+        let cell = Arc::new(AtomicU8::new(HEALTH_ALIVE));
+        let handle = thread::Builder::new()
+            .name("canonical-io-worker".to_owned())
+            .spawn({
+                let fault = fault.clone();
+                let health = Health(cell.clone());
+                move || worker_loop(rx, store, health, fault)
+            })
+            .map_err(|error| MediumError::Io {
+                op: "io-worker spawn",
+                path: location.display_path(),
+                source: error,
+            })?;
+        Ok(IoWorker {
+            tx: Some(tx),
+            health: Health(cell),
+            tier,
+            fault,
+            handle: Some(handle),
+        })
+    }
+
+    /// The worker-backed source (cloneable; each `open_medium` is a
+    /// queue proxy to the one serialization point).
+    pub fn source(&self) -> Result<WorkerSource, MediumError> {
+        match &self.tx {
+            Some(tx) => Ok(WorkerSource {
+                tx: tx.clone(),
+                tier: self.tier,
+                health: self.health.clone(),
+            }),
+            None => Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is stopped".to_owned(),
+            }),
+        }
+    }
+
+    /// Whether the worker thread is alive — readable WITHOUT a
+    /// blocking worker request (the shared health cell; any exit
+    /// path, including a panic, flips it through the drop guard).
+    pub fn healthy(&self) -> bool {
+        self.health.alive()
+    }
+
+    /// The cached durability tier, read from the actual provider at
+    /// spawn (truthful; never a round trip).
+    pub fn tier(&self) -> SyncTier {
+        self.tier
+    }
+
+    /// POISON the session: mark the worker unusable for authoritative
+    /// progression — every crossing operation refuses through the
+    /// source's `alive` gate, journal-only deactivations included.
+    /// Idempotent; the thread itself is unaffected (it drains
+    /// harmlessly). Worker deaths flip the same cell automatically.
+    pub fn poison(&self) {
+        self.health.dead();
+    }
+
+    /// STOP: close this handle's admission (drops its queue sender).
+    /// The worker exits once every other sender — the sources and
+    /// proxies — is dropped; `join` waits for that exit.
+    pub fn stop(&mut self) {
+        self.tx = None;
+    }
+
+    /// JOIN: stop, then wait for the thread's exit (all sources and
+    /// proxies must already be dropped). A panicked worker surfaces as
+    /// the typed unavailable error.
+    pub fn join(mut self) -> Result<(), MediumError> {
+        self.stop();
+        match self.handle.take() {
+            Some(handle) => handle.join().map_err(|_| MediumError::WorkerUnavailable {
+                detail: "the I/O worker thread panicked".to_owned(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Test-only: submit one raw job and receive its reply receiver
+    /// (the abandoned-receiver and queue-saturation evidence; also the
+    /// fixture's foreign-writer path).
+    #[doc(hidden)]
+    pub fn submit_probe(
+        &self,
+        op: MediumOp,
+    ) -> Result<Receiver<Result<WorkerReply, MediumError>>, MediumError> {
+        let (reply, slot) = completion_slot();
+        match &self.tx {
+            Some(tx) => tx.send(Job { op, reply }).map(|()| slot).map_err(|_| {
+                MediumError::WorkerUnavailable {
+                    detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+                }
+            }),
+            None => Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is stopped".to_owned(),
+            }),
+        }
+    }
+
+    /// Test-only: the per-instance fault control.
+    #[doc(hidden)]
+    pub fn fault_control(&self) -> WorkerFaultControl {
+        self.fault.clone()
+    }
+}

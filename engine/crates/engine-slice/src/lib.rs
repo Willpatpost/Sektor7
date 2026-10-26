@@ -18,4 +18,5 @@ pub mod sim;
 pub mod sim_demo;
 pub mod store;
 pub mod window_demo;
+pub mod worker;
 pub mod world;

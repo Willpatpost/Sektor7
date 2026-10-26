@@ -65,6 +65,16 @@ pub trait MediumSource: Clone {
     /// future worker instantiation's "handles" are queue proxies to
     /// the one serialization point.
     fn open_medium(&self) -> Result<Self::Medium, MediumError>;
+
+    /// Whether the source's medium path is usable for AUTHORITATIVE
+    /// progression (PP-B4 checkpoint 2's poison surface). The default
+    /// is always true — a store location cannot die; the worker-backed
+    /// source reports its shared health cell, so a dead or poisoned
+    /// worker fails every authoritative crossing operation closed
+    /// (journal-only deactivations included) until fresh recovery.
+    fn alive(&self) -> bool {
+        true
+    }
 }
 
 impl MediumSource for StoreLocation {
