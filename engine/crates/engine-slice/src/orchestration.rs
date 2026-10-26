@@ -31,6 +31,16 @@
 //! was queued; an unknown disposition is reported as unknown, never
 //! interpreted. Worker death poisons authoritative progression
 //! through the composed gate — without anyone polling a completion.
+//! Every completion RETAINS its typed disposition in the in-session
+//! completion ledger ([`CompletionRecord`]) — the one-shot poll/wait
+//! result and the durable-in-session record are distinct surfaces,
+//! and the authority-side reconciliation reads the ledger after the
+//! caller consumed the outcome; the pending slots and the ledger
+//! grow unboundedly over the session's lifetime by design (a bounded
+//! queue bounds ADMISSION, never the accounting — unresolved
+//! obligations are never silently discarded), and
+//! [`OrchestratedSession::join`] harvests the unpolled slots exactly
+//! as Checkpoint 4's maintenance drain will.
 //!
 //! NO maintenance entry points (rotation/reclamation orchestration
 //! and the graceful-shutdown final-save belong to Checkpoint 4) and
@@ -187,15 +197,97 @@ pub enum PublicationOutcome {
     Canceled { revision: Hash },
 }
 
-/// One retained completion record: the candidate identity and the
-/// captured frontier survive the completion (the accounting never
-/// depends on the caller's polling).
+/// One completion's retained disposition (C3-F3): the typed outcome
+/// classification the in-session completion ledger retains AFTER the
+/// caller consumed the one-shot poll/wait result — the authority-side
+/// reconciliation (and Checkpoint 4's maintenance drain) reads THESE
+/// records, never the caller's transient return value. The candidate
+/// identity lives on the record itself; the class-specific evidence
+/// (the provider-confirmed revision and its ACTUAL durability tier,
+/// the observed stale parent, the unknown-class reason, the
+/// definite-failure detail) lives here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionDisposition {
+    /// Accepted by the provider at the captured parent — the
+    /// provider-confirmed revision identity and its actual
+    /// durability tier.
+    Accepted { revision: Hash, tier: SyncTier },
+    /// The stale CAS rejection (the captured parent no longer the
+    /// canonical HEAD; the bytes were never rebased) — the observed
+    /// parent when the provider reported one.
+    Stale { observed: Option<Hash> },
+    /// The unresolved class — a possibly executed append whose reply
+    /// was lost (or a worker death in flight): never interpreted as
+    /// accepted or rejected; the unresolved candidate identity is
+    /// the record's `revision` field, retained for reconciliation.
+    Unknown { reason: UnknownReason },
+    /// A definite medium failure — nothing was installed (the
+    /// pre-commit class, or a job refused at the worker's execution
+    /// boundary); the detail is the error's display and NEVER an
+    /// implication that an append committed.
+    Failed { detail: String },
+    /// Canceled before the job started — a definite non-event.
+    Canceled,
+}
+
+impl CompletionDisposition {
+    /// The ledger's classification of one one-shot outcome.
+    fn of(outcome: &PublicationOutcome) -> Self {
+        match outcome {
+            PublicationOutcome::Accepted { revision, tier } => CompletionDisposition::Accepted {
+                revision: *revision,
+                tier: *tier,
+            },
+            PublicationOutcome::Stale { observed, .. } => CompletionDisposition::Stale {
+                observed: *observed,
+            },
+            PublicationOutcome::Unknown { reason, .. } => {
+                CompletionDisposition::Unknown { reason: *reason }
+            }
+            PublicationOutcome::Failed { error, .. } => CompletionDisposition::Failed {
+                detail: error.to_string(),
+            },
+            PublicationOutcome::Canceled { .. } => CompletionDisposition::Canceled,
+        }
+    }
+}
+
+/// The honest outcome for one publication reply — the shared mapping
+/// (the poll/wait completions and the join harvest both derive it).
+fn publication_outcome(
+    revision: Hash,
+    reply: Result<WorkerReply, MediumError>,
+) -> PublicationOutcome {
+    match reply {
+        Ok(WorkerReply::Append(AppendOutcome::Accepted { id, tier })) => {
+            PublicationOutcome::Accepted { revision: id, tier }
+        }
+        Ok(WorkerReply::Append(AppendOutcome::RejectedStaleParent { observed })) => {
+            PublicationOutcome::Stale { revision, observed }
+        }
+        Ok(WorkerReply::Append(AppendOutcome::Unknown { reason })) => {
+            PublicationOutcome::Unknown { revision, reason }
+        }
+        Ok(WorkerReply::Canceled) => PublicationOutcome::Canceled { revision },
+        Ok(other) => unreachable!("the publication reply was {other:?}"),
+        Err(error) => PublicationOutcome::Failed { revision, error },
+    }
+}
+
+/// One retained completion record: the candidate identity, the typed
+/// disposition, and the captured frontier survive the completion —
+/// the accounting never depends on the caller's polling, and an
+/// outcome the caller already consumed remains available for the
+/// authority-side reconciliation (C3-F3).
 #[derive(Debug, Clone)]
 pub struct CompletionRecord {
     /// The publication's orchestrator-local id.
     pub id: u64,
-    /// The candidate's identity (the publication record's id).
+    /// The candidate's identity (the publication record's id) —
+    /// retained for every class, including the unresolved Unknown.
     pub revision: Hash,
+    /// The retained typed disposition.
+    pub disposition: CompletionDisposition,
     /// The captured consequential coverage.
     pub coverage: CoverageFrontier,
     /// The captured journal frontier.
@@ -230,6 +322,22 @@ pub struct TickReport {
     pub regions_transitioned: Vec<usize>,
 }
 
+/// The join report (C3-F1): the worker thread's disposition and the
+/// FINAL in-session completion ledger — every previously polled
+/// completion plus the harvested dispositions of the unpolled
+/// pending publications. NEVER a "safely saved" claim: a clean join
+/// says only that the thread exited and the accounting is complete.
+#[derive(Debug)]
+pub struct JoinReport {
+    /// The worker thread's join result (Ok on the clean drain; a
+    /// panicked worker surfaces as the typed unavailable error).
+    pub worker: Result<(), MediumError>,
+    /// The final completion ledger: the candidate identity, the
+    /// typed disposition, and the captured frontier for every
+    /// publication this session admitted.
+    pub completions: Vec<CompletionRecord>,
+}
+
 // ------------------------------------------------------------- the session
 
 /// The orchestrated authoritative session (PP-B4 checkpoint 3): the
@@ -254,10 +362,18 @@ pub struct OrchestratedSession {
     required_waiting: AtomicBool,
     /// The pending optional publications (the completion slots the
     /// orchestrator RETAINS — caller cancellation never orphans the
-    /// accounting).
+    /// accounting). IN-MEMORY GROWTH HONESTY (C3-F3): the bounded
+    /// queue bounds ADMISSION, never the lifetime accumulation of
+    /// pending and completed records — an unpolled completion stays
+    /// pending with its live reply slot until consumed (never
+    /// silently discarded to enforce an artificial bound); Checkpoint
+    /// 4's maintenance drain harvests exactly these retained slots
+    /// (the same try_recv harvest [`Self::join`] performs).
     pending: Vec<PendingPublication>,
-    /// The retained completion records (bounded by the queue capacity
-    /// plus the in-flight window).
+    /// The retained completion records — every typed disposition
+    /// survives the caller's one-shot consumption (the authority-side
+    /// reconciliation reads these). The same in-memory growth honesty
+    /// applies: unbounded over the session's lifetime by design.
     completed: Vec<CompletionRecord>,
     next_id: u64,
 }
@@ -369,6 +485,18 @@ impl OrchestratedSession {
                 // application of the already-durable captures).
                 self.crossing
                     .activate(&mut self.spine, &mut self.director, region, next, now)?;
+                // C3-F4: the crossing preserves the LEGACY
+                // Ok-on-coherent-refusal semantics — a refused
+                // activation leaves the region safely dormant. The
+                // orchestrated tick REFUSES on it: a typed error
+                // BEFORE `run_tick` (the clock never advances, the
+                // incomplete transition is never recorded as
+                // successful); the transitions already completed this
+                // tick stand, and the next boundary retries coherently
+                // (the level check skips what completed).
+                if self.director.levels()[region] != next {
+                    return Err(TransitionError::ActivationRefused { region });
+                }
                 regions_transitioned.push(region);
             } else {
                 // Ordinary live→live: the accepted safe transition path.
@@ -424,7 +552,17 @@ impl OrchestratedSession {
         let bytes = save_session(&self.spine, &self.director).map_err(PipelineError::Format)?;
         let object = StoredObject::new(bytes).map_err(PipelineError::Medium)?;
         let coverage = self.coverage_frontier();
-        let scan = T1Journal::scan_file(&self.journal_root).map_err(PipelineError::Journal)?;
+        // C3-F2: the frontier derives from the AUTHORITATIVE ACTIVE
+        // journal generation — the pointer-resolved path, never the
+        // root file itself (after a PP-B3 rotation the root still
+        // holds the retired transactions and lacks the post-rotation
+        // ones). The ROOT stays the pointer's authoritative location
+        // — never replaced by the resolved generation; a campaign
+        // without a pointer resolves to the root itself (the
+        // pre-rotation behavior, byte-identical), and a pointer
+        // naming a missing journal fails the capture closed.
+        let active = active_journal_path(&self.journal_root).map_err(PipelineError::Journal)?;
+        let scan = T1Journal::scan_file(&active).map_err(PipelineError::Journal)?;
         let journal_frontier = scan
             .committed
             .iter()
@@ -607,10 +745,69 @@ impl OrchestratedSession {
         self.worker.fault_control()
     }
 
-    /// Joins the worker (the clean drain — every source and proxy
-    /// drops with the session).
-    pub fn join(self) -> Result<(), MediumError> {
-        self.worker.join()
+    /// Joins the worker (the bounded clean-shutdown accounting,
+    /// C3-F1): the crossing — and the pipeline's queue proxies it
+    /// owns — is released FIRST (the worker loop exits only when
+    /// EVERY queue sender is dropped; joining while the crossing
+    /// lives would block indefinitely). With the senders released,
+    /// the worker drains every admitted job FIFO (admitted work is
+    /// never abandoned — the C2-F2 discipline) and exits; the
+    /// unpolled completion slots are then harvested into the
+    /// completion ledger with their honest dispositions — the same
+    /// harvest Checkpoint 4's maintenance drain will perform (a slot
+    /// with no reply after the exit is the unresolved Unknown class,
+    /// never interpreted, never silently discarded).
+    ///
+    /// This is NOT the graceful final-save shutdown (Checkpoint 4's
+    /// scope): no final required snapshot is published, and a clean
+    /// join is NEVER itself a claim that anything was safely saved —
+    /// the dispositions in the report speak for themselves.
+    pub fn join(self) -> JoinReport {
+        // Release the crossing first — the sender-lifetime deadlock
+        // (C3-F1): the pipeline's proxy and the crossing's source
+        // hold queue senders, and the loop's exit requires every one
+        // of them dropped BEFORE the join blocks.
+        let Self {
+            spine,
+            director,
+            crossing,
+            worker,
+            journal_root: _,
+            required_waiting: _,
+            pending,
+            completed,
+            next_id: _,
+        } = self;
+        drop(spine);
+        drop(director);
+        drop(crossing);
+        // The pending entries hold only reply RECEIVERS — retaining
+        // them through the join is safe (an abandoned reply is a
+        // typed send failure the worker ignores).
+        let thread = worker.join();
+        let mut completions = completed;
+        for entry in pending {
+            let outcome = match entry.slot.try_recv() {
+                Ok(reply) => publication_outcome(entry.revision, reply),
+                // No reply after the thread's exit (a death in flight
+                // or a dropped reply slot): the unresolved class.
+                Err(_) => PublicationOutcome::Unknown {
+                    revision: entry.revision,
+                    reason: UnknownReason::WorkerReplyLost,
+                },
+            };
+            completions.push(CompletionRecord {
+                id: entry.id,
+                revision: entry.revision,
+                disposition: CompletionDisposition::of(&outcome),
+                coverage: entry.coverage,
+                journal_frontier: entry.journal_frontier,
+            });
+        }
+        JoinReport {
+            worker: thread,
+            completions,
+        }
     }
 
     // ----------------------------------------------------------- internals
@@ -660,45 +857,25 @@ impl OrchestratedSession {
     }
 
     /// Completes the pending entry at `index` with the worker's reply,
-    /// retaining the completion record (the candidate identity and the
-    /// captured frontier) and returning the outcome.
+    /// retaining the completion record (the candidate identity, the
+    /// TYPED DISPOSITION, and the captured frontier — the record
+    /// survives the caller's consumption of the returned outcome) and
+    /// returning the outcome.
     fn complete_at(
         &mut self,
         index: usize,
         reply: Result<WorkerReply, MediumError>,
     ) -> PublicationOutcome {
         let entry = self.pending.remove(index);
+        let outcome = publication_outcome(entry.revision, reply);
         self.completed.push(CompletionRecord {
             id: entry.id,
             revision: entry.revision,
+            disposition: CompletionDisposition::of(&outcome),
             coverage: entry.coverage,
             journal_frontier: entry.journal_frontier,
         });
-        match reply {
-            Ok(WorkerReply::Append(AppendOutcome::Accepted { id, tier })) => {
-                PublicationOutcome::Accepted { revision: id, tier }
-            }
-            Ok(WorkerReply::Append(AppendOutcome::RejectedStaleParent { observed })) => {
-                PublicationOutcome::Stale {
-                    revision: entry.revision,
-                    observed,
-                }
-            }
-            Ok(WorkerReply::Append(AppendOutcome::Unknown { reason })) => {
-                PublicationOutcome::Unknown {
-                    revision: entry.revision,
-                    reason,
-                }
-            }
-            Ok(WorkerReply::Canceled) => PublicationOutcome::Canceled {
-                revision: entry.revision,
-            },
-            Ok(other) => unreachable!("the publication reply was {other:?}"),
-            Err(error) => PublicationOutcome::Failed {
-                revision: entry.revision,
-                error,
-            },
-        }
+        outcome
     }
 
     /// The disconnected-slot completion: the worker died with the job
@@ -706,15 +883,19 @@ impl OrchestratedSession {
     /// UNKNOWN (never interpreted), the candidate identity retained.
     fn unknown_at(&mut self, index: usize) -> PublicationOutcome {
         let entry = self.pending.remove(index);
+        let outcome = PublicationOutcome::Unknown {
+            revision: entry.revision,
+            reason: UnknownReason::WorkerReplyLost,
+        };
         self.completed.push(CompletionRecord {
             id: entry.id,
             revision: entry.revision,
+            disposition: CompletionDisposition::Unknown {
+                reason: UnknownReason::WorkerReplyLost,
+            },
             coverage: entry.coverage,
             journal_frontier: entry.journal_frontier,
         });
-        PublicationOutcome::Unknown {
-            revision: entry.revision,
-            reason: UnknownReason::WorkerReplyLost,
-        }
+        outcome
     }
 }

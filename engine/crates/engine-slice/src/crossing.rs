@@ -385,6 +385,21 @@ pub enum TransitionError {
     /// (PP-B2 — nothing to summarize, or the retained window exceeds
     /// the ledger length).
     Compaction(CompactionError),
+    /// The coherent activation refusal surfaced BY THE ORCHESTRATED
+    /// TICK (PP-B4 checkpoint 3's C3-F4): the director's staged
+    /// application refused coherently — the region remains safely
+    /// dormant (the checkpoint retained, the held obligations intact,
+    /// nothing journaled, nothing half-promoted) and the tick refused
+    /// BEFORE the clock advanced. A RETRYABLE soft abort — the
+    /// `JournalFailed` class, never the `InstallIncompatible` halt:
+    /// the transitions already completed this tick stand (each
+    /// individually durable), and the next boundary retries (the
+    /// level check skips what completed). Constructed only by
+    /// [`crate::orchestration::OrchestratedSession::tick`]; the
+    /// crossing's own `activate` preserves the legacy
+    /// Ok-on-coherent-refusal semantics for the pipeline-free
+    /// callers.
+    ActivationRefused { region: usize },
 }
 
 /// The explicit session compaction's report (PP-B2 — the GO's §2/§3

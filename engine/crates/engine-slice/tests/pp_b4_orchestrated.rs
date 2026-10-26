@@ -7,18 +7,23 @@
 //! polling, both providers, the completion accounting, and the
 //! legacy-path preservation.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use engine_core::{
     EventClass, EventId, EventSpec, LodLevel, PresenceSample, Schedule, Spine, Tick,
 };
 use engine_persist::{
     AuthorityMode, CanonicalMedium, CommitOutcome, FaultAction, JournalFaultControl,
-    JournalFaultPoint, RevisionRecord, SyncTier, T1Journal,
+    JournalFaultPoint, RevisionRecord, SyncTier, T1Journal, TransactionId, UnknownReason,
+    active_journal_path,
 };
 use engine_slice::crossing::{SessionCrossing, TransitionError};
-use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
-use engine_slice::orchestration::{OrchestratedSession, PublicationOutcome, SubmitRefusal};
+use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
+use engine_slice::orchestration::{
+    CompletionDisposition, OrchestratedSession, PublicationOutcome, SubmitRefusal,
+};
 use engine_slice::region::{RegionConfig, RegionDirector};
 use engine_slice::store::{SessionStore, StoreLocation};
 use engine_slice::worker::{IoWorker, WorkerFault};
@@ -852,4 +857,549 @@ fn poisoning_during_an_executing_append_completes_honestly() {
     }
     // The poisoned session refuses further progression.
     assert!(session.tick(&far_presence()).is_err());
+}
+
+// ----------------------------------------------- the C3 corrective regressions
+
+/// The durable boundary routing (the pp_b3 rotation fixture's
+/// proven shape), COLLECTING the journaled transaction identities —
+/// the C3-F2 regression's classification evidence.
+fn durable_boundary_receipts(
+    crossing: &mut SessionCrossing,
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    presence: &PresenceSample,
+    journaled: &mut Vec<TransactionId>,
+) {
+    let now = spine.clock();
+    for region in 0..REGION_COUNT {
+        let current = director.levels()[region];
+        let next = director.target_level(region, std::slice::from_ref(presence));
+        if next == current {
+            continue;
+        }
+        if next == LodLevel::Dormant {
+            if let Some(receipt) = crossing
+                .deactivate(spine, director, region, now)
+                .expect("the deactivation commits")
+            {
+                journaled.push(receipt.journal.id);
+            }
+        } else if current == LodLevel::Dormant {
+            crossing
+                .activate(spine, director, region, next, now)
+                .expect("the activation installs");
+        } else {
+            director.transition_region(spine, region, next, now);
+        }
+    }
+}
+
+fn run_ticks_near(
+    spine: &mut Spine<NpcWorld>,
+    director: &mut RegionDirector,
+    presence: &PresenceSample,
+    ticks: u64,
+) {
+    for _ in 0..ticks {
+        director.apply(spine, std::slice::from_ref(presence));
+        spine.run_tick();
+    }
+}
+
+/// C3-F1 — the join eliminates the sender-lifetime deadlock: the
+/// crossing (the pipeline's queue proxies) is released BEFORE the
+/// join blocks, the worker drains every admitted job FIFO, and the
+/// unpolled completion slots are harvested into the ledger with
+/// their honest dispositions — never a "safely saved" claim.
+#[test]
+fn join_releases_the_crossing_and_harvests_unpolled_completions() {
+    let dir = TestDir::new("join-harvest");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // Worker-backed operations first (the crossing holds live queue
+    // proxies through its pipeline).
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    // Pending optional work, deliberately unpolled: both captures
+    // taken BEFORE either submission (a later capture's observe_head
+    // would queue behind the first append and read the ADVANCED head
+    // — a different record with the same content key, the
+    // duplicate-key rejection) — two byte-identical records: the
+    // first accepts, the second hits the advanced parent's CAS
+    // rejection.
+    let capture_a = session.capture_snapshot().unwrap();
+    let capture_b = session.capture_snapshot().unwrap();
+    let first = session.submit_publication(capture_a).unwrap();
+    let second = session.submit_publication(capture_b).unwrap();
+    assert_eq!(session.pending_publications(), 2);
+    // THE JOIN: must RETURN (the pre-fix join blocked indefinitely —
+    // the crossing's queue senders outlived the blocked thread join).
+    let report = session.join();
+    assert!(report.worker.is_ok(), "the worker joined cleanly");
+    let first_record = report
+        .completions
+        .iter()
+        .find(|record| record.id == first.id)
+        .expect("the unpolled first publication is harvested");
+    let second_record = report
+        .completions
+        .iter()
+        .find(|record| record.id == second.id)
+        .expect("the unpolled second publication is harvested");
+    match &first_record.disposition {
+        CompletionDisposition::Accepted { revision, .. } => {
+            assert_eq!(*revision, oracle_head_at(&location));
+        }
+        other => panic!("the drained first publication: {other:?}"),
+    }
+    assert!(matches!(
+        second_record.disposition,
+        CompletionDisposition::Stale { .. }
+    ));
+    // The candidate identity and the captured frontier retained.
+    assert_eq!(first_record.revision, oracle_head_at(&location));
+    assert!(!first_record.coverage.materialized.is_empty());
+}
+
+/// C3-F1 — the real-child join bound: the child performs the full
+/// worker-backed scenario with unpolled pending work and joins; the
+/// parent asserts the child TERMINATES within a bound (the pre-fix
+/// join deadlocked indefinitely — the crossing's queue senders
+/// outlived the blocked join). The parent invocation without the
+/// environment variable is a no-op pass.
+#[test]
+fn a_real_child_join_terminates_within_a_bound() {
+    if let Ok(child_root) = std::env::var("S7_PP_B4_JOIN_CHILD_DIR") {
+        // ==== the child: the join scenario in this process ====
+        let root = PathBuf::from(child_root);
+        std::fs::create_dir_all(&root).unwrap();
+        let location = StoreLocation::Directory(root.join("store"));
+        let mut store = SessionStore::open(&location).unwrap();
+        if store.head().unwrap().is_none() {
+            store
+                .append(
+                    &RevisionRecord::founding(AuthorityMode::Standalone, "pp-b4-join", 0),
+                    &[],
+                    None,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let (spine, director) = scenario_pair(150, &near_region_4());
+        let journal = T1Journal::open(root.join("journal.t1")).unwrap();
+        let mut session =
+            OrchestratedSession::open(spine, director, &location, journal, "pp-b4-join").unwrap();
+        session.tick(&far_presence()).unwrap();
+        assert!(matches!(
+            session.commit_canonical().unwrap(),
+            CommitOutcome::Confirmed(_)
+        ));
+        let capture_a = session.capture_snapshot().unwrap();
+        let capture_b = session.capture_snapshot().unwrap();
+        let first = session.submit_publication(capture_a).unwrap();
+        let second = session.submit_publication(capture_b).unwrap();
+        let _ = (first, second);
+        let report = session.join();
+        assert!(report.worker.is_ok(), "the child's join is clean");
+        assert_eq!(
+            report.completions.len(),
+            2,
+            "both unpolled publications harvested"
+        );
+        eprintln!(
+            "the child joined cleanly with {} harvested completions",
+            report.completions.len()
+        );
+        return;
+    }
+    // ==== the parent: the bounded wait ====
+    let dir = TestDir::new("join-child");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "a_real_child_join_terminates_within_a_bound",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("S7_PP_B4_JOIN_CHILD_DIR", dir.0.display().to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!(
+                    "the child's join did not terminate within the bound \
+                     (the sender-lifetime deadlock)"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    assert!(
+        status.success(),
+        "the child joined and exited cleanly: {status}"
+    );
+}
+
+/// C3-F2 — the captured journal frontier follows the ACTIVE
+/// generation: after a rotation with genuinely different
+/// retained/retired sets and post-rotation T1 activity, the
+/// recovery-resolved orchestrated session's capture carries the
+/// ACTIVE journal's validated committed identities — never the
+/// retired root's set (the pre-fix capture scanned the root and
+/// carried the retired identities).
+#[test]
+fn the_captured_frontier_follows_the_active_journal_generation() {
+    let dir = TestDir::new("frontier-active");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let legacy = dir.journal();
+    // The legacy pre-worker campaign (the rotation remains
+    // Checkpoint 4's orchestrated scope — the fixture rotates through
+    // the accepted crossing directly, the pp_b3 lifecycle's proven
+    // shape).
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&legacy).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "pp-b4-fa").unwrap();
+    // S1 — the pre-checkpoint publication (the checkpoint's range).
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // T1 — the first far boundary: region 4's captures journaled,
+    // unconfirmed.
+    let mut journaled = Vec::new();
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    let t1 = journaled
+        .last()
+        .copied()
+        .expect("the first far boundary journals");
+    // Confirm + materialize: C1 confirms the captures; the near
+    // boundary reactivates region 4 (the captures apply) and the
+    // near run accrues the post-reactivation crossing work.
+    assert!(matches!(
+        crossing.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    // THE ANCHOR — the checkpoint (the compaction's lane boundary +
+    // SK+MK): T1 becomes confirmed-materialized-SUBSUMED.
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the checkpoint publishes the anchor");
+    // T2 — the second far boundary: the NEW outstanding unconfirmed
+    // transaction over the post-reactivation accrual.
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    let t2 = journaled
+        .last()
+        .copied()
+        .expect("the second far boundary journals");
+    assert_ne!(t1, t2);
+    // THE ROTATION: the subsumed T1 retires (it stays in the root,
+    // byte-untouched); the outstanding T2 re-anchors into the new
+    // ACTIVE generation.
+    let rotation = crossing.rotate_journal().expect("the rotation completes");
+    assert_eq!(rotation.retained, vec![t2], "the outstanding survives");
+    assert!(rotation.retired.contains(&t1), "the subsumed retires");
+    assert_eq!(active_journal_path(&legacy).unwrap(), rotation.new_path);
+    // POST-ROTATION T1 ACTIVITY: the near boundary + accrual + the
+    // third far boundary — T3 lands ONLY in the ACTIVE generation.
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &near,
+        &mut journaled,
+    );
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary_receipts(
+        &mut crossing,
+        &mut spine,
+        &mut director,
+        &far,
+        &mut journaled,
+    );
+    let t3 = journaled
+        .last()
+        .copied()
+        .expect("the third far boundary journals");
+    let active_ids: BTreeSet<TransactionId> = T1Journal::scan_file(&rotation.new_path)
+        .unwrap()
+        .committed
+        .iter()
+        .map(|transaction| transaction.id)
+        .collect();
+    let root_ids: BTreeSet<TransactionId> = T1Journal::scan_file(&legacy)
+        .unwrap()
+        .committed
+        .iter()
+        .map(|transaction| transaction.id)
+        .collect();
+    assert!(active_ids.contains(&t2) && active_ids.contains(&t3));
+    assert!(root_ids.contains(&t1) && !root_ids.contains(&t3));
+    assert_ne!(root_ids, active_ids, "the sets genuinely differ");
+    drop(crossing);
+    // THE ORCHESTRATED RECOVERY over the campaign root: the pointer
+    // resolves the ACTIVE generation and the outstanding plans (T2,
+    // T3) replay — the coherent recovery.
+    let location = StoreLocation::Directory(dir.store());
+    let session = OrchestratedSession::recover(&location, &legacy, "pp-b4-fa").unwrap();
+    assert_eq!(
+        session.region_level(4),
+        LodLevel::Dormant,
+        "the outstanding plan replayed through the active generation"
+    );
+    // THE CAPTURE: the frontier equals the ACTIVE generation's
+    // committed identities — not the root's (the pre-fix capture
+    // scanned the root and carried the retired T1).
+    let capture = session.capture_snapshot().unwrap();
+    assert_eq!(capture.journal_frontier(), &active_ids);
+    assert_ne!(capture.journal_frontier(), &root_ids);
+}
+
+/// C3-F3 — the retained completion dispositions: every outcome class
+/// (Accepted with the actual tier, Stale with the observed parent,
+/// Canceled, Failed with the definite detail, Unknown with the
+/// reason) survives the caller's one-shot consumption in the
+/// completion ledger, and an unpolled completed slot stays pending
+/// with its live reply — recoverable by the future drain, never
+/// silently discarded.
+#[test]
+fn completion_dispositions_survive_the_callers_consumption() {
+    let dir = TestDir::new("dispositions");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // ACCEPTED: consumed by the caller, retained with the tier.
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    let (accepted_revision, accepted_tier) = match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Accepted { revision, tier } => (revision, tier),
+        other => panic!("the first publication: {other:?}"),
+    };
+    let record = session.completion_record(handle).unwrap();
+    assert_eq!(record.revision, accepted_revision);
+    match &record.disposition {
+        CompletionDisposition::Accepted { revision, tier } => {
+            assert_eq!(*revision, accepted_revision);
+            assert_eq!(*tier, accepted_tier);
+        }
+        other => panic!("the accepted disposition: {other:?}"),
+    }
+    assert!(!record.coverage.materialized.is_empty());
+    // STALE: the captured parent advanced past the confirmation.
+    let stale_capture = session.capture_snapshot().unwrap();
+    session.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let advanced = oracle_head_at(&location);
+    let handle = session.submit_publication(stale_capture).unwrap();
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Stale { observed, .. } => assert_eq!(observed, Some(advanced)),
+        other => panic!("the stale capture: {other:?}"),
+    }
+    let record = session.completion_record(handle).unwrap();
+    match &record.disposition {
+        CompletionDisposition::Stale { observed } => assert_eq!(*observed, Some(advanced)),
+        other => panic!("the stale disposition: {other:?}"),
+    }
+    // CANCELED: before the job starts — a definite non-event with
+    // the candidate identity still retained.
+    let capture = session.capture_snapshot().unwrap();
+    session.fault_control().set(WorkerFault::ParkNext);
+    let handle = session.submit_publication(capture).unwrap();
+    session.cancel_publication(handle);
+    session.fault_control().release_park();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Canceled { .. }
+    ));
+    let record = session.completion_record(handle).unwrap();
+    assert!(matches!(
+        record.disposition,
+        CompletionDisposition::Canceled
+    ));
+    assert!(!record.coverage.materialized.is_empty());
+    // FAILED: the definite pre-commit fault — nothing installed, the
+    // detail retained WITHOUT implying an append committed.
+    let head_before = oracle_head_at(&location);
+    session
+        .fault_control()
+        .set(WorkerFault::FailAppendPreCommit);
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Failed { .. }
+    ));
+    let record = session.completion_record(handle).unwrap();
+    match &record.disposition {
+        CompletionDisposition::Failed { detail } => assert!(!detail.is_empty()),
+        other => panic!("the failed disposition: {other:?}"),
+    }
+    assert_eq!(oracle_head_at(&location), head_before, "nothing installed");
+    // UNKNOWN: the lost append reply — identifiable as Unknown AFTER
+    // the polling consumed it.
+    session.fault_control().set(WorkerFault::LoseAppendReply);
+    let handle = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Unknown { .. }
+    ));
+    let record = session.completion_record(handle).unwrap();
+    assert!(matches!(
+        record.disposition,
+        CompletionDisposition::Unknown {
+            reason: UnknownReason::WorkerReplyLost,
+        }
+    ));
+    // UNPOLLED: a completed-but-unconsumed slot stays pending with
+    // its live reply (the future drain's input) — never silently
+    // discarded; the late poll recovers it. A FRESH content identity
+    // first: the Unknown case's EXECUTED append already installed
+    // this state's content key — a transition-free far tick advances
+    // the clock (part of the serialized state), giving the two
+    // captures a fresh key and keeping the deterministic
+    // accept-then-stale pair.
+    session.tick(&far_presence()).unwrap();
+    let capture_a = session.capture_snapshot().unwrap();
+    let capture_b = session.capture_snapshot().unwrap();
+    let first = session.submit_publication(capture_a).unwrap();
+    let second = session.submit_publication(capture_b).unwrap();
+    // FIFO: waiting for the second proves the first already finished.
+    assert!(matches!(
+        session.wait_publication(second).unwrap(),
+        PublicationOutcome::Stale { .. }
+    ));
+    assert_eq!(
+        session.pending_publications(),
+        1,
+        "the unpolled first stays pending"
+    );
+    assert!(matches!(
+        session.poll_publication(first).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    assert_eq!(session.pending_publications(), 0);
+    assert!(matches!(
+        session.completion_record(first).unwrap().disposition,
+        CompletionDisposition::Accepted { .. }
+    ));
+}
+
+/// C3-F4 — the coherent activation refusal refuses the tick BEFORE
+/// the clock: the dormant region's reactivation coherently refused
+/// (the accepted director seam, armed pre-open — the encapsulated
+/// director admits no mutable escape), the typed orchestration error
+/// surfaces with the region safely dormant, the already-completed
+/// transitions of the refused tick stand, the clock is unchanged,
+/// and the one-shot retry succeeds WITHOUT double application (the
+/// clean twin reaches the identical consequential state).
+#[test]
+fn a_coherent_activation_refusal_refuses_the_tick_before_the_clock() {
+    let dir = TestDir::new("activation-refusal");
+    let location = found_location(&dir, false);
+    // The injection is armed BEFORE the open (the flag consults only
+    // the named region's NEXT activation — the far boundary's
+    // deactivation never consumes it) and is consumed by the refused
+    // attempt (the retry is clean).
+    let (spine, mut director) = scenario_pair(150, &near_region_4());
+    director.debug_inject_apply_failure(4);
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "pp-b4-orch").unwrap();
+    // A genuinely dormant region with a valid checkpoint: the far
+    // boundary's six-phase deactivation (the T1 journal transaction
+    // carrying region 4's plan and checkpoint).
+    session.tick(&far_presence()).unwrap();
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert_eq!(scan.committed.len(), 1);
+    assert!(!scan.committed[0].plan.is_empty(), "the checkpoint is real");
+    assert!(matches!(
+        session.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    let clock_before = session.clock();
+    // THE REFUSAL: the near boundary's reactivation coherently
+    // refused — the typed orchestration error, BEFORE the clock.
+    match session.tick(&near_presence()) {
+        Err(TransitionError::ActivationRefused { region: 4 }) => {}
+        other => panic!("the coherent refusal is the typed error: {other:?}"),
+    }
+    assert_eq!(
+        session.region_level(4),
+        LodLevel::Dormant,
+        "nothing half-promoted — the region stays dormant"
+    );
+    assert_eq!(session.clock(), clock_before, "the clock did not advance");
+    // The already-completed transitions of the refused tick stand
+    // (region 3's activation preceded region 4 in the loop).
+    assert_ne!(
+        session.region_level(3),
+        LodLevel::Dormant,
+        "the completed transitions stand"
+    );
+    // THE RETRY: the injection is one-shot — the next near boundary
+    // activates cleanly, exactly once.
+    session.tick(&near_presence()).unwrap();
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    assert_eq!(session.clock().as_u64(), clock_before.as_u64() + 1);
+    // WITHOUT DOUBLE APPLICATION — the clean twin: the same scenario
+    // with ONE successful near boundary reaches the IDENTICAL
+    // consequential coverage, full serialized state, clock, and
+    // levels (the refused attempt applied nothing; the retry applied
+    // exactly once).
+    let twin_dir = TestDir::new("activation-refusal-twin");
+    let mut twin = orchestrated(&twin_dir);
+    twin.tick(&far_presence()).unwrap();
+    assert!(matches!(
+        twin.commit_canonical().unwrap(),
+        CommitOutcome::Confirmed(_)
+    ));
+    twin.tick(&near_presence()).unwrap();
+    assert_ne!(twin.region_level(4), LodLevel::Dormant);
+    assert_eq!(twin.clock().as_u64(), session.clock().as_u64());
+    assert_eq!(twin.region_level(4), session.region_level(4));
+    let session_capture = session.capture_snapshot().unwrap();
+    let twin_capture = twin.capture_snapshot().unwrap();
+    assert_eq!(
+        session_capture.coverage(),
+        twin_capture.coverage(),
+        "the consequential coverage matches the clean twin"
+    );
+    assert_eq!(
+        session_capture.content_identity(),
+        twin_capture.content_identity(),
+        "the full serialized state matches the clean twin (no double application)"
+    );
 }
