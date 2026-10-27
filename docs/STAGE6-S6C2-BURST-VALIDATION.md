@@ -1,14 +1,16 @@
 # STAGE 6 — S6-C2 BURST VALIDATION
 
-> **Status:** v2 · 2026-10-27 · **S6-C2 implementation artifact** — the
+> **Status:** v3 · 2026-10-27 · **S6-C2 implementation artifact** — the
 > finite-burst event stress, identity-conservation, and no-silent-drop
 > verification matrix (Stage 6 Checkpoint 2, the owner GO of 2026-10-27),
-> corrected per the source review's three test-harness findings (C2-F1
-> the B3 reservation verification, C2-F2 the unique scenario identities,
-> C2-F3 the deterministic B8 gates). Delivered on the
-> `s6-c2-burst-accounting` branch; NOT yet independently reviewed or
-> owner-accepted. S6-C3 (the 900-second soak), S6-C4 (hardware), and
-> S6-C5 (the report) remain gated.
+> corrected per the source review's findings (C2-F1 the B3 reservation
+> verification, C2-F2 the unique scenario identities, C2-F3 the B8
+> gates — v3 completes C2-F3C with the genuinely capture-bearing
+> durability path, the RAII park guard, and the actual-identity
+> assertion) and the final test-corrective GO's PP-B1 race-test fix.
+> Delivered on the `s6-c2-burst-accounting` branch; NOT yet
+> independently reviewed or owner-accepted. S6-C3 (the 900-second
+> soak), S6-C4 (hardware), and S6-C5 (the report) remain gated.
 
 ## 1. The burst cohort
 
@@ -73,7 +75,7 @@ counter.
 | **B5** dormant holds and reactivation (region 5 dormant at founding) | the cohort enters the held path with identities unchanged; nothing executes while dormant; no NPC-state change in the region; the six-phase reactivation makes the work eligible; exactly-once completion; the routine reconstruction resumes |
 | **B6** sustained overload and recovery (budget 60 vs 100 injected/tick for 30 ticks, every window's scenario identities asserted unique) | the outstanding cohort GROWS during the window and is never falsely declared recovered; peak backlog and max lateness recorded; complete drain after the injection stops; an `s6-evidence/2` package emitted through the accepted S6-C1 collector and verified by `verify_package` |
 | **B7** late arrivals (dues behind the clock) | `late_arrivals` reported; the safe watermark never overclaims past a pending earlier-due event and stays ≤ max executed due; exactly-once; lateness first-class |
-| **B8** persistence under burst load — **the C2-F3 correction** | a 200-burst load with unique scenario identities; the publication queue **deterministically saturated** through the accepted `WorkerFault::ParkExecutingAppend` seam (the captures collected FIRST — the observed-head read is a worker round-trip — then the consumer parked at its entry barrier with a bounded `park_entered` wait, the queue filled against the KNOWN blocked consumer, and the release on every path BEFORE any assertion: the typed `Busy` refusal is proven regardless of host scheduling); a **WITNESSED** capture-bearing six-phase deactivation (the region's level and the director's captured-delta counter read before and after — never assumed) with the required canonical confirmation **consistent with the witnessed capture** (a `Confirmed` receipt only over captured consequences; a valid `NothingPending` only when nothing was captured — never a claimed new confirmation); per-identity **exactly-once occurrence counting** (each accepted identity exactly once in the ledger — no missing, no duplicates — with the full-history availability checked before the scan); a graceful close; an EXACT recovery (clock, stage-4 fingerprint, conserved obligations) and a continued tick |
+| **B8** persistence under burst load — **the C2-F3 correction (v3: the genuinely capture-bearing path)** | a 200-burst load with the ACTUALLY SUBMITTED scenario identities collected at scheduling time and asserted unique (not a generated expected set); the publication queue **deterministically saturated** through the accepted `WorkerFault::ParkExecutingAppend` seam (the captures collected FIRST — the observed-head read is a worker round-trip — then the consumer parked at its entry barrier with a bounded `park_entered` wait and an **RAII park guard** whose Drop releases and clears on every path including a panic unwind, so a parked worker can never outlive the scenario); the **genuinely capture-bearing durability path**: 260 deterministic accrual ticks under the real NPC routine execution (no direct state mutation — the spine's own recorded executions accrue region 0's pending consequential signals), the witnessed six-phase deactivation (region 0 read Dormant; the captured-delta counter before/after) with **`captured_during > 0` REQUIRED**, the required canonical confirmation **REQUIRED `Confirmed`** with the receipt's key count equal to the witnessed captured set and the target region's consequence identities present (the Checkpoint-1 attribution filter); the reactivation applying the captured consequences as **exactly-once credits** (the applied change equals the captured signal sum); per-identity **exactly-once occurrence counting**; a graceful close; an EXACT recovery (clock, stage-4 fingerprint, **the retained consequential state** — region 0's applied credits survive the cycle — and conserved obligations) and a continued tick. The **empty-capture companion** (separately labeled) verifies the truthful `NothingPending` for a young campaign — a valid outcome that can never satisfy the capture-bearing test |
 
 Focused failure/boundary gates: the authority-gate refusal (poisoned
 worker → typed `Gate` rejections, the composed tick refuses, the close
@@ -112,3 +114,34 @@ worker fault seam's entry-barrier semantics (the captures must be
 collected while the consumer is live — the observed-head read is a
 worker round-trip). No new read-only engine-core capability was
 required — the existing public APIs sufficed.
+
+## 6. The PP-B1 race-test correction (the final test-corrective GO)
+
+`concurrent_canonical_writer_never_yields_a_coherent_backup`
+(`pp_b1_backup.rs`) now distinguishes writer ACTIVITY (proven by a
+bounded readiness handshake before the backup starts, plus the
+attempt/accept counters) from an IN-WINDOW COMMITTED MUTATION (proven
+only by the specific refusal classes). The corrected outcome oracle:
+on `Err`, only the proven classes are admitted (Quiescence,
+Contention, and the constrained Incoherent with its
+committed-mutation proof), with the no-manifest and
+verification-refuses assertions retained; on `Ok`, the set MUST pass
+`verify_backup` AND the reported chain head must be a REAL source
+state — the pre-writer validated head or one of the writer's
+committed heads (recorded in a synchronized vector). The safety
+property is "the backup never yields an INCOHERENT usable set", never
+"a live writer always forces a refusal", and never the fabricated
+converse (that a success proves the writer did not run). The new
+`quiescent_source_backup_succeeds_and_later_writes_do_not_invalidate`
+regression verifies deterministically (a go/stop channel handshake
+with a 60-second safety cap — the writer can never remain permanently
+blocked) that a writer gated until after the backup yields: success,
+verification, the exact known quiescent head, a coherent pair, and a
+later commit that does not retroactively invalidate the snapshot.
+**The remaining deterministic-coverage gap:** the in-window mutation
+classes (Quiescence between the head reads, Incoherent between the
+source validation and the capture) cannot be induced deterministically
+without an internal `backup_campaign` phase seam — NOT authorized in
+this corrective; the racing-writer test exercises them
+probabilistically, and repeated local runs cannot prove all
+cross-platform interleavings have been explored.

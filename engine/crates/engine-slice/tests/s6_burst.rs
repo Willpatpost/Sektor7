@@ -1205,8 +1205,10 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         .expect("the session opens");
 
     // The burst cohort (the load) and the independent registry (the
-    // scenario indices allocated per slice — unique identities).
+    // scenario indices allocated per slice — unique identities, the
+    // ACTUAL submitted set collected at scheduling time).
     let mut registered: Vec<EventId> = Vec::new();
+    let mut scenario_identities: HashSet<(u16, u32)> = HashSet::new();
     let mut next_index: u32 = 0;
     for offset in 0..10u64 {
         let due = Tick(20 + offset);
@@ -1220,17 +1222,22 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
             let id = session
                 .schedule_event(spec)
                 .expect("the scheduling accepted");
+            assert!(
+                scenario_identities.insert((8, next_index)),
+                "the scenario identity (8, {next_index}) is unique among the \
+                 actually submitted specifications"
+            );
             registered.push(id);
             next_index += 1;
         }
         session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     }
     assert_eq!(registered.len(), 200);
-    let scenario_identities: HashSet<(u16, u32)> = (0..200u32).map(|index| (8u16, index)).collect();
     assert_eq!(
         scenario_identities.len(),
         registered.len(),
-        "every scheduling attempt carries a unique scenario identity"
+        "the actually scheduled scenario identities are unique (not a generated \
+         expected set)"
     );
 
     // THE DETERMINISTIC SATURATION: collect the captures FIRST (the
@@ -1240,14 +1247,30 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
     // ParkExecutingAppend discipline the persistence benchmark uses),
     // then fill the bounded queue against the KNOWN blocked consumer —
     // the Busy refusal is proven, never left to host scheduling. The
-    // release happens on every path BEFORE any assertion (a parked
-    // worker must never outlive the scenario).
+    // RAII park guard releases the worker on EVERY path — normal
+    // completion, assertion failure, or early panic — so a parked
+    // worker can never outlive the scenario.
     session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     let captures: Vec<_> = (0..80)
         .map(|_| session.capture_snapshot().expect("the capture"))
         .collect();
     let control = session.fault_control();
     control.set(WorkerFault::ParkExecutingAppend);
+    // The fail-safe release guard: Drop releases the park and clears
+    // the fault, including during a panic unwind between arming and
+    // the explicit release.
+    struct ParkGuard {
+        control: engine_slice::worker::WorkerFaultControl,
+    }
+    impl Drop for ParkGuard {
+        fn drop(&mut self) {
+            self.control.release_park();
+            self.control.clear();
+        }
+    }
+    let _park_guard = ParkGuard {
+        control: control.clone(),
+    };
     let mut handles = Vec::new();
     let mut admitted = 0usize;
     let mut busy = 0usize;
@@ -1262,20 +1285,19 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         }
     }
     // The first admitted job parks the consumer at its entry barrier
-    // (a bounded wait — release on the deadline path BEFORE failing).
+    // (a bounded wait; the guard's Drop covers the deadline failure
+    // path too).
     let deadline = Instant::now() + Duration::from_secs(10);
     while !control.park_entered() {
         if Instant::now() >= deadline {
-            control.release_park();
-            control.clear();
             panic!("the worker never reached the park boundary");
         }
         std::hint::spin_loop();
     }
     // The consumer is deterministically blocked mid-append with the
     // queue filled behind it: the typed Busy refusal was returned
-    // against a KNOWN blocked consumer. Release FIRST (every normal
-    // and error path), then assert.
+    // against a KNOWN blocked consumer. Release FIRST (the explicit
+    // release; the guard remains as the fail-safe), then assert.
     control.release_park();
     control.clear();
     assert!(
@@ -1288,14 +1310,28 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         let _ = session.wait_publication(handle);
     }
 
-    // A WITNESSED capture-bearing durable transition (never assumed):
-    // the antipodal presence drives region 0's six-phase deactivation
-    // — the region's level and the director's captured-delta counter
-    // are read before and after, and the REQUIRED canonical
-    // confirmation's outcome must be CONSISTENT with the witnessed
-    // capture (a Confirmed receipt for captured consequences; a valid
-    // NothingPending only when nothing was captured — never a claimed
-    // new confirmation over an empty capture).
+    // THE GENUINELY CAPTURE-BEARING DURABILITY PATH (C2-F3C): accrue
+    // real consequential signals in region 0 through the existing NPC
+    // routine path — a deterministic, bounded logical-tick progression
+    // (each region-0 NPC accrues a pending signal every 16th real
+    // step; at the Full-LOD cadence ~260 ticks guarantees the first
+    // milestone wave) — then witness the durable six-phase
+    // deactivation, REQUIRE captured_during > 0, and REQUIRE the
+    // genuinely confirmed receipt. No NPC state is ever directly
+    // mutated: the signals arise only from the routine executions the
+    // spine itself records.
+    for _ in 0..260 {
+        session
+            .tick(&[DEMO_PRESENCE])
+            .expect("the accrual tick runs");
+    }
+    let world = session.spine().world();
+    let signals_before = engine_slice::persist_demo::region_signal_sum(world, 0);
+    let credits_before = engine_slice::persist_demo::region_credit_sum(world, 0);
+    assert!(
+        signals_before > 0,
+        "region 0 holds a real accrued consequential signal ({signals_before})"
+    );
     let far = PresenceSample {
         position: (-100.0, 0.0),
         velocity: (0.0, 0.0),
@@ -1310,37 +1346,56 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         "the deactivation is WITNESSED, not assumed"
     );
     let captured_during = session.director().diagnostics().captured_deltas - captured_before;
+    assert!(
+        captured_during > 0,
+        "the capture-bearing case REQUIRES captured consequences ({captured_during})"
+    );
+    let episode = session.director().states()[0].episode;
     let commit = session.commit_canonical().expect("the required commit");
-    match (&commit, captured_during) {
-        (CommitOutcome::Confirmed(receipt), captured) => {
-            assert!(
-                captured > 0,
-                "a Confirmed receipt requires witnessed captured consequences \
-                 (captured {captured}, receipt keys {})",
-                receipt.keys.len()
-            );
-        }
-        (CommitOutcome::NothingPending, 0) => {
-            // The valid empty-capture response: nothing was captured,
-            // so nothing was pending — never claimed as a new
-            // confirmation.
-        }
-        (CommitOutcome::NothingPending, captured) => {
-            panic!(
-                "NothingPending over a witnessed capture of {captured} consequences — \
-                 the capture's T1 work is unaccounted"
-            );
-        }
-        (other, captured) => panic!(
-            "the confirmation outcome is inconsistent with the witnessed capture \
-             ({other:?} with {captured} captured)"
-        ),
-    }
-    // The reactivation and the remaining load drain.
+    let CommitOutcome::Confirmed(receipt) = &commit else {
+        panic!(
+            "the capture-bearing case REQUIRES a confirmed receipt \
+             (captured {captured_during}, got {commit:?})"
+        );
+    };
+    // The receipt's relation to the captured consequence set: the
+    // batch confirms exactly the witnessed captures, and the target
+    // region's consequence identities are present (the Checkpoint-1
+    // attribution filter — region 0, this episode, its NPCs).
+    assert_eq!(
+        receipt.keys.len(),
+        captured_during as usize,
+        "the confirmed batch is exactly the captured consequence set"
+    );
+    let expected: HashSet<engine_persist::ConsequenceId> = (0..engine_slice::npc::NPC_COUNT)
+        .filter(|npc| npc % engine_slice::npc::REGION_COUNT == 0)
+        .map(|npc| engine_persist::ConsequenceId::new(0, episode, npc as u32))
+        .collect();
+    let matched = receipt
+        .keys
+        .iter()
+        .filter(|key| expected.contains(*key))
+        .count();
+    assert!(
+        matched > 0,
+        "the target region's consequence identities are confirmed ({matched} of {})",
+        receipt.keys.len()
+    );
+    // The reactivation: the captured consequences apply as exactly-once
+    // credits (the applied change must equal the captured signal sum).
     session.tick(&[DEMO_PRESENCE]).expect("the near tick");
     for _ in 0..40 {
         session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     }
+    let credits_after = engine_slice::persist_demo::region_credit_sum(session.spine().world(), 0);
+    assert_eq!(
+        credits_after - credits_before,
+        signals_before,
+        "the reactivation applied the captured consequences exactly once \
+         (credits {} -> {}, signals {signals_before})",
+        credits_before,
+        credits_after
+    );
 
     // THE EXACTLY-ONCE VERIFICATION (per-identity occurrence counts,
     // not set cardinality): each accepted identity appears EXACTLY
@@ -1379,7 +1434,9 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
     assert!(close.failure.is_none(), "{:?}", close.failure);
 
     // The exact recovery: the restored clock and fingerprint, the
-    // restored obligation state, and a continued tick.
+    // restored obligation state, the RETAINED consequential state
+    // (region 0's applied credits survive the close/recovery cycle),
+    // and a continued tick.
     let mut recovered =
         OrchestratedSession::recover(&location, &journal_path, "s6c2-b8").expect("the recovery");
     assert_eq!(
@@ -1391,6 +1448,12 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         engine_slice::region::stage4_state_fingerprint_hex(recovered.spine(), recovered.director()),
         closing_fingerprint,
         "the restored fingerprint is exact"
+    );
+    assert_eq!(
+        engine_slice::persist_demo::region_credit_sum(recovered.spine().world(), 0),
+        credits_after,
+        "the recovered campaign retains the expected consequential state \
+         (region 0's applied credits)"
     );
     assert_eq!(
         recovered.spine().stats().scheduled,
@@ -1405,6 +1468,53 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
         .expect("the recovered tick runs");
     let report = recovered.close();
     assert!(report.failure.is_none(), "{:?}", report.failure);
+}
+
+/// The separately labeled EMPTY-CAPTURE companion (C2-F3C's other
+/// half): a young campaign whose deactivation captures nothing gets
+/// the truthful `NothingPending` — a valid outcome that must NEVER
+/// satisfy the positive capture-bearing test above.
+#[test]
+fn b8_companion_empty_capture_reports_nothing_pending_truthfully() {
+    let timing = SimConfig::default();
+    let cleaner = TestDir::new("b8-empty");
+    let location = found_store(&cleaner.root);
+    let (spine, director) = demo_scenario(&timing, &[DEMO_PRESENCE]).expect("the scenario builds");
+    let journal = T1Journal::open(cleaner.root.join("journal.t1")).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "s6c2-b8-empty")
+            .expect("the session opens");
+    // A young campaign: no NPC has reached a milestone, so region 0
+    // holds no pending consequential signal.
+    session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
+    assert_eq!(
+        engine_slice::persist_demo::region_signal_sum(session.spine().world(), 0),
+        0,
+        "the young region 0 holds no consequential signal"
+    );
+    let far = PresenceSample {
+        position: (-100.0, 0.0),
+        velocity: (0.0, 0.0),
+    };
+    let captured_before = session.director().diagnostics().captured_deltas;
+    session.tick(&[far]).expect("the far tick");
+    session.tick(&[far]).expect("the far tick");
+    session.tick(&[far]).expect("the far tick");
+    assert_eq!(
+        session.region_level(0),
+        LodLevel::Dormant,
+        "the empty-capture deactivation is witnessed too"
+    );
+    let captured_during = session.director().diagnostics().captured_deltas - captured_before;
+    assert_eq!(captured_during, 0, "nothing was captured");
+    let commit = session.commit_canonical().expect("the commit runs");
+    assert!(
+        matches!(commit, CommitOutcome::NothingPending),
+        "the empty capture reports NothingPending truthfully: {commit:?}"
+    );
+    session.tick(&[DEMO_PRESENCE]).expect("the near tick");
+    let close = session.close();
+    assert!(close.failure.is_none(), "{:?}", close.failure);
 }
 
 // ------------------------------------------- focused failure and boundary tests

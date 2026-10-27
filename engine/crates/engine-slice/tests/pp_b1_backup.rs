@@ -9,6 +9,7 @@
 //! pairings, and the never-quiet-overwrite rule.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
 use engine_persist::{
@@ -422,11 +423,19 @@ fn live_session_holding_the_journal_refuses_the_backup() {
 
 #[test]
 fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
-    // THE REVIEW CORRECTIVE (Finding 3), the canonical-write half of
-    // the boundary: a writer outside the journal discipline (a raw
+    // THE CANONICAL-WRITE HALF OF THE BOUNDARY (the review corrective,
+    // Finding 3, with the Ubuntu-incident correction of 2026-10-27, run
+    // 40580374199): a writer outside the journal discipline (a raw
     // medium append — exactly what the head-stability verification
-    // targets) during the capture must refuse the set — never a
-    // silent "coherent" backup of a moving campaign.
+    // targets) racing the capture. The safety property is that the
+    // backup NEVER yields an INCOHERENT usable set: an in-window
+    // committed mutation refuses (Quiescence / Contention /
+    // Incoherent — each with its own proof); a genuinely quiescent
+    // interval may legitimately succeed, and that success is admitted
+    // ONLY with independent verification and provenance (the reported
+    // head must be a real source state). Writer ACTIVITY alone —
+    // proven by the readiness handshake and the counters — is never
+    // conflated with an in-window committed mutation.
     let near = near_region_4();
     let (mut spine, mut director) = scenario_pair(150, &near);
     let dir = TestDir::new("racing-writer");
@@ -461,17 +470,40 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
     // dependence (a fast runner finished all appends before the
     // backup's boundary reads, and the backup then correctly captured
     // the post-race quiescent state). The continuous writer makes the
-    // refusal deterministic on every machine.
+    // race REAL on every machine — but, as the Ubuntu CI failure
+    // (run 40580374199) proved, a real race does NOT guarantee a
+    // committed mutation INSIDE the protected interval: on a loaded
+    // runner the spawned thread may not be scheduled before the
+    // backup completes, and a coherent snapshot of the momentarily
+    // quiescent source is then the CORRECT outcome. The corrected
+    // oracle below therefore distinguishes writer ACTIVITY (proven by
+    // the readiness handshake and the attempt counters) from an
+    // IN-WINDOW committed mutation (proven only by the specific
+    // refusal classes) — and admits a successful backup ONLY when it
+    // is independently verified and its chain head is a real source
+    // state (the pre-writer head or one of the writer's committed
+    // heads, recorded in the shared vector).
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer_stop = stop.clone();
     // The deterministic writer-activity evidence (the CI corrective):
     // every append attempt and every ACCEPTED append are counted —
     // the race is proven firsthand, never assumed from thread
-    // scheduling.
+    // scheduling. The READINESS handshake makes the aliveness proof
+    // independent of host scheduling: the main thread waits (bounded)
+    // for the writer's first attempt BEFORE starting the backup, so
+    // `attempts > 0` no longer depends on whether the spawned thread
+    // was scheduled — while proving nothing about WHERE any commit
+    // landed (that remains the refusal classes' job).
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer_attempts = attempts.clone();
     let writer_accepted = accepted.clone();
+    // The writer's committed heads, recorded for the success-path
+    // provenance check (a synchronized, inspectable structure).
+    let committed_heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer_heads = committed_heads.clone();
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_ready = ready.clone();
     let writer = std::thread::spawn(move || {
         let mut medium = SqliteMedium::open(db_path).unwrap();
         let mut head = start_head;
@@ -479,6 +511,7 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
         let mut index = 0u64;
         while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) && index < 10_000 {
             writer_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            writer_ready.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut enc = Encoder::new();
             enc.write_str("sektor7/engine-slice/backup-race/1");
             enc.write_bytes(&index.to_le_bytes());
@@ -489,6 +522,7 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
             match medium.append(&record, std::slice::from_ref(&object), Some(head)) {
                 Ok(AppendOutcome::Accepted { id, .. }) => {
                     writer_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    writer_heads.lock().unwrap().push(id);
                     head = id;
                     epoch += 1;
                 }
@@ -503,57 +537,240 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
             index += 1;
         }
     });
+    // The bounded readiness handshake: the writer has made at least
+    // one append attempt before the backup starts (aliveness —
+    // never an in-window-mutation claim).
+    let handshake = Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+        if Instant::now() >= handshake {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.join().unwrap();
+            panic!("the racing writer never became ready");
+        }
+        std::hint::spin_loop();
+    }
     let result = backup_campaign(&dir.db(), &dir.journal(), &dir.output());
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
-    // The writer demonstrably ran during the capture window — the
-    // deterministic activity proof.
+    // The writer demonstrably ran (the handshake made this
+    // deterministic) — aliveness, never an in-window-mutation proof.
     assert!(
         attempts.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "the concurrent writer demonstrably ran"
     );
-    let refusal = result.expect_err("the concurrent writer never yields a usable backup");
-    // THE REFUSAL CLASSES — three legitimate fail-closed outcomes of
-    // the one boundary. Quiescence: the canonical head moved across
-    // the stability reads. Contention: the capture's TRUNCATE
-    // checkpoint contended the writer's SQLite write lock. Incoherent
-    // (the macOS CI evidence 2026-10-27, run 40445534468): the writer
-    // committed BETWEEN the source validation and the first head read
-    // — the stability pair then straddles a quiet interval while the
-    // captured chain differs from the pre-capture validated summary,
-    // and the audit refuses the set as not cohering with the source
-    // chain BEFORE any manifest is written. That admission is
-    // constrained to exactly the proven race condition and carries
-    // its committed-mutation proof; every other outcome remains a
-    // failure.
-    match &refusal {
-        BackupError::Quiescence { .. } | BackupError::Medium(MediumError::Contention { .. }) => {}
-        BackupError::Incoherent { detail } => {
+    // THE CORRECTED OUTCOME ORACLE: the safety property is that the
+    // backup NEVER yields an incoherent usable set. A refusal is the
+    // boundary at work; a success is admissible ONLY as an
+    // independently verified coherent snapshot of a REAL source
+    // state — never merely because the function returned Ok, and
+    // never with the fabricated claim that the writer did not run.
+    match result {
+        Err(refusal) => {
+            // THE REFUSAL CLASSES — three legitimate fail-closed
+            // outcomes of the one boundary. Quiescence: the canonical
+            // head moved across the stability reads (a committed
+            // mutation INSIDE the capture). Contention: the capture's
+            // TRUNCATE checkpoint contended the writer's SQLite write
+            // lock. Incoherent (the macOS CI evidence, run
+            // 40445534468): the writer committed BETWEEN the source
+            // validation and the first head read — the stability pair
+            // then straddles a quiet interval while the captured chain
+            // differs from the pre-capture validated summary, and the
+            // audit refuses the set BEFORE any manifest. The
+            // Incoherent admission is constrained to exactly the
+            // proven race condition and carries its committed-mutation
+            // proof; every other outcome remains a failure.
+            match &refusal {
+                BackupError::Quiescence { .. }
+                | BackupError::Medium(MediumError::Contention { .. }) => {}
+                BackupError::Incoherent { detail } => {
+                    assert!(
+                        detail.contains(
+                            "the captured database does not validate to the source chain"
+                        ),
+                        "only the proven race condition's Incoherent is admitted: {detail}"
+                    );
+                    assert!(
+                        accepted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                        "the Incoherent refusal requires a committed concurrent revision — \
+                         the captured chain differs from the validated source chain"
+                    );
+                }
+                other => panic!("the refusal is the boundary at work: {other:?}"),
+            }
+            // A refused backup never publishes a completion manifest
+            // (the manifest is written LAST — every refusal above
+            // precedes it) and is never usable: the verification path
+            // refuses the set.
             assert!(
-                detail.contains("the captured database does not validate to the source chain"),
-                "only the proven race condition's Incoherent is admitted: {detail}"
+                !dir.output().join("MANIFEST").is_file(),
+                "the refused backup never publishes a completion manifest"
             );
+            let verification = verify_backup(&dir.output());
             assert!(
-                accepted.load(std::sync::atomic::Ordering::Relaxed) > 0,
-                "the Incoherent refusal requires a committed concurrent revision — \
-                 the captured chain differs from the validated source chain"
+                matches!(verification, Err(BackupError::Incomplete { .. })),
+                "the refused set is refused by the verification path (the manifest is \
+                 absent — the capture never completed): {verification:?}"
             );
         }
-        other => panic!("the refusal is the boundary at work: {other:?}"),
+        Ok(report) => {
+            // THE SUCCESS PATH — a coherent snapshot of a genuinely
+            // quiescent interval: admissible ONLY with independent
+            // verification AND provenance. The reported head must be
+            // a REAL source state — the pre-writer head (the writer's
+            // commits all landed outside the protected interval) or
+            // one of the writer's committed heads (recorded by the
+            // writer thread) — and the set must pass the real
+            // verification (the manifest, the re-validation, the
+            // journal rescan, and the isolated-scratch B4 recovery).
+            let verification = verify_backup(&dir.output());
+            assert!(
+                verification.is_ok(),
+                "a successful backup must verify: {verification:?}"
+            );
+            let known_heads = committed_heads.lock().unwrap();
+            let head_is_real =
+                report.summary.head == start_head || known_heads.contains(&report.summary.head);
+            assert!(
+                head_is_real,
+                "the reported head {} is a real source state (the pre-writer head \
+                 {} or one of the {} committed writer heads)",
+                report.summary.head,
+                start_head,
+                known_heads.len()
+            );
+            // Never the fabricated converse claim: the writer DID run
+            // (the handshake and the counters prove activity); the
+            // success proves only that no committed mutation landed
+            // inside the protected interval — the boundary held.
+        }
     }
-    // A refused backup never publishes a completion manifest (the
-    // manifest is written LAST — every refusal above precedes it) and
-    // is never usable: the verification path refuses the set.
-    assert!(
-        !dir.output().join("MANIFEST").is_file(),
-        "the refused backup never publishes a completion manifest"
+}
+
+/// The DETERMINISTIC QUIESCENT-SUCCESS regression (the Ubuntu CI
+/// incident's lesson, run 40580374199): an independent writer that
+/// CANNOT commit until after the backup completes must never cause a
+/// refusal — the backup succeeds, verifies, and captures the known
+/// quiescent source exactly; a LATER writer commit does not
+/// retroactively invalidate the captured snapshot. The writer waits
+/// on a bounded go/stop handshake (a channel receive with a timeout
+/// plus a hard wall-clock cap) — it can never remain permanently
+/// blocked on a test failure.
+#[test]
+fn quiescent_source_backup_succeeds_and_later_writes_do_not_invalidate() {
+    let (mut spine, mut director) = scenario_pair(150, &near_region_4());
+    let dir = TestDir::new("quiescent-success");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "quiescent-campaign",
+    )
+    .unwrap();
+    run(&mut spine, &mut director, &near_region_4(), 100);
+    for _ in 0..4 {
+        run(&mut spine, &mut director, &near_region_4(), 1);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+    }
+    crossing.checkpoint().unwrap();
+    drop(crossing);
+    // The known quiescent source head, read before the writer exists.
+    let quiescent_head = {
+        let mut probe = SqliteMedium::open_read_only(dir.db()).unwrap();
+        probe.validate().unwrap().head
+    };
+    // The gated writer: it cannot commit until the test releases the
+    // go signal AFTER the backup completes (or exits on the stop
+    // signal / the 60-second safety cap — never permanently blocked).
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let committed = std::sync::Arc::new(std::sync::Mutex::new(Option::<Hash>::None));
+    let writer_committed = committed.clone();
+    let writer_db_path = dir.db();
+    let writer = std::thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            if writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if Instant::now() - started > std::time::Duration::from_secs(60) {
+                return;
+            }
+            match go_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        // Released: one real commit onto the source.
+        let mut medium = SqliteMedium::open(&writer_db_path).unwrap();
+        let mut enc = Encoder::new();
+        enc.write_str("sektor7/engine-slice/backup-race/1");
+        enc.write_bytes(&0u64.to_le_bytes());
+        let object = StoredObject::new(enc.into_bytes()).unwrap();
+        let (head, epoch) = {
+            let mut probe = SqliteMedium::open_read_only(&writer_db_path).unwrap();
+            let summary = probe.validate().unwrap();
+            (summary.head, summary.height)
+        };
+        let record = RevisionRecord::regular(head, epoch, 20_000)
+            .with_idempotency_key(b"quiescent-later-write".to_vec())
+            .with_content_refs(vec![object.hash()]);
+        match medium.append(&record, std::slice::from_ref(&object), Some(head)) {
+            Ok(AppendOutcome::Accepted { id, .. }) => {
+                *writer_committed.lock().unwrap() = Some(id);
+            }
+            Ok(other) => panic!("the later write must be accepted, got {other:?}"),
+            Err(other) => panic!("the later write failed: {other}"),
+        }
+    });
+    // The backup over the quiescent source: it MUST succeed.
+    let report = backup_campaign(&dir.db(), &dir.journal(), &dir.output()).expect(
+        "the quiescent backup succeeds — a gated writer that has not committed \
+                 is not a boundary violation",
     );
-    let verification = verify_backup(&dir.output());
+    // (1) The backup succeeded; (2) the verification succeeds (the
+    // manifest, the re-validation, the journal rescan, the
+    // isolated-scratch recovery).
     assert!(
-        matches!(verification, Err(BackupError::Incomplete { .. })),
-        "the refused set is refused by the verification path (the manifest is \
-         absent — the capture never completed): {verification:?}"
+        verify_backup(&dir.output()).is_ok(),
+        "the quiescent set verifies"
     );
+    // (3) The captured head matches the known quiescent source.
+    assert_eq!(
+        report.summary.head, quiescent_head,
+        "the captured head is the known quiescent source head"
+    );
+    // (4) The preserved source/journal pair is coherent (the
+    // verification's scratch recovery already proved the pair; the
+    // summary is a validated chain).
+    assert_eq!(report.summary.campaign_id, "quiescent-campaign");
+    // Release the writer, wait for its commit (bounded by the join —
+    // the writer exits within the cap on every path).
+    go_tx.send(()).unwrap();
+    writer.join().unwrap();
+    // (5) A later independent writer commit does not retroactively
+    // invalidate the captured snapshot: the set STILL verifies and
+    // the captured head is unchanged.
+    let later = committed
+        .lock()
+        .unwrap()
+        .expect("the later write committed");
+    assert_ne!(later, quiescent_head, "the source head genuinely moved");
+    assert!(
+        verify_backup(&dir.output()).is_ok(),
+        "the later source write does not invalidate the captured snapshot"
+    );
+    let recheck = {
+        let mut probe = SqliteMedium::open_read_only(dir.output().join("store.db")).unwrap();
+        probe.validate().unwrap().head
+    };
+    assert_eq!(
+        recheck, quiescent_head,
+        "the captured database is untouched by the later source write"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[test]
