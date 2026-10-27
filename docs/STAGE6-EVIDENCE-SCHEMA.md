@@ -136,15 +136,34 @@ the schema is versioned and closed.
 ## 4. Package verification
 
 `soak_evidence::verify_package(dir)` independently checks a package
-against its manifest, without mutating it: the expected stream files,
-byte lengths, record counts, per-line decodability, the recomputed
-FNV-1a integrity digests, the counts' complete-consistency (including
-the flush-error counts), and the declared completeness (a manifest
+against its manifest, without mutating it. A **complete** verdict
+requires all of the following: the **supported schema version**
+(another version is a structural refusal — a foreign schema is never
+interpreted); the manifest declaring **exactly the five required
+stream identities** — `frames`, `ticks`, `persistence`, `regions`,
+`memory` — with none missing, none duplicated, and no unknown names
+(names are matched against the fixed whitelist before any path is
+constructed, so a hostile name — including path traversal — never
+reaches the filesystem); and every required stream file present and
+passing the per-stream checks — byte lengths, record counts, strict
+per-line decodability, the recomputed FNV-1a digests, and the counts'
+complete-consistency (including the flush-error counts). A manifest
 declaring complete while checks fail — or while also declaring a
-failure — is a problem). Structural unreadability (a missing or
-unparseable manifest) is a typed error. An honestly-declared
-INCOMPLETE package whose files are intact verifies with no problems
-and `verified_complete() == false`.
+failure — is itself a problem.
+
+Three distinct layers, never conflated:
+
+- **Structurally invalid** (a missing or unparseable manifest, an
+  unsupported schema version): a typed `Err`.
+- **Honestly incomplete** (the manifest declares `complete: false`):
+  the verification reports at least the counts-consistency diagnostic
+  naming WHY it is incomplete (e.g. unexecuted writes, queue losses,
+  flush errors) — its **file integrity** may be fully intact (bytes,
+  records, digests all matching); the diagnostic problems and the
+  file-integrity checks are separate layers. `verified_complete()`
+  is false, and readable files can never upgrade the verdict.
+- **Valid, independently verified complete**: the manifest declares
+  complete AND the verification found no problem of any kind.
 
 ## 5. Statistics helpers and overhead
 

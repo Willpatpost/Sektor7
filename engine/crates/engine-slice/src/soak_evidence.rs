@@ -1658,9 +1658,13 @@ pub struct VerifiedStream {
 /// manifest (S6-C1 HOLD-3): the expected stream files, byte lengths,
 /// record counts, per-line decodability, integrity digests, and the
 /// completeness status. `problems` lists every mismatch; structural
-/// unreadability (a missing or unparseable manifest) is an `Err`. An
-/// honestly-declared INCOMPLETE package whose files are intact
-/// verifies with no problems and `verified_complete() == false`.
+/// unreadability (a missing or unparseable manifest, or an unsupported
+/// schema version) is an `Err`. An honestly-declared INCOMPLETE
+/// package always carries at least the counts-consistency diagnostic
+/// naming why it is incomplete (its files may be fully intact — file
+/// integrity, declared completeness, and the diagnostic problems are
+/// distinct layers); it verifies with `verified_complete() == false`
+/// and can never be upgraded to complete by readable files alone.
 #[derive(Debug, Clone)]
 pub struct PackageVerification {
     pub schema_version: String,
@@ -1672,7 +1676,9 @@ pub struct PackageVerification {
 
 impl PackageVerification {
     /// The verification's own verdict: complete iff the manifest
-    /// declares complete AND every check passed.
+    /// declares complete AND the verification found no problem of any
+    /// kind — integrity, counts-consistency, or manifest-shape (the
+    /// exact required stream set, no duplicates, no unknown names).
     pub fn verified_complete(&self) -> bool {
         self.declared_complete && self.problems.is_empty()
     }
@@ -1693,7 +1699,15 @@ fn as_list(value: json::Value) -> Result<Vec<json::Value>, EvidenceError> {
 }
 
 /// Independently verifies the evidence package at `dir` against its
-/// manifest (S6-C1 HOLD-3). Never mutates the package.
+/// manifest (S6-C1 HOLD-3 + the final verifier-completeness
+/// correction). Never mutates the package. A complete verdict
+/// requires, beyond the per-stream integrity checks: the supported
+/// schema version; the manifest declaring EXACTLY the five required
+/// stream identities — none missing, none duplicated, no unknown
+/// names — and every required stream file present and passing. The
+/// stream names are matched against the fixed whitelist before any
+/// path is constructed, so an unknown or hostile name (including path
+/// traversal) never reaches the filesystem.
 pub fn verify_package(dir: &Path) -> Result<PackageVerification, EvidenceError> {
     let manifest_path = dir.join("manifest.json");
     let manifest_text =
@@ -1703,6 +1717,12 @@ pub fn verify_package(dir: &Path) -> Result<PackageVerification, EvidenceError> 
         })?;
     let mut fields = json::parse_object(&manifest_text).map_err(decode_error)?;
     let schema_version = as_str(take(&mut fields, "schema")?)?;
+    if schema_version != EVIDENCE_SCHEMA_VERSION {
+        return Err(decode_error(format!(
+            "unsupported evidence schema version {schema_version:?} — expected \
+             {EVIDENCE_SCHEMA_VERSION:?}, refusing to interpret a foreign schema"
+        )));
+    }
     let scenario = as_str(take(&mut fields, "scenario")?)?;
     let _metadata = take(&mut fields, "metadata")?;
     let _dir_synced = as_bool(take(&mut fields, "dir_synced")?)?;
@@ -1717,9 +1737,32 @@ pub fn verify_package(dir: &Path) -> Result<PackageVerification, EvidenceError> 
 
     let mut problems = Vec::new();
     let mut streams = Vec::new();
+    // The exact required stream set (the final verifier-completeness
+    // correction): each manifest row's name must be one of the five
+    // whitelisted identities BEFORE any path is constructed — unknown
+    // or hostile names (including traversal) never reach the
+    // filesystem; duplicates and missing required streams are
+    // problems, so an incomplete or tampered manifest can never
+    // produce a complete verdict.
+    let mut seen = [false; STREAM_COUNT];
     for entry in as_list(streams_value)? {
         let mut row = as_obj(entry)?;
         let name = as_str(take(&mut row, "name")?)?;
+        let Some(stream) = STREAM_NAMES.iter().position(|required| *required == name) else {
+            problems.push(format!(
+                "unknown stream name {name:?} in the manifest — not one of the \
+                 required streams, never read"
+            ));
+            // The name check IS the boundary: a row outside the
+            // whitelist is recorded as a problem and never parsed
+            // further or read from the filesystem — no path outside
+            // the required set is ever constructed.
+            continue;
+        };
+        if seen[stream] {
+            problems.push(format!("duplicate manifest stream {name:?}"));
+        }
+        seen[stream] = true;
         let produced = as_u64(take(&mut row, "produced")?)?;
         let written = as_u64(take(&mut row, "written")?)?;
         let lost = as_u64(take(&mut row, "lost")?)?;
@@ -1802,6 +1845,17 @@ pub fn verify_package(dir: &Path) -> Result<PackageVerification, EvidenceError> 
             digest_matches,
             all_lines_decode,
         });
+    }
+    // The exact-set requirement's other half: every required stream
+    // must have been declared — an omitted stream can never produce a
+    // false complete verdict (the most important regression).
+    for stream in 0..STREAM_COUNT {
+        if !seen[stream] {
+            problems.push(format!(
+                "the manifest is missing the required {} stream",
+                STREAM_NAMES[stream]
+            ));
+        }
     }
     if declared_complete && !problems.is_empty() {
         problems
@@ -2300,6 +2354,199 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("manifest.json"));
         assert!(verify_package(&dir).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Builds one clean, verified-complete package and returns its
+    /// (root, evidence-dir) — the shared fixture of the manifest-
+    /// shape regressions.
+    fn clean_package(tag: &str) -> (PathBuf, PathBuf) {
+        let root = evidence_temp_root(tag);
+        let dir = root.join("evidence");
+        let collector = EvidenceCollector::start(EvidenceConfig::new(&dir, tag)).unwrap();
+        for tick in 0..20u64 {
+            let mut sample = tick_sample();
+            sample.tick = tick;
+            collector.produce(EvidenceRecord::Tick(sample));
+        }
+        let outcome = collector.finalize();
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(
+            verify_package(&dir).unwrap().verified_complete(),
+            "the untouched fixture verifies complete"
+        );
+        (root, dir)
+    }
+
+    fn rewrite_manifest(dir: &Path, transform: impl FnOnce(String) -> String) {
+        let path = dir.join("manifest.json");
+        let manifest = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, transform(manifest)).unwrap();
+    }
+
+    /// Removes one stream row from the manifest text (the writer's
+    /// fixed row shape: the row's values contain no braces).
+    fn remove_manifest_stream_row(manifest: String, name: &str) -> String {
+        let marker = format!("{{\"name\":\"{name}\",");
+        let start = manifest
+            .find(&marker)
+            .unwrap_or_else(|| panic!("the {name} row"));
+        let end = manifest[start..].find('}').expect("the row's end") + start;
+        (manifest[..start].to_string() + &manifest[end + 1..])
+            .replace(",,", ",")
+            .replace("[,", "[")
+            .replace(",]", "]")
+    }
+
+    #[test]
+    fn verify_package_requires_the_exact_required_stream_set() {
+        // The final verifier-completeness correction: the manifest
+        // must declare EXACTLY the five required streams under the
+        // supported schema version — a missing row (the most
+        // important regression: no false complete verdict), a missing
+        // file, a duplicate row, an unknown name, or a hostile name
+        // can never produce a complete verdict, and names outside the
+        // whitelist never reach the filesystem.
+        {
+            // The unchanged complete package still verifies.
+            let (root, _dir) = clean_package("set-unchanged");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // A required stream OMITTED from the manifest — the
+            // remaining files are intact and readable, yet the
+            // verdict can never be complete.
+            let (root, dir) = clean_package("set-missing-row");
+            rewrite_manifest(&dir, |manifest| {
+                remove_manifest_stream_row(manifest, "regions")
+            });
+            let verification = verify_package(&dir).unwrap();
+            assert!(!verification.verified_complete());
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("missing the required regions stream")),
+                "{:?}",
+                verification.problems
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // The corresponding stream FILE missing (the row
+            // present): the existing unreadable check flags it.
+            let (root, dir) = clean_package("set-missing-file");
+            std::fs::remove_file(dir.join("regions.jsonl")).unwrap();
+            let verification = verify_package(&dir).unwrap();
+            assert!(!verification.verified_complete());
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("regions stream is unreadable")),
+                "{:?}",
+                verification.problems
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // A DUPLICATED manifest row.
+            let (root, dir) = clean_package("set-duplicate");
+            rewrite_manifest(&dir, |manifest| {
+                let marker = "{\"name\":\"regions\",";
+                let start = manifest.find(marker).expect("the regions row");
+                let end = manifest[start..].find('}').expect("the row's end") + start;
+                let row = manifest[start..=end].to_string();
+                format!("{}{},{}", &manifest[..start], row, &manifest[start..])
+            });
+            let verification = verify_package(&dir).unwrap();
+            assert!(!verification.verified_complete());
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("duplicate manifest stream \"regions\"")),
+                "{:?}",
+                verification.problems
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // An UNKNOWN stream name (its required counterpart now
+            // missing): never read, never accepted as a substitute.
+            let (root, dir) = clean_package("set-unknown-name");
+            rewrite_manifest(&dir, |manifest| {
+                manifest.replace("\"name\":\"regions\"", "\"name\":\"tickz\"")
+            });
+            let verification = verify_package(&dir).unwrap();
+            assert!(!verification.verified_complete());
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("unknown stream name \"tickz\"")),
+                "{:?}",
+                verification.problems
+            );
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("missing the required regions stream")),
+                "{:?}",
+                verification.problems
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // An UNSAFE stream name: the whitelist never joins it
+            // into a path — the decoy file OUTSIDE the evidence
+            // directory is never examined (no byte-length, count,
+            // decode, or digest problem for the hostile name — only
+            // the unknown-name and missing-required diagnostics).
+            let (root, dir) = clean_package("set-unsafe-name");
+            std::fs::write(root.join("evidence.jsonl"), b"decoy\n").unwrap();
+            rewrite_manifest(&dir, |manifest| {
+                manifest.replace("\"name\":\"regions\"", "\"name\":\"../evidence\"")
+            });
+            let verification = verify_package(&dir).unwrap();
+            assert!(!verification.verified_complete());
+            assert!(
+                verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("unknown stream name \"../evidence\"")),
+                "{:?}",
+                verification.problems
+            );
+            assert!(
+                !verification
+                    .problems
+                    .iter()
+                    .any(|problem| problem.contains("byte length")
+                        || problem.contains("record count")
+                        || problem.contains("undecodable")
+                        || problem.contains("integrity digest")),
+                "the hostile name never reached the filesystem: {:?}",
+                verification.problems
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // An UNSUPPORTED schema version is a structural refusal.
+            let (root, dir) = clean_package("set-schema-version");
+            rewrite_manifest(&dir, |manifest| {
+                manifest.replace(
+                    "\"schema\":\"s6-evidence/2\"",
+                    "\"schema\":\"s6-evidence/1\"",
+                )
+            });
+            let error = verify_package(&dir).unwrap_err();
+            assert!(
+                format!("{error}").contains("unsupported evidence schema version"),
+                "{error}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
