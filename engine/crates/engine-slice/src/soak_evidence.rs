@@ -43,9 +43,15 @@ use std::time::{Duration, Instant};
 use engine_core::LodLevel;
 use engine_core::fingerprint::Fingerprinter;
 
+use crate::region::{TransitionKind, TransitionScope};
+
 /// The evidence schema's version tag — carried by every manifest and
-/// compared on decode.
-pub const EVIDENCE_SCHEMA_VERSION: &str = "s6-evidence/1";
+/// compared on decode. v2: the region records carry the per-transition
+/// duration, kind, scope, and applied flag (S6-C1 HOLD-4); the
+/// manifest carries the flush-error counts and the directory-sync
+/// flag (HOLD-1/3); the collector refuses a pre-existing evidence
+/// directory (HOLD-2).
+pub const EVIDENCE_SCHEMA_VERSION: &str = "s6-evidence/2";
 
 /// Default bounded-channel capacity (records). Worst-case in-memory
 /// retention is this capacity plus the writer's buffers — a few MB at
@@ -66,7 +72,8 @@ const STREAM_NAMES: [&str; STREAM_COUNT] = ["frames", "ticks", "persistence", "r
 /// (objects of scalars, `null`s, and arrays of numbers — the schema
 /// has no nested objects).
 mod json {
-    /// One parsed JSON value (the schema's subset).
+    /// One parsed JSON value (the schema's subset — objects appear
+    /// only inside the manifest).
     #[derive(Debug, Clone, PartialEq)]
     pub enum Value {
         Uint(u64),
@@ -75,6 +82,7 @@ mod json {
         Str(String),
         Null,
         Arr(Vec<Value>),
+        Obj(Vec<(String, Value)>),
     }
 
     /// Appends `text` to `out` as escaped JSON string content (no
@@ -159,7 +167,10 @@ mod json {
         fn parse_value(&mut self) -> Result<Value, String> {
             self.skip_whitespace();
             match self.peek() {
-                Some(b'{') => Err("nested objects are not part of the schema".into()),
+                // Nested objects appear only inside the manifest —
+                // the record lines remain flat (the strict record
+                // decoder rejects them by field set, not by shape).
+                Some(b'{') => self.parse_object_value().map(Value::Obj),
                 Some(b'"') => Ok(Value::Str(self.parse_string()?)),
                 Some(b'[') => self.parse_array().map(Value::Arr),
                 Some(b't') => {
@@ -176,6 +187,39 @@ mod json {
                 }
                 Some(byte) if byte == b'-' || byte.is_ascii_digit() => self.parse_number(),
                 other => Err(format!("unexpected character {other:?}")),
+            }
+        }
+
+        fn parse_object_value(&mut self) -> Result<Vec<(String, Value)>, String> {
+            self.skip_whitespace();
+            self.expect(b'{')?;
+            let mut fields: Vec<(String, Value)> = Vec::new();
+            self.skip_whitespace();
+            if self.peek() == Some(b'}') {
+                self.position += 1;
+                return Ok(fields);
+            }
+            loop {
+                let key = self.parse_string()?;
+                self.skip_whitespace();
+                self.expect(b':')?;
+                let value = self.parse_value()?;
+                if fields.iter().any(|(existing, _)| *existing == key) {
+                    return Err(format!("duplicate field {key:?}"));
+                }
+                fields.push((key, value));
+                self.skip_whitespace();
+                match self.peek() {
+                    Some(b',') => {
+                        self.position += 1;
+                        self.skip_whitespace();
+                    }
+                    Some(b'}') => {
+                        self.position += 1;
+                        return Ok(fields);
+                    }
+                    other => return Err(format!("expected ',' or '}}', found {other:?}")),
+                }
             }
         }
 
@@ -343,10 +387,12 @@ mod json {
     }
 }
 
-/// Quantizes a millisecond value to the schema's documented precision
-/// (microsecond resolution — six decimal places) so encode/decode
-/// round-trips are exact. Non-finite values pass through (encoded as
-/// `null`, never as silent garbage).
+/// Quantizes a millisecond value to the schema's documented encoding
+/// precision — six decimal places of milliseconds, nanosecond-scale
+/// numerical increments (the effective measurement resolution is
+/// bounded by the clock source, not by the encoding) — so
+/// encode/decode round-trips are exact. Non-finite values pass
+/// through (encoded as `null`, never as silent garbage).
 fn ms6(value: f64) -> f64 {
     if !value.is_finite() {
         return value;
@@ -570,16 +616,30 @@ pub struct PersistenceSample {
     pub revision: Option<String>,
 }
 
-/// One region transition identity (from the tick's `TickReport` and
-/// the director's before/after levels).
+/// One region transition's evidence record (S6-C1 HOLD-4): the
+/// region, the attempted from→to LOD ordinals, whether the level
+/// actually changed, the transition kind, the boundary the duration
+/// covers (`director-legacy` — the director's own transition, no T1
+/// journaling — or `orchestrated-crossing` — the FULL six-phase
+/// durable crossing, never the install phase alone), and the
+/// per-transition duration (`null` only where genuinely unavailable,
+/// never a substituted zero). `tick` is the boundary clock at the
+/// moment of the transition (the same `now` the crossing machinery
+/// stamps).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionSample {
     pub tick: u64,
     pub wall_offset_ms: f64,
     pub region: u64,
-    /// LOD detail ordinals ([`lod_ordinal`]).
+    /// LOD detail ordinals ([`lod_ordinal`]) — the ATTEMPTED target.
     pub from_level: u8,
     pub to_level: u8,
+    /// Whether the region's level actually reached the target (a
+    /// coherent activation refusal is recorded honestly).
+    pub applied: bool,
+    pub kind: TransitionKind,
+    pub scope: TransitionScope,
+    pub duration_ms: Option<f64>,
 }
 
 /// One process/structural memory sample (the graphical loop's fixed
@@ -623,8 +683,8 @@ impl EvidenceRecord {
         }
     }
 
-    /// The JSONL line (microsecond-resolution milliseconds; `null` for
-    /// unsupported/absent values).
+    /// The JSONL line (milliseconds at the documented six-decimal
+    /// encoding precision; `null` for unsupported/absent values).
     pub fn encode(&self) -> String {
         match self {
             EvidenceRecord::Frame(sample) => {
@@ -693,6 +753,10 @@ impl EvidenceRecord {
                 line.u64("region", sample.region);
                 line.u32("from_level", u32::from(sample.from_level));
                 line.u32("to_level", u32::from(sample.to_level));
+                line.boolean("applied", sample.applied);
+                line.text("kind", sample.kind.tag());
+                line.text("scope", sample.scope.tag());
+                line.opt_f64("duration_ms", sample.duration_ms);
                 line.finish("region")
             }
             EvidenceRecord::Memory(sample) => {
@@ -707,12 +771,19 @@ impl EvidenceRecord {
     }
 }
 
-/// A collected evidence failure (open errors, strict decode errors).
+/// A collected evidence failure (open errors, strict decode errors,
+/// and the no-overwrite destination refusal).
 #[derive(Debug)]
 pub enum EvidenceError {
     Open {
         path: PathBuf,
         error: std::io::Error,
+    },
+    /// S6-C1 HOLD-2: the evidence directory already exists — a fresh,
+    /// exclusively created run directory is required; a previous
+    /// package is never overwritten, truncated, or deleted.
+    DestinationExists {
+        path: PathBuf,
     },
     Decode(String),
 }
@@ -723,6 +794,12 @@ impl std::fmt::Display for EvidenceError {
             EvidenceError::Open { path, error } => {
                 write!(formatter, "open {}: {error}", path.display())
             }
+            EvidenceError::DestinationExists { path } => write!(
+                formatter,
+                "the evidence directory {} already exists — a fresh run directory is \
+                 required; a previous package is never overwritten or truncated",
+                path.display()
+            ),
             EvidenceError::Decode(detail) => write!(formatter, "decode: {detail}"),
         }
     }
@@ -828,6 +905,23 @@ fn as_opt_revision(value: json::Value) -> Result<Option<String>, EvidenceError> 
     }
 }
 
+fn as_transition_kind(value: json::Value) -> Result<TransitionKind, EvidenceError> {
+    match as_str(value)?.as_str() {
+        "activation" => Ok(TransitionKind::Activation),
+        "deactivation" => Ok(TransitionKind::Deactivation),
+        "reclassification" => Ok(TransitionKind::Reclassification),
+        other => Err(decode_error(format!("unknown transition kind {other:?}"))),
+    }
+}
+
+fn as_transition_scope(value: json::Value) -> Result<TransitionScope, EvidenceError> {
+    match as_str(value)?.as_str() {
+        "director-legacy" => Ok(TransitionScope::DirectorTransition),
+        "orchestrated-crossing" => Ok(TransitionScope::OrchestratedCrossing),
+        other => Err(decode_error(format!("unknown transition scope {other:?}"))),
+    }
+}
+
 /// Strictly decodes one evidence line (the type tag dispatches; the
 /// field set must match the schema exactly — unknown or missing
 /// fields are errors).
@@ -906,8 +1000,15 @@ pub fn decode_line(line: &str) -> Result<EvidenceRecord, EvidenceError> {
                 region: as_u64(take(&mut fields, "region")?)?,
                 from_level: as_u32(take(&mut fields, "from_level")?)? as u8,
                 to_level: as_u32(take(&mut fields, "to_level")?)? as u8,
+                applied: as_bool(take(&mut fields, "applied")?)?,
+                kind: as_transition_kind(take(&mut fields, "kind")?)?,
+                scope: as_transition_scope(take(&mut fields, "scope")?)?,
+                duration_ms: as_opt_f64(take(&mut fields, "duration_ms")?)?,
             };
             sample.wall_offset_ms = ms6(sample.wall_offset_ms);
+            if let Some(duration) = &mut sample.duration_ms {
+                *duration = ms6(*duration);
+            }
             EvidenceRecord::Region(sample)
         }
         "memory" => {
@@ -952,6 +1053,7 @@ pub fn one_percent_low_fps(intervals_ms: &[f64]) -> Option<f64> {
 #[derive(Debug, Default)]
 struct FaultInner {
     fail_writes: AtomicBool,
+    fail_flushes: AtomicBool,
     park_writes: AtomicBool,
     park_entered: AtomicBool,
 }
@@ -959,7 +1061,10 @@ struct FaultInner {
 /// Deterministic fault injection for the evidence writer (the
 /// `WorkerFaultControl` discipline — observable state, never sleeps):
 /// `fail_writes` makes every subsequent record fail at the write
-/// boundary; `park_writes` parks the writer between records (with
+/// boundary; `fail_flushes` makes every subsequent flush boundary
+/// fail (the HOLD-1 intermediate-flush regression — buffered records
+/// stay buffered, the package verdict fails permanently);
+/// `park_writes` parks the writer between records (with
 /// `park_entered` observable) so a full bounded queue can be produced
 /// deterministically. Engine code never sets these.
 #[derive(Debug, Clone)]
@@ -970,6 +1075,10 @@ pub struct EvidenceFaultControl {
 impl EvidenceFaultControl {
     pub fn set_fail_writes(&self, on: bool) {
         self.inner.fail_writes.store(on, Ordering::SeqCst);
+    }
+
+    pub fn set_fail_flushes(&self, on: bool) {
+        self.inner.fail_flushes.store(on, Ordering::SeqCst);
     }
 
     /// Parks the writer between records (releases with
@@ -996,6 +1105,7 @@ struct Counters {
     lost: [AtomicU64; STREAM_COUNT],
     written: [AtomicU64; STREAM_COUNT],
     write_failed: [AtomicU64; STREAM_COUNT],
+    flush_errors: [AtomicU64; STREAM_COUNT],
 }
 
 impl Counters {
@@ -1005,6 +1115,7 @@ impl Counters {
             lost: std::array::from_fn(|_| AtomicU64::new(0)),
             written: std::array::from_fn(|_| AtomicU64::new(0)),
             write_failed: std::array::from_fn(|_| AtomicU64::new(0)),
+            flush_errors: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -1016,6 +1127,7 @@ impl Counters {
                 written: self.written[stream].load(Ordering::Relaxed),
                 lost: self.lost[stream].load(Ordering::Relaxed),
                 write_failed: self.write_failed[stream].load(Ordering::Relaxed),
+                flush_errors: self.flush_errors[stream].load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -1059,12 +1171,6 @@ fn writer_main(inputs: WriterInputs) {
     let mut bytes = [0u64; STREAM_COUNT];
     let mut buffered = 0usize;
     let mut broken = false;
-    let flush_all = |files: &mut [BufWriter<File>], buffered: &mut usize| {
-        for file in files {
-            let _ = file.flush();
-        }
-        *buffered = 0;
-    };
     'writer: loop {
         if fault.park_writes.load(Ordering::SeqCst) {
             fault.park_entered.store(true, Ordering::SeqCst);
@@ -1103,7 +1209,8 @@ fn writer_main(inputs: WriterInputs) {
                         counters.written[stream].fetch_add(1, Ordering::Relaxed);
                         buffered += 1;
                         if buffered >= flush_records {
-                            flush_all(&mut files, &mut buffered);
+                            flush_streams(&mut files, &counters, &fault, &failure);
+                            buffered = 0;
                         }
                     }
                     Err(error) => {
@@ -1115,22 +1222,41 @@ fn writer_main(inputs: WriterInputs) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if buffered > 0 {
-                    flush_all(&mut files, &mut buffered);
+                    flush_streams(&mut files, &counters, &fault, &failure);
+                    buffered = 0;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break 'writer,
         }
     }
-    for file in &mut files {
-        if let Err(error) = file.flush() {
+    // The finalization protocol (S6-C1 HOLD-3), entirely on this
+    // dedicated thread — never the authoritative or render critical
+    // paths: (1) the drain completed above; (2) every final flush is
+    // checked; (3) the completed stream files are synchronized;
+    // (4) any failure fails the verdict; (5) the manifest is prepared
+    // only after the streams pass their checks; (6) it is written to
+    // a temporary file, synchronized, then atomically published;
+    // (7) a publication failure fails the verdict — a complete
+    // durable package is never claimed without the published
+    // manifest; (8) the directory-entry sync is best-effort and
+    // platform-limited, recorded in the manifest.
+    flush_streams(&mut files, &counters, &fault, &failure);
+    for file in &files {
+        if let Err(error) = file.get_ref().sync_all() {
             note_failure(
                 &failure,
-                format!("the final evidence flush failed: {error}"),
+                format!("the evidence stream sync failed: {error}"),
             );
         }
     }
-    // The manifest (best-effort; a manifest failure is noted and the
-    // in-memory outcome remains the authoritative verdict).
+    // Best-effort directory-entry synchronization for the stream
+    // files (available on Unix; not available through std on Windows
+    // — recorded as the honest platform limitation, never a verdict
+    // failure on its own).
+    let dir_synced = match File::open(&dir) {
+        Ok(handle) => handle.sync_all().is_ok(),
+        Err(_) => false,
+    };
     let rows = counters.summary_rows();
     let digests: Vec<String> = (0..STREAM_COUNT)
         .map(|stream| fingerprints[stream].finish_hex())
@@ -1140,9 +1266,12 @@ fn writer_main(inputs: WriterInputs) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let complete = failure_snapshot.is_none()
-        && rows
-            .iter()
-            .all(|row| row.lost == 0 && row.write_failed == 0 && row.produced == row.written);
+        && rows.iter().all(|row| {
+            row.lost == 0
+                && row.write_failed == 0
+                && row.flush_errors == 0
+                && row.produced == row.written
+        });
     let mut manifest = String::new();
     manifest.push_str("{\"schema\":\"");
     manifest.push_str(EVIDENCE_SCHEMA_VERSION);
@@ -1162,16 +1291,24 @@ fn writer_main(inputs: WriterInputs) {
             manifest.push_str(&json::quoted(value));
         }
     }
-    manifest.push_str("},\"streams\":[");
+    manifest.push_str("},\"dir_synced\":");
+    manifest.push_str(if dir_synced { "true" } else { "false" });
+    manifest.push_str(",\"streams\":[");
     for stream in 0..STREAM_COUNT {
         if stream > 0 {
             manifest.push(',');
         }
         let row = &rows[stream];
         manifest.push_str(&format!(
-            "{{\"name\":\"{}\",\"produced\":{},\"written\":{},\"lost\":{},\"write_failed\":{},\"bytes\":{},\"fnv\":\"{}\"}}",
-            row.name, row.produced, row.written, row.lost, row.write_failed,
-            bytes[stream], digests[stream]
+            "{{\"name\":\"{}\",\"produced\":{},\"written\":{},\"lost\":{},\"write_failed\":{},\"flush_errors\":{},\"bytes\":{},\"fnv\":\"{}\"}}",
+            row.name,
+            row.produced,
+            row.written,
+            row.lost,
+            row.write_failed,
+            row.flush_errors,
+            bytes[stream],
+            digests[stream]
         ));
     }
     manifest.push_str("],\"failure\":");
@@ -1180,8 +1317,58 @@ fn writer_main(inputs: WriterInputs) {
         None => manifest.push_str("null"),
     }
     manifest.push_str(&format!(",\"complete\":{complete}}}"));
-    if let Err(error) = std::fs::write(dir.join("manifest.json"), &manifest) {
-        note_failure(&failure, format!("the manifest write failed: {error}"));
+    let manifest_path = dir.join("manifest.json");
+    let temporary_path = dir.join("manifest.json.tmp");
+    let published = std::fs::write(&temporary_path, &manifest)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temporary_path)
+        })
+        .and_then(|file| file.sync_all())
+        .and_then(|()| std::fs::rename(&temporary_path, &manifest_path));
+    if let Err(error) = published {
+        note_failure(
+            &failure,
+            format!("the manifest publication failed: {error}"),
+        );
+    }
+    // The manifest's own directory entry: the final best-effort sync.
+    if let Ok(handle) = File::open(&dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Flushes every stream buffer, CHECKED (S6-C1 HOLD-1): every
+/// intermediate flush error is detected, counted per stream, and
+/// fails the package verdict permanently — a later successful
+/// operation never clears it. The records buffered in a failed-flush
+/// window remain accounted as written (buffer-accepted) with their
+/// on-disk persistence uncertain — no per-record persistence
+/// knowledge is fabricated. Producers stay nonblocking; the
+/// campaign's graceful close is untouched.
+fn flush_streams(
+    files: &mut [BufWriter<File>],
+    counters: &Counters,
+    fault: &FaultInner,
+    failure: &Mutex<Option<String>>,
+) {
+    for (stream, file) in files.iter_mut().enumerate() {
+        // The deterministic flush-failure seam (the HOLD-1
+        // intermediate-flush regression): counted and noted, the real
+        // flush skipped so the buffered records stay buffered.
+        if fault.fail_flushes.load(Ordering::SeqCst) {
+            counters.flush_errors[stream].fetch_add(1, Ordering::Relaxed);
+            note_failure(
+                failure,
+                "an injected evidence flush failure (the test seam)".into(),
+            );
+            continue;
+        }
+        if let Err(error) = file.flush() {
+            counters.flush_errors[stream].fetch_add(1, Ordering::Relaxed);
+            note_failure(failure, format!("the evidence flush failed: {error}"));
+        }
     }
 }
 
@@ -1218,9 +1405,13 @@ impl EvidenceConfig {
 pub struct StreamSummary {
     pub name: &'static str,
     pub produced: u64,
+    /// Buffer-accepted record count. With `flush_errors > 0` the
+    /// on-disk persistence of the affected window is UNCERTAIN — the
+    /// verdict fails and no per-record persistence is claimed.
     pub written: u64,
     pub lost: u64,
     pub write_failed: u64,
+    pub flush_errors: u64,
 }
 
 /// The collector's final verdict: per-stream counts, the first
@@ -1262,8 +1453,8 @@ impl EvidenceOutcome {
         );
         for row in &self.streams {
             text.push_str(&format!(
-                "\n  {}: produced {} · written {} · lost {} · write-failed {}",
-                row.name, row.produced, row.written, row.lost, row.write_failed
+                "\n  {}: produced {} · written {} · lost {} · write-failed {} · flush-failed {}",
+                row.name, row.produced, row.written, row.lost, row.write_failed, row.flush_errors
             ));
         }
         if let Some(failure) = &self.failure {
@@ -1291,13 +1482,23 @@ pub struct EvidenceCollector {
 }
 
 impl EvidenceCollector {
-    /// Creates the evidence directory, opens the stream files (fail
-    /// fast, typed — before any session exists), and spawns the
-    /// writer thread.
+    /// Creates the evidence directory EXCLUSIVELY (S6-C1 HOLD-2: a
+    /// pre-existing destination is refused with the typed error — a
+    /// previous package is never overwritten, truncated, or deleted,
+    /// and the failure surfaces before the campaign opens), opens the
+    /// stream files, and spawns the writer thread.
     pub fn start(config: EvidenceConfig) -> Result<Self, EvidenceError> {
-        std::fs::create_dir_all(&config.dir).map_err(|error| EvidenceError::Open {
-            path: config.dir.clone(),
-            error,
+        std::fs::create_dir(&config.dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                EvidenceError::DestinationExists {
+                    path: config.dir.clone(),
+                }
+            } else {
+                EvidenceError::Open {
+                    path: config.dir.clone(),
+                    error,
+                }
+            }
         })?;
         let mut files = Vec::with_capacity(STREAM_COUNT);
         for name in STREAM_NAMES {
@@ -1373,6 +1574,15 @@ impl EvidenceCollector {
         }
     }
 
+    /// The live flush-error total across streams — the
+    /// flush-failure regression's observable handshake (the
+    /// deterministic condition the test waits on, never a sleep).
+    pub fn flush_error_count(&self) -> u64 {
+        (0..STREAM_COUNT)
+            .map(|stream| self.counters.flush_errors[stream].load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Records one metadata pair into the manifest (environment and
     /// presentation facts the loops observe).
     pub fn note_metadata(&self, key: &str, value: &str) {
@@ -1391,8 +1601,9 @@ impl EvidenceCollector {
     }
 
     /// Finalizes exactly once: releases any park, drops the sender
-    /// (the writer drains every buffered sample, flushes, and writes
-    /// the manifest), joins the writer, and returns the verdict.
+    /// (the writer drains every buffered sample, runs the checked
+    /// finalization protocol — flush, sync, and the atomic manifest
+    /// publication), joins the writer, and returns the verdict.
     pub fn finalize(mut self) -> EvidenceOutcome {
         self.fault_control().release_park();
         self.sender = None;
@@ -1410,9 +1621,12 @@ impl EvidenceCollector {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let complete = failure.is_none()
-            && rows
-                .iter()
-                .all(|row| row.lost == 0 && row.write_failed == 0 && row.produced == row.written);
+            && rows.iter().all(|row| {
+                row.lost == 0
+                    && row.write_failed == 0
+                    && row.flush_errors == 0
+                    && row.produced == row.written
+            });
         EvidenceOutcome {
             schema_version: EVIDENCE_SCHEMA_VERSION,
             dir: self.dir,
@@ -1424,22 +1638,206 @@ impl EvidenceCollector {
     }
 }
 
+// ------------------------------------------------- package verification
+
+/// One stream's independent verification result (S6-C1 HOLD-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedStream {
+    pub name: String,
+    /// The manifest's `written` (the expected record count).
+    pub declared_records: u64,
+    /// The lines actually present in the stream file.
+    pub counted_records: u64,
+    pub declared_bytes: u64,
+    pub actual_bytes: u64,
+    pub digest_matches: bool,
+    pub all_lines_decode: bool,
+}
+
+/// An independent verification of an evidence package against its
+/// manifest (S6-C1 HOLD-3): the expected stream files, byte lengths,
+/// record counts, per-line decodability, integrity digests, and the
+/// completeness status. `problems` lists every mismatch; structural
+/// unreadability (a missing or unparseable manifest) is an `Err`. An
+/// honestly-declared INCOMPLETE package whose files are intact
+/// verifies with no problems and `verified_complete() == false`.
+#[derive(Debug, Clone)]
+pub struct PackageVerification {
+    pub schema_version: String,
+    pub scenario: String,
+    pub declared_complete: bool,
+    pub streams: Vec<VerifiedStream>,
+    pub problems: Vec<String>,
+}
+
+impl PackageVerification {
+    /// The verification's own verdict: complete iff the manifest
+    /// declares complete AND every check passed.
+    pub fn verified_complete(&self) -> bool {
+        self.declared_complete && self.problems.is_empty()
+    }
+}
+
+fn as_obj(value: json::Value) -> Result<Vec<(String, json::Value)>, EvidenceError> {
+    match value {
+        json::Value::Obj(fields) => Ok(fields),
+        other => Err(decode_error(format!("expected an object, found {other:?}"))),
+    }
+}
+
+fn as_list(value: json::Value) -> Result<Vec<json::Value>, EvidenceError> {
+    match value {
+        json::Value::Arr(values) => Ok(values),
+        other => Err(decode_error(format!("expected an array, found {other:?}"))),
+    }
+}
+
+/// Independently verifies the evidence package at `dir` against its
+/// manifest (S6-C1 HOLD-3). Never mutates the package.
+pub fn verify_package(dir: &Path) -> Result<PackageVerification, EvidenceError> {
+    let manifest_path = dir.join("manifest.json");
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).map_err(|error| EvidenceError::Open {
+            path: manifest_path,
+            error,
+        })?;
+    let mut fields = json::parse_object(&manifest_text).map_err(decode_error)?;
+    let schema_version = as_str(take(&mut fields, "schema")?)?;
+    let scenario = as_str(take(&mut fields, "scenario")?)?;
+    let _metadata = take(&mut fields, "metadata")?;
+    let _dir_synced = as_bool(take(&mut fields, "dir_synced")?)?;
+    let streams_value = take(&mut fields, "streams")?;
+    let failure_value = take(&mut fields, "failure")?;
+    let declared_complete = as_bool(take(&mut fields, "complete")?)?;
+    finish_fields(fields)?;
+    let declared_failure = match failure_value {
+        json::Value::Null => None,
+        other => Some(as_str(other)?),
+    };
+
+    let mut problems = Vec::new();
+    let mut streams = Vec::new();
+    for entry in as_list(streams_value)? {
+        let mut row = as_obj(entry)?;
+        let name = as_str(take(&mut row, "name")?)?;
+        let produced = as_u64(take(&mut row, "produced")?)?;
+        let written = as_u64(take(&mut row, "written")?)?;
+        let lost = as_u64(take(&mut row, "lost")?)?;
+        let write_failed = as_u64(take(&mut row, "write_failed")?)?;
+        let flush_errors = as_u64(take(&mut row, "flush_errors")?)?;
+        let declared_bytes = as_u64(take(&mut row, "bytes")?)?;
+        let declared_digest = as_str(take(&mut row, "fnv")?)?;
+        finish_fields(row)?;
+
+        let path = dir.join(format!("{name}.jsonl"));
+        let content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                problems.push(format!("the {name} stream is unreadable: {error}"));
+                streams.push(VerifiedStream {
+                    name,
+                    declared_records: written,
+                    counted_records: 0,
+                    declared_bytes,
+                    actual_bytes: 0,
+                    digest_matches: false,
+                    all_lines_decode: false,
+                });
+                continue;
+            }
+        };
+        let actual_bytes = content.len() as u64;
+        if actual_bytes != declared_bytes {
+            problems.push(format!(
+                "the {name} stream's byte length {actual_bytes} != the manifest's {declared_bytes}"
+            ));
+        }
+        let mut counted_records = 0u64;
+        let mut all_lines_decode = true;
+        let mut digest = Fingerprinter::new();
+        digest.write_bytes(&content);
+        for line in content.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            counted_records += 1;
+            let text = match std::str::from_utf8(line) {
+                Ok(text) => text,
+                Err(_) => {
+                    all_lines_decode = false;
+                    continue;
+                }
+            };
+            if decode_line(text).is_err() {
+                all_lines_decode = false;
+            }
+        }
+        if counted_records != written {
+            problems.push(format!(
+                "the {name} stream's record count {counted_records} != the manifest's written {written}"
+            ));
+        }
+        if !all_lines_decode {
+            problems.push(format!("the {name} stream contains undecodable lines"));
+        }
+        let digest_matches = digest.finish_hex() == declared_digest;
+        if !digest_matches {
+            problems.push(format!(
+                "the {name} stream's integrity digest does not match the manifest"
+            ));
+        }
+        if lost != 0 || write_failed != 0 || flush_errors != 0 || produced != written {
+            problems.push(format!(
+                "the {name} stream's counts are not complete-consistent (produced {produced} · \
+                 written {written} · lost {lost} · write-failed {write_failed} · flush-failed \
+                 {flush_errors})"
+            ));
+        }
+        streams.push(VerifiedStream {
+            name,
+            declared_records: written,
+            counted_records,
+            declared_bytes,
+            actual_bytes,
+            digest_matches,
+            all_lines_decode,
+        });
+    }
+    if declared_complete && !problems.is_empty() {
+        problems
+            .push("the manifest declares complete but the verification found mismatches".into());
+    }
+    if declared_complete && declared_failure.is_some() {
+        problems.push("the manifest declares complete while also declaring a failure".into());
+    }
+    Ok(PackageVerification {
+        schema_version,
+        scenario,
+        declared_complete,
+        streams,
+        problems,
+    })
+}
+
 // ------------------------------------------------------------------ tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn evidence_temp_dir(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+    fn evidence_temp_root(tag: &str) -> PathBuf {
+        // A unique PARENT directory; the collector's own directory is
+        // a fresh leaf under it (the HOLD-2 no-overwrite contract:
+        // `start` creates its destination exclusively).
+        let root = std::env::temp_dir().join(format!(
             "s6-evidence-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
     fn frame_sample() -> FrameSample {
@@ -1505,6 +1903,10 @@ mod tests {
             region: 4,
             from_level: 1,
             to_level: 3,
+            applied: true,
+            kind: TransitionKind::Activation,
+            scope: TransitionScope::OrchestratedCrossing,
+            duration_ms: Some(1.977),
         }
     }
 
@@ -1535,9 +1937,12 @@ mod tests {
     }
 
     #[test]
-    fn precision_contract_is_microsecond_milliseconds() {
-        // A value finer than the documented precision quantizes to it
-        // on encode and decodes to exactly the quantized form.
+    fn precision_contract_is_six_decimal_places_of_milliseconds() {
+        // Six decimal places of milliseconds are nanosecond-scale
+        // numerical increments (the clock source bounds the effective
+        // measurement resolution, not the encoding): a finer value
+        // quantizes on encode and decodes to exactly the quantized
+        // form.
         let mut sample = frame_sample();
         sample.interval_ms = 0.1234567;
         let line = EvidenceRecord::Frame(sample).encode();
@@ -1601,9 +2006,9 @@ mod tests {
 
     #[test]
     fn clean_collection_counts_match_files_and_manifest() {
-        let dir = evidence_temp_dir("clean");
-        let collector =
-            EvidenceCollector::start(EvidenceConfig::new(dir.clone(), "clean-test")).unwrap();
+        let root = evidence_temp_root("clean");
+        let dir = root.join("evidence");
+        let collector = EvidenceCollector::start(EvidenceConfig::new(&dir, "clean-test")).unwrap();
         collector.note_metadata("platform", std::env::consts::OS);
         for tick in 0..50u64 {
             let mut sample = tick_sample();
@@ -1619,9 +2024,10 @@ mod tests {
         assert_eq!(outcome.total_samples(), 50 + 5 + 5);
 
         let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-        assert!(manifest.contains("\"schema\":\"s6-evidence/1\""));
+        assert!(manifest.contains("\"schema\":\"s6-evidence/2\""));
         assert!(manifest.contains("\"scenario\":\"clean-test\""));
         assert!(manifest.contains("\"platform\""));
+        assert!(manifest.contains("\"dir_synced\":"));
         assert!(manifest.contains("\"complete\":true"));
 
         let ticks = std::fs::read_to_string(dir.join("ticks.jsonl")).unwrap();
@@ -1632,13 +2038,22 @@ mod tests {
         }
         let regions = std::fs::read_to_string(dir.join("regions.jsonl")).unwrap();
         assert_eq!(regions.lines().count(), 5);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.join("manifest.json.tmp").exists());
+
+        // The independent verification accepts the complete package.
+        let verification = verify_package(&dir).unwrap();
+        assert!(
+            verification.verified_complete(),
+            "{:?}",
+            verification.problems
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn queue_overflow_counts_loss_and_fails_the_verdict() {
-        let dir = evidence_temp_dir("overflow");
-        let mut config = EvidenceConfig::new(dir.clone(), "overflow-test");
+        let root = evidence_temp_root("overflow");
+        let mut config = EvidenceConfig::new(root.join("evidence"), "overflow-test");
         config.channel_capacity = 4;
         let collector = EvidenceCollector::start(config).unwrap();
         let control = collector.fault_control();
@@ -1666,15 +2081,17 @@ mod tests {
         assert_eq!(ticks.produced, 50);
         assert_eq!(ticks.lost, 46);
         assert!(outcome.failure.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn write_failure_fails_the_verdict_without_losing_counts() {
-        let dir = evidence_temp_dir("write-failure");
-        let collector =
-            EvidenceCollector::start(EvidenceConfig::new(dir.clone(), "write-failure-test"))
-                .unwrap();
+        let root = evidence_temp_root("write-failure");
+        let collector = EvidenceCollector::start(EvidenceConfig::new(
+            root.join("evidence"),
+            "write-failure-test",
+        ))
+        .unwrap();
         collector.fault_control().set_fail_writes(true);
         for tick in 0..20u64 {
             let mut sample = tick_sample();
@@ -1693,21 +2110,212 @@ mod tests {
         assert_eq!(ticks.written, 0);
         assert_eq!(ticks.lost, 0);
         assert!(outcome.failure.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        // The verification independently reports the failed
+        // finalization's package: honestly incomplete, counts flagged.
+        let verification = verify_package(&root.join("evidence")).unwrap();
+        assert!(!verification.verified_complete());
+        assert!(!verification.declared_complete);
+        assert!(
+            !verification.problems.is_empty(),
+            "{:?}",
+            verification.problems
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_intermediate_flush_failure_fails_the_verdict_permanently() {
+        // S6-C1 HOLD-1: a mid-run flush boundary fails (the
+        // deterministic seam), a later successful flush and the final
+        // real finalization both run — and the verdict STAYS
+        // incomplete, the flush errors counted, the buffered records
+        // never claimed safely persisted. The arm stays on until the
+        // failure is OBSERVED through the live counter (the
+        // park_entered discipline — a bounded wait on a deterministic
+        // condition, never a sleep).
+        let root = evidence_temp_root("flush-failure");
+        let mut config = EvidenceConfig::new(root.join("evidence"), "flush-failure-test");
+        config.flush_records = 4;
+        let collector = EvidenceCollector::start(config).unwrap();
+        collector.fault_control().set_fail_flushes(true);
+        for tick in 0..20u64 {
+            let mut sample = tick_sample();
+            sample.tick = tick;
+            collector.produce(EvidenceRecord::Tick(sample));
+        }
+        // The arm stays on until one COMPLETE seam pass over every
+        // stream is observed (the park_entered discipline — a bounded
+        // wait on a deterministic condition, never a sleep): a
+        // partial pass would let the disarm land between the writer's
+        // per-stream iterations, leaving the measured stream
+        // uncounted.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while collector.flush_error_count() < STREAM_COUNT as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never completed a flush-boundary pass"
+            );
+            std::hint::spin_loop();
+        }
+        // A later successful operation never clears the failure: the
+        // disarm precedes the finalization, the final real flush
+        // succeeds — and the verdict stays failed.
+        collector.fault_control().set_fail_flushes(false);
+        let outcome = collector.finalize();
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        let ticks = outcome
+            .streams
+            .iter()
+            .find(|row| row.name == "ticks")
+            .unwrap();
+        assert_eq!(ticks.produced, 20);
+        assert_eq!(ticks.written, 20, "buffer-accepted, no queue loss");
+        assert_eq!(ticks.lost, 0);
+        assert!(ticks.flush_errors >= 1, "{ticks:?}");
+        let failure = outcome.failure.as_deref().unwrap_or_default();
+        assert!(failure.contains("flush"), "{failure}");
+
+        // The records reached disk through the final real flush, but
+        // the verification honors the flush-failure counts: the
+        // package is honestly incomplete, the mismatch flagged.
+        let verification = verify_package(&root.join("evidence")).unwrap();
+        assert!(!verification.verified_complete());
+        assert!(!verification.declared_complete);
+        assert!(
+            verification
+                .problems
+                .iter()
+                .any(|problem| problem.contains("flush-failed")),
+            "{:?}",
+            verification.problems
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repeated_start_refuses_and_preserves_the_first_package() {
+        // S6-C1 HOLD-2: a repeated start against the same evidence
+        // path is refused with the typed error, and the first
+        // package's bytes remain unchanged.
+        let root = evidence_temp_root("no-overwrite");
+        let dir = root.join("evidence");
+        let first = EvidenceCollector::start(EvidenceConfig::new(&dir, "first")).unwrap();
+        for tick in 0..25u64 {
+            let mut sample = tick_sample();
+            sample.tick = tick;
+            first.produce(EvidenceRecord::Tick(sample));
+        }
+        let first_outcome = first.finalize();
+        assert!(first_outcome.is_complete(), "{first_outcome:?}");
+
+        let snapshot = |dir: &Path| -> Vec<(String, Vec<u8>)> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    files.push((name, std::fs::read(&path).unwrap()));
+                }
+            }
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        };
+        let before = snapshot(&dir);
+        let second = EvidenceCollector::start(EvidenceConfig::new(&dir, "second"));
+        assert!(matches!(
+            second,
+            Err(EvidenceError::DestinationExists { .. })
+        ));
+        let after = snapshot(&dir);
+        assert_eq!(before, after, "the first package's bytes are unchanged");
+
+        let verification = verify_package(&dir).unwrap();
+        assert!(
+            verification.verified_complete(),
+            "{:?}",
+            verification.problems
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_package_rejects_truncation_and_content_corruption() {
+        // S6-C1 HOLD-3: the independent verification catches a
+        // truncated stream and a same-length content corruption.
+        let root = evidence_temp_root("corruption");
+        let dir = root.join("evidence");
+        let collector =
+            EvidenceCollector::start(EvidenceConfig::new(&dir, "corruption-test")).unwrap();
+        for tick in 0..20u64 {
+            let mut sample = tick_sample();
+            sample.tick = tick;
+            collector.produce(EvidenceRecord::Tick(sample));
+        }
+        let outcome = collector.finalize();
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(
+            verify_package(&dir).unwrap().verified_complete(),
+            "the intact package verifies"
+        );
+
+        // Truncation: byte length, record count, and digest all
+        // mismatch.
+        let ticks_path = dir.join("ticks.jsonl");
+        let content = std::fs::read(&ticks_path).unwrap();
+        let truncated = &content[..content.len() - 40];
+        std::fs::write(&ticks_path, truncated).unwrap();
+        let verification = verify_package(&dir).unwrap();
+        assert!(!verification.verified_complete());
+        assert!(
+            verification
+                .problems
+                .iter()
+                .any(|problem| problem.contains("byte length")),
+            "{:?}",
+            verification.problems
+        );
+
+        // Same-length corruption: the digest (and possibly the
+        // decode) catches it.
+        std::fs::write(&ticks_path, &content).unwrap();
+        let mut corrupted = content.clone();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] = match corrupted[middle] {
+            b'9' => b'8',
+            byte => byte ^ 0x01,
+        };
+        std::fs::write(&ticks_path, &corrupted).unwrap();
+        let verification = verify_package(&dir).unwrap();
+        assert!(!verification.verified_complete());
+        assert!(
+            verification
+                .problems
+                .iter()
+                .any(|problem| problem.contains("integrity digest")),
+            "{:?}",
+            verification.problems
+        );
+
+        // A missing manifest is a structural error.
+        let _ = std::fs::remove_file(dir.join("manifest.json"));
+        assert!(verify_package(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_clean_empty_collection_writes_a_null_failure_manifest() {
         // The manifest encodes the absence of failure as an explicit
         // null — distinct from any failure text.
-        let dir = evidence_temp_dir("manifest-failure-null");
+        let root = evidence_temp_root("manifest-failure-null");
         let collector =
-            EvidenceCollector::start(EvidenceConfig::new(dir.clone(), "null-failure")).unwrap();
+            EvidenceCollector::start(EvidenceConfig::new(root.join("evidence"), "null-failure"))
+                .unwrap();
         let outcome = collector.finalize();
         assert!(outcome.is_complete());
-        let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest =
+            std::fs::read_to_string(root.join("evidence").join("manifest.json")).unwrap();
         assert!(manifest.contains("\"failure\":null"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

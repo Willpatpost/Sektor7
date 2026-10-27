@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 
 use engine_slice::persist_demo::{DemoOptions, run_persist_demo, run_persist_demo_headless};
-use engine_slice::soak_evidence::{EvidenceConfig, decode_line};
+use engine_slice::region::{TransitionKind, TransitionScope};
+use engine_slice::soak_evidence::{
+    EvidenceConfig, EvidenceRecord, RegionSample, decode_line, verify_package,
+};
 
 /// A unique test campaign root (removed on drop — best-effort).
 struct TestDir {
@@ -182,10 +185,17 @@ fn a_clean_run_writes_a_complete_evidence_package() {
     assert!(outcome.is_complete(), "{outcome:?}");
 
     let manifest = std::fs::read_to_string(evidence_dir.join("manifest.json")).unwrap();
-    assert!(manifest.contains("\"schema\":\"s6-evidence/1\""));
+    assert!(manifest.contains("\"schema\":\"s6-evidence/2\""));
     assert!(manifest.contains("\"scenario\":\"s6c1-package\""));
     assert!(manifest.contains("\"complete\":true"));
     assert!(manifest.contains("\"failure\":null"));
+    assert!(manifest.contains("\"dir_synced\":"));
+    let verification = verify_package(&evidence_dir).unwrap();
+    assert!(
+        verification.verified_complete(),
+        "{:?}",
+        verification.problems
+    );
 
     let ticks = std::fs::read_to_string(evidence_dir.join("ticks.jsonl")).unwrap();
     let lines: Vec<&str> = ticks.lines().collect();
@@ -221,6 +231,157 @@ fn a_clean_run_writes_a_complete_evidence_package() {
     assert!(kinds.contains(&"recovery"), "{kinds:?}");
     assert!(kinds.contains(&"close"), "{kinds:?}");
     assert!(kinds.contains(&"confirmation"), "{kinds:?}");
+}
+
+/// The region stream's per-transition records (S6-C1 HOLD-4): every
+/// entry carries its own duration, kind, and boundary scope — the
+/// excursion's target shows the FULL orchestrated crossing pair (a
+/// deactivation then a reactivation, never the install phase alone),
+/// every duration is present (never a substituted zero), every
+/// recorded transition applied (a clean run), and the independent
+/// verification accepts the package.
+#[test]
+fn the_excursion_crossings_carry_full_orchestrated_per_transition_durations() {
+    let dir = TestDir::new("excursion-crossings");
+    let mut run_options = options(&dir, 300, Some(120));
+    run_options.evidence = Some(EvidenceConfig::new(
+        dir.root.join("evidence"),
+        "s6c1-excursion-crossings",
+    ));
+    let report = run_persist_demo_headless(run_options).expect("the run completes");
+    assert!(report.close.failure.is_none());
+    let outcome = report.evidence.as_ref().expect("the verdict");
+    assert!(outcome.is_complete(), "{outcome:?}");
+
+    let evidence_dir = dir.root.join("evidence");
+    let mut entries = Vec::new();
+    for line in std::fs::read_to_string(evidence_dir.join("regions.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        match decode_line(line).expect("decodable region line") {
+            EvidenceRecord::Region(sample) => entries.push(sample),
+            other => panic!("a non-region record in the regions stream: {other:?}"),
+        }
+    }
+    assert!(!entries.is_empty());
+
+    // The excursion's target pair: the FULL six-phase orchestrated
+    // deactivation, then the durable reactivation — individually
+    // timed.
+    let target = u64::from(report.action.as_ref().expect("the action").region as u16);
+    let deactivations: Vec<&RegionSample> = entries
+        .iter()
+        .filter(|entry| {
+            entry.region == target
+                && entry.kind == TransitionKind::Deactivation
+                && entry.scope == TransitionScope::OrchestratedCrossing
+        })
+        .collect();
+    let activations: Vec<&RegionSample> = entries
+        .iter()
+        .filter(|entry| {
+            entry.region == target
+                && entry.kind == TransitionKind::Activation
+                && entry.scope == TransitionScope::OrchestratedCrossing
+        })
+        .collect();
+    assert_eq!(deactivations.len(), 1, "{entries:?}");
+    assert_eq!(activations.len(), 1, "{entries:?}");
+
+    // Every record: a present duration, an applied transition, and
+    // the founding/reclassify work honestly labeled with the
+    // director-legacy scope (both scopes present in a real run).
+    for entry in &entries {
+        assert!(
+            entry.duration_ms.is_some(),
+            "no substituted zero: {entry:?}"
+        );
+        assert!(
+            entry.applied,
+            "a clean run applies every recorded transition: {entry:?}"
+        );
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.scope == TransitionScope::DirectorTransition),
+        "the founding/reclassify work carries the director-legacy scope: {entries:?}"
+    );
+
+    // The per-tick cross-check: every TickReport transitioned region
+    // has exactly one region record (plus the founding entries
+    // emitted before the first tick).
+    let mut transitioned_total = 0u64;
+    for line in std::fs::read_to_string(evidence_dir.join("ticks.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        if let EvidenceRecord::Tick(sample) = decode_line(line).unwrap() {
+            transitioned_total += sample.transitioned_regions.len() as u64;
+        }
+    }
+    assert!(
+        entries.len() as u64 >= transitioned_total,
+        "every reported transition carries a record (plus the founding entries)"
+    );
+
+    let verification = verify_package(&evidence_dir).unwrap();
+    assert!(
+        verification.verified_complete(),
+        "{:?}",
+        verification.problems
+    );
+}
+
+/// The director's own transition path (S6-C1 HOLD-4): the
+/// pipeline-free legacy transitions log individually timed entries
+/// with the DirectorTransition scope — one entry per level change,
+/// exact count, no overflow, never a tick aggregate.
+#[test]
+fn director_legacy_transitions_log_individual_durations_and_scope() {
+    let (mut spine, mut director) = engine_slice::persist_demo::demo_scenario(
+        &engine_slice::sim::SimConfig::default(),
+        &[engine_slice::persist_demo::DEMO_PRESENCE],
+    )
+    .expect("the scenario builds");
+    // Clear the founding demotions (the loops emit those separately);
+    // this test drives the legacy path directly.
+    let _ = director.take_transition_entries();
+
+    let far = engine_core::PresenceSample {
+        position: (-100.0, 0.0),
+        velocity: (0.0, 0.0),
+    };
+    let mut expected_entries = 0usize;
+    for _ in 0..40 {
+        let before = director.levels();
+        director.apply(&mut spine, std::slice::from_ref(&far));
+        let after = director.levels();
+        expected_entries += (0..8usize)
+            .filter(|region| before[*region] != after[*region])
+            .count();
+        spine.run_tick();
+    }
+    let entries = director.take_transition_entries();
+    assert!(!entries.is_empty());
+    assert_eq!(
+        entries.len(),
+        expected_entries,
+        "one entry per level change — never a tick aggregate"
+    );
+    for entry in &entries {
+        assert_eq!(entry.scope, TransitionScope::DirectorTransition);
+        assert!(
+            entry.duration_ms.is_some(),
+            "no substituted zero: {entry:?}"
+        );
+        assert!(
+            entry.applied,
+            "the far-presence demotions all apply: {entry:?}"
+        );
+    }
+    assert_eq!(director.transition_log_overflow(), 0);
 }
 
 /// The frame-sample producers under the software Vulkan ICD — the

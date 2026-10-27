@@ -558,6 +558,77 @@ pub struct RegionDiagnostics {
     pub invalid_transitions: u64,
 }
 
+/// One region transition's observational evidence kind (S6-C1
+/// HOLD-4): what the transition did, from the attempted routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionKind {
+    Activation,
+    Deactivation,
+    Reclassification,
+}
+
+impl TransitionKind {
+    /// The evidence schema's tag.
+    pub fn tag(self) -> &'static str {
+        match self {
+            TransitionKind::Activation => "activation",
+            TransitionKind::Deactivation => "deactivation",
+            TransitionKind::Reclassification => "reclassification",
+        }
+    }
+}
+
+/// The boundary a recorded transition duration actually covers (S6-C1
+/// HOLD-4) — never conflated: a director transition is the
+/// pipeline-free transition (including the orchestrated tick's
+/// live↔live reclassifies, which carry no T1 journaling); an
+/// orchestrated crossing is the FULL six-phase durable crossing (the
+/// journal staging, the T1 append with its fsync, the verification,
+/// and the install) — never the install phase alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionScope {
+    DirectorTransition,
+    OrchestratedCrossing,
+}
+
+impl TransitionScope {
+    /// The evidence schema's tag.
+    pub fn tag(self) -> &'static str {
+        match self {
+            TransitionScope::DirectorTransition => "director-legacy",
+            TransitionScope::OrchestratedCrossing => "orchestrated-crossing",
+        }
+    }
+}
+
+/// One region transition's per-transition observational record (S6-C1
+/// HOLD-4): the region, the attempted from→to levels, whether the
+/// level actually changed (a coherent activation refusal leaves the
+/// region dormant — honestly recorded), the boundary clock at the
+/// moment of the transition (the same `now` the crossing machinery
+/// itself stamps), and the duration of exactly the boundary named by
+/// [`TransitionScope`] — never a tick aggregate. Never fingerprinted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransitionEntry {
+    pub tick: Tick,
+    pub region: usize,
+    pub from: LodLevel,
+    /// The ATTEMPTED target level.
+    pub to: LodLevel,
+    /// Whether the region's level actually reached `to`.
+    pub applied: bool,
+    pub kind: TransitionKind,
+    pub scope: TransitionScope,
+    /// The boundary's duration in milliseconds; `None` only where a
+    /// duration is genuinely unavailable — never a substituted zero.
+    pub duration_ms: Option<f64>,
+}
+
+/// The bounded observational transition log's capacity. Drained per
+/// tick by the evidence path; overflow (only possible without a
+/// drain) drops the oldest entry and counts — never silent.
+const TRANSITION_LOG_CAPACITY: usize = 8_192;
+
 /// Deterministic scripted presence for headless verification — explicit
 /// simulation inputs, exact-rational arithmetic (no trigonometry), so
 /// every platform computes identical positions, projections, and
@@ -626,6 +697,13 @@ pub struct RegionDirector {
     /// counterpart): one entry per capture-bearing deactivation,
     /// bounded like the activation history. Never fingerprinted.
     deactivation_latencies_ms: Vec<f64>,
+    /// The bounded observational per-transition evidence log (S6-C1
+    /// HOLD-4) — drained by the evidence path, never fingerprinted,
+    /// never authoritative state.
+    transition_log: std::collections::VecDeque<TransitionEntry>,
+    /// Entries dropped from the log's bound before a drain (only
+    /// possible when no drain runs — counted, never silent).
+    transition_log_overflowed: u64,
     /// Test-only fault injection (corrective finding C): makes the
     /// NAMED region's next activation fail its capture application
     /// BEFORE any mutation — other regions activating at the same tick
@@ -644,6 +722,8 @@ impl RegionDirector {
             diagnostics: RegionDiagnostics::default(),
             activation_latencies_ms: Vec::new(),
             deactivation_latencies_ms: Vec::new(),
+            transition_log: std::collections::VecDeque::new(),
+            transition_log_overflowed: 0,
             fail_next_apply_region: None,
         })
     }
@@ -809,6 +889,32 @@ impl RegionDirector {
         crate::math::percentile(&self.deactivation_latencies_ms, quantile)
     }
 
+    /// Records one per-transition evidence entry (S6-C1 HOLD-4) —
+    /// bounded, observational, never fingerprinted. Pushed by the
+    /// director's own transition path and by the orchestrated tick's
+    /// full-crossing boundary; overflow (only without a drain) drops
+    /// the oldest and counts.
+    pub(crate) fn push_transition_entry(&mut self, entry: TransitionEntry) {
+        self.transition_log.push_back(entry);
+        if self.transition_log.len() > TRANSITION_LOG_CAPACITY {
+            self.transition_log.pop_front();
+            self.transition_log_overflowed += 1;
+        }
+    }
+
+    /// Drains the per-transition evidence log (the evidence path calls
+    /// this once per tick; the drained entries are the region
+    /// stream's records).
+    pub fn take_transition_entries(&mut self) -> Vec<TransitionEntry> {
+        self.transition_log.drain(..).collect()
+    }
+
+    /// Entries the bounded log dropped before a drain (zero whenever
+    /// the evidence path drains per tick — reported, never silent).
+    pub fn transition_log_overflow(&self) -> u64 {
+        self.transition_log_overflowed
+    }
+
     /// Schedules a new obligation under the director's policy: dormant
     /// regions take the held path directly (reviewer priority B — new
     /// work targeting a dormant region can never execute unnoticed).
@@ -852,6 +958,11 @@ impl RegionDirector {
         to: LodLevel,
         now: Tick,
     ) {
+        // S6-C1 HOLD-4: the per-transition duration — this boundary is
+        // the director's own transition (the pipeline-free path, and
+        // the orchestrated tick's live↔live reclassifies), timed
+        // individually, never a tick aggregate, never fingerprinted.
+        let transition_start = Instant::now();
         match (from, to) {
             (_, LodLevel::Dormant) => self.deactivate(spine, region, from, now),
             (LodLevel::Dormant, _) => self.activate(spine, region, to, now),
@@ -866,6 +977,25 @@ impl RegionDirector {
                 self.states[region].level = to;
             }
         }
+        let kind = if to == LodLevel::Dormant {
+            TransitionKind::Deactivation
+        } else if from == LodLevel::Dormant {
+            TransitionKind::Activation
+        } else {
+            TransitionKind::Reclassification
+        };
+        self.push_transition_entry(TransitionEntry {
+            tick: now,
+            region,
+            from,
+            to,
+            // A coherent activation refusal leaves the region dormant
+            // — recorded honestly, never claimed applied.
+            applied: self.states[region].level == to,
+            kind,
+            scope: TransitionScope::DirectorTransition,
+            duration_ms: Some(transition_start.elapsed().as_secs_f64() * 1000.0),
+        });
     }
 
     /// Capture-before-discard deactivation (corrective findings A and

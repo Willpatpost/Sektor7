@@ -915,6 +915,30 @@ impl PersistDemo {
         self.evidence = Some(collector);
     }
 
+    /// Emits any pre-open transition entries (S6-C1 HOLD-4): the
+    /// scenario construction's founding demotions are real
+    /// transitions at boundary tick 0 — emitted before the first
+    /// tick's drain so the log never mixes founding work into a
+    /// tick's records.
+    pub fn emit_founding_transitions(&mut self) {
+        let Some(ev) = self.evidence.as_ref() else {
+            return;
+        };
+        for entry in self.session.take_transition_evidence() {
+            ev.produce(EvidenceRecord::Region(RegionSample {
+                tick: entry.tick.as_u64(),
+                wall_offset_ms: ev.wall_offset_ms(),
+                region: u64::from(entry.region as u16),
+                from_level: lod_ordinal(entry.from),
+                to_level: lod_ordinal(entry.to),
+                applied: entry.applied,
+                kind: entry.kind,
+                scope: entry.scope,
+                duration_ms: entry.duration_ms,
+            }));
+        }
+    }
+
     /// The attached evidence collector, when collection is enabled.
     pub fn evidence(&self) -> Option<&EvidenceCollector> {
         self.evidence.as_ref()
@@ -1001,13 +1025,6 @@ impl PersistDemo {
                 Some(sample) => vec![sample],
                 None => self.presence.clone(),
             };
-            // S6-C1 (observational): the levels before the tick — the
-            // transition records' from-side, read only when a
-            // collector is attached.
-            let levels_before = self
-                .evidence
-                .as_ref()
-                .map(|_| self.session.director().levels());
             // The whole orchestrated boundary — the composed gate, the
             // presence-driven transitions (the durable crossings when
             // they occur), and the spine tick — timed as one unit and
@@ -1072,27 +1089,22 @@ impl PersistDemo {
                 }
             }
             self.refresh_action();
-            self.emit_tick_evidence(
-                tick_ms,
-                &report,
-                levels_before,
-                index,
-                due_now,
-                settles_debt,
-            );
+            self.emit_tick_evidence(tick_ms, &report, index, due_now, settles_debt);
         }
         Ok(())
     }
 
     /// S6-C1 (observational, never on the logical path): the per-tick
     /// evidence — the spine/lane counter snapshots, the tick's
-    /// duration, the fixed-step debt, and one region record per
-    /// transition with its before/after LOD levels.
+    /// duration, the fixed-step debt, and the per-transition region
+    /// records drained from the director's evidence log (each with
+    /// its own duration, kind, and boundary scope — the HOLD-4
+    /// correction: never a tick aggregate, never an install phase
+    /// mislabeled as a full crossing).
     fn emit_tick_evidence(
-        &self,
+        &mut self,
         tick_ms: f64,
         report: &crate::orchestration::TickReport,
-        levels_before: Option<[LodLevel; REGION_COUNT]>,
         index: u32,
         due_now: u32,
         settles_debt: bool,
@@ -1138,17 +1150,23 @@ impl PersistDemo {
                 .map(|region| u64::from(*region as u16))
                 .collect(),
         }));
-        if let Some(before) = levels_before {
-            let after = self.session.director().levels();
-            for region in &report.regions_transitioned {
-                ev.produce(EvidenceRecord::Region(RegionSample {
-                    tick,
-                    wall_offset_ms: ev.wall_offset_ms(),
-                    region: u64::from(*region as u16),
-                    from_level: lod_ordinal(before[*region]),
-                    to_level: lod_ordinal(after[*region]),
-                }));
-            }
+        // The drained per-transition records: this tick's transitions
+        // with their individual durations and scopes (the drain is
+        // the evidence path's only surface over the director's log; a
+        // session that errors mid-tick leaves that tick's entries in
+        // the bounded log — an errored run never carries them).
+        for entry in self.session.take_transition_evidence() {
+            ev.produce(EvidenceRecord::Region(RegionSample {
+                tick: entry.tick.as_u64(),
+                wall_offset_ms: ev.wall_offset_ms(),
+                region: u64::from(entry.region as u16),
+                from_level: lod_ordinal(entry.from),
+                to_level: lod_ordinal(entry.to),
+                applied: entry.applied,
+                kind: entry.kind,
+                scope: entry.scope,
+                duration_ms: entry.duration_ms,
+            }));
         }
     }
 
@@ -1810,6 +1828,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         }));
         demo.attach_evidence(evidence);
     }
+    demo.emit_founding_transitions();
 
     {
         let stats = renderer.stats();
@@ -2313,7 +2332,9 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             director.activation_latency_percentile(1.0)
         );
         println!(
-            "  deactivation latency (observational): p50 {:.2} ms · p95 {:.2} ms · worst {:.2} ms",
+            "  deactivation-install latency (the crossing's director install phase — the FULL \
+             crossings carry their own per-transition durations in the evidence regions stream): \
+             p50 {:.2} ms · p95 {:.2} ms · worst {:.2} ms",
             director.deactivation_latency_percentile(0.50),
             director.deactivation_latency_percentile(0.95),
             director.deactivation_latency_percentile(1.0)
@@ -2477,6 +2498,7 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         }));
         demo.attach_evidence(evidence);
     }
+    demo.emit_founding_transitions();
     let mut application_failure: Option<String> = None;
     for tick_index in 0..options.headless_ticks {
         if options.action_at == Some(tick_index) {

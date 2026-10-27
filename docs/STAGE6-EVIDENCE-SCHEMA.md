@@ -1,11 +1,12 @@
 # STAGE 6 — S6-C1 EVIDENCE SCHEMA
 
-> **Status:** v1 · 2026-10-27 · **S6-C1 implementation artifact** — the
+> **Status:** v2 · 2026-10-27 · **S6-C1 implementation artifact** — the
 > observational evidence format and collection contract for Stage 6
-> (Slice 0's diagnostics & soak stage). Stage 6 remains gated; this
-> document describes only the instrumentation delivered by the S6-C1
-> checkpoint (its owner GO and the independent review's conditional
-> pass). No soak runner, burst injection, or S6-C2+ work exists yet.
+> (Slice 0's diagnostics & soak stage), corrected per the S6-C1 source
+> review (the four evidence-reliability and measurement-accuracy
+> findings). Stage 6 remains gated; this document describes only the
+> S6-C1 instrumentation. No soak runner, burst injection, or S6-C2+
+> work exists yet.
 
 ## 1. Scope and contract
 
@@ -14,62 +15,71 @@ is a **strictly opt-in, composition-level, observational** collector for
 the integrated `--demo-persist` application. When no collector is
 configured (`DemoOptions::evidence = None`, the default), the
 application's behavior, cost, and logical fingerprints are unchanged.
-When configured, the run additionally produces a machine-readable
-evidence package:
+The contract:
 
 - **Never on the critical path** — sample production is a nonblocking
   `try_send` onto a bounded channel; a dedicated writer thread owns all
-  serialization and buffered disk work (batched flushes; a 200 ms
-  receive timeout also flushes; fsync only at finalization). The
-  authoritative simulation and render submission never block on
-  evidence.
-- **No silent loss** — every stream keeps `produced / written / lost /
-  write_failed` counts; a full queue or a failing writer counts the
-  loss and fails the verdict. An incomplete package is a failed run
-  (the `Finalization::combined` discipline extends to it), reported
-  independently of the graceful close — a writer failure can never
-  bypass the close, which always runs first.
+  serialization and disk work (batched flushes; a 200 ms receive
+  timeout also flushes). All blocking flush/sync work stays on that
+  thread — never the authoritative tick or render submission paths.
+- **No silent loss, no unchecked failure** — every stream keeps
+  `produced / written / lost / write_failed / flush_errors` counts; a
+  full queue, a failing write, **or a failing flush (intermediate or
+  final)** counts the loss and fails the verdict **permanently** — a
+  later successful operation never clears it. Records buffered during
+  a failed-flush window remain accounted as written
+  (buffer-accepted) with their on-disk persistence uncertain — no
+  per-record persistence knowledge is fabricated.
+- **No overwrite** — the collector's destination is a **fresh,
+  exclusively created** directory (`std::fs::create_dir`): a
+  pre-existing destination is refused with the typed
+  `EvidenceError::DestinationExists` **before the campaign opens**; a
+  previous package is never overwritten, truncated, or deleted.
 - **Null ≠ zero** — unsupported GPU timestamps serialize as `null`
   (countable absence), never a substituted `0.000000`; platform RSS
   likewise (`null` where no sampler exists — Windows physical runs use
   the external sampler, S6-C4).
-- **Observational only** — nothing in the collector touches logical
-  state; the integration gate proves instrumentation-enabled and
-  -disabled runs produce byte-identical logical fingerprints.
+- **Observational only** — nothing here touches logical state; the
+  integration gate proves instrumentation-enabled and -disabled runs
+  produce byte-identical logical fingerprints.
 - **Bounded memory** — in-memory retention is the bounded channel
   (default 8,192 records) plus the writer's buffers; the interactive
   rolling diagnostic histories (the overlay's inputs, 600/128-sample
   caps) are deliberately untouched.
 
-## 2. The package layout
+## 2. The package layout and the finalization protocol
 
-An evidence directory (configurable, outside the tracked source tree)
-contains:
+An evidence directory (fresh per run, outside the tracked source tree)
+contains five JSONL streams — `frames`, `ticks`, `persistence`,
+`regions`, `memory` — plus `manifest.json`.
 
-| File | Stream | Cadence |
-|---|---|---|
-| `frames.jsonl` | `frame` | every graphical loop iteration |
-| `ticks.jsonl` | `tick` | every authoritative tick |
-| `persistence.jsonl` | `persistence` | every application-boundary persistence operation |
-| `regions.jsonl` | `region` | every region transition (per region) |
-| `memory.jsonl` | `memory` | 1 s wall-clock cadence (graphical loop) |
-| `manifest.json` | — | written once at finalization |
+The finalization protocol (entirely on the writer thread): drain every
+buffered sample → **check every flush** → `sync_all` each completed
+stream file (a sync failure fails the verdict) → best-effort
+directory-entry sync (Unix; unavailable through std on Windows —
+recorded as the honest platform limitation in the manifest's
+`dir_synced`, never a verdict failure on its own) → prepare the
+manifest **only after the streams pass** → write it to
+`manifest.json.tmp`, synchronize it, then **atomically publish** it by
+rename (a publication failure fails the verdict — a complete durable
+package is never claimed without the published manifest).
 
-`manifest.json` carries the schema version (`s6-evidence/1`), the
-scenario label, the run metadata (mode, platform, GPU/device/Vulkan
-version, present mode, extent, swapchain images, validation, fps
-target — graphical runs), per-stream counts, byte counts, per-stream
-FNV-1a integrity digests, the first failure note (`null` when clean),
-and the completeness verdict. **`complete` is true iff nothing was
-lost, no write failed, and every produced sample was written.**
+`manifest.json` carries the schema version (`s6-evidence/2`), the
+scenario label, the run metadata, `dir_synced`, per-stream counts
+(`produced`, `written`, `lost`, `write_failed`, `flush_errors`), byte
+counts, per-stream FNV-1a integrity digests, the first failure note
+(`null` when clean), and the completeness verdict. **`complete` is
+true iff nothing was lost, no write failed, no flush failed, and
+every produced sample was written.**
 
 ## 3. The record schemas
 
-All `_ms` fields are **milliseconds at microsecond resolution** (six
-decimal places — the documented precision contract; finer values
-quantize). All wall offsets are milliseconds since collector start.
-Unknown, missing, or duplicate fields fail a strict decode
-(`decode_line`); the schema is versioned and closed.
+All `_ms` fields are **milliseconds encoded with six decimal places —
+nanosecond-scale numerical increments** (the effective measurement
+resolution is bounded by the clock source, not by the encoding).
+Wall offsets are milliseconds since collector start. Unknown,
+missing, or duplicate fields fail a strict decode (`decode_line`);
+the schema is versioned and closed.
 
 - **`frame`** — `sample` (iteration index), `wall_offset_ms`,
   `interval_ms` (the raw interval handed to the sim accumulator,
@@ -87,68 +97,85 @@ Unknown, missing, or duplicate fields fail a strict decode
   event-spine obligations and never restored by recovery), the spine
   counters (`executed`, `scheduled`, `late_arrivals`,
   `late_executions`, `blocked_transitions`, `invalid_dropped`,
-  `budget_exhausted_ticks`), queue/lane snapshots (`near_pending`,
-  `far_pending`, `blocked`, `held`, cumulative lane totals and
-  backlogged-tick counts), the watermark pair (`processed_through`,
-  `max_executed_due` — `null` when `None`), and `transitioned_regions`.
+  `budget_exhausted_ticks`), queue/lane snapshots, the watermark pair
+  (`processed_through`, `max_executed_due`), and `transitioned_regions`.
 - **`persistence`** — `kind` (`recovery`, `capture`, `admission`,
   `busy`, `completion`, `confirmation`, `close` — the latency families
   stay separate, never conflated), `tick`, `latency_ms`, `outcome`
-  (the truthful label, verbatim), `revision` (`null` when none). All
-  measured at the **application boundary** (the frozen
-  `engine-persist` interior is not instrumented); completion latency
-  spans admission → observed terminal state (queue + append + fsync +
-  readback — what the authority thread experiences); `close` is n=1
-  per run and measured separately from the soak wall duration.
-- **`region`** — `tick`, `region`, `from_level` / `to_level` (the LOD
-  detail ordinals: 3 Full · 2 Simplified · 1 EventDriven · 0 Dormant).
-  Identities come from the tick's `TickReport` and the director's
-  before/after levels.
+  (the truthful label, verbatim), `revision`. All measured at the
+  **application boundary** (the frozen `engine-persist` interior is
+  not instrumented); completion spans admission → observed terminal
+  state; `close` is n=1 per run, measured separately from the soak
+  wall duration.
+- **`region`** — `tick` (the boundary clock at the moment of the
+  transition — the same `now` the crossing machinery stamps), `region`,
+  `from_level` / `to_level` (the LOD detail ordinals: 3 Full ·
+  2 Simplified · 1 EventDriven · 0 Dormant — the attempted target),
+  `applied` (whether the level actually changed; a coherent activation
+  refusal is recorded honestly), `kind` (`activation` /
+  `deactivation` / `reclassification`), **`scope`** — the boundary the
+  duration covers, never conflated: `director-legacy` (the director's
+  own pipeline-free transition, including the orchestrated tick's
+  live↔live reclassifies, which carry no T1 journaling) or
+  `orchestrated-crossing` (**the FULL six-phase durable crossing** —
+  the journal staging, the T1 append with its fsync, the
+  verification, and the install as one per-region boundary, **never
+  the install phase alone**) — and `duration_ms` (the per-transition
+  duration, `null` only where genuinely unavailable, never a
+  substituted zero, **never a tick aggregate**). The run summary's
+  activation/deactivation percentile lines are the separate
+  128-cap overlay histories; the deactivation line is labeled as the
+  crossing's director install phase.
 - **`memory`** — `rss_kib` (Linux `/proc/self/status`; `null`
-  elsewhere), `held_by_region` (the structural dormant occupancy —
-  held obligations per region), `pending_total` (the capture ledger's
-  pending consequences). **Attribution metadata, never an
-  allocation-exact per-NPC cost** — the flat-array NPC representation
-  makes per-LOD allocation differences absent at Slice 0 scale.
+  elsewhere), `held_by_region` (the structural dormant occupancy),
+  `pending_total` (the capture ledger's pending consequences).
+  **Attribution metadata, never an allocation-exact per-NPC cost** —
+  the flat-array NPC representation makes per-LOD allocation
+  differences absent at Slice 0 scale.
 
-## 4. Statistics helpers
+## 4. Package verification
 
-`soak_evidence` provides the documented 1%-low calculation
-(`one_percent_low_fps`: the `ceil(0.01 × n)` worst presented-frame
-intervals, their mean rate; **not claimed below 100 samples**) and
-reuses `math::percentile` (the established ceil-index convention) for
-P50/P95/P99/max. Full-run distributions are computed from the raw
-JSONL at analysis time (S6-C5); the interactive overlay's rolling
-histories are unchanged.
+`soak_evidence::verify_package(dir)` independently checks a package
+against its manifest, without mutating it: the expected stream files,
+byte lengths, record counts, per-line decodability, the recomputed
+FNV-1a integrity digests, the counts' complete-consistency (including
+the flush-error counts), and the declared completeness (a manifest
+declaring complete while checks fail — or while also declaring a
+failure — is a problem). Structural unreadability (a missing or
+unparseable manifest) is a typed error. An honestly-declared
+INCOMPLETE package whose files are intact verifies with no problems
+and `verified_complete() == false`.
 
-## 5. Instrumentation overhead
+## 5. Statistics helpers and overhead
 
-`engine-slice --benchmark-instrumentation` measures (pod, dev-profile,
-observational — never CI thresholds, never physical-rig claims):
-
-1. the produce path (sample construction + the bounded enqueue) as a
-   distribution over 10,000 samples;
-2. the same deterministic headless workload (600 ticks + the action)
-   with evidence disabled versus enabled — wall-time comparison and
-   the logical-fingerprint equality gate.
-
-The overhead comparison's authoritative repetition belongs to the
-owner's rig (S6-C4), matching the accepted evidence-class discipline.
+`one_percent_low_fps` (the documented `ceil(0.01 × n)` worst-interval
+mean-rate calculation; not claimed below 100 samples) and
+`math::percentile` (the established ceil-index convention).
+`engine-slice --benchmark-instrumentation` measures the produce path
+(construction + the bounded enqueue) and the same deterministic
+headless workload with evidence disabled versus enabled, gated by the
+logical-fingerprint equality assertion — pod/dev-profile
+observational numbers, never CI thresholds, never physical-rig claims.
 
 ## 6. Fault seams and limits
 
-The `EvidenceFaultControl` (the `WorkerFaultControl` discipline —
-observable state, never sleeps) provides deterministic
-`fail_writes` and `park_writes` injection for the overflow and
-writer-failure tests; `DemoOptions::evidence_fail_writes` is the
-application-level test seam (never set by the binary), mirroring
-`poison_at_tick`.
+`EvidenceFaultControl` (the `WorkerFaultControl` discipline —
+observable state, never sleeps): `fail_writes` (write-boundary
+failures), **`fail_flushes` (flush-boundary failures — the HOLD-1
+regression; the test waits for one complete seam pass over every
+stream through the live counter before disarming, so the disarm can
+never land between the writer's per-stream iterations)**, and
+`park_writes` (the overflow regression's deterministic full queue).
+`DemoOptions::evidence_fail_writes` is the application-level test
+seam (never set by the binary), mirroring `poison_at_tick`.
 
-**Known limits (honest, not papered over):** the writer join can block
-on pathological disk stalls (the same class as any thread join); a
-manifest write failure is noted in the in-memory verdict (the outcome,
-not the file, is authoritative); the run's git commit SHA is not
+**Known limits (honest, not papered over):** the writer join can
+block on pathological disk stalls; a manifest-publication failure is
+noted in the in-memory verdict (the outcome, not a file, is
+authoritative); directory-entry synchronization is Unix-only through
+std (recorded via `dir_synced`); the run's git commit SHA is not
 recorded in-process (the runner records it — S6-C3); memory sampling
-exists only where the platform sampler does; per-transition latencies
-beyond the activation/deactivation percentile aggregates are deferred
-to S6-C3's scenario records.
+exists only where the platform sampler does; an errored run leaves
+that tick's drained-but-unemitted transition entries in the bounded
+log. This pod has no Vulkan loader — the graphical frame producers'
+live exercise belongs to CI's lavapipe runners and the rig.

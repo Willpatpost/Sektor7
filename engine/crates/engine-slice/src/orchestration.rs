@@ -67,6 +67,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
+use std::time::Instant;
 
 use engine_core::{EventId, EventSpec, LodLevel, PresenceSample, ScheduleError, Spine, Tick};
 use engine_persist::checkpoint::peek_object_domain;
@@ -81,7 +82,7 @@ use crate::crossing::{
     is_session_object, save_session,
 };
 use crate::npc::{NPC_COUNT, NpcWorld, REGION_COUNT};
-use crate::region::RegionDirector;
+use crate::region::{RegionDirector, TransitionEntry, TransitionKind, TransitionScope};
 use crate::store::{MediumSource, StoreLocation};
 use crate::worker::{IoWorker, MediumOp, TrySubmitError, WorkerReply, WorkerSource};
 
@@ -653,14 +654,45 @@ impl OrchestratedSession {
                 // Live→dormant: the SIX-PHASE durable crossing (the T1
                 // journal transaction and its fsync precede the
                 // destructive simulation changes).
+                // S6-C1 HOLD-4: the FULL crossing, timed per region —
+                // the journal staging, the T1 append with its fsync,
+                // the verification, and the install as one boundary,
+                // never the install phase alone and never a tick
+                // aggregate; observational and fingerprint-excluded.
+                let crossing_start = Instant::now();
                 self.crossing
                     .deactivate(&mut self.spine, &mut self.director, region, now)?;
+                let crossing_ms = crossing_start.elapsed().as_secs_f64() * 1000.0;
+                self.director.push_transition_entry(TransitionEntry {
+                    tick: now,
+                    region,
+                    from: current,
+                    to: next,
+                    applied: self.director.levels()[region] == next,
+                    kind: TransitionKind::Deactivation,
+                    scope: TransitionScope::OrchestratedCrossing,
+                    duration_ms: Some(crossing_ms),
+                });
                 regions_transitioned.push(region);
             } else if current == LodLevel::Dormant {
                 // Dormant→live: the durable reactivation (the live
                 // application of the already-durable captures).
+                // S6-C1 HOLD-4: the FULL durable reactivation crossing,
+                // timed per region — the same scope discipline.
+                let crossing_start = Instant::now();
                 self.crossing
                     .activate(&mut self.spine, &mut self.director, region, next, now)?;
+                let crossing_ms = crossing_start.elapsed().as_secs_f64() * 1000.0;
+                self.director.push_transition_entry(TransitionEntry {
+                    tick: now,
+                    region,
+                    from: current,
+                    to: next,
+                    applied: self.director.levels()[region] == next,
+                    kind: TransitionKind::Activation,
+                    scope: TransitionScope::OrchestratedCrossing,
+                    duration_ms: Some(crossing_ms),
+                });
                 // C3-F4: the crossing preserves the LEGACY
                 // Ok-on-coherent-refusal semantics — a refused
                 // activation leaves the region safely dormant. The
@@ -675,7 +707,10 @@ impl OrchestratedSession {
                 }
                 regions_transitioned.push(region);
             } else {
-                // Ordinary live→live: the accepted safe transition path.
+                // Ordinary live→live: the accepted safe transition path
+                // (the director's own transition — its evidence entry
+                // carries the DirectorTransition scope, pushed inside
+                // the director).
                 self.director
                     .transition_region(&mut self.spine, region, next, now);
                 regions_transitioned.push(region);
@@ -944,6 +979,13 @@ impl OrchestratedSession {
     /// nonpersistent render demo consumes from its own driver).
     pub fn director(&self) -> &RegionDirector {
         &self.director
+    }
+
+    /// Drains the per-transition observational evidence log (S6-C1
+    /// HOLD-4) — the evidence path's only surface over the director's
+    /// log; authoritative state is untouched.
+    pub fn take_transition_evidence(&mut self) -> Vec<TransitionEntry> {
+        self.director.take_transition_entries()
     }
 
     /// The per-key durable status passthrough
