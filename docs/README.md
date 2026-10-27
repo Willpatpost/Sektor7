@@ -1,6 +1,6 @@
 # Project Documentation — Working Title SEKTOR 7
 
-> **Status:** Folder index and documentation governance v0.5 · 2026-10-19 · registers `TECH-ARCHITECTURE.md` (provisional engine blueprint — foundation ratified 2026-10-19, DECISIONS T-01–T-10; Stages 0–1 complete, later stages gated).
+> **Status:** Folder index and documentation governance v0.6 · 2026-10-26 · registers `TECH-ARCHITECTURE.md` (provisional engine blueprint — foundation ratified 2026-10-19, DECISIONS T-01–T-10) and the acceptance-record family (Stage 4; Stage 5 B1–B5; PP-B1–B4; and the Slice 0 Integration Checkpoint 1 — **CLOSED-PASS, independently reviewed and owner-ratified 2026-10-26**: [`SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md`](SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md); Stage 6 gated — Slice 0's overall closure awaits it).
 >
 > **Authority and scope:** The human project lead makes final commitments. This folder records the vision, game mechanics, shared-campaign rules, original-engine research framework and prior prototype evidence. **This document set does not authorize implementing or modifying the game/engine.**
 >

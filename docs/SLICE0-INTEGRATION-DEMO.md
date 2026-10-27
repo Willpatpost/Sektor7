@@ -1,6 +1,6 @@
 # SLICE 0 INTEGRATION DEMONSTRATION (`--demo-persist`)
 
-> **Status:** The Checkpoint-1 **corrective pass** delivered on `slice0-integration-demo` for independent re-review — the owner's bounded GO addressing the independent review's five findings (the error-path finalization, the absolute time accounting, the target-attributed action lifecycle, the overlapping-action admission rule, and the strengthened pending-publication coverage). **NOT YET PHYSICALLY ACCEPTED:** the graphical verification belongs to the owner's physical Windows rig; everything runnable headlessly is proven by the focused integration tests (`engine/crates/engine-slice/tests/integration_demo.rs`, 11 tests) and the full workspace gates. Delivery is not acceptance.
+> **Status:** **CLOSED-PASS — independently reviewed and owner-ratified, October 26, 2026.** The acceptance chain and the physical Windows evidence: [`SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md`](SLICE0-INTEGRATION-ACCEPTANCE-RECORD-2026-10-26.md). The accepted revision: `29ccfa601bf5bc67b91c4f704fbe53553760b4e5` (the corrective pass that resolved the independent review's five findings — the error-path finalization, the absolute time accounting, the target-attributed action lifecycle, the overlapping-action admission rule, and the strengthened pending-publication coverage). The instructions below remain the reproducible run.
 
 ## What this is
 
@@ -67,7 +67,7 @@ and the relaunch — the **absolute time accounting** correct after recovery (th
 
 A tampered database fails closed: `error: open the campaign store …: file is not a database — refusing to touch the durable state` (exit 1; the file untouched). An application-level failure mid-run (e.g., a persistence-worker death) exits THROUGH the finalization: the report preserves the failure and the independent close outcome (the binary exits nonzero on either).
 
-### Graphical — the physical-rig procedure (NOT YET PHYSICALLY ACCEPTED)
+### Graphical — the physical-rig procedure (the owner's physical acceptance COMPLETED 2026-10-26 — PASS; the record §E)
 
 ```powershell
 # 0) Verify the exact reviewed commit and a clean tree (no blind resets):
