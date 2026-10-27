@@ -622,6 +622,10 @@ pub struct RegionDirector {
     ledger: CaptureLedger,
     diagnostics: RegionDiagnostics,
     activation_latencies_ms: Vec<f64>,
+    /// Observational deactivation latencies (S6-C1 — the activation
+    /// counterpart): one entry per capture-bearing deactivation,
+    /// bounded like the activation history. Never fingerprinted.
+    deactivation_latencies_ms: Vec<f64>,
     /// Test-only fault injection (corrective finding C): makes the
     /// NAMED region's next activation fail its capture application
     /// BEFORE any mutation — other regions activating at the same tick
@@ -639,6 +643,7 @@ impl RegionDirector {
             ledger: CaptureLedger::default(),
             diagnostics: RegionDiagnostics::default(),
             activation_latencies_ms: Vec::new(),
+            deactivation_latencies_ms: Vec::new(),
             fail_next_apply_region: None,
         })
     }
@@ -764,6 +769,7 @@ impl RegionDirector {
         episode: u64,
         checkpoint: RegionCheckpoint,
     ) {
+        let install_start = Instant::now();
         self.states[region] = RegionState {
             level: LodLevel::Dormant,
             episode,
@@ -773,6 +779,12 @@ impl RegionDirector {
             last_dormancy_span: 0,
         };
         self.diagnostics.deactivations += 1;
+        self.deactivation_latencies_ms
+            .push(install_start.elapsed().as_secs_f64() * 1000.0);
+        let len = self.deactivation_latencies_ms.len();
+        if len > 128 {
+            self.deactivation_latencies_ms.drain(0..len - 128);
+        }
     }
 
     pub fn diagnostics(&self) -> RegionDiagnostics {
@@ -785,6 +797,16 @@ impl RegionDirector {
             return 0.0;
         }
         crate::math::percentile(&self.activation_latencies_ms, quantile)
+    }
+
+    /// Observational deactivation-latency percentiles (milliseconds) —
+    /// the capture-before-discard boundary's own cost (S6-C1), never
+    /// presented as activation or spine time.
+    pub fn deactivation_latency_percentile(&self, quantile: f64) -> f64 {
+        if self.deactivation_latencies_ms.is_empty() {
+            return 0.0;
+        }
+        crate::math::percentile(&self.deactivation_latencies_ms, quantile)
     }
 
     /// Schedules a new obligation under the director's policy: dormant
@@ -862,6 +884,7 @@ impl RegionDirector {
         from: LodLevel,
         now: Tick,
     ) {
+        let deactivation_start = Instant::now();
         let class = EventClass::new(region as u16);
         spine.suspend_matching(|view| view.class == class);
         spine.world_mut().set_region_lod(region, LodLevel::Dormant);
@@ -905,6 +928,12 @@ impl RegionDirector {
             last_dormancy_span: 0,
         };
         self.diagnostics.deactivations += 1;
+        self.deactivation_latencies_ms
+            .push(deactivation_start.elapsed().as_secs_f64() * 1000.0);
+        let len = self.deactivation_latencies_ms.len();
+        if len > 128 {
+            self.deactivation_latencies_ms.drain(0..len - 128);
+        }
     }
 
     /// Reactivation (corrective findings A and C): commit the captured

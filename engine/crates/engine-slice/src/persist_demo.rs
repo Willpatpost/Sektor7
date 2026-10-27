@@ -82,7 +82,9 @@ use engine_persist::{
     T1Journal, UnknownReason,
 };
 use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
-use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
+use engine_shell::{
+    DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig, resident_set_kib,
+};
 
 use crate::crossing::TransitionError;
 use crate::frame_timing::FrameTiming;
@@ -95,6 +97,10 @@ use crate::orchestration::{
 use crate::region::{RegionConfig, RegionDirector, stage4_state_fingerprint_hex};
 use crate::region_render::{build_region_scene, camera_presence, levels_compact};
 use crate::sim::SimConfig;
+use crate::soak_evidence::{
+    EvidenceCollector, EvidenceConfig, EvidenceOutcome, EvidenceRecord, FrameSample, MemorySample,
+    PersistenceKind, PersistenceSample, RegionSample, TickSample, lod_ordinal,
+};
 use crate::store::{SessionStore, StoreLocation};
 
 /// The demonstration campaign's identity (the founding record's
@@ -166,6 +172,19 @@ pub struct DemoOptions {
     /// path's finalization deterministically. Never set by the binary.
     #[doc(hidden)]
     pub poison_at_tick: Option<u64>,
+    /// S6-C1 observational evidence collection (opt-in; `None` is the
+    /// default — zero cost, zero behavior change): when set, the run
+    /// carries a [`EvidenceCollector`] whose bounded non-blocking
+    /// streams record the full-run measurements, finalized through
+    /// the single finalization site AFTER the graceful close — a
+    /// failed evidence package never bypasses it.
+    pub evidence: Option<EvidenceConfig>,
+    /// Test-only (the S6-C1 error-path regression's controlled seam):
+    /// arm the evidence writer's fail-writes fault before the run so
+    /// the writer fails deterministically mid-campaign. Never set by
+    /// the binary.
+    #[doc(hidden)]
+    pub evidence_fail_writes: bool,
 }
 
 /// One advance step's outcome (observational, mirrors `SimStep`).
@@ -431,6 +450,11 @@ struct TrackedPublication {
     /// The capture's simulation tick — the pending display's honest
     /// provenance (when the unverified state was captured).
     capture_tick: u64,
+    /// The admission instant (S6-C1): the completion-latency
+    /// measurement's start — admission-to-observed-completion, the
+    /// latency the authority thread actually experiences (queue +
+    /// append + fsync + readback), never the worker's interior.
+    submitted_at: Instant,
     state: PublicationState,
 }
 
@@ -441,26 +465,33 @@ struct ExcursionState {
 }
 
 /// The application-level finalization outcome (HOLD-1): the preserved
-/// application failure (None on normal exit) and the graceful close's
-/// honest report — combined so the original error stays visible, the
-/// close outcome is reported independently, and a failed close is
-/// never represented as successful.
+/// application failure (None on normal exit), the graceful close's
+/// honest report, and (when evidence collection was enabled) the
+/// evidence package's own verdict — combined so the original error
+/// stays visible, the close outcome is reported independently, a
+/// failed close is never represented as successful, and an incomplete
+/// evidence package is a failed run without ever having bypassed the
+/// close.
 pub struct Finalization {
     pub application_failure: Option<String>,
     pub close: CloseReport,
+    /// The evidence collector's verdict (S6-C1) — `None` when the run
+    /// collected no evidence (the default).
+    pub evidence: Option<EvidenceOutcome>,
 }
 
 impl Finalization {
     /// The combined outcome: `Err` iff anything failed — the original
     /// application error first, the close outcome stated
-    /// independently; never a success claim over a failed close.
+    /// independently, the evidence verdict last; never a success
+    /// claim over a failed close or a lost-evidence run.
     pub fn combined(&self) -> Result<(), String> {
         let close_failure = self
             .close
             .failure
             .as_ref()
             .map(|failure| format!("{failure:?}"));
-        match (&self.application_failure, close_failure) {
+        let base = match (&self.application_failure, close_failure) {
             (None, None) => Ok(()),
             (Some(application), None) => Err(format!(
                 "{application}; the graceful close COMPLETED (final {}, checkpoint {}, settled {})",
@@ -478,6 +509,31 @@ impl Finalization {
                 "{application}; AND the close did not complete: {close} — the verified evidence stands; \
                  the campaign remains recoverable from its durable state"
             )),
+        };
+        let evidence_failure = self
+            .evidence
+            .as_ref()
+            .filter(|outcome| !outcome.is_complete())
+            .map(|outcome| {
+                format!(
+                    "the evidence package is incomplete ({} samples, first failure: {})",
+                    outcome.total_samples(),
+                    outcome.failure.as_deref().unwrap_or("counts mismatched")
+                )
+            });
+        match (base, evidence_failure) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(evidence)) => Err(format!(
+                "{evidence}; the graceful close COMPLETED independently (final {}, checkpoint {}, settled {})",
+                self.close
+                    .final_revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                self.close.lifecycle_checkpoint,
+                self.close.required_settled
+            )),
+            (Err(existing), None) => Err(existing),
+            (Err(existing), Some(evidence)) => Err(format!("{existing}; AND {evidence}")),
         }
     }
 
@@ -539,6 +595,9 @@ pub struct HeadlessReport {
     /// durable-outcome witness for the deliberate consequence.
     pub closed_region: Option<(usize, u64, u64)>,
     pub close: CloseSummary,
+    /// The evidence package's verdict (S6-C1) — `None` when the run
+    /// collected no evidence.
+    pub evidence: Option<EvidenceOutcome>,
 }
 
 impl HeadlessReport {
@@ -599,6 +658,17 @@ impl HeadlessReport {
             self.close.required_settled,
             self.close.failure
         );
+        if let Some(outcome) = &self.evidence {
+            println!(
+                "  evidence: {} samples · verdict {}",
+                outcome.total_samples(),
+                if outcome.is_complete() {
+                    "COMPLETE"
+                } else {
+                    "INCOMPLETE"
+                }
+            );
+        }
     }
 }
 
@@ -681,6 +751,10 @@ pub struct PersistDemo {
     last_capture_error: Option<String>,
     last_commit: Option<String>,
     confirmed_revision: Option<Hash>,
+    /// The S6-C1 evidence collector (opt-in; `None` by default —
+    /// every emission site is guarded by it, so an absent collector
+    /// is zero cost and zero behavior change).
+    evidence: Option<EvidenceCollector>,
 }
 
 impl PersistDemo {
@@ -704,6 +778,7 @@ impl PersistDemo {
             last_capture_error: None,
             last_commit: None,
             confirmed_revision: None,
+            evidence: None,
         }
     }
 
@@ -833,6 +908,18 @@ impl PersistDemo {
         &self.session
     }
 
+    /// Attaches the S6-C1 evidence collector. The loops create it
+    /// BEFORE the campaign opens (so recovery is timed), then hand it
+    /// here; every emission site afterwards is guarded by it.
+    pub fn attach_evidence(&mut self, collector: EvidenceCollector) {
+        self.evidence = Some(collector);
+    }
+
+    /// The attached evidence collector, when collection is enabled.
+    pub fn evidence(&self) -> Option<&EvidenceCollector> {
+        self.evidence.as_ref()
+    }
+
     /// The campaign clock at this session's start (the absolute
     /// time-accounting offset — 0 for a fresh founding, the recovered
     /// clock for a relaunch).
@@ -872,7 +959,7 @@ impl PersistDemo {
         self.accumulator_ns += elapsed.as_nanos();
         let due = (self.accumulator_ns / self.period_ns) as u32;
         let executed = due.min(self.timing.max_catchup_per_frame);
-        self.run_ticks(executed)?;
+        self.run_ticks(executed, true)?;
         self.accumulator_ns -= u128::from(executed) * self.period_ns;
         Ok(DemoStep {
             executed_ticks: executed,
@@ -882,14 +969,20 @@ impl PersistDemo {
     }
 
     /// Runs exactly `ticks` fixed ticks — the headless deterministic
-    /// path (no real-time input at all).
+    /// path (no real-time input at all; these ticks never settle
+    /// accrued time debt).
     pub fn run_headless(&mut self, ticks: u64) -> Result<(), TransitionError> {
         self.headless_ticks += ticks;
-        self.run_ticks(ticks as u32)
+        self.run_ticks(ticks as u32, false)
     }
 
-    fn run_ticks(&mut self, ticks: u32) -> Result<(), TransitionError> {
-        for _ in 0..ticks {
+    fn run_ticks(&mut self, ticks: u32, settles_debt: bool) -> Result<(), TransitionError> {
+        // The fixed-step debt observable at the batch boundary (S6-C1):
+        // the accumulator's due count as this batch begins. Per-tick
+        // samples report it decrementing as the batch executes; the
+        // headless path's free ticks never settle accrued debt.
+        let due_now = (self.accumulator_ns / self.period_ns) as u32;
+        for index in 0..ticks {
             // The effective presence: the deliberate action's excursion
             // override while active (the region held at its antipode),
             // the caller's presence otherwise. Computed BEFORE the
@@ -908,6 +1001,13 @@ impl PersistDemo {
                 Some(sample) => vec![sample],
                 None => self.presence.clone(),
             };
+            // S6-C1 (observational): the levels before the tick — the
+            // transition records' from-side, read only when a
+            // collector is attached.
+            let levels_before = self
+                .evidence
+                .as_ref()
+                .map(|_| self.session.director().levels());
             // The whole orchestrated boundary — the composed gate, the
             // presence-driven transitions (the durable crossings when
             // they occur), and the spine tick — timed as one unit and
@@ -950,18 +1050,130 @@ impl PersistDemo {
                 // required canonical confirmation (the tests'
                 // discipline — T1 durability precedes it, and the
                 // outcome label lands in the overlay).
+                let commit_start = Instant::now();
                 let outcome = self.session.commit_canonical()?;
-                self.last_commit = Some(commit_label(&outcome));
-                if let CommitOutcome::Confirmed(receipt) = &outcome {
+                let confirmation_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
+                let label = commit_label(&outcome);
+                let revision = if let CommitOutcome::Confirmed(receipt) = &outcome {
                     self.confirmed_revision = Some(receipt.revision);
-                }
+                    Some(receipt.revision.to_string())
+                } else {
+                    None
+                };
+                self.emit_persistence(
+                    PersistenceKind::Confirmation,
+                    Some(confirmation_ms),
+                    label.clone(),
+                    revision,
+                );
+                self.last_commit = Some(label);
                 if target_deactivated {
                     self.attribute_action_confirmation(&outcome);
                 }
             }
             self.refresh_action();
+            self.emit_tick_evidence(
+                tick_ms,
+                &report,
+                levels_before,
+                index,
+                due_now,
+                settles_debt,
+            );
         }
         Ok(())
+    }
+
+    /// S6-C1 (observational, never on the logical path): the per-tick
+    /// evidence — the spine/lane counter snapshots, the tick's
+    /// duration, the fixed-step debt, and one region record per
+    /// transition with its before/after LOD levels.
+    fn emit_tick_evidence(
+        &self,
+        tick_ms: f64,
+        report: &crate::orchestration::TickReport,
+        levels_before: Option<[LodLevel; REGION_COUNT]>,
+        index: u32,
+        due_now: u32,
+        settles_debt: bool,
+    ) {
+        let Some(ev) = self.evidence.as_ref() else {
+            return;
+        };
+        let spine = self.session.spine();
+        let stats = spine.stats();
+        let totals = spine.lane_totals();
+        let outstanding = if settles_debt {
+            due_now.saturating_sub(index + 1)
+        } else {
+            due_now
+        };
+        let tick = report.tick.as_u64();
+        ev.produce(EvidenceRecord::Tick(TickSample {
+            tick,
+            wall_offset_ms: ev.wall_offset_ms(),
+            tick_ms,
+            ticks_due_total: self.ticks_due_total(),
+            outstanding_ticks: outstanding,
+            executed: stats.executed,
+            scheduled: stats.scheduled,
+            late_arrivals: stats.late_arrivals,
+            late_executions: stats.late_executions,
+            blocked_transitions: stats.blocked_transitions,
+            invalid_dropped: stats.invalid_dropped,
+            budget_exhausted_ticks: stats.budget_exhausted_ticks,
+            near_pending: spine.near_pending_count() as u32,
+            far_pending: spine.far_pending_count() as u32,
+            blocked: spine.blocked_count() as u32,
+            held: spine.held_count() as u32,
+            near_executed_total: totals.near_executed,
+            far_executed_total: totals.far_executed,
+            near_backlogged_ticks: totals.near_backlogged_ticks,
+            far_backlogged_ticks: totals.far_backlogged_ticks,
+            processed_through: spine.processed_through().map(|tick| tick.as_u64()),
+            max_executed_due: spine.max_executed_due().map(|tick| tick.as_u64()),
+            transitioned_regions: report
+                .regions_transitioned
+                .iter()
+                .map(|region| u64::from(*region as u16))
+                .collect(),
+        }));
+        if let Some(before) = levels_before {
+            let after = self.session.director().levels();
+            for region in &report.regions_transitioned {
+                ev.produce(EvidenceRecord::Region(RegionSample {
+                    tick,
+                    wall_offset_ms: ev.wall_offset_ms(),
+                    region: u64::from(*region as u16),
+                    from_level: lod_ordinal(before[*region]),
+                    to_level: lod_ordinal(after[*region]),
+                }));
+            }
+        }
+    }
+
+    /// S6-C1 (observational): one application-boundary persistence
+    /// record — the latency families stay separate (capture,
+    /// admission, busy, completion, confirmation, close, recovery),
+    /// never conflated.
+    fn emit_persistence(
+        &self,
+        kind: PersistenceKind,
+        latency_ms: Option<f64>,
+        outcome: String,
+        revision: Option<String>,
+    ) {
+        let Some(ev) = self.evidence.as_ref() else {
+            return;
+        };
+        ev.produce(EvidenceRecord::Persistence(PersistenceSample {
+            kind,
+            wall_offset_ms: ev.wall_offset_ms(),
+            tick: self.session.clock().as_u64(),
+            latency_ms,
+            outcome,
+            revision,
+        }));
     }
 
     /// HOLD-3: attribute the action's confirmation to the TARGET's
@@ -1212,25 +1424,53 @@ impl PersistDemo {
     /// never an error; the close's required final snapshot guarantees
     /// durability regardless).
     pub fn publish(&mut self) {
+        let capture_start = Instant::now();
         let capture = match self.session.capture_snapshot() {
             Ok(capture) => capture,
             Err(error) => {
-                self.last_capture_error = Some(format!("capture refused: {error:?}"));
+                let message = format!("capture refused: {error:?}");
+                self.emit_persistence(
+                    PersistenceKind::Capture,
+                    Some(capture_start.elapsed().as_secs_f64() * 1000.0),
+                    message.clone(),
+                    None,
+                );
+                self.last_capture_error = Some(message);
                 return;
             }
         };
+        self.emit_persistence(
+            PersistenceKind::Capture,
+            Some(capture_start.elapsed().as_secs_f64() * 1000.0),
+            "captured".into(),
+            None,
+        );
         let candidate = capture.content_identity();
         let capture_tick = capture.tick();
+        let submit_start = Instant::now();
         match self.session.submit_publication(capture) {
             Ok(handle) => {
+                self.emit_persistence(
+                    PersistenceKind::Admission,
+                    Some(submit_start.elapsed().as_secs_f64() * 1000.0),
+                    "admitted".into(),
+                    None,
+                );
                 self.publication = Some(TrackedPublication {
                     handle,
                     capture_tick,
+                    submitted_at: Instant::now(),
                     state: PublicationState::Pending { candidate },
                 });
                 self.last_refusal = None;
             }
             Err(refusal) => {
+                self.emit_persistence(
+                    PersistenceKind::Busy,
+                    Some(submit_start.elapsed().as_secs_f64() * 1000.0),
+                    format!("{refusal:?}"),
+                    None,
+                );
                 self.last_refusal = Some(refusal);
             }
         }
@@ -1264,6 +1504,14 @@ impl PersistDemo {
     }
 
     fn record_outcome(&mut self, outcome: PublicationOutcome) {
+        // S6-C1: the completion latency — admission (the tracked
+        // publication's `submitted_at`) to this observed terminal
+        // state, the latency the authority thread actually
+        // experiences (queue + append + fsync + readback).
+        let completion_latency_ms = self
+            .publication
+            .as_ref()
+            .map(|tracked| tracked.submitted_at.elapsed().as_secs_f64() * 1000.0);
         let state = match outcome {
             PublicationOutcome::Accepted { revision, tier } => {
                 self.confirmed_revision = Some(revision);
@@ -1280,9 +1528,23 @@ impl PersistDemo {
             },
             PublicationOutcome::Canceled { revision } => PublicationState::Canceled { revision },
         };
+        let label = state.label();
+        let revision = match &state {
+            PublicationState::Accepted { revision, .. }
+            | PublicationState::Stale { revision, .. }
+            | PublicationState::Unknown { revision, .. }
+            | PublicationState::Canceled { revision } => Some(revision.to_string()),
+            _ => None,
+        };
         if let Some(tracked) = self.publication.as_mut() {
             tracked.state = state;
         }
+        self.emit_persistence(
+            PersistenceKind::Completion,
+            completion_latency_ms,
+            label,
+            revision,
+        );
     }
 
     /// The tracked publication's state (read-only).
@@ -1349,10 +1611,36 @@ impl PersistDemo {
     /// snapshot with readback verification, the SQLite WAL TRUNCATE
     /// lifecycle checkpoint, the settled required confirmations —
     /// `failure == None` the only complete success).
-    pub fn finalize(self, application_failure: Option<String>) -> Finalization {
+    pub fn finalize(mut self, application_failure: Option<String>) -> Finalization {
+        // S6-C1: the evidence collector finalizes AFTER the close — a
+        // writer failure can never bypass it — with the close's own
+        // duration recorded first (while the writer still runs). The
+        // close duration is measured separately from every other
+        // latency family (n=1 per run: the full close sequence).
+        let evidence = self.evidence.take();
+        let closing_tick = self.session.clock().as_u64();
+        let close_start = Instant::now();
+        let close = self.session.close();
+        let close_ms = close_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(ev) = &evidence {
+            ev.produce(EvidenceRecord::Persistence(PersistenceSample {
+                kind: PersistenceKind::Close,
+                wall_offset_ms: ev.wall_offset_ms(),
+                tick: closing_tick,
+                latency_ms: Some(close_ms),
+                outcome: if close.failure.is_none() {
+                    "complete".into()
+                } else {
+                    format!("{:?}", close.failure)
+                },
+                revision: close.final_revision.map(|revision| revision.to_string()),
+            }));
+        }
+        let evidence_outcome = evidence.map(|ev| ev.finalize());
         Finalization {
             application_failure,
-            close: self.session.close(),
+            close,
+            evidence: evidence_outcome,
         }
     }
 }
@@ -1411,6 +1699,29 @@ impl Camera {
     }
 }
 
+/// S6-C1: one memory sample — the platform RSS where the sampler
+/// exists (Linux; Windows physical runs use the external sampler —
+/// S6-C4) plus the structural dormant occupancy (held obligations per
+/// region) and the capture ledger's pending total. Attribution
+/// metadata, never an allocation-exact per-NPC cost.
+fn emit_memory_evidence(demo: &PersistDemo, evidence: &EvidenceCollector) {
+    let session = demo.session();
+    let spine = session.spine();
+    let mut held_by_region = vec![0u64; REGION_COUNT];
+    for view in spine.held_view() {
+        let region = usize::from(view.class.0);
+        if region < REGION_COUNT {
+            held_by_region[region] += 1;
+        }
+    }
+    evidence.produce(EvidenceRecord::Memory(MemorySample {
+        wall_offset_ms: evidence.wall_offset_ms(),
+        rss_kib: resident_set_kib(),
+        held_by_region,
+        pending_total: session.director().ledger().pending_total(),
+    }));
+}
+
 /// Runs the integrated graphical demonstration (behavior *B–E* over
 /// the one authoritative persisted session). The loop mirrors the
 /// Stage 4 `--render --regions` skeleton exactly — the differences
@@ -1440,10 +1751,65 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
     renderer.set_overlay_enabled(options.overlay);
 
+    // S6-C1: the evidence collector starts BEFORE the campaign opens
+    // (the open/recovery boundary is the first latency family) and
+    // AFTER the renderer (so the device and presentation metadata are
+    // known). A start failure is a visible error before any session
+    // exists; an open failure finalizes the (empty) package first.
+    let collector = match options.evidence.clone() {
+        Some(config) => Some(
+            EvidenceCollector::start(config)
+                .map_err(|error| format!("start the evidence collector: {error}"))?,
+        ),
+        None => None,
+    };
+    if let Some(evidence) = &collector
+        && options.evidence_fail_writes
+    {
+        evidence.fault_control().set_fail_writes(true);
+    }
+
     // The campaign: found-and-anchor, or recover (fail closed on
     // corrupt/divergent/unverifiable state — never an overwrite).
     let timing = SimConfig::default();
-    let (mut demo, launch) = PersistDemo::open_or_recover(&options.campaign_dir, timing)?;
+    let open_start = Instant::now();
+    let (mut demo, launch) = match PersistDemo::open_or_recover(&options.campaign_dir, timing) {
+        Ok(opened) => opened,
+        Err(error) => {
+            if let Some(evidence) = collector {
+                let _ = evidence.finalize();
+            }
+            return Err(error);
+        }
+    };
+    if let Some(evidence) = collector {
+        {
+            let stats = renderer.stats();
+            evidence.note_metadata("mode", "graphical");
+            evidence.note_metadata("platform", std::env::consts::OS);
+            evidence.note_metadata("gpu", &stats.gpu_name);
+            evidence.note_metadata("device_type", &stats.device_type);
+            evidence.note_metadata("vulkan_api", &stats.api_version);
+            evidence.note_metadata("present_mode", &stats.present_mode);
+            evidence.note_metadata("extent", &format!("{}x{}", stats.extent.0, stats.extent.1));
+            evidence.note_metadata("swapchain_images", &stats.swapchain_images.to_string());
+            evidence.note_metadata("validation_active", &stats.validation_active.to_string());
+            evidence.note_metadata("fps_target", &options.fps.to_string());
+        }
+        evidence.produce(EvidenceRecord::Persistence(PersistenceSample {
+            kind: PersistenceKind::Recovery,
+            wall_offset_ms: evidence.wall_offset_ms(),
+            tick: demo.start_tick(),
+            latency_ms: Some(open_start.elapsed().as_secs_f64() * 1000.0),
+            outcome: if launch.founded {
+                "founded+anchor".into()
+            } else {
+                "recovered".into()
+            },
+            revision: launch.anchor_revision.map(|revision| revision.to_string()),
+        }));
+        demo.attach_evidence(evidence);
+    }
 
     {
         let stats = renderer.stats();
@@ -1499,6 +1865,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     let mut cpu_work_ms: Vec<f64> = Vec::new();
     let mut frame_intervals_ms: Vec<f64> = Vec::new();
     let mut presented: u64 = 0;
+    // S6-C1: the evidence bookkeeping — the loop-iteration sample
+    // index and the memory cadence anchor (1 s wall).
+    let mut evidence_sample_index: u64 = 0;
+    let mut last_memory_sample: Option<Instant> = None;
     // Each accepted action's completion is reported exactly once,
     // keyed by its start tick (a subsequent action reports
     // independently).
@@ -1519,6 +1889,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 
     'run: loop {
         let frame_start = Instant::now();
+        let input_start = frame_start;
         let snapshot = app.frame();
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
             break;
@@ -1537,6 +1908,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                 Err(message) => println!("action refused: {message}"),
             }
         }
+        // S6-C1: the input phase — the event pump plus the key
+        // handling above, the first of the separately labeled frame
+        // phases.
+        let input_ms = input_start.elapsed().as_secs_f64() * 1000.0;
 
         let split = frame_timing.begin_frame(frame_start, !snapshot.minimized);
         frame_intervals_ms.push((split.sim_advance.as_secs_f64() * 1000.0).min(100.0));
@@ -1544,13 +1919,32 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         if len > 600 {
             frame_intervals_ms.drain(0..len - 600);
         }
+        evidence_sample_index += 1;
 
         if snapshot.minimized {
             // The campaign clock keeps advancing while the application
             // runs — no silent pause policy (the accepted discipline).
+            let sim_start = Instant::now();
             if let Err(error) = demo.advance(split.sim_advance) {
                 loop_failure = Some(format!("the authoritative tick refused: {error:?}"));
                 break 'run;
+            }
+            let sim_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
+            if let Some(evidence) = demo.evidence() {
+                evidence.produce(EvidenceRecord::Frame(FrameSample {
+                    sample: evidence_sample_index,
+                    wall_offset_ms: evidence.wall_offset_ms(),
+                    interval_ms: split.sim_advance.as_secs_f64() * 1000.0,
+                    presented: false,
+                    recreated: false,
+                    deferred: false,
+                    cpu_work_ms: None,
+                    input_ms: Some(input_ms),
+                    sim_ms: Some(sim_ms),
+                    render_ms: None,
+                    poll_ms: None,
+                    gpu_ms: None,
+                }));
             }
             std::thread::sleep(Duration::from_millis(50));
             continue;
@@ -1569,11 +1963,17 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         // genuinely cadence-dependent external input as `--regions`;
         // the deliberate action's excursion overrides it while
         // active).
+        let sim_start = Instant::now();
         if let Err(error) = demo.advance(split.sim_advance) {
             loop_failure = Some(format!("the authoritative tick refused: {error:?}"));
             break 'run;
         }
+        let sim_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
+        // S6-C1: the persistence poll phase — the tracked
+        // publication's nonblocking check.
+        let poll_start = Instant::now();
         demo.poll();
+        let poll_ms = poll_start.elapsed().as_secs_f64() * 1000.0;
 
         if let Some(action) = demo.action()
             && action.phase.is_terminal()
@@ -1583,6 +1983,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             println!("action completed: {}", action.describe());
         }
 
+        // S6-C1: the render phase — the derived scene, the overlay
+        // text, and the frame submission (CPU-side; the GPU duration
+        // arrives separately through the timestamp result).
+        let render_start = Instant::now();
         // The derived scene: read-only over the authoritative world
         // (rendering stays strictly downstream of authoritative
         // state — the excursion's LOD cycle is visible as the plates
@@ -1716,6 +2120,39 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                 break 'run;
             }
         };
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+
+        // S6-C1: the per-iteration frame sample — raw (unclamped)
+        // values, the presented/recreated/deferred flags, the four
+        // CPU phases, and the GPU timestamp result verbatim (`null`
+        // when unsupported — never a substituted zero). The memory
+        // cadence rides the same guard (1 s wall).
+        if let Some(evidence) = demo.evidence() {
+            evidence.produce(EvidenceRecord::Frame(FrameSample {
+                sample: evidence_sample_index,
+                wall_offset_ms: evidence.wall_offset_ms(),
+                interval_ms: split.sim_advance.as_secs_f64() * 1000.0,
+                presented: frame_result.presented,
+                recreated: frame_result.recreated,
+                deferred: frame_result.deferred,
+                cpu_work_ms: frame_result
+                    .presented
+                    .then(|| frame_start.elapsed().as_secs_f64() * 1000.0),
+                input_ms: Some(input_ms),
+                sim_ms: Some(sim_ms),
+                render_ms: Some(render_ms),
+                poll_ms: Some(poll_ms),
+                gpu_ms: frame_result.gpu_render_ms,
+            }));
+            let sample_memory = match last_memory_sample {
+                None => true,
+                Some(last) => last.elapsed() >= Duration::from_secs(1),
+            };
+            if sample_memory {
+                emit_memory_evidence(&demo, evidence);
+                last_memory_sample = Some(Instant::now());
+            }
+        }
 
         if frame_result.deferred {
             std::thread::sleep(Duration::from_millis(50));
@@ -1876,6 +2313,12 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             director.activation_latency_percentile(1.0)
         );
         println!(
+            "  deactivation latency (observational): p50 {:.2} ms · p95 {:.2} ms · worst {:.2} ms",
+            director.deactivation_latency_percentile(0.50),
+            director.deactivation_latency_percentile(0.95),
+            director.deactivation_latency_percentile(1.0)
+        );
+        println!(
             "  fingerprints: stage4 {} · held {}",
             stage4_state_fingerprint_hex(session.spine(), director),
             session.spine().held_fingerprint_hex()
@@ -1940,6 +2383,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             "  close: FAILED — {failure:?} (the campaign remains recoverable from its durable state)"
         ),
     }
+    if let Some(outcome) = &finalization.evidence {
+        println!("--- evidence ---");
+        println!("{}", outcome.summary());
+    }
     if report.failure.is_none() && finalization.application_failure.is_none() {
         println!(
             "relaunch with the same --demo-persist directory to recover this campaign \
@@ -1985,7 +2432,51 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 /// alongside the independent close outcome.
 pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport, String> {
     let timing = SimConfig::default();
-    let (mut demo, launch) = PersistDemo::open_or_recover(&options.campaign_dir, timing)?;
+    // S6-C1: the collector starts BEFORE the campaign opens — the
+    // open/recovery boundary is the first latency family. A start
+    // failure is a visible error before any session exists (nothing
+    // to close); an open failure after the collector started
+    // finalizes the (empty) evidence package before returning.
+    let collector = match options.evidence.clone() {
+        Some(config) => Some(
+            EvidenceCollector::start(config)
+                .map_err(|error| format!("start the evidence collector: {error}"))?,
+        ),
+        None => None,
+    };
+    if let Some(evidence) = &collector
+        && options.evidence_fail_writes
+    {
+        evidence.fault_control().set_fail_writes(true);
+    }
+    let open_start = Instant::now();
+    let (mut demo, launch) = match PersistDemo::open_or_recover(&options.campaign_dir, timing) {
+        Ok(opened) => opened,
+        Err(error) => {
+            if let Some(evidence) = collector {
+                let _ = evidence.finalize();
+            }
+            return Err(error);
+        }
+    };
+    if let Some(evidence) = collector {
+        evidence.note_metadata("mode", "headless");
+        evidence.note_metadata("platform", std::env::consts::OS);
+        evidence.note_metadata("headless_ticks", &options.headless_ticks.to_string());
+        evidence.produce(EvidenceRecord::Persistence(PersistenceSample {
+            kind: PersistenceKind::Recovery,
+            wall_offset_ms: evidence.wall_offset_ms(),
+            tick: demo.start_tick(),
+            latency_ms: Some(open_start.elapsed().as_secs_f64() * 1000.0),
+            outcome: if launch.founded {
+                "founded+anchor".into()
+            } else {
+                "recovered".into()
+            },
+            revision: launch.anchor_revision.map(|revision| revision.to_string()),
+        }));
+        demo.attach_evidence(evidence);
+    }
     let mut application_failure: Option<String> = None;
     for tick_index in 0..options.headless_ticks {
         if options.action_at == Some(tick_index) {
@@ -2033,6 +2524,7 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
     });
     // THE SINGLE FINALIZATION SITE (HOLD-1) — every path.
     let finalization = demo.finalize(application_failure);
+    let close = finalization.close_summary();
     Ok(HeadlessReport {
         launch,
         application_failure: finalization.application_failure.clone(),
@@ -2043,6 +2535,7 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         closed_outstanding,
         closed_fingerprint,
         closed_region,
-        close: finalization.close_summary(),
+        close,
+        evidence: finalization.evidence,
     })
 }

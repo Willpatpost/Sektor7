@@ -18,6 +18,7 @@ pub mod save_demo;
 pub mod session;
 pub mod sim;
 pub mod sim_demo;
+pub mod soak_evidence;
 pub mod store;
 pub mod window_demo;
 pub mod worker;

@@ -42,7 +42,9 @@ use engine_persist::{
 use crate::crossing::{SessionCrossing, restore_session, save_session};
 use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use crate::orchestration::{OrchestratedSession, SubmitRefusal};
+use crate::persist_demo::{DemoOptions, run_persist_demo_headless};
 use crate::region::{RegionConfig, RegionDirector};
+use crate::soak_evidence::{EvidenceCollector, EvidenceConfig, EvidenceRecord, TickSample};
 use crate::store::{SessionStore, StoreLocation};
 use crate::worker::WorkerFault;
 
@@ -1100,4 +1102,147 @@ pub fn run() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S6-C1: the instrumentation-overhead measurement (the accepted
+/// measurement plan §5): (1) the produce-path cost — sample
+/// construction plus the bounded nonblocking enqueue — over 10,000
+/// samples; (2) the SAME deterministic headless workload (600 ticks,
+/// the deliberate action at tick 300) run twice, evidence collection
+/// disabled versus enabled, compared for wall time and
+/// logical-fingerprint equality. Pod results — observational, never
+/// physical-rig evidence, never CI pass/fail thresholds.
+pub fn run_instrumentation_overhead() {
+    println!(
+        "S6-C1 instrumentation overhead (POD results — observational, not physical-rig evidence)"
+    );
+
+    // 1. The produce path — construction + the nonblocking enqueue.
+    //    The flood's channel is sized for the full 10,000 samples
+    //    (the default 8,192 bound is sized for real-run production
+    //    rates; a first draft at the default bound overflowed and the
+    //    verdict failed exactly as designed — 1,764 samples counted
+    //    lost, none silent — the lossless micro measurement sizes its
+    //    own bound instead).
+    let micro_root = campaign_dir("s6c1-overhead-micro");
+    let mut micro_config = EvidenceConfig::new(micro_root.join("evidence"), "s6c1-micro");
+    micro_config.channel_capacity = 10_000;
+    let collector = EvidenceCollector::start(micro_config).expect("the evidence collector starts");
+    let mut produce_costs = Vec::with_capacity(10_000);
+    for tick in 0..10_000u64 {
+        let record = EvidenceRecord::Tick(minimal_tick_sample(tick));
+        let start = Instant::now();
+        collector.produce(record);
+        produce_costs.push(start.elapsed());
+    }
+    let micro = collector.finalize();
+    assert!(micro.is_complete(), "{micro:?}");
+    report(
+        "the sample produce path (construct + enqueue)",
+        &mut produce_costs,
+    );
+    println!(
+        "  micro run: {} samples · verdict complete = {}",
+        micro.total_samples(),
+        micro.is_complete()
+    );
+    let _ = std::fs::remove_dir_all(&micro_root);
+
+    // 2. The same deterministic workload, evidence off vs on — each
+    // arm measured around its own fresh campaign directory.
+    let plain_root = campaign_dir("s6c1-overhead-plain");
+    let start = Instant::now();
+    let plain = run_persist_demo_headless(overhead_options(&plain_root, None))
+        .expect("the plain headless run");
+    let plain_wall = start.elapsed();
+
+    let evidence_root = campaign_dir("s6c1-overhead-evidence");
+    let start = Instant::now();
+    let instrumented = run_persist_demo_headless(overhead_options(
+        &evidence_root,
+        Some(EvidenceConfig::new(
+            evidence_root.join("evidence"),
+            "s6c1-overhead",
+        )),
+    ))
+    .expect("the instrumented headless run");
+    let instrumented_wall = start.elapsed();
+
+    assert_eq!(
+        plain.closed_fingerprint, instrumented.closed_fingerprint,
+        "instrumentation must not change logical state"
+    );
+    assert_eq!(plain.closed_at_tick, instrumented.closed_at_tick);
+    let outcome = instrumented
+        .evidence
+        .as_ref()
+        .expect("the evidence verdict");
+    assert!(outcome.is_complete(), "{outcome:?}");
+    println!(
+        "  run wall (600 ticks + the action): plain {:.1} ms vs instrumented {:.1} ms",
+        plain_wall.as_secs_f64() * 1e3,
+        instrumented_wall.as_secs_f64() * 1e3
+    );
+    println!(
+        "  evidence: {} samples · verdict complete = {}",
+        outcome.total_samples(),
+        outcome.is_complete()
+    );
+    println!(
+        "  logical fingerprints identical: {} (closed at tick {})",
+        instrumented.closed_fingerprint,
+        instrumented.closed_at_tick.as_u64()
+    );
+    println!(
+        "  limitations: single-process pod timing, dev-profile scheduler noise, one repetition \
+         each; the authoritative overhead evidence is the owner's rig (S6-C4); never CI \
+         pass/fail thresholds"
+    );
+    let _ = std::fs::remove_dir_all(&plain_root);
+    let _ = std::fs::remove_dir_all(&evidence_root);
+}
+
+fn minimal_tick_sample(tick: u64) -> TickSample {
+    TickSample {
+        tick,
+        wall_offset_ms: 0.0,
+        tick_ms: 0.0,
+        ticks_due_total: tick,
+        outstanding_ticks: 0,
+        executed: tick,
+        scheduled: tick,
+        late_arrivals: 0,
+        late_executions: 0,
+        blocked_transitions: 0,
+        invalid_dropped: 0,
+        budget_exhausted_ticks: 0,
+        near_pending: 0,
+        far_pending: 0,
+        blocked: 0,
+        held: 0,
+        near_executed_total: 0,
+        far_executed_total: 0,
+        near_backlogged_ticks: 0,
+        far_backlogged_ticks: 0,
+        processed_through: None,
+        max_executed_due: None,
+        transitioned_regions: Vec::new(),
+    }
+}
+
+fn overhead_options(root: &Path, evidence: Option<EvidenceConfig>) -> DemoOptions {
+    DemoOptions {
+        campaign_dir: root.to_path_buf(),
+        fps: 60,
+        present: engine_renderer::PresentModePreference::Auto,
+        frames: None,
+        overlay: true,
+        validation: engine_renderer::ValidationPreference::Auto,
+        headless: true,
+        headless_ticks: 600,
+        action_at: Some(300),
+        poison_at_tick: None,
+        evidence,
+        evidence_fail_writes: false,
+    }
 }

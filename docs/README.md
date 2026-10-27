@@ -33,6 +33,7 @@
 | `SIMULATION-ARCHITECTURE-RESEARCH.md` | Unapproved research: living-world simulation architecture and experiments | DESIGN-BIBLE gameplay rules, MULTIPLAYER-SPEC policy, MULTIPLAYER-ARCHITECTURE-RESEARCH state taxonomy, DECISIONS registry, lead approval |
 | `TECH-ARCHITECTURE.md` | Provisional blueprint: engine subsystems, boundaries, contracts; ratified foundation + technology decision map; vertical-slice plan and stage gates | VISION summits, research-study hypotheses, game-policy owners, DECISIONS registry, lead approval |
 | `PROTOTYPE-INVENTORY.md` | Reported existing-experiment evidence and source limitations | Technical validation and new tests |
+| `STAGE6-EVIDENCE-SCHEMA.md` | S6-C1 implementation artifact: the observational evidence format and collection contract (Stage 6 gated — checkpoint 1 instrumentation only) | TECH-ARCHITECTURE stage gates, DECISIONS registry, lead approval |
 | `README.md` | Folder map, maintenance rules | All substantive owners above |
 
 **Prevent contradictory copies:** A high-level file may summarize a decision in one sentence and link to its owner. It must not redefine the owner's thresholds or mechanisms. If a future subsystem gets a dedicated implementation specification, record its boundary explicitly. For example, `MULTIPLAYER-SPEC.md` owns what saves/waits mean to players; a possible future `SAVE-ARCHITECTURE.md` would own serialization, distributed snapshot replication and crash consistency.

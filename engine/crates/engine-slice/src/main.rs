@@ -52,6 +52,15 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--benchmark-instrumentation") {
+        // S6-C1: the instrumentation-overhead benchmark — the same
+        // deterministic headless workload with evidence collection
+        // disabled and enabled, plus the produce-path cost (pod
+        // results, observational; never CI thresholds).
+        engine_slice::benchmark::run_instrumentation_overhead();
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "--sim") {
@@ -182,6 +191,8 @@ fn main() {
             headless_ticks: 600,
             action_at: None,
             poison_at_tick: None,
+            evidence: None,
+            evidence_fail_writes: false,
         };
         let mut index = position + 2;
         while index < args.len() {
