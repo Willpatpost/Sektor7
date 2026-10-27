@@ -181,6 +181,7 @@ fn main() {
             headless: false,
             headless_ticks: 600,
             action_at: None,
+            poison_at_tick: None,
         };
         let mut index = position + 2;
         while index < args.len() {
@@ -247,7 +248,7 @@ fn main() {
             match engine_slice::persist_demo::run_persist_demo_headless(options) {
                 Ok(report) => {
                     report.print();
-                    if report.close.failure.is_some() {
+                    if report.application_failure.is_some() || report.close.failure.is_some() {
                         std::process::exit(1);
                     }
                 }

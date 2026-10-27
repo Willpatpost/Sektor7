@@ -1,19 +1,24 @@
 //! The Slice 0 integration demonstration's focused tests — the GO's
-//! six verification categories concentrated on the NEW application
-//! integration seam (the campaign lifecycle, the deliberate action's
-//! consequence cycle, the publication lifecycle, and the fail-closed
-//! boundaries), reusing the accepted PP-B4 machinery underneath
-//! rather than duplicating its failure matrix. Test 6 (regression
+//! verification categories at the NEW application integration seam,
+//! plus the Checkpoint-1 corrective pass's regressions: HOLD-1's
+//! error-path finalization, HOLD-2's absolute time accounting,
+//! HOLD-3's target attribution (unrelated transitions, reactivation
+//! gating, the actual consequence, the zero-capture no-op), the
+//! overlapping-action admission rule, and the strengthened
+//! pending-publication coverage (the required confirmation and the
+//! optional publication never conflated). Test 6 (regression
 //! preservation) is the full workspace run plus the pinned
-//! fingerprint/save self-tests — unchanged by this batch and re-run
-//! by the delivery gates.
+//! fingerprint/save self-tests — re-run by the delivery gates.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use engine_core::PresenceSample;
 use engine_persist::CanonicalMedium;
+use engine_slice::npc::{NPC_COUNT, REGION_COUNT};
 use engine_slice::persist_demo::{
-    self, CampaignPaths, DEMO_PRESENCE, DemoOptions, EXCURSION_TICKS, PersistDemo,
+    self, ActionPhase, CampaignPaths, DEMO_PRESENCE, DemoOptions, EXCURSION_TICKS, PersistDemo,
     PublicationState, demo_scenario, nearest_region, region_antipode, region_credit_sum,
     region_signal_sum,
 };
@@ -59,6 +64,7 @@ fn headless_options(dir: &TestDir, ticks: u64, action_at: Option<u64>) -> DemoOp
         headless: true,
         headless_ticks: ticks,
         action_at,
+        poison_at_tick: None,
     }
 }
 
@@ -75,8 +81,9 @@ fn oracle_head(dir: &TestDir) -> Option<engine_persist::Hash> {
 
 /// The deliberate action enters the authoritative consequence path
 /// and produces the observable world change; the resulting
-/// consequence is confirmed, the session closed, a fresh session
-/// recovered from storage, and the exact durable outcome restored.
+/// consequence is confirmed, attributed to the target's own
+/// identities, applied as exactly-once credits, closed, and recovered
+/// exactly.
 #[test]
 fn the_deliberate_action_persists_through_close_and_recovery() {
     let dir = TestDir::new("lifecycle");
@@ -92,20 +99,22 @@ fn the_deliberate_action_persists_through_close_and_recovery() {
     );
     let action = first.action.as_ref().expect("the action record");
     assert!(
-        action.signals_before > 0,
+        action.captured_delta > 0,
         "the region had accrued uncommitted consequential signals"
     );
-    let confirmation = action
-        .confirmed
-        .as_ref()
-        .expect("the excursion's capture confirmed canonically");
+    let ActionPhase::Applied { keys, .. } = &action.phase else {
+        panic!(
+            "the action completed with the verified application: {:?}",
+            action.phase
+        )
+    };
     assert!(
-        confirmation.keys > 0,
-        "the confirmed receipt carries the consequence keys"
+        *keys > 0,
+        "the confirmed receipt carries the target's consequence keys"
     );
     assert_eq!(
         action.credits_after,
-        Some(action.credits_before + action.signals_before),
+        Some(action.credits_before + action.captured_delta),
         "the reactivation applied the captured signals as exactly-once credits"
     );
     assert!(
@@ -249,52 +258,69 @@ fn the_recovered_continuation_matches_the_never_persisted_twin() {
     );
 }
 
-// ---------------------------------------------------------- GO test 4
+// ------------------------------------- GO test 4 + the corrective finding
 
-/// The demonstration cannot report safe persistence before canonical
-/// confirmation — a pending publication is displayed as pending
-/// (unverified), an accepted one only with the verified receipt, and
-/// the non-accepted classes never label themselves saved/confirmed.
+/// The required canonical confirmation and the optional snapshot
+/// publication are DISTINCT acknowledgments, never conflated: a
+/// genuine nonempty capture is confirmed and applied (the receipt
+/// attributed), while the optional publication separately remains
+/// pending — deterministically, because the tracked state only
+/// advances through the application's own poll/wait — and only the
+/// verified `Accepted` receipt updates the label.
 #[test]
 fn pending_publications_are_never_reported_as_confirmed() {
     let dir = TestDir::new("pending");
     let (mut demo, _launch) =
         PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
-    demo.run_headless(2).unwrap();
+    // A GENUINE nonempty capture: 120 ticks near region 0 first — the
+    // region's citizens accrue milestone signals before the action.
+    for _ in 0..120 {
+        demo.run_headless(1).unwrap();
+    }
     demo.excursion().expect("the action");
-    // The excursion window plus the return tick plus one settling
-    // tick — enough for the completion refresh and the publication.
-    demo.run_headless(EXCURSION_TICKS + 2).unwrap();
+    for _ in 0..(EXCURSION_TICKS + 2) {
+        demo.run_headless(1).unwrap();
+    }
 
-    // The action completed → the snapshot publication was submitted.
-    // Before the application verifies the outcome the status may be
-    // pending or already accepted — but pending NEVER claims
-    // confirmation.
+    // The action COMPLETED with a real consequence — the required
+    // canonical confirmation verified and attributed:
+    let action = demo.action().expect("the action");
+    let ActionPhase::Applied { keys, .. } = &action.phase else {
+        panic!("the applied phase: {:?}", action.phase)
+    };
+    assert!(*keys > 0, "real consequence keys confirmed");
+    assert_eq!(
+        action.credits_after,
+        Some(action.credits_before + action.captured_delta)
+    );
+
+    // ...while the OPTIONAL snapshot publication is a SEPARATE
+    // acknowledgment, still pending (deterministic — no poll has
+    // consumed the tracked state):
     let status = demo.status();
+    assert!(
+        status.confirmed_revision.is_some(),
+        "the required confirmation verified"
+    );
     let publication = status
         .publication
         .clone()
         .expect("the action's publication");
-    match &publication {
-        PublicationState::Pending { .. } => {
-            assert!(
-                status.confirmed_revision.is_none(),
-                "a pending publication is never confirmed"
-            );
-            assert!(status.pending_publications >= 1, "the admission is tracked");
-            assert!(
-                publication.label().starts_with("pending"),
-                "the label names itself: {}",
-                publication.label()
-            );
-        }
-        PublicationState::Accepted { revision, .. } => {
-            assert_eq!(status.confirmed_revision, Some(*revision));
-        }
-        other => panic!("the action publication completed unexpectedly: {other:?}"),
-    }
+    assert!(
+        publication.is_pending(),
+        "the optional publication separately pending: {publication:?}"
+    );
+    assert!(status.pending_publications >= 1, "the admission is tracked");
+    assert!(
+        publication.label().starts_with("pending"),
+        "the label names itself: {}",
+        publication.label()
+    );
+    // A confirmed required consequence does NOT imply the optional
+    // publication completed — both states coexist above (the two
+    // acknowledgments proven distinct).
 
-    // The completed publication verifies — the only confirmed state.
+    // The verified receipt updates the label only on completion:
     demo.wait_current();
     let status = demo.status();
     assert!(
@@ -312,8 +338,12 @@ fn pending_publications_are_never_reported_as_confirmed() {
         .contains("FAILED")
     );
 
-    let close = demo.close();
-    assert!(close.failure.is_none(), "{:?}", close.failure);
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
 }
 
 // ---------------------------------------------------------- GO test 5
@@ -353,12 +383,12 @@ fn a_poisoned_worker_refuses_progression_and_the_close_reports_it() {
         "no authoritative world change sneaks through"
     );
 
-    let report = demo.close();
+    let finalization = demo.finalize(None);
     assert!(
-        report.failure.is_some(),
+        finalization.close.failure.is_some(),
         "the poisoned close is an explicit failure — never a claimed save"
     );
-    assert!(!report.required_settled);
+    assert!(!finalization.close.required_settled);
 
     // The poison is in-memory only: the durable state is untouched and
     // a fresh recovery is coherent.
@@ -366,8 +396,12 @@ fn a_poisoned_worker_refuses_progression_and_the_close_reports_it() {
         PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
     assert!(!launch.founded, "the recovery path");
     fresh.run_headless(1).unwrap();
-    let close = fresh.close();
-    assert!(close.failure.is_none(), "{:?}", close.failure);
+    let finalization = fresh.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
 }
 
 /// The fail-closed corruption boundary (the GO §2A): a corrupt
@@ -404,4 +438,405 @@ fn a_corrupt_database_fails_closed_without_overwriting() {
     );
     // The journal beside it is untouched too.
     assert!(dir.root.join("journal.t1").exists());
+}
+
+// ------------------------------------------------- HOLD-1: error-path close
+
+/// A controlled application-boundary failure after the session opened
+/// (the worker poisoned mid-run through the test seam) exits THROUGH
+/// the single finalization site: the original error preserved, the
+/// close attempted and its outcome observable, the failed close never
+/// reported as success, and the recovery consistent with the actual
+/// durable state (no durability asserted beyond what was confirmed).
+#[test]
+fn an_application_failure_after_open_still_finalizes_the_close_once() {
+    let dir = TestDir::new("finalization");
+    let mut options = headless_options(&dir, 240, Some(100));
+    options.poison_at_tick = Some(120); // the controlled failure
+    let report = persist_demo::run_persist_demo_headless(options)
+        .expect("the run reports through the finalization rather than bypassing it");
+
+    // 1. The original application error is preserved:
+    let failure = report
+        .application_failure
+        .as_ref()
+        .expect("the application failure preserved");
+    assert!(failure.contains("tick 120 refused"), "{failure}");
+
+    // 2 + 3. The finalization ran (the single close report present —
+    // the driver is consumed by it, so it cannot run twice) and its
+    // outcome is observable: the poisoned worker's close FAILED —
+    // reported as a failure, never as success.
+    assert!(
+        report.close.failure.is_some(),
+        "the failed close is a reported failure"
+    );
+    assert!(!report.close.required_settled);
+    assert!(
+        report.close.final_revision.is_none(),
+        "no final snapshot is claimed over the failed drain"
+    );
+
+    // 5. The recovery is consistent with the ACTUAL durable state:
+    // the failed run's ticks after the last verified snapshot are not
+    // claimed — the recovery restores at most the durably represented
+    // state.
+    let (mut fresh, launch) =
+        PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    assert!(!launch.founded, "the recovery path");
+    assert!(
+        launch
+            .recovered_at_tick
+            .expect("the restored clock")
+            .as_u64()
+            <= 120,
+        "the recovery restores at most the durably represented state"
+    );
+    fresh.run_headless(1).unwrap();
+    let finalization = fresh.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
+}
+
+// ---------------------------------------- HOLD-2: absolute time accounting
+
+/// The reported time-accounting equation is mathematically correct
+/// for a founded campaign, a recovered campaign, and a recovered
+/// campaign with retained catch-up obligations (the long/stalled
+/// graphical frame is the same retained-obligation mechanism): the
+/// absolute due == campaign clock + outstanding, with the recovered
+/// starting clock included.
+#[test]
+fn the_time_accounting_equation_holds_across_founding_and_recovery() {
+    let dir = TestDir::new("accounting");
+
+    // FOUNDING: 240 headless ticks — due == clock, nothing retained.
+    let first = persist_demo::run_persist_demo_headless(headless_options(&dir, 240, None)).unwrap();
+    assert_eq!(first.closed_at_tick.as_u64(), 240);
+    assert_eq!(first.closed_ticks_due, 240, "founding: due == clock");
+    assert_eq!(first.closed_outstanding, 0);
+
+    // RECOVERY: 60 further ticks — the ABSOLUTE equation (the original
+    // defect displayed `60 = 300 + 0` here).
+    let second = persist_demo::run_persist_demo_headless(headless_options(&dir, 60, None)).unwrap();
+    assert_eq!(
+        second.launch.recovered_at_tick.map(|tick| tick.as_u64()),
+        Some(240)
+    );
+    assert_eq!(second.closed_at_tick.as_u64(), 300);
+    assert_eq!(
+        second.closed_ticks_due, 300,
+        "recovery: due == recovered-start 240 + session 60 == clock 300 + outstanding 0"
+    );
+
+    // RECOVERED WITH OUTSTANDING: a wall-clock burst beyond the
+    // per-frame catch-up bound retains a REPORTED obligation, the
+    // equation holds at every step, and the drain loses nothing.
+    let (mut demo, launch) = PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    assert_eq!(
+        launch.recovered_at_tick.map(|tick| tick.as_u64()),
+        Some(300)
+    );
+    // 2 seconds at the 10 Hz demo rate = 20 ticks due in one advance;
+    // the 8-per-frame catch-up bound executes 8 and retains 12.
+    demo.advance(Duration::from_millis(2_000)).unwrap();
+    assert_eq!(
+        demo.outstanding_ticks(),
+        12,
+        "the burst beyond the bound is retained, never discarded"
+    );
+    assert_eq!(
+        demo.ticks_due_total(),
+        demo.session().clock().as_u64() + u64::from(demo.outstanding_ticks()),
+        "the conservation invariant holds with the retained obligation"
+    );
+    assert_eq!(
+        demo.ticks_due_total(),
+        300 + 20,
+        "the absolute due includes the recovered starting clock"
+    );
+    // Drain the retained obligation across further frames — the
+    // equation holds throughout and nothing is silently discarded.
+    while demo.outstanding_ticks() > 0 {
+        demo.advance(Duration::from_millis(700)).unwrap();
+        assert_eq!(
+            demo.ticks_due_total(),
+            demo.session().clock().as_u64() + u64::from(demo.outstanding_ticks()),
+            "the conservation invariant holds at every drain step"
+        );
+    }
+    assert_eq!(
+        demo.ticks_due_total(),
+        demo.session().clock().as_u64(),
+        "fully drained: due == clock"
+    );
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
+}
+
+// ------------------------------------- HOLD-3 A + C: target attribution
+
+/// The action claims ONLY its target region's consequences: with
+/// unrelated regions capturing and confirming in the SAME
+/// deactivation batch, the action's attributed keys are exactly the
+/// target's own identities, and the applied credits equal the
+/// TARGET's captured delta — never the unrelated regions'.
+#[test]
+fn an_action_claims_only_its_target_regions_consequences() {
+    let dir = TestDir::new("attribution");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    // 450 ticks at a presence that keeps region 0 Full AND its
+    // neighbor region 1 Simplified: BOTH accrue milestone signals —
+    // the excursion's same-tick deactivations capture BOTH, so the
+    // confirmed receipt carries unrelated identities the action must
+    // NOT claim.
+    demo.set_presence(vec![PresenceSample {
+        position: (100.0, 24.0),
+        velocity: (0.0, 0.0),
+    }]);
+    for _ in 0..450 {
+        demo.run_headless(1).unwrap();
+    }
+    let world = demo.session().spine().world();
+    let target_signals = region_signal_sum(world, 0);
+    let unrelated_signals = region_signal_sum(world, 1);
+    assert!(target_signals > 0, "the target accrued signals");
+    assert!(
+        unrelated_signals > 0,
+        "the unrelated regions accrued signals too (the same-batch case is real)"
+    );
+    let expected_keys = (0..NPC_COUNT)
+        .filter(|npc| npc % REGION_COUNT == 0 && world.pending_signals()[*npc] > 0)
+        .count();
+    let record = demo.excursion().expect("the action");
+    assert_eq!(record.region, 0, "the target is the presence's region");
+    for _ in 0..(EXCURSION_TICKS + 2) {
+        demo.run_headless(1).unwrap();
+    }
+    let action = demo.action().expect("the action");
+    let ActionPhase::Applied { keys, .. } = &action.phase else {
+        panic!("the applied phase: {:?}", action.phase)
+    };
+    assert_eq!(
+        *keys, expected_keys,
+        "only the target's consequence identities are attributed — the unrelated \
+         regions' same-batch captures are excluded"
+    );
+    assert_eq!(
+        action.credits_after,
+        Some(action.credits_before + action.captured_delta),
+        "the applied credits equal the TARGET's captured delta ({target_signals})"
+    );
+    // The unrelated region's captures applied to ITS OWN NPCs at the
+    // reactivation — background work, never claimed by the action:
+    let world = demo.session().spine().world();
+    assert!(
+        region_credit_sum(world, 1) > 0,
+        "the unrelated region's own credits applied separately"
+    );
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
+}
+
+// ----------------------------------- HOLD-3 B: reactivation gating
+
+/// The action cannot claim completed credit application while its
+/// target has not reactivated: with the presence kept far after the
+/// excursion (the player walked away), the action stays honestly
+/// `AwaitingReactivation` — durably confirmed, credits NOT applied —
+/// and completes only when the target actually reactivates, with the
+/// applied change verified against the captured delta.
+#[test]
+fn an_action_awaits_its_targets_reactivation_before_claiming_credits() {
+    let dir = TestDir::new("reactivation");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    for _ in 0..120 {
+        demo.run_headless(1).unwrap();
+    }
+    let record = demo.excursion().expect("the action");
+    assert_eq!(record.region, 0);
+    assert!(record.captured_delta > 0, "a nonempty capture");
+
+    // Run the excursion out, then keep the presence FAR from the
+    // target — the return tick does not reactivate it:
+    for _ in 0..EXCURSION_TICKS {
+        demo.run_headless(1).unwrap();
+    }
+    let far = region_antipode(demo.session().director().config(), 0);
+    demo.set_presence(vec![far]);
+    demo.run_headless(1).unwrap(); // the return tick under a far presence
+
+    let action = demo.action().expect("the action");
+    assert!(
+        matches!(action.phase, ActionPhase::AwaitingReactivation { keys, .. } if keys > 0),
+        "durably confirmed but NOT applied while the target stays dormant: {:?}",
+        action.phase
+    );
+    assert!(
+        action.credits_after.is_none(),
+        "no credit application claimed before the reactivation"
+    );
+
+    // The player returns — the target reactivates and the application
+    // completes, verified against the captured delta:
+    demo.set_presence(vec![DEMO_PRESENCE]);
+    demo.run_headless(2).unwrap();
+    let action = demo.action().expect("the action");
+    assert!(
+        matches!(action.phase, ActionPhase::Applied { .. }),
+        "{:?}",
+        action.phase
+    );
+    assert_eq!(
+        action.credits_after,
+        Some(action.credits_before + action.captured_delta)
+    );
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
+}
+
+// ------------------------------------------- HOLD-3 D: the zero-capture case
+
+/// An excursion before milestone signals have accumulated completes
+/// honestly as a zero-consequence no-op — not indefinitely labeled
+/// pending, and no nonexistent canonical confirmation claimed (the
+/// empty-scratch deactivation journals nothing, by the accepted rule).
+#[test]
+fn a_zero_capture_excursion_completes_as_an_honest_no_op() {
+    let dir = TestDir::new("zero-capture");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    // Two ticks — no milestone signals have accumulated yet.
+    demo.run_headless(2).unwrap();
+    let world = demo.session().spine().world();
+    assert_eq!(region_signal_sum(world, 0), 0, "no signals accrued yet");
+    demo.excursion().expect("the action");
+    for _ in 0..(EXCURSION_TICKS + 2) {
+        demo.run_headless(1).unwrap();
+    }
+    let action = demo.action().expect("the action");
+    assert!(
+        matches!(action.phase, ActionPhase::ZeroCapture),
+        "completes honestly as a no-op — not pending, not a false confirmation: {:?}",
+        action.phase
+    );
+    assert_eq!(
+        action.credits_after,
+        Some(action.credits_before),
+        "the observed credits are unchanged"
+    );
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
+}
+
+// -------------------------------------- the overlapping-action admission
+
+/// One deliberate action at a time: a press during an active or
+/// unsettled excursion is refused WITHOUT changing the active
+/// action's target or attribution; the first action's capture and
+/// reward apply exactly once; a valid subsequent action is accepted
+/// and reported independently once the first settles.
+#[test]
+fn overlapping_space_presses_are_refused_without_overwriting() {
+    let dir = TestDir::new("overlap");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
+    for _ in 0..120 {
+        demo.run_headless(1).unwrap();
+    }
+    let first = demo.excursion().expect("the first action");
+    assert_eq!(first.region, 0);
+
+    // The press during the ACTIVE excursion — refused; the first
+    // action's target and attribution preserved:
+    assert!(
+        demo.excursion().is_err(),
+        "the overlapping press is refused"
+    );
+    let active = demo.action().expect("the active action");
+    assert_eq!(active.region, first.region);
+    assert_eq!(active.started_at, first.started_at);
+
+    // Run the excursion out but keep the target dormant (unsettled):
+    for _ in 0..EXCURSION_TICKS {
+        demo.run_headless(1).unwrap();
+    }
+    let far = region_antipode(demo.session().director().config(), 0);
+    demo.set_presence(vec![far]);
+    demo.run_headless(1).unwrap();
+    assert!(
+        demo.excursion().is_err(),
+        "the press while unsettled is refused"
+    );
+    let unsettled = demo.action().expect("the unsettled action");
+    assert_eq!(
+        unsettled.started_at, first.started_at,
+        "no overwrite of the first action's provenance"
+    );
+
+    // The player returns — the first action completes with its own
+    // attribution (exactly one capture, exactly one reward):
+    demo.set_presence(vec![DEMO_PRESENCE]);
+    demo.run_headless(2).unwrap();
+    let completed = demo.action().expect("the completed action");
+    assert!(
+        matches!(completed.phase, ActionPhase::Applied { .. }),
+        "{:?}",
+        completed.phase
+    );
+    assert_eq!(
+        completed.credits_after,
+        Some(completed.credits_before + completed.captured_delta),
+        "the first action's reward applied exactly once"
+    );
+
+    // A valid SUBSEQUENT action is accepted independently once the
+    // first settles (an honest zero-capture no-op here — the scratch
+    // was captured by the first):
+    let second = demo.excursion().expect("the subsequent action");
+    assert!(
+        second.started_at > first.started_at,
+        "an independent record"
+    );
+    assert_eq!(second.region, 0);
+    for _ in 0..(EXCURSION_TICKS + 2) {
+        demo.run_headless(1).unwrap();
+    }
+    let second_final = demo.action().expect("the second action");
+    assert!(
+        matches!(second_final.phase, ActionPhase::ZeroCapture),
+        "the second action completes independently: {:?}",
+        second_final.phase
+    );
+    assert_eq!(
+        second_final.started_at, second.started_at,
+        "the second action's own record preserved"
+    );
+    let finalization = demo.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
 }

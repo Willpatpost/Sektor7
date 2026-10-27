@@ -29,7 +29,11 @@
 //! driver). The app owns only the fixed-step timing: the accumulator
 //! and bounded catch-up mirror `SimDriver::advance` exactly —
 //! wall-clock time never enters logical state, and outstanding
-//! obligations are retained and reported, never discarded.
+//! obligations are retained and reported, never discarded. The time
+//! accounting is ABSOLUTE across sessions: the recovered starting
+//! clock is included, so `ticks_due_total == campaign clock +
+//! outstanding` holds for founded, recovered, recovered-with-
+//! outstanding, and stalled-frame runs alike.
 //!
 //! *C — one deliberate player action.* `Space` starts a bounded
 //! PRESENCE EXCURSION on the camera's region: the region the player
@@ -37,38 +41,45 @@
 //! lifecycle — the durable deactivation (its NPCs' accrued uncommitted
 //! consequential signals captured under the T1 journal before the
 //! discard), the required canonical confirmation (the `Confirmed`
-//! receipt with the consequence keys), and the reactivation (the
-//! captures applied as exactly-once credits on those NPCs' durable
-//! state). The effect is a real, durable, observable NPC consequence
-//! through the existing consequence mechanism — no new event is
-//! injected (the workload's one-pending-routine-chain-per-NPC
-//! discipline is exactly what the accepted deactivation-plan codec
-//! validates), and the consequence survives close/recovery by the
-//! accepted exactly-once identities.
+//! receipt, attributed to the TARGET's actual consequence identities
+//! only — unrelated same-ticket regional captures are never claimed),
+//! and the reactivation (the captures applied as exactly-once
+//! credits, verified against the action's actual captured delta
+//! BEFORE completion is reported). An action whose target does not
+//! reactivate stays honestly `AwaitingReactivation` — durably
+//! confirmed, credits not yet applied, never claimed complete. An
+//! empty-capture excursion completes honestly as a zero-consequence
+//! no-op. One action at a time: a press during an active or unsettled
+//! excursion is refused without changing the active action's target
+//! or attribution.
 //!
 //! *D — truthful persistence state.* The overlay reports the actual
-//! lifecycle: the excursion's live-but-unconfirmed captures, pending
-//! publications (admitted, outcome unverified), `Accepted` revisions
-//! with the provider's tier, stale/unknown/failed/canceled
-//! dispositions, the T1-capture counts, and the required-confirmation
-//! outcomes. Nothing is ever called "saved" without a verified
+//! lifecycle: the action's phase, the capture counts, the tracked
+//! publication (pending-unverified / `Accepted` with the provider
+//! tier / stale / unknown / failed / canceled — each its own label),
+//! the required-confirmation outcomes, and the absolute time
+//! accounting. Nothing is ever called "saved" without a verified
 //! receipt.
 //!
-//! *E — quit and restart.* Exit runs the graceful durable close (the
+//! *E — quit and restart.* EVERY exit path after the campaign opened
+//! — normal and application-failed alike — runs the single
+//! [`PersistDemo::finalize`] site: the accepted graceful close (the
 //! final required snapshot with readback verification, the SQLite WAL
-//! TRUNCATE lifecycle checkpoint, the settled required confirmations);
-//! a relaunch recovers exactly — no input replay, no duplicated
-//! consequence (the accepted exactly-once identities and the recovery
-//! machinery guarantee it; the integration tests prove it against the
-//! never-persisted twin).
+//! TRUNCATE lifecycle checkpoint, the settled required confirmations
+//! — `failure == None` is the only complete success), with the
+//! original application error preserved and the close outcome
+//! reported independently; a failed close is never represented as
+//! successful. A relaunch recovers exactly — no input replay, no
+//! duplicated consequence.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine_core::{PresenceSample, Spine, Tick};
+use engine_core::{LodLevel, PresenceSample, Spine, Tick};
 use engine_persist::{
-    AuthorityMode, CanonicalMedium, CommitOutcome, Hash, RevisionRecord, SyncTier, T1Journal,
-    UnknownReason,
+    AuthorityMode, CanonicalMedium, CommitOutcome, ConsequenceId, Hash, RevisionRecord, SyncTier,
+    T1Journal, UnknownReason,
 };
 use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
@@ -105,8 +116,7 @@ pub const DEMO_PRESENCE: PresenceSample = PresenceSample {
 /// held at its antipodal presence for exactly this many tick
 /// boundaries — long enough for the durable deactivation, the T1
 /// capture, and the required confirmation to complete — before the
-/// live presence (the camera) resumes and the reactivation applies
-/// the captured credits.
+/// live presence (the camera) resumes.
 pub const EXCURSION_TICKS: u64 = 3;
 
 /// Where the demonstration campaign's durable state lives: the SQLite
@@ -150,6 +160,12 @@ pub struct DemoOptions {
     /// Headless mode: the tick index at which the deliberate action
     /// fires (None = no action this run).
     pub action_at: Option<u64>,
+    /// Test-only (the HOLD-1 regression's controlled seam): poison the
+    /// persistence worker at this tick index — the next tick refuses
+    /// through the composed gate, exercising the application error
+    /// path's finalization deterministically. Never set by the binary.
+    #[doc(hidden)]
+    pub poison_at_tick: Option<u64>,
 }
 
 /// One advance step's outcome (observational, mirrors `SimStep`).
@@ -207,38 +223,69 @@ pub fn region_credit_sum(world: &NpcWorld, region: usize) -> u64 {
         .sum()
 }
 
-/// The excursion's canonically confirmed capture (from the required
-/// confirmation's receipt — the verified evidence, never a guess).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Confirmation {
-    /// The confirmed consequence keys (the captured NPCs' identities).
-    pub keys: usize,
-    /// The confirmed revision on the canonical chain.
-    pub revision: Hash,
+/// The deliberate action's attribution state (HOLD-3: the honest,
+/// target-attributed lifecycle — an unrelated regional confirmation is
+/// never claimed, and completed credit application is reported only
+/// after the target actually reactivated and the applied change
+/// matched the captured delta).
+#[derive(Debug, Clone)]
+pub enum ActionPhase {
+    /// The excursion is running (the target region recorded).
+    Excursion,
+    /// The target's deactivation captured nothing (an empty-scratch
+    /// deactivation journals nothing, by the accepted rule) — the
+    /// action completed honestly as a zero-consequence no-op. A
+    /// same-ticket receipt for OTHER regions' captures is never
+    /// attributed.
+    ZeroCapture,
+    /// The target's capture is durably confirmed (the receipt's
+    /// TARGET-REGION identities only); the target has not yet
+    /// reactivated — the credits are NOT yet applied. An honest
+    /// pending state, never claimed complete; it completes at the
+    /// target's next reactivation.
+    AwaitingReactivation { keys: usize, revision: Hash },
+    /// The target reactivated and the captured delta was applied as
+    /// credits — the applied change verified against the action's
+    /// actual captured delta.
+    Applied { keys: usize, revision: Hash },
+    /// Attribution could not be verified honestly (an unknown or
+    /// stale confirmation, or an applied credit change that did not
+    /// match the captured delta) — incomplete, never claimed
+    /// complete.
+    Incomplete { reason: String },
+}
+
+impl ActionPhase {
+    /// Whether a subsequent deliberate action may begin: only the
+    /// settled states (an active excursion or an unreactivated
+    /// capture refuses a new press).
+    pub fn is_terminal(&self) -> bool {
+        !matches!(
+            self,
+            ActionPhase::Excursion | ActionPhase::AwaitingReactivation { .. }
+        )
+    }
 }
 
 /// One deliberate action's full record: the target region, the
-/// excursion window, the consequence's before-state, the confirmed
-/// capture, and the applied credits after the return.
+/// excursion window, the captured-delta expectation, and the honest
+/// attribution state.
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
     pub region: usize,
-    /// The tick index the excursion started at.
+    /// The tick index the excursion started at (each accepted action's
+    /// independent identity for start/completion reporting).
     pub started_at: u64,
     pub excursion_ticks: u64,
-    /// The region's uncommitted signal scratch before the excursion —
-    /// the consequence that will be captured and confirmed.
-    pub signals_before: u64,
-    /// The region's committed credits before the excursion.
+    /// The target region's uncommitted signal scratch at the action's
+    /// start — the captured-delta expectation the completion verifies
+    /// the applied credits against.
+    pub captured_delta: u64,
     pub credits_before: u64,
-    /// The deactivation's canonically confirmed capture — `Some` once
-    /// the excursion's required confirmation returns `Confirmed` (the
-    /// verified receipt; `None` for an empty-scratch deactivation,
-    /// which journals nothing by the accepted rule).
-    pub confirmed: Option<Confirmation>,
-    /// The region's credits after the reactivation — `Some` once the
-    /// excursion has fully returned (the exactly-once application
-    /// observed, never claimed before it happens).
+    pub phase: ActionPhase,
+    /// `Some` once the action's credit outcome is observed (the
+    /// applied sum for a completed application; the unchanged sum for
+    /// a zero-capture no-op) — never claimed before it happens.
     pub credits_after: Option<u64>,
 }
 
@@ -246,22 +293,30 @@ impl ActionRecord {
     /// The overlay/print form — the truthful progressive states, never
     /// claiming confirmation or application before it is observed.
     pub fn describe(&self) -> String {
-        let confirmed = self
-            .confirmed
-            .as_ref()
-            .map(|confirmation| format!("{} keys @ {}", confirmation.keys, confirmation.revision))
-            .unwrap_or_else(|| "pending".into());
+        let phase = match &self.phase {
+            ActionPhase::Excursion => "excursion running".to_string(),
+            ActionPhase::ZeroCapture => {
+                "zero-capture no-op (nothing captured, nothing applied)".to_string()
+            }
+            ActionPhase::AwaitingReactivation { keys, revision } => format!(
+                "confirmed {keys} keys @ {revision} — awaiting the target's reactivation (credits NOT yet applied)"
+            ),
+            ActionPhase::Applied { keys, revision } => {
+                format!("applied {keys} keys @ {revision}")
+            }
+            ActionPhase::Incomplete { reason } => format!("INCOMPLETE — {reason}"),
+        };
         let credits_after = self
             .credits_after
             .map(|credits| credits.to_string())
             .unwrap_or_else(|| "…".into());
         format!(
-            "excursion r{} @ tick {} ({} ticks) — signals {} · confirmed {} · credits {}→{}",
+            "excursion r{} @ tick {} ({} ticks) — captured-delta {} · {} · credits {}→{}",
             self.region,
             self.started_at,
             self.excursion_ticks,
-            self.signals_before,
-            confirmed,
+            self.captured_delta,
+            phase,
             self.credits_before,
             credits_after
         )
@@ -364,7 +419,8 @@ pub struct LaunchReport {
     /// verified at open, so the campaign is recoverable from the
     /// moment it starts).
     pub anchor_revision: Option<Hash>,
-    /// A recovered campaign's restored clock.
+    /// A recovered campaign's restored clock (the absolute time
+    /// accounting's starting offset).
     pub recovered_at_tick: Option<Tick>,
     /// A recovered campaign's restored stage-4 fingerprint.
     pub recovered_fingerprint: Option<String>,
@@ -382,6 +438,53 @@ struct TrackedPublication {
 struct ExcursionState {
     region: usize,
     remaining: u64,
+}
+
+/// The application-level finalization outcome (HOLD-1): the preserved
+/// application failure (None on normal exit) and the graceful close's
+/// honest report — combined so the original error stays visible, the
+/// close outcome is reported independently, and a failed close is
+/// never represented as successful.
+pub struct Finalization {
+    pub application_failure: Option<String>,
+    pub close: CloseReport,
+}
+
+impl Finalization {
+    /// The combined outcome: `Err` iff anything failed — the original
+    /// application error first, the close outcome stated
+    /// independently; never a success claim over a failed close.
+    pub fn combined(&self) -> Result<(), String> {
+        let close_failure = self
+            .close
+            .failure
+            .as_ref()
+            .map(|failure| format!("{failure:?}"));
+        match (&self.application_failure, close_failure) {
+            (None, None) => Ok(()),
+            (Some(application), None) => Err(format!(
+                "{application}; the graceful close COMPLETED (final {}, checkpoint {}, settled {})",
+                self.close
+                    .final_revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                self.close.lifecycle_checkpoint,
+                self.close.required_settled
+            )),
+            (None, Some(close)) => Err(format!(
+                "the close did not complete: {close} — the campaign remains recoverable from its durable state"
+            )),
+            (Some(application), Some(close)) => Err(format!(
+                "{application}; AND the close did not complete: {close} — the verified evidence stands; \
+                 the campaign remains recoverable from its durable state"
+            )),
+        }
+    }
+
+    /// The close's extracted summary (report-safe).
+    pub fn close_summary(&self) -> CloseSummary {
+        CloseSummary::of(&self.close)
+    }
 }
 
 /// The graceful close's extracted summary (report-safe: the failure
@@ -417,9 +520,18 @@ impl CloseSummary {
 #[derive(Debug, Clone)]
 pub struct HeadlessReport {
     pub launch: LaunchReport,
+    /// The preserved application-level failure from the run's loop
+    /// (None when the ticks and action ran clean) — HOLD-1: the error
+    /// that triggered the finalization, never swallowed.
+    pub application_failure: Option<String>,
     pub action: Option<ActionRecord>,
     pub action_publication: Option<PublicationState>,
     pub closed_at_tick: Tick,
+    /// The ABSOLUTE campaign ticks due at close (the recovered
+    /// starting clock included — HOLD-2's conservation input).
+    pub closed_ticks_due: u64,
+    /// The retained outstanding catch-up obligations at close.
+    pub closed_outstanding: u64,
     /// The stage-4 state fingerprint at close (before the close's own
     /// snapshot — the state the close then durably represents).
     pub closed_fingerprint: String,
@@ -457,6 +569,9 @@ impl HeadlessReport {
                 fingerprint.unwrap_or("?")
             );
         }
+        if let Some(failure) = &self.application_failure {
+            println!("  APPLICATION FAILURE (preserved): {failure}");
+        }
         if let Some(action) = &self.action {
             println!("  action: {}", action.describe());
         }
@@ -467,8 +582,11 @@ impl HeadlessReport {
             println!("  closed action region r{region}: signals {signals} · credits {credits}");
         }
         println!(
-            "  closed at tick {} · stage4 fingerprint {}",
+            "  closed at tick {} · ticks due {} · outstanding {} · conservation {} · stage4 fingerprint {}",
             self.closed_at_tick.as_u64(),
+            self.closed_ticks_due,
+            self.closed_outstanding,
+            self.closed_ticks_due == self.closed_at_tick.as_u64() + self.closed_outstanding,
             self.closed_fingerprint
         );
         println!(
@@ -539,6 +657,10 @@ pub struct PersistDemo {
     session: OrchestratedSession,
     timing: SimConfig,
     period_ns: u128,
+    /// The campaign clock at this session's start (0 for a fresh
+    /// founding; the recovered clock for a relaunch) — the absolute
+    /// time-accounting offset (HOLD-2).
+    start_tick: u64,
     accumulator_ns: u128,
     /// Total elapsed time accepted via `advance` — timing state only,
     /// never fingerprinted (the same discipline as `SimDriver`).
@@ -563,10 +685,12 @@ pub struct PersistDemo {
 
 impl PersistDemo {
     fn empty(session: OrchestratedSession, timing: SimConfig, period_ns: u128) -> Self {
+        let start_tick = session.clock().as_u64();
         PersistDemo {
             session,
             timing,
             period_ns,
+            start_tick,
             accumulator_ns: 0,
             total_advanced_ns: 0,
             headless_ticks: 0,
@@ -709,16 +833,34 @@ impl PersistDemo {
         &self.session
     }
 
+    /// The campaign clock at this session's start (the absolute
+    /// time-accounting offset — 0 for a fresh founding, the recovered
+    /// clock for a relaunch).
+    pub fn start_tick(&self) -> u64 {
+        self.start_tick
+    }
+
     /// Accrued due-but-unexecuted ticks right now (retained
     /// obligation — reported, never discarded).
     pub fn outstanding_ticks(&self) -> u32 {
         (self.accumulator_ns / self.period_ns) as u32
     }
 
-    /// Ticks due since start, from every source (the no-discard
-    /// accounting invariant, mirroring `SimDriver`).
-    pub fn ticks_due_total(&self) -> u64 {
+    /// The session-relative ticks due (this process only — the
+    /// advanced-time and headless executions).
+    pub fn session_ticks_due(&self) -> u64 {
         (self.total_advanced_ns / self.period_ns) as u64 + self.headless_ticks
+    }
+
+    /// The ABSOLUTE campaign ticks due since founding (HOLD-2): the
+    /// recovered starting clock plus this session's due ticks — so
+    /// `ticks_due_total == campaign clock + outstanding` holds for a
+    /// founded campaign, a recovered campaign, a recovered campaign
+    /// with retained catch-up obligations, and a long or stalled
+    /// graphical frame alike (the no-discard invariant across
+    /// sessions, never a false equation).
+    pub fn ticks_due_total(&self) -> u64 {
+        self.start_tick + self.session_ticks_due()
     }
 
     /// Advances the authoritative session by elapsed monotonic time —
@@ -761,6 +903,7 @@ impl PersistDemo {
                 _ => None,
             };
             let during_excursion = antipode.is_some();
+            let excursion_target = self.excursion.as_ref().map(|excursion| excursion.region);
             let presence: Vec<PresenceSample> = match antipode {
                 Some(sample) => vec![sample],
                 None => self.presence.clone(),
@@ -792,6 +935,16 @@ impl PersistDemo {
             if clear_excursion {
                 self.excursion = None;
             }
+            // The target's ACTUAL capture-bearing transition (HOLD-3):
+            // the attribution gate — only a deactivation OF THE TARGET
+            // during the excursion attributes the confirmation that
+            // follows; any other regional transition is background
+            // work the action never claims.
+            let target_deactivated = during_excursion
+                && excursion_target.is_some_and(|region| {
+                    report.regions_transitioned.contains(&region)
+                        && self.session.region_level(region) == LodLevel::Dormant
+                });
             if !report.regions_transitioned.is_empty() {
                 // A capture-bearing boundary occurred: drive the
                 // required canonical confirmation (the tests'
@@ -801,20 +954,84 @@ impl PersistDemo {
                 self.last_commit = Some(commit_label(&outcome));
                 if let CommitOutcome::Confirmed(receipt) = &outcome {
                     self.confirmed_revision = Some(receipt.revision);
-                    if during_excursion
-                        && let Some(action) = &mut self.action
-                        && action.confirmed.is_none()
-                    {
-                        action.confirmed = Some(Confirmation {
-                            keys: receipt.keys.len(),
-                            revision: receipt.revision,
-                        });
-                    }
+                }
+                if target_deactivated {
+                    self.attribute_action_confirmation(&outcome);
                 }
             }
             self.refresh_action();
         }
         Ok(())
+    }
+
+    /// HOLD-3: attribute the action's confirmation to the TARGET's
+    /// actual captured identities only. The receipt is filtered
+    /// against the target's expected consequence ids (its region,
+    /// the deactivation's episode, its NPCs) — unrelated same-ticket
+    /// regional captures are never claimed; an empty-capture target
+    /// completes honestly as a no-op regardless of the receipt.
+    fn attribute_action_confirmation(&mut self, outcome: &CommitOutcome) {
+        let Some(action) = &self.action else { return };
+        if !matches!(action.phase, ActionPhase::Excursion) {
+            return;
+        }
+        let region = action.region;
+        let captured_delta = action.captured_delta;
+        if captured_delta == 0 {
+            // The target's deactivation captured nothing: journals
+            // nothing by the accepted rule — completed as an honest
+            // no-op (the observed, unchanged credits); the
+            // same-ticket receipt (other regions' captures) is NEVER
+            // attributed.
+            let credits_after = region_credit_sum(self.session.spine().world(), region);
+            if let Some(action) = self.action.as_mut() {
+                action.phase = ActionPhase::ZeroCapture;
+                action.credits_after = Some(credits_after);
+            }
+            return;
+        }
+        let episode = self.session.director().states()[region].episode;
+        let expected: HashSet<ConsequenceId> = (0..NPC_COUNT)
+            .filter(|npc| npc % REGION_COUNT == region)
+            .map(|npc| ConsequenceId::new(region as u32, episode, npc as u32))
+            .collect();
+        let phase = match outcome {
+            CommitOutcome::Confirmed(receipt) => {
+                let keys = receipt
+                    .keys
+                    .iter()
+                    .copied()
+                    .filter(|key| expected.contains(key))
+                    .count();
+                if keys > 0 {
+                    ActionPhase::AwaitingReactivation {
+                        keys,
+                        revision: receipt.revision,
+                    }
+                } else {
+                    ActionPhase::Incomplete {
+                        reason: "the confirmed batch carried no identities for the target region"
+                            .into(),
+                    }
+                }
+            }
+            CommitOutcome::Unknown { revision, .. } => ActionPhase::Incomplete {
+                reason: format!(
+                    "the target's confirmation is UNKNOWN ({revision}) — never interpreted as confirmed"
+                ),
+            },
+            CommitOutcome::StaleParent { observed } => ActionPhase::Incomplete {
+                reason: format!("the target's confirmation hit a stale parent ({observed:?})"),
+            },
+            CommitOutcome::NothingPending => ActionPhase::Incomplete {
+                reason: "nothing pending at the target's capture-bearing boundary — \
+                         the capture did not journal as expected"
+                    .into(),
+            },
+        };
+        if let Some(action) = self.action.as_mut() {
+            action.phase = phase;
+        }
     }
 
     /// THE deliberate player action (behavior *C*): starts a bounded
@@ -825,17 +1042,40 @@ impl PersistDemo {
     /// the reactivation applying the captures as exactly-once
     /// credits). No new event is injected; the effect flows entirely
     /// through the existing consequence mechanism.
+    ///
+    /// The admission rule (the overlapping-action corrective): ONE
+    /// deliberate action at a time — a press during an active
+    /// excursion, or while the previous action's captured
+    /// consequences still await their target's reactivation, is
+    /// refused WITHOUT changing the active action's target or
+    /// attribution.
     pub fn excursion(&mut self) -> Result<ActionRecord, String> {
         if !self.session.healthy() {
             return Err(
                 "the persistence worker is down — the action refuses (fail closed)".to_string(),
             );
         }
+        if self.excursion.is_some() {
+            return Err(
+                "an excursion is already active — one deliberate action at a time \
+                 (the press is refused without changing the active action's target or state)"
+                    .to_string(),
+            );
+        }
+        if let Some(action) = &self.action
+            && !action.phase.is_terminal()
+        {
+            return Err(
+                "the previous action has not settled — its captured consequences await \
+                 the target's reactivation; one deliberate action at a time"
+                    .to_string(),
+            );
+        }
         let region = nearest_region(
             self.session.director().config(),
             self.presence.first().unwrap_or(&DEMO_PRESENCE),
         );
-        let (signals_before, credits_before) = {
+        let (captured_delta, credits_before) = {
             let world = self.session.spine().world();
             (
                 region_signal_sum(world, region),
@@ -846,9 +1086,9 @@ impl PersistDemo {
             region,
             started_at: self.session.clock().as_u64(),
             excursion_ticks: EXCURSION_TICKS,
-            signals_before,
+            captured_delta,
             credits_before,
-            confirmed: None,
+            phase: ActionPhase::Excursion,
             credits_after: None,
         };
         self.excursion = Some(ExcursionState {
@@ -865,26 +1105,106 @@ impl PersistDemo {
     }
 
     fn refresh_action(&mut self) {
-        let Some(action) = &self.action else { return };
-        if action.credits_after.is_some() {
+        let Some(action) = self.action.as_ref() else {
             return;
+        };
+        // The decision is computed read-only first (the two-phase
+        // borrow discipline); the mutation applies it below.
+        enum Decision {
+            None,
+            ZeroCapture {
+                credits_after: u64,
+            },
+            Applied {
+                keys: usize,
+                revision: Hash,
+                credits_now: u64,
+            },
+            Incomplete {
+                reason: String,
+            },
         }
-        // The application is observed only after the excursion has
-        // fully returned (the reactivation tick ran — the excursion
-        // state cleared) — never claimed before it happens.
-        if self.excursion.is_some() {
-            return;
+        let decision = match &action.phase {
+            ActionPhase::Excursion => {
+                if self.excursion.is_some() {
+                    // Still running — nothing to observe yet.
+                    Decision::None
+                } else {
+                    // The excursion returned without the target's
+                    // deactivation (e.g., the target was already
+                    // dormant): nothing was captured — an honest no-op
+                    // with the observed (unchanged) credits.
+                    Decision::ZeroCapture {
+                        credits_after: region_credit_sum(
+                            self.session.spine().world(),
+                            action.region,
+                        ),
+                    }
+                }
+            }
+            ActionPhase::AwaitingReactivation { keys, revision } => {
+                // Completed credit application ONLY after the target
+                // actually reactivated AND the applied change matched
+                // the captured delta — verified, never assumed; while
+                // the target stays dormant the state is honestly
+                // pending.
+                if self.session.region_level(action.region) == LodLevel::Dormant {
+                    Decision::None
+                } else {
+                    let credits_now =
+                        region_credit_sum(self.session.spine().world(), action.region);
+                    let applied = credits_now.saturating_sub(action.credits_before);
+                    if applied == action.captured_delta {
+                        Decision::Applied {
+                            keys: *keys,
+                            revision: *revision,
+                            credits_now,
+                        }
+                    } else {
+                        Decision::Incomplete {
+                            reason: format!(
+                                "the applied credit change ({applied}) did not match the \
+                                 captured delta ({})",
+                                action.captured_delta
+                            ),
+                        }
+                    }
+                }
+            }
+            ActionPhase::ZeroCapture
+            | ActionPhase::Applied { .. }
+            | ActionPhase::Incomplete { .. } => Decision::None,
+        };
+        match decision {
+            Decision::None => {}
+            Decision::ZeroCapture { credits_after } => {
+                if let Some(action) = self.action.as_mut() {
+                    action.phase = ActionPhase::ZeroCapture;
+                    action.credits_after = Some(credits_after);
+                }
+            }
+            Decision::Applied {
+                keys,
+                revision,
+                credits_now,
+            } => {
+                if let Some(action) = self.action.as_mut() {
+                    action.phase = ActionPhase::Applied { keys, revision };
+                    action.credits_after = Some(credits_now);
+                }
+                // The action's consequence is confirmed through the
+                // required canonical confirmation (the receipt);
+                // publish the snapshot (optional, nonblocking) so the
+                // world state's own canonical representation also
+                // proceeds — the overlay polls it.
+                self.publish();
+            }
+            Decision::Incomplete { reason } => {
+                if let Some(action) = self.action.as_mut() {
+                    action.phase = ActionPhase::Incomplete { reason };
+                }
+            }
         }
-        let region = action.region;
-        let credits_after = region_credit_sum(self.session.spine().world(), region);
-        if let Some(action) = self.action.as_mut() {
-            action.credits_after = Some(credits_after);
-        }
-        // The action's consequence is confirmed through the required
-        // canonical confirmation (the receipt); publish the snapshot
-        // (optional, nonblocking) so the world state's own canonical
-        // representation also proceeds — the overlay polls it.
-        self.publish();
     }
 
     /// Captures and submits one optional snapshot publication
@@ -1019,14 +1339,21 @@ impl PersistDemo {
         self.tick_ms_history.len()
     }
 
-    /// THE graceful durable close (behavior *E*): the final required
+    /// THE single finalization site (HOLD-1): attempt the accepted
+    /// graceful close on EVERY exit path after the campaign opened —
+    /// normal and application-failed alike — exactly once (the
+    /// session is consumed; the structure cannot double-close), with
+    /// the original application error preserved alongside the
+    /// independent close outcome. The close itself is the accepted
+    /// `OrchestratedSession::close` verbatim (the final required
     /// snapshot with readback verification, the SQLite WAL TRUNCATE
-    /// lifecycle checkpoint, the settled required confirmations, the
-    /// clean worker join — `failure == None` is the only complete
-    /// success (the accepted `CloseReport` contract, surfaced
-    /// truthfully).
-    pub fn close(self) -> CloseReport {
-        self.session.close()
+    /// lifecycle checkpoint, the settled required confirmations —
+    /// `failure == None` the only complete success).
+    pub fn finalize(self, application_failure: Option<String>) -> Finalization {
+        Finalization {
+            application_failure,
+            close: self.session.close(),
+        }
     }
 }
 
@@ -1086,11 +1413,13 @@ impl Camera {
 
 /// Runs the integrated graphical demonstration (behavior *B–E* over
 /// the one authoritative persisted session). The loop mirrors the
-/// Stage 4 `--render --regions` skeleton exactly — the only
-/// differences are the orchestrated driver behind it, the `Space`
-/// action, the campaign overlay block, and the graceful durable close
-/// on exit (run before any validation-error report, so a rendering
-/// failure never leaves the campaign unclosed).
+/// Stage 4 `--render --regions` skeleton exactly — the differences
+/// are the orchestrated driver behind it, the `Space` action, the
+/// campaign overlay block, and the single finalization site: every
+/// exit path after the campaign opened (user quit, `--frames` limit,
+/// OR an application-level failure — a refused tick, a render error)
+/// runs the graceful durable close, with the original error preserved
+/// and the close outcome reported independently.
 pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     let shell_config = ShellConfig {
         title: "Sektor7 original engine — Slice 0 integration demo".to_string(),
@@ -1158,7 +1487,8 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         println!(
             "  controls: WASD move · mouse look · Q/E roll · R/F up/down · \
              Shift fast · Space action (the region's durable consequence \
-             cycle) · O overlay · Esc/close quit (runs the graceful durable close)"
+             cycle — one at a time) · O overlay · Esc/close quit (runs the \
+             graceful durable close)"
         );
     }
 
@@ -1169,7 +1499,14 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     let mut cpu_work_ms: Vec<f64> = Vec::new();
     let mut frame_intervals_ms: Vec<f64> = Vec::new();
     let mut presented: u64 = 0;
-    let mut action_completed_printed = false;
+    // Each accepted action's completion is reported exactly once,
+    // keyed by its start tick (a subsequent action reports
+    // independently).
+    let mut action_completion_printed_at: Option<u64> = None;
+    // The application-level failure captured from the loop (HOLD-1):
+    // a refused tick or a render error breaks OUT of the loop into
+    // the single finalization site instead of bypassing the close.
+    let mut loop_failure: Option<String> = None;
     let start = Instant::now();
     let frame_interval = if options.fps == 0 {
         None
@@ -1180,7 +1517,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     };
     let mut frame_timing = FrameTiming::new();
 
-    loop {
+    'run: loop {
         let frame_start = Instant::now();
         let snapshot = app.frame();
         if snapshot.quit_requested || snapshot.keys_pressed.contains(&Keycode::Escape) {
@@ -1191,8 +1528,9 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         }
         // THE deliberate action: one keypress → the region's full
         // durable consequence cycle (behavior *C*). A refusal (the
-        // worker down) is reported and the run continues — the next
-        // tick fails closed if the gate is genuinely down.
+        // worker down, or an action still active/unsettled) is
+        // reported and the run continues — the next tick fails closed
+        // if the gate is genuinely down.
         if snapshot.keys_pressed.contains(&Keycode::Space) {
             match demo.excursion() {
                 Ok(record) => println!("action started: {}", record.describe()),
@@ -1210,8 +1548,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         if snapshot.minimized {
             // The campaign clock keeps advancing while the application
             // runs — no silent pause policy (the accepted discipline).
-            demo.advance(split.sim_advance)
-                .map_err(|error| format!("the authoritative tick refused: {error:?}"))?;
+            if let Err(error) = demo.advance(split.sim_advance) {
+                loop_failure = Some(format!("the authoritative tick refused: {error:?}"));
+                break 'run;
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -1229,19 +1569,18 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         // genuinely cadence-dependent external input as `--regions`;
         // the deliberate action's excursion overrides it while
         // active).
-        demo.advance(split.sim_advance)
-            .map_err(|error| format!("the authoritative tick refused: {error:?}"))?;
+        if let Err(error) = demo.advance(split.sim_advance) {
+            loop_failure = Some(format!("the authoritative tick refused: {error:?}"));
+            break 'run;
+        }
         demo.poll();
 
-        if demo
-            .action()
-            .is_some_and(|record| record.credits_after.is_some())
-            && !action_completed_printed
+        if let Some(action) = demo.action()
+            && action.phase.is_terminal()
+            && action_completion_printed_at != Some(action.started_at)
         {
-            action_completed_printed = true;
-            if let Some(record) = demo.action() {
-                println!("action completed: {}", record.describe());
-            }
+            action_completion_printed_at = Some(action.started_at);
+            println!("action completed: {}", action.describe());
         }
 
         // The derived scene: read-only over the authoritative world
@@ -1365,14 +1704,18 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             text
         });
 
-        let frame_result = renderer
-            .render_frame(
-                &view_proj,
-                &region_scene,
-                overlay_text.as_deref(),
-                app.window_size(),
-            )
-            .map_err(|error| format!("{error}"))?;
+        let frame_result = match renderer.render_frame(
+            &view_proj,
+            &region_scene,
+            overlay_text.as_deref(),
+            app.window_size(),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                loop_failure = Some(format!("{error}"));
+                break 'run;
+            }
+        };
 
         if frame_result.deferred {
             std::thread::sleep(Duration::from_millis(50));
@@ -1402,6 +1745,10 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 
     let elapsed = start.elapsed();
     let stats = renderer.stats();
+    if let Some(failure) = &loop_failure {
+        println!("--- APPLICATION FAILURE (the run exits through the finalization) ---");
+        println!("  {failure}");
+    }
     println!("--- run summary ---");
     println!(
         "presented {} frames over {:.1}s ({:.1} fps avg)",
@@ -1442,9 +1789,18 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             demo.config().near_reserve_description(),
             demo.config().max_catchup_per_frame
         );
+        // The ABSOLUTE time accounting (HOLD-2): the recovered starting
+        // clock included, so the conservation equation is correct for
+        // founded and recovered campaigns alike.
         println!(
-            "sim time: advanced {:.1} ms · ticks due {} = campaign {} + outstanding {} (accounted, never discarded)",
+            "sim time: advanced {:.1} ms this session · campaign ticks due {} = start {} + session {} (absolute, never discarded)",
             frame_timing.total_sim_advanced().as_secs_f64() * 1000.0,
+            demo.ticks_due_total(),
+            demo.start_tick(),
+            demo.session_ticks_due()
+        );
+        println!(
+            "conservation: due {} == campaign tick {} + outstanding {}",
             demo.ticks_due_total(),
             spine.clock(),
             demo.outstanding_ticks()
@@ -1549,12 +1905,16 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             .unwrap_or_else(|| "none yet".into())
     );
 
-    // THE GRACEFUL DURABLE CLOSE (behavior *E*) — always runs, even
-    // when a validation error is about to fail the run: durability is
-    // independent of rendering, and the campaign must never be left
-    // unclosed by a rendering-correctness failure.
+    // THE SINGLE FINALIZATION SITE (HOLD-1): every exit path — the
+    // user quit, the `--frames` limit, or the captured application
+    // failure above — runs the accepted graceful close exactly once,
+    // with the original error preserved and the close outcome
+    // reported independently. A rendering failure never leaves the
+    // campaign unclosed, and a failed close is never represented as
+    // successful.
     println!("--- campaign close ---");
-    let report = demo.close();
+    let finalization = demo.finalize(loop_failure);
+    let report = &finalization.close;
     println!(
         "  final revision: {}",
         report
@@ -1573,38 +1933,45 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         Err(error) => println!("  worker join: {error}"),
     }
     match &report.failure {
-        None => {
-            println!(
-                "  close: COMPLETE — verified final snapshot + lifecycle checkpoint + settled confirmations + clean join"
-            );
-            println!(
-                "relaunch with the same --demo-persist directory to recover this campaign \
-                 (no input replay, no duplicated consequences)"
-            );
-        }
-        Some(failure) => {
-            return Err(format!(
-                "the close did not complete: {failure:?} — the verified evidence above stands; \
-                 the campaign remains recoverable from its durable state"
-            ));
-        }
+        None => println!(
+            "  close: COMPLETE — verified final snapshot + lifecycle checkpoint + settled confirmations + clean join"
+        ),
+        Some(failure) => println!(
+            "  close: FAILED — {failure:?} (the campaign remains recoverable from its durable state)"
+        ),
     }
+    if report.failure.is_none() && finalization.application_failure.is_none() {
+        println!(
+            "relaunch with the same --demo-persist directory to recover this campaign \
+             (no input replay, no duplicated consequences)"
+        );
+    }
+    // The combined outcome (HOLD-1): the original application error
+    // first, the close outcome independent, never a success claim
+    // over a failed close — then the validation findings merged in.
+    let mut outcome = finalization.combined();
     for message in &stats.recent_validation {
         println!("  validation: {message}");
     }
     if stats.validation_active && stats.validation_errors > 0 {
-        return Err(format!(
+        let validation_error = format!(
             "validation layer reported {} error(s) while active — see the messages above",
             stats.validation_errors
-        ));
+        );
+        outcome = Err(match outcome {
+            Err(existing) => format!("{existing}; AND {validation_error}"),
+            Ok(()) => validation_error,
+        });
     }
-    println!(
-        "note: instrument readings of this demonstration scene — not \
-         first-game performance claims; software-ICD runs are correctness \
-         smoke only, and physical graphical acceptance belongs to the \
-         owner's rig."
-    );
-    Ok(())
+    if outcome.is_err() {
+        println!(
+            "note: instrument readings of this demonstration scene — not \
+             first-game performance claims; software-ICD runs are correctness \
+             smoke only, and physical graphical acceptance belongs to the \
+             owner's rig."
+        );
+    }
+    outcome
 }
 
 /// Runs the demonstration headlessly: the same campaign lifecycle,
@@ -1612,21 +1979,48 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 /// [`DEMO_PRESENCE`] (the deliberate action's excursion overrides it
 /// while active) — the deterministic evidence path (no GPU, no
 /// window; graphical verification belongs to physical hardware).
+/// Errors after the campaign opened (a refused tick or action) do
+/// NOT bypass the close: the run finalizes through the single site
+/// and the report carries the preserved application failure
+/// alongside the independent close outcome.
 pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport, String> {
     let timing = SimConfig::default();
     let (mut demo, launch) = PersistDemo::open_or_recover(&options.campaign_dir, timing)?;
+    let mut application_failure: Option<String> = None;
     for tick_index in 0..options.headless_ticks {
         if options.action_at == Some(tick_index) {
-            let record = demo.excursion()?;
-            println!("action @ tick {tick_index}: {}", record.describe());
+            match demo.excursion() {
+                Ok(record) => println!("action @ tick {tick_index}: {}", record.describe()),
+                Err(message) => {
+                    application_failure = Some(format!(
+                        "the action refused at tick {tick_index}: {message}"
+                    ));
+                    break;
+                }
+            }
         }
-        demo.run_headless(1)
-            .map_err(|error| format!("tick {tick_index} refused: {error:?}"))?;
+        // The HOLD-1 regression's controlled seam: poison the worker
+        // at the named tick — the next tick refuses through the
+        // composed gate, exercising the error path's finalization
+        // deterministically (never set by the binary).
+        if options.poison_at_tick == Some(tick_index) {
+            demo.session().poison();
+        }
+        if let Err(error) = demo.run_headless(1) {
+            application_failure = Some(format!("tick {tick_index} refused: {error:?}"));
+            break;
+        }
     }
+    // Complete the tracked publication (the headless paths' blocking
+    // wait) before reading the evidence — the report's publication
+    // state must be the verified outcome, not an unpolled pending.
     demo.wait_current();
+    // The evidence, read before the finalization consumes the session.
     let action = demo.action().cloned();
     let action_publication = demo.publication_state().cloned();
     let closed_at_tick = demo.session().clock();
+    let closed_ticks_due = demo.ticks_due_total();
+    let closed_outstanding = u64::from(demo.outstanding_ticks());
     let closed_fingerprint =
         stage4_state_fingerprint_hex(demo.session().spine(), demo.session().director());
     let closed_region = demo.action().map(|record| {
@@ -1637,14 +2031,18 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
             region_credit_sum(world, record.region),
         )
     });
-    let report = demo.close();
+    // THE SINGLE FINALIZATION SITE (HOLD-1) — every path.
+    let finalization = demo.finalize(application_failure);
     Ok(HeadlessReport {
         launch,
+        application_failure: finalization.application_failure.clone(),
         action,
         action_publication,
         closed_at_tick,
+        closed_ticks_due,
+        closed_outstanding,
         closed_fingerprint,
         closed_region,
-        close: CloseSummary::of(&report),
+        close: finalization.close_summary(),
     })
 }
