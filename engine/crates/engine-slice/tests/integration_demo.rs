@@ -67,6 +67,10 @@ fn headless_options(dir: &TestDir, ticks: u64, action_at: Option<u64>) -> DemoOp
         poison_at_tick: None,
         evidence: None,
         evidence_fail_writes: false,
+        scenario: None,
+        scenario_seed: None,
+        soak_wall_seconds: None,
+        stabilization_deadline_secs: None,
     }
 }
 

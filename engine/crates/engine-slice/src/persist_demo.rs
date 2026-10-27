@@ -76,7 +76,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine_core::{LodLevel, PresenceSample, Spine, Tick};
+use engine_core::{EventClass, EventSpec, LodLevel, PresenceSample, Schedule, Spine, Tick};
 use engine_persist::{
     AuthorityMode, CanonicalMedium, CommitOutcome, ConsequenceId, Hash, RevisionRecord, SyncTier,
     T1Journal, UnknownReason,
@@ -99,7 +99,11 @@ use crate::region_render::{build_region_scene, camera_presence, levels_compact};
 use crate::sim::SimConfig;
 use crate::soak_evidence::{
     EvidenceCollector, EvidenceConfig, EvidenceOutcome, EvidenceRecord, FrameSample, MemorySample,
-    PersistenceKind, PersistenceSample, RegionSample, TickSample, lod_ordinal,
+    PersistenceKind, PersistenceSample, RegionSample, TickSample, lod_ordinal, verify_package,
+};
+use crate::soak_scenario::{
+    CoverageReport, DEFAULT_STABILIZATION_DEADLINE_SECS, STAGE6_SCENARIO_SEED, ScenarioRunReport,
+    SoakScenario, SoakScenarioId, burst_payload,
 };
 use crate::store::{SessionStore, StoreLocation};
 
@@ -185,6 +189,22 @@ pub struct DemoOptions {
     /// the binary.
     #[doc(hidden)]
     pub evidence_fail_writes: bool,
+    /// S6-C3: the versioned, logical-tick-indexed soak scenario
+    /// (opt-in; `None` is the default — normal interactive behavior
+    /// is unchanged). Headless mode is the accelerated logical
+    /// replay; graphical mode requires `soak_wall_seconds` (the
+    /// integrated soak).
+    pub scenario: Option<SoakScenarioId>,
+    /// S6-C3: the scenario seed override (None = the canonical
+    /// [`STAGE6_SCENARIO_SEED`]).
+    pub scenario_seed: Option<u64>,
+    /// S6-C3: the measured wall-clock window of the integrated
+    /// graphical soak in seconds (None = no wall boundary; the loop
+    /// runs until quit/frames/failure exactly as before).
+    pub soak_wall_seconds: Option<u64>,
+    /// S6-C3: the bounded post-soak stabilization deadline in seconds
+    /// (None = [`crate::soak_scenario::DEFAULT_STABILIZATION_DEADLINE_SECS`]).
+    pub stabilization_deadline_secs: Option<u64>,
 }
 
 /// One advance step's outcome (observational, mirrors `SimStep`).
@@ -598,9 +618,28 @@ pub struct HeadlessReport {
     /// The evidence package's verdict (S6-C1) — `None` when the run
     /// collected no evidence.
     pub evidence: Option<EvidenceOutcome>,
+    /// The S6-C3 scenario's end-of-run report — `None` when no
+    /// scenario ran.
+    pub scenario: Option<ScenarioRunReport>,
 }
 
 impl HeadlessReport {
+    /// Whether a requested evidence package failed its verdict (a
+    /// visible failure, never a passing report over lost evidence).
+    pub fn evidence_failed(&self) -> bool {
+        self.evidence
+            .as_ref()
+            .is_some_and(|outcome| !outcome.is_complete())
+    }
+
+    /// Whether the scenario's hard gates failed (conservation at
+    /// every checkpoint, the zero-silent-drop verdict).
+    pub fn scenario_failed(&self) -> bool {
+        self.scenario
+            .as_ref()
+            .is_some_and(|report| !report.verdict_ok())
+    }
+
     /// The CLI evidence print (also used by the tests' failure
     /// messages).
     pub fn print(&self) {
@@ -666,6 +705,39 @@ impl HeadlessReport {
                     "COMPLETE"
                 } else {
                     "INCOMPLETE"
+                }
+            );
+        }
+        if let Some(scenario) = &self.scenario {
+            println!(
+                "  scenario: {} · seed {} · scripted ticks {}/{} · registered {} · rejected {}",
+                scenario.scenario,
+                scenario.seed,
+                scenario.scenario_tick,
+                scenario.horizon,
+                scenario.registered,
+                scenario.rejected
+            );
+            for cohort in &scenario.terminal.cohorts {
+                println!(
+                    "  cohort {}: expected {} · executed {} · queued {} · blocked {} · held {} · missing {} · duplicates {} ({})",
+                    cohort.cohort,
+                    cohort.expected,
+                    cohort.executed,
+                    cohort.queued,
+                    cohort.blocked,
+                    cohort.held,
+                    cohort.missing,
+                    cohort.duplicate_executions,
+                    cohort.identity_note()
+                );
+            }
+            println!(
+                "  scenario verdict: {} (conservation at every checkpoint, no missing identity, no duplicates)",
+                if scenario.verdict_ok() {
+                    "PASS"
+                } else {
+                    "FAIL"
                 }
             );
         }
@@ -755,6 +827,10 @@ pub struct PersistDemo {
     /// every emission site is guarded by it, so an absent collector
     /// is zero cost and zero behavior change).
     evidence: Option<EvidenceCollector>,
+    /// The S6-C3 tick-indexed scenario driver (opt-in; `None` by
+    /// default — every hook is guarded, so an absent scenario is zero
+    /// cost and zero behavior change).
+    scenario: Option<SoakScenario>,
 }
 
 impl PersistDemo {
@@ -779,6 +855,69 @@ impl PersistDemo {
             last_commit: None,
             confirmed_revision: None,
             evidence: None,
+            scenario: None,
+        }
+    }
+
+    /// Attaches the S6-C3 scenario driver (opt-in): from this point
+    /// every executed logical tick first consumes the scenario's
+    /// scripted inputs (presence, bursts, action, publication),
+    /// applied per tick inside `run_ticks` — never per rendered
+    /// frame, so frame cadence cannot change logical behavior.
+    pub fn attach_scenario(&mut self, scenario: SoakScenario) {
+        self.scenario = Some(scenario);
+    }
+
+    /// The attached scenario driver (read-only; `None` when no
+    /// scenario runs).
+    pub fn scenario(&self) -> Option<&SoakScenario> {
+        self.scenario.as_ref()
+    }
+
+    /// The attached scenario driver (mutable — the runner's
+    /// measurement-origin and checkpoint interactions).
+    pub fn scenario_mut(&mut self) -> Option<&mut SoakScenario> {
+        self.scenario.as_mut()
+    }
+
+    /// S6-C3 §6: the bounded post-soak stabilization drain — the
+    /// ALREADY-ACCRUED fixed-step debt settled through the accepted
+    /// tick path with NO additional wall-time accrual
+    /// (`advance(Duration::ZERO)` — the pinned no-new-time drain
+    /// primitive), under a separately configurable bounded deadline.
+    /// A debt that cannot drain by the deadline is reported honestly
+    /// (`completed == false`, the remainder in `outstanding_after`)
+    /// — never silently discarded, never a manufactured success; a
+    /// refusing tick surfaces as `refused` (the caller routes it
+    /// through the single finalization site like every application
+    /// failure).
+    pub fn drain_bounded(&mut self, deadline_secs: u64) -> SoakDrain {
+        let deadline = Duration::from_secs(deadline_secs);
+        let drain_start = Instant::now();
+        let outstanding_before = self.outstanding_ticks();
+        let mut completed = true;
+        let mut refused = None;
+        while self.outstanding_ticks() > 0 {
+            if drain_start.elapsed() >= deadline {
+                completed = false;
+                break;
+            }
+            if let Err(error) = self.advance(Duration::ZERO) {
+                completed = false;
+                refused = Some(format!("the drain's authoritative tick refused: {error:?}"));
+                break;
+            }
+        }
+        let time_accounting_holds = self.ticks_due_total()
+            == self.session.clock().as_u64() + u64::from(self.outstanding_ticks());
+        SoakDrain {
+            deadline_secs,
+            drain_ms: drain_start.elapsed().as_secs_f64() * 1000.0,
+            outstanding_before,
+            outstanding_after: self.outstanding_ticks(),
+            completed,
+            time_accounting_holds,
+            refused,
         }
     }
 
@@ -1007,6 +1146,73 @@ impl PersistDemo {
         // headless path's free ticks never settle accrued debt.
         let due_now = (self.accumulator_ns / self.period_ns) as u32;
         for index in 0..ticks {
+            // S6-C3: the tick-indexed scenario hook — every scripted
+            // input is computed and applied per LOGICAL tick (never
+            // per rendered frame): the scripted presence replaces the
+            // frame-sampled camera for this tick; the scheduled bursts
+            // go through the accepted `schedule_event` boundary with
+            // `due = the upcoming campaign tick + the scripted
+            // offset` (never a late arrival by construction); the
+            // scripted action and publication fire through the
+            // accepted lifecycles. The excursion antipode below still
+            // overrides the scripted presence while an action's
+            // excursion is active.
+            if let Some(step) = self.scenario.as_mut().map(|scenario| scenario.step()) {
+                self.presence = vec![step.presence];
+                let upcoming = self.session.clock().as_u64() + 1;
+                for burst in step.bursts {
+                    let spec = EventSpec::new(
+                        EventClass::new(burst.region),
+                        Schedule::AtLogicalTime {
+                            due: Tick(upcoming + burst.due_offset),
+                        },
+                        burst_payload(burst.cohort, burst.index),
+                    )
+                    .in_field(burst.field);
+                    let result = self.session.schedule_event(spec);
+                    if let Some(scenario) = self.scenario.as_mut() {
+                        scenario.record_scheduled(burst.cohort, burst.index, result);
+                    }
+                }
+                if step.fire_action {
+                    let observed = match self.excursion() {
+                        Ok(record) => (true, record.describe()),
+                        Err(message) => (false, message),
+                    };
+                    if let Some(scenario) = self.scenario.as_mut() {
+                        scenario.record_action(step.scenario_tick, observed.0, observed.1);
+                    }
+                }
+                if step.fire_publication {
+                    self.publish();
+                    if let Some(scenario) = self.scenario.as_mut() {
+                        scenario.record_publication(step.scenario_tick);
+                    }
+                }
+                // The controlled light checkpoint AFTER this tick
+                // executes: the O(1) whole-campaign conservation
+                // identity plus the per-cohort live states (the full
+                // ledger scan belongs to finalization, never the
+                // per-tick path).
+                if self
+                    .scenario
+                    .as_ref()
+                    .is_some_and(|scenario| scenario.id().is_checkpoint(step.scenario_tick))
+                {
+                    let debt_now = if settles_debt {
+                        due_now.saturating_sub(index + 1)
+                    } else {
+                        (self.accumulator_ns / self.period_ns) as u32
+                    };
+                    let checkpoint = self
+                        .scenario
+                        .as_ref()
+                        .map(|scenario| scenario.checkpoint(&self.session, debt_now, false));
+                    if let (Some(scenario), Some(checkpoint)) = (&mut self.scenario, checkpoint) {
+                        scenario.record_checkpoint(checkpoint);
+                    }
+                }
+            }
             // The effective presence: the deliberate action's excursion
             // override while active (the region held at its antipode),
             // the caller's presence otherwise. Computed BEFORE the
@@ -1740,6 +1946,176 @@ fn emit_memory_evidence(demo: &PersistDemo, evidence: &EvidenceCollector) {
     }));
 }
 
+/// The S6-C3 measured wall-clock window's state (the §6 termination
+/// protocol's observational bookkeeping — never logical state).
+#[derive(Debug)]
+struct SoakMeasurement {
+    wall_seconds: u64,
+    start: Instant,
+    /// Whether the loop ended AT the wall boundary (false = the run
+    /// was interrupted by quit/frames/failure before the cutoff — an
+    /// incomplete measurement, honestly reported).
+    cutoff_reached: bool,
+    cutoff: Option<SoakCutoff>,
+    drain: Option<SoakDrain>,
+}
+
+/// The cutoff observations — recorded BEFORE the post-soak drain
+/// advances anything (the in-window truth; phases reached during the
+/// drain are post-soak catch-up, never in-window evidence).
+#[derive(Debug, Clone)]
+struct SoakCutoff {
+    wall_duration_ms: f64,
+    campaign_tick: u64,
+    outstanding_debt: u32,
+    coverage: Option<CoverageReport>,
+}
+
+/// The bounded post-soak drain's outcome (§6's stabilization phase).
+#[derive(Debug, Clone)]
+pub struct SoakDrain {
+    pub deadline_secs: u64,
+    pub drain_ms: f64,
+    pub outstanding_before: u32,
+    pub outstanding_after: u32,
+    pub completed: bool,
+    pub time_accounting_holds: bool,
+    /// The drain's authoritative tick refusal, when one occurred
+    /// (an application failure — the caller routes it through the
+    /// finalization like every other tick refusal).
+    pub refused: Option<String>,
+}
+
+/// Escapes the few JSON-string metacharacters the soak summary can
+/// contain (paths and labels — all otherwise plain).
+fn json_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Serializes the S6-C3 soak summary (`s6-soak-summary/1`, written to
+/// the CAMPAIGN directory — the evidence package stays the pure
+/// s6-evidence/2 five-stream contract, and this summary identifies
+/// it). Honest fields only: measured values as measured, verdicts as
+/// verdicts.
+#[allow(clippy::too_many_arguments)]
+fn soak_summary_json(
+    measurement: &SoakMeasurement,
+    scenario: Option<&ScenarioRunReport>,
+    close_failure: Option<&crate::orchestration::CloseFailure>,
+    evidence_complete: Option<bool>,
+    workload_gate: Option<&str>,
+    timing: &SimConfig,
+    git_commit: &str,
+    git_dirty: bool,
+) -> String {
+    let mut json = String::new();
+    json.push_str("{\"schema\":\"s6-soak-summary/1\"");
+    json.push_str(&format!(
+        ",\"git_commit\":\"{}\",\"git_dirty\":{git_dirty}",
+        json_escape(git_commit)
+    ));
+    json.push_str(&format!(
+        ",\"platform\":\"{}\",\"arch\":\"{}\"",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    json.push_str(&format!(
+        ",\"tick_rate_hz\":{},\"budget\":{},\"near_reserve\":\"{}\"",
+        timing.tick_rate_hz,
+        timing.budget,
+        timing.near_reserve_description()
+    ));
+    json.push_str(&format!(
+        ",\"wall_seconds_requested\":{},\"wall_duration_ms\":{:.3}",
+        measurement.wall_seconds,
+        measurement
+            .cutoff
+            .as_ref()
+            .map_or(0.0, |cutoff| cutoff.wall_duration_ms)
+    ));
+    if let Some(cutoff) = &measurement.cutoff {
+        json.push_str(&format!(
+            ",\"cutoff_campaign_tick\":{},\"cutoff_fixed_step_debt\":{},\"cutoff_reached\":{}",
+            cutoff.campaign_tick, cutoff.outstanding_debt, measurement.cutoff_reached
+        ));
+        if let Some(coverage) = &cutoff.coverage {
+            let phases: Vec<String> = coverage
+                .phases
+                .iter()
+                .map(|phase| {
+                    format!(
+                        "{{\"name\":\"{}\",\"start\":{},\"end\":{},\"entered\":{},\"wall_offset_ms\":{}}}",
+                        phase.name,
+                        phase.start,
+                        phase.end,
+                        phase.entered,
+                        phase.wall_offset_ms.map_or_else(|| "null".into(), |ms| format!("{ms:.3}"))
+                    )
+                })
+                .collect();
+            json.push_str(&format!(
+                ",\"coverage\":{{\"horizon_reached\":{},\"phases\":[{}]}}",
+                coverage.horizon_reached,
+                phases.join(",")
+            ));
+        }
+    }
+    if let Some(drain) = &measurement.drain {
+        json.push_str(&format!(
+            ",\"drain\":{{\"deadline_secs\":{},\"drain_ms\":{:.3},\"outstanding_before\":{},\"outstanding_after\":{},\"completed\":{},\"time_accounting_holds\":{}}}",
+            drain.deadline_secs,
+            drain.drain_ms,
+            drain.outstanding_before,
+            drain.outstanding_after,
+            drain.completed,
+            drain.time_accounting_holds
+        ));
+    }
+    if let Some(scenario) = scenario {
+        json.push_str(&format!(
+            ",\"scenario\":\"{}\",\"scenario_seed\":{},\"scripted_ticks\":{},\"horizon\":{},\"registered\":{},\"rejected\":{}",
+            scenario.scenario, scenario.seed, scenario.scenario_tick, scenario.horizon,
+            scenario.registered, scenario.rejected
+        ));
+        let cohorts: Vec<String> = scenario
+            .terminal
+            .cohorts
+            .iter()
+            .map(|cohort| {
+                format!(
+                    "{{\"cohort\":{},\"expected\":{},\"executed\":{},\"queued\":{},\"blocked\":{},\"held\":{},\"missing\":{},\"duplicates\":{},\"identity_evidence\":\"{}\"}}",
+                    cohort.cohort,
+                    cohort.expected,
+                    cohort.executed,
+                    cohort.queued,
+                    cohort.blocked,
+                    cohort.held,
+                    cohort.missing,
+                    cohort.duplicate_executions,
+                    cohort.identity_note()
+                )
+            })
+            .collect();
+        json.push_str(&format!(
+            ",\"scenario_verdict\":{},\"cohorts_drained\":{},\"cohorts\":[{}]",
+            scenario.verdict_ok(),
+            scenario.cohorts_drained(),
+            cohorts.join(",")
+        ));
+    }
+    if let Some(gate) = workload_gate {
+        json.push_str(&format!(",\"workload_gate\":\"{}\"", json_escape(gate)));
+    } else {
+        json.push_str(",\"workload_gate\":\"PASS\"");
+    }
+    json.push_str(&format!(
+        ",\"close_failure\":{},\"evidence_complete\":{}}}",
+        close_failure.is_some(),
+        evidence_complete.unwrap_or(true)
+    ));
+    json
+}
+
 /// Runs the integrated graphical demonstration (behavior *B–E* over
 /// the one authoritative persisted session). The loop mirrors the
 /// Stage 4 `--render --regions` skeleton exactly — the differences
@@ -1813,6 +2189,28 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             evidence.note_metadata("swapchain_images", &stats.swapchain_images.to_string());
             evidence.note_metadata("validation_active", &stats.validation_active.to_string());
             evidence.note_metadata("fps_target", &options.fps.to_string());
+            evidence.note_metadata("git_commit", env!("S7_GIT_COMMIT"));
+            evidence.note_metadata("git_dirty", env!("S7_GIT_DIRTY"));
+            if let Some(id) = options.scenario {
+                evidence.note_metadata("scenario", id.as_str());
+                evidence.note_metadata(
+                    "scenario_seed",
+                    &options
+                        .scenario_seed
+                        .unwrap_or(STAGE6_SCENARIO_SEED)
+                        .to_string(),
+                );
+            }
+            if let Some(seconds) = options.soak_wall_seconds {
+                evidence.note_metadata("soak_wall_seconds", &seconds.to_string());
+                evidence.note_metadata(
+                    "stabilization_deadline_secs",
+                    &options
+                        .stabilization_deadline_secs
+                        .unwrap_or(DEFAULT_STABILIZATION_DEADLINE_SECS)
+                        .to_string(),
+                );
+            }
         }
         evidence.produce(EvidenceRecord::Persistence(PersistenceSample {
             kind: PersistenceKind::Recovery,
@@ -1892,6 +2290,41 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     // keyed by its start tick (a subsequent action reports
     // independently).
     let mut action_completion_printed_at: Option<u64> = None;
+    // S6-C3: the tick-indexed scenario driver (opt-in; the camera
+    // remains the VISUAL source while the scripted presence is the
+    // AUTHORITATIVE input — the CLI requires the wall window for a
+    // graphical scenario run).
+    if let Some(id) = options.scenario {
+        demo.attach_scenario(SoakScenario::new(
+            id,
+            options.scenario_seed.unwrap_or(STAGE6_SCENARIO_SEED),
+            demo.session().director().config().centers,
+        ));
+    }
+    // S6-C3 §6: the measured window begins at READINESS — after the
+    // renderer, the campaign open, the evidence attach, and the
+    // founding transitions — with an explicit monotonic timestamp
+    // (the scenario's phase wall stamps are offsets from it).
+    let mut soak_measurement: Option<SoakMeasurement> = None;
+    if let Some(wall_seconds) = options.soak_wall_seconds {
+        let measurement_start = Instant::now();
+        if let Some(scenario) = demo.scenario_mut() {
+            scenario.set_measurement_origin(measurement_start);
+        }
+        println!(
+            "--- S6-C3 integrated soak: the measured window opens — {wall_seconds}s · \
+             scenario {} (seed {}) ---",
+            options.scenario.map(|id| id.as_str()).unwrap_or("?"),
+            options.scenario_seed.unwrap_or(STAGE6_SCENARIO_SEED),
+        );
+        soak_measurement = Some(SoakMeasurement {
+            wall_seconds,
+            start: measurement_start,
+            cutoff_reached: false,
+            cutoff: None,
+            drain: None,
+        });
+    }
     // The application-level failure captured from the loop (HOLD-1):
     // a refused tick or a render error breaks OUT of the loop into
     // the single finalization site instead of bypassing the close.
@@ -1931,6 +2364,18 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         // handling above, the first of the separately labeled frame
         // phases.
         let input_ms = input_start.elapsed().as_secs_f64() * 1000.0;
+
+        // S6-C3 §6: the measured wall boundary — at the cutoff, NO
+        // further wall time accrues and no further scripted inputs
+        // apply: the loop breaks BEFORE this frame's interval reaches
+        // the accumulator, and the distinct post-soak phase below
+        // settles the already-accrued debt with zero new wall time.
+        if let Some(measurement) = soak_measurement.as_mut()
+            && Instant::now() >= measurement.start + Duration::from_secs(measurement.wall_seconds)
+        {
+            measurement.cutoff_reached = true;
+            break;
+        }
 
         let split = frame_timing.begin_frame(frame_start, !snapshot.minimized);
         frame_intervals_ms.push((split.sim_advance.as_secs_f64() * 1000.0).min(100.0));
@@ -2199,6 +2644,50 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         }
     }
 
+    // S6-C3 §6: the corrected time-debt termination protocol. The
+    // cutoff state is recorded FIRST (the in-window truth — the
+    // coverage observed INSIDE the measured window, never the
+    // post-soak catch-up), then the distinct post-soak stabilization
+    // phase drains the ALREADY-ACCRUED fixed-step debt through the
+    // accepted tick path with NO additional wall-time accrual
+    // (`advance(Duration::ZERO)` — the pinned no-new-time drain
+    // primitive), under the separately configured bounded deadline.
+    // Unexecuted fixed-step debt is NOT a canonical recovered
+    // obligation (the recovery initializes the accumulator anew), so
+    // draining it here is the only honest completion; a debt that
+    // cannot drain by the deadline marks the workload gate
+    // FAILED/INCOMPLETE with the remainder reported — never silently
+    // discarded, never a manufactured success.
+    let mut drain_failure: Option<String> = None;
+    if let Some(measurement) = soak_measurement.as_mut() {
+        measurement.cutoff = Some(SoakCutoff {
+            wall_duration_ms: measurement.start.elapsed().as_secs_f64() * 1000.0,
+            campaign_tick: demo.session().clock().as_u64(),
+            outstanding_debt: demo.outstanding_ticks(),
+            coverage: demo.scenario().map(|scenario| scenario.coverage()),
+        });
+        let deadline_secs = options
+            .stabilization_deadline_secs
+            .unwrap_or(DEFAULT_STABILIZATION_DEADLINE_SECS);
+        let drain = demo.drain_bounded(deadline_secs);
+        if !drain.completed {
+            if let Some(refusal) = &drain.refused {
+                drain_failure = Some(refusal.clone());
+                if loop_failure.is_none() {
+                    loop_failure = drain_failure.clone();
+                }
+            } else {
+                drain_failure = Some(format!(
+                    "the fixed-step debt did not drain within the stabilization deadline \
+                     ({deadline_secs}s): {} ticks outstanding at campaign tick {}",
+                    drain.outstanding_after,
+                    demo.session().clock().as_u64()
+                ));
+            }
+        }
+        measurement.drain = Some(drain);
+    }
+
     let elapsed = start.elapsed();
     let stats = renderer.stats();
     if let Some(failure) = &loop_failure {
@@ -2376,6 +2865,14 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     // reported independently. A rendering failure never leaves the
     // campaign unclosed, and a failed close is never represented as
     // successful.
+    // The S6-C3 scenario's end-of-run report and the timing echo,
+    // read before the finalization consumes the session (the terminal
+    // accounting needs the live spine).
+    let timing_config = demo.config();
+    let scenario_report = demo.scenario().map(|scenario| {
+        let terminal = scenario.terminal_accounting(demo.session());
+        scenario.run_report(terminal)
+    });
     println!("--- campaign close ---");
     let finalization = demo.finalize(loop_failure);
     let report = &finalization.close;
@@ -2414,6 +2911,177 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
              (no input replay, no duplicated consequences)"
         );
     }
+    // S6-C3: the integrated soak's report and workload gate — the
+    // preserved measurements printed in full, the summary written
+    // beside the campaign (never inside the evidence package), and
+    // the gate composed into the run's outcome (a failed gate is a
+    // visible failure, never a passing report).
+    let mut soak_gate_failure: Option<String> = None;
+    if let Some(measurement) = &soak_measurement {
+        println!("--- S6-C3 integrated soak report ---");
+        let cutoff = measurement.cutoff.as_ref();
+        println!(
+            "  measured window: requested {}s · actual {:.1}s · cutoff reached {}",
+            measurement.wall_seconds,
+            cutoff.map_or(0.0, |state| state.wall_duration_ms / 1000.0),
+            measurement.cutoff_reached
+        );
+        if let Some(cutoff) = cutoff {
+            println!(
+                "  cutoff state: campaign tick {} · fixed-step debt {} · scripted ticks {}/{}",
+                cutoff.campaign_tick,
+                cutoff.outstanding_debt,
+                scenario_report
+                    .as_ref()
+                    .map_or(0, |report| report.scenario_tick),
+                scenario_report.as_ref().map_or(0, |report| report.horizon)
+            );
+            if let Some(coverage) = &cutoff.coverage {
+                let entered = coverage.phases.iter().filter(|phase| phase.entered).count();
+                println!(
+                    "  coverage (in window): {}/{} phases · horizon reached {}",
+                    entered,
+                    coverage.phases.len(),
+                    coverage.horizon_reached
+                );
+                for phase in &coverage.phases {
+                    if !phase.entered {
+                        println!(
+                            "    phase NOT covered in window: {} (ticks {}–{})",
+                            phase.name, phase.start, phase.end
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(drain) = &measurement.drain {
+            println!(
+                "  drain: {} → {} outstanding · {:.1} ms (deadline {}s) · completed {} · time accounting {}",
+                drain.outstanding_before,
+                drain.outstanding_after,
+                drain.drain_ms,
+                drain.deadline_secs,
+                drain.completed,
+                drain.time_accounting_holds
+            );
+        }
+        if let Some(scenario) = &scenario_report {
+            println!(
+                "  scenario: {} · seed {} · registered {} · rejected {} · verdict {}",
+                scenario.scenario,
+                scenario.seed,
+                scenario.registered,
+                scenario.rejected,
+                if scenario.verdict_ok() {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
+            );
+            for cohort in &scenario.terminal.cohorts {
+                println!(
+                    "  cohort {}: expected {} · executed {} · queued {} · blocked {} · held {} · missing {} · duplicates {} ({})",
+                    cohort.cohort,
+                    cohort.expected,
+                    cohort.executed,
+                    cohort.queued,
+                    cohort.blocked,
+                    cohort.held,
+                    cohort.missing,
+                    cohort.duplicate_executions,
+                    cohort.identity_note()
+                );
+            }
+        }
+        // The gate (in order): the window completed at the wall
+        // boundary, the accrued debt drained within its bounded
+        // deadline, the workload covered INSIDE the measured window,
+        // and the scenario's hard gates.
+        if !measurement.cutoff_reached {
+            soak_gate_failure = Some(
+                "the measured window ended before the wall boundary (interrupted — an \
+                 incomplete Stage 6 measurement)"
+                    .into(),
+            );
+        } else if let Some(failure) = &drain_failure {
+            soak_gate_failure = Some(failure.clone());
+        } else {
+            let covered = measurement
+                .cutoff
+                .as_ref()
+                .and_then(|state| state.coverage.as_ref())
+                .is_some_and(|coverage| coverage.all_phases_entered() && coverage.horizon_reached);
+            if !covered {
+                soak_gate_failure = Some(
+                    "the measured window did not cover the full workload — phases reached \
+                     during the post-soak drain are catch-up, NOT in-window evidence"
+                        .into(),
+                );
+            } else if scenario_report
+                .as_ref()
+                .is_some_and(|report| !report.verdict_ok())
+            {
+                soak_gate_failure = Some(
+                    "the scenario's hard gates failed (conservation or the zero-silent-drop \
+                     verdict)"
+                        .into(),
+                );
+            }
+        }
+        println!(
+            "  workload gate: {}",
+            if let Some(failure) = &soak_gate_failure {
+                format!("FAIL — {failure}")
+            } else {
+                "PASS".to_string()
+            }
+        );
+        // §6 step 11: the INDEPENDENT package verification, from
+        // disk, after the writer finalized — a package that does not
+        // verify is a failed gate, never a passing report.
+        let evidence_verification = options
+            .evidence
+            .as_ref()
+            .and_then(|config| verify_package(&config.dir).ok());
+        if let Some(verification) = &evidence_verification {
+            if verification.verified_complete() {
+                println!("  evidence package: verified complete (independently, from disk)");
+            } else {
+                println!(
+                    "  evidence package: NOT verified complete — {} problem(s)",
+                    verification.problems.len()
+                );
+                for problem in verification.problems.iter().take(5) {
+                    println!("    {problem}");
+                }
+                if soak_gate_failure.is_none() {
+                    soak_gate_failure = Some("the evidence package did not verify complete".into());
+                }
+                println!("  workload gate: FAIL — the evidence package did not verify complete");
+            }
+        }
+        let summary_path = options.campaign_dir.join("soak-summary.json");
+        let summary = soak_summary_json(
+            measurement,
+            scenario_report.as_ref(),
+            finalization.close.failure.as_ref(),
+            finalization
+                .evidence
+                .as_ref()
+                .map(|outcome| outcome.is_complete()),
+            soak_gate_failure.as_deref(),
+            &timing_config,
+            env!("S7_GIT_COMMIT"),
+            env!("S7_GIT_DIRTY") == "true",
+        );
+        match std::fs::write(&summary_path, summary) {
+            Ok(()) => println!("  summary: {}", summary_path.display()),
+            Err(error) => println!(
+                "  summary: NOT WRITTEN ({}: {error})",
+                summary_path.display()
+            ),
+        }
+    }
     // The combined outcome (HOLD-1): the original application error
     // first, the close outcome independent, never a success claim
     // over a failed close — then the validation findings merged in.
@@ -2429,6 +3097,14 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         outcome = Err(match outcome {
             Err(existing) => format!("{existing}; AND {validation_error}"),
             Ok(()) => validation_error,
+        });
+    }
+    // S6-C3: the workload gate composes into the same outcome — the
+    // soak's verdicts are run failures, visible in the exit code.
+    if let Some(failure) = soak_gate_failure {
+        outcome = Err(match outcome {
+            Err(existing) => format!("{existing}; AND {failure}"),
+            Ok(()) => failure,
         });
     }
     if outcome.is_err() {
@@ -2484,6 +3160,18 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         evidence.note_metadata("mode", "headless");
         evidence.note_metadata("platform", std::env::consts::OS);
         evidence.note_metadata("headless_ticks", &options.headless_ticks.to_string());
+        evidence.note_metadata("git_commit", env!("S7_GIT_COMMIT"));
+        evidence.note_metadata("git_dirty", env!("S7_GIT_DIRTY"));
+        if let Some(id) = options.scenario {
+            evidence.note_metadata("scenario", id.as_str());
+            evidence.note_metadata(
+                "scenario_seed",
+                &options
+                    .scenario_seed
+                    .unwrap_or(STAGE6_SCENARIO_SEED)
+                    .to_string(),
+            );
+        }
         evidence.produce(EvidenceRecord::Persistence(PersistenceSample {
             kind: PersistenceKind::Recovery,
             wall_offset_ms: evidence.wall_offset_ms(),
@@ -2499,9 +3187,20 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         demo.attach_evidence(evidence);
     }
     demo.emit_founding_transitions();
+    // S6-C3: the accelerated headless replay — the same tick-indexed
+    // scenario driving the same campaign lifecycle (the deterministic
+    // evidence path; the graphical integrated soak is the wall-clock
+    // mode, and physical verification belongs to the rig).
+    if let Some(id) = options.scenario {
+        demo.attach_scenario(SoakScenario::new(
+            id,
+            options.scenario_seed.unwrap_or(STAGE6_SCENARIO_SEED),
+            demo.session().director().config().centers,
+        ));
+    }
     let mut application_failure: Option<String> = None;
     for tick_index in 0..options.headless_ticks {
-        if options.action_at == Some(tick_index) {
+        if options.scenario.is_none() && options.action_at == Some(tick_index) {
             match demo.excursion() {
                 Ok(record) => println!("action @ tick {tick_index}: {}", record.describe()),
                 Err(message) => {
@@ -2528,6 +3227,13 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
     // wait) before reading the evidence — the report's publication
     // state must be the verified outcome, not an unpolled pending.
     demo.wait_current();
+    // The scenario's end-of-run report, read before the finalization
+    // consumes the session (the terminal accounting needs the live
+    // spine).
+    let scenario = demo.scenario().map(|scenario| {
+        let terminal = scenario.terminal_accounting(demo.session());
+        scenario.run_report(terminal)
+    });
     // The evidence, read before the finalization consumes the session.
     let action = demo.action().cloned();
     let action_publication = demo.publication_state().cloned();
@@ -2559,5 +3265,6 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         closed_region,
         close,
         evidence: finalization.evidence,
+        scenario,
     })
 }

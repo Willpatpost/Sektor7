@@ -117,6 +117,32 @@ jobs:
           # surface-format-change lifecycle (region-scene buffer
           # carry-over) that same-format resizing cannot reach.
           SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize --replace-pipelines
+      - name: Stage 6 integrated soak smoke (Linux only — lavapipe, correctness evidence, NOT performance evidence)
+        if: runner.os == 'Linux'
+        # The bounded S6-C3 smoke, never a 900-second CI job: the REAL
+        # binary, offscreen, a ~40 s wall window over the compressed
+        # fixture — the full protocol end to end (the measured window,
+        # the cutoff, the bounded drain, the graceful close, the
+        # verified evidence package, the workload gate) with validation
+        # active, then the fresh-process recovery relaunch. Lavapipe is
+        # a software rasterizer: correctness smoke only, never GPU
+        # performance evidence.
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          SOAK="$RUNNER_TEMP/s7-s6c3-smoke"
+          EVI="$RUNNER_TEMP/s7-s6c3-smoke-evidence"
+          rm -rf "$SOAK" "$EVI"
+          # The external watchdog discipline (§6): a process-level
+          # bound comfortably above the window + drain + close.
+          SDL_VIDEODRIVER=offscreen timeout 300 cargo run -q -p engine-slice -- \
+            --demo-persist "$SOAK" \
+            --soak-wall-seconds 40 --scenario stage6-v1-short \
+            --evidence-dir "$EVI" --validation on
+          # The fresh-process recovery verification (the closed
+          # campaign continues exactly — no input replay).
+          cargo run -q -p engine-slice -- --demo-persist "$SOAK" --headless --ticks 30
+          echo "S6-C3 integrated soak smoke: window + drain + close + evidence + recovery clean"
 
   # Mac 1 (macos-port authorization 2026-10-20, independent Mac 0 review
   # GO): additive macOS ARM64 job — CPU portability only (no GPU, no

@@ -176,7 +176,10 @@ fn main() {
                 "usage: --demo-persist <campaign-dir> [--headless --ticks <n> \
                  [--action-at <tick>]] [--fps <n>|uncapped] [--frames <n>] \
                  [--validation auto|on|off] [--present auto|fifo|mailbox|immediate] \
-                 [--no-overlay]"
+                 [--no-overlay] [--scenario stage6-v1|stage6-v1-short \
+                 [--scenario-seed <n>] [--evidence-dir <dir>]] \
+                 [--soak-wall-seconds <n> --scenario <id> --evidence-dir <dir> \
+                 [--stabilization-deadline-secs <n>]]"
             );
             std::process::exit(1);
         };
@@ -193,7 +196,12 @@ fn main() {
             poison_at_tick: None,
             evidence: None,
             evidence_fail_writes: false,
+            scenario: None,
+            scenario_seed: None,
+            soak_wall_seconds: None,
+            stabilization_deadline_secs: None,
         };
+        let mut ticks_given = false;
         let mut index = position + 2;
         while index < args.len() {
             match args[index].as_str() {
@@ -203,6 +211,7 @@ fn main() {
                         && let Ok(ticks) = value.parse::<u64>()
                     {
                         options.headless_ticks = ticks.clamp(1, 1_000_000);
+                        ticks_given = true;
                         index += 1;
                     }
                 }
@@ -255,11 +264,61 @@ fn main() {
             }
             index += 1;
         }
+        // S6-C3: the namespaced integrated-soak flags — STRICT
+        // parsing (visible errors with a nonzero exit; never silent
+        // defaults, never silent clamps), then the relational rules
+        // against the mode context. All existing non-soak behavior is
+        // unchanged (the legacy lenient flags above stay exactly as
+        // they were).
+        let soak = match engine_slice::soak_scenario::SoakOptions::parse(&args) {
+            Ok(soak) => soak,
+            Err(message) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(message) = soak.validate(
+            options.headless,
+            options.frames,
+            options.action_at,
+            ticks_given,
+        ) {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        options.scenario = soak.scenario;
+        options.scenario_seed = soak.scenario_seed;
+        options.soak_wall_seconds = soak.wall_seconds;
+        options.stabilization_deadline_secs = soak.stabilization_deadline_secs;
+        if let Some(evidence_dir) = &soak.evidence_dir {
+            // The collector's exclusive-create destination rule
+            // enforces the fresh evidence directory (a prior package
+            // is never overwritten — the typed refusal names it).
+            let label = options.scenario.map(|id| id.as_str()).unwrap_or("demo");
+            options.evidence = Some(engine_slice::soak_evidence::EvidenceConfig::new(
+                evidence_dir.clone(),
+                label,
+            ));
+        }
+        // The headless replay's tick budget defaults to the scenario
+        // horizon when --scenario is given without --ticks (an
+        // explicit --ticks caps the replay — the interrupted-run
+        // fixtures use exactly that).
+        if options.headless
+            && let Some(id) = options.scenario
+            && !ticks_given
+        {
+            options.headless_ticks = id.horizon();
+        }
         if options.headless {
             match engine_slice::persist_demo::run_persist_demo_headless(options) {
                 Ok(report) => {
                     report.print();
-                    if report.application_failure.is_some() || report.close.failure.is_some() {
+                    if report.application_failure.is_some()
+                        || report.close.failure.is_some()
+                        || report.evidence_failed()
+                        || report.scenario_failed()
+                    {
                         std::process::exit(1);
                     }
                 }

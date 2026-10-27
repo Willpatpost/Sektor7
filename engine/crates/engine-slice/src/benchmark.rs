@@ -1244,5 +1244,9 @@ fn overhead_options(root: &Path, evidence: Option<EvidenceConfig>) -> DemoOption
         poison_at_tick: None,
         evidence,
         evidence_fail_writes: false,
+        scenario: None,
+        scenario_seed: None,
+        soak_wall_seconds: None,
+        stabilization_deadline_secs: None,
     }
 }
