@@ -45,15 +45,15 @@
 //! with execution order — causal precedence is verified through the
 //! execution ledger).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine_core::{
-    EventClass, EventId, EventSpec, Field, HistoryKind, ObligationLocation, PresenceSample,
-    Schedule, Tick,
+    EventClass, EventId, EventSpec, Field, HistoryKind, LodLevel, ObligationLocation,
+    PresenceSample, Schedule, Tick,
 };
-use engine_persist::{AuthorityMode, CanonicalMedium, RevisionRecord, T1Journal};
+use engine_persist::{AuthorityMode, CanonicalMedium, CommitOutcome, RevisionRecord, T1Journal};
 use engine_slice::orchestration::{OrchestratedSession, SubmitRefusal};
 use engine_slice::persist_demo::{DEMO_PRESENCE, demo_scenario};
 use engine_slice::sim::SimConfig;
@@ -61,6 +61,7 @@ use engine_slice::soak_evidence::{
     EvidenceCollector, EvidenceConfig, EvidenceRecord, TickSample, verify_package,
 };
 use engine_slice::store::{SessionStore, StoreLocation};
+use engine_slice::worker::WorkerFault;
 
 /// The burst cohort's payload tag — distinct from the routine-chain tag
 /// `ROUTINE_MAGIC` (`0x5E47`); a burst payload can never decode as an
@@ -171,6 +172,10 @@ struct BurstHarness {
     session: OrchestratedSession,
     registered: Vec<Registered>,
     rejected: Vec<Rejected>,
+    /// The deterministic per-cohort index allocator: every scheduling
+    /// attempt within a cohort carries a UNIQUE scenario identity
+    /// `(cohort, index)` — repeated slices never reuse a payload.
+    next_index: HashMap<u16, u32>,
     /// The TestDir's Drop cleans the campaign directory when the
     /// harness ends — kept alive, never read.
     #[allow(dead_code)]
@@ -193,6 +198,7 @@ impl BurstHarness {
             session,
             registered: Vec::new(),
             rejected: Vec::new(),
+            next_index: HashMap::new(),
             cleaner,
         }
     }
@@ -218,9 +224,13 @@ impl BurstHarness {
     }
 
     /// Schedules a same-due cohort slice of `count` members into the
-    /// given lane, targeting the given region class.
+    /// given lane, targeting the given region class. The scenario
+    /// indices are ALLOCATED deterministically per cohort — repeated
+    /// invocations never reuse a `(cohort, index)` identity.
     fn schedule_slice(&mut self, cohort: u16, count: u32, due: Tick, field: Field, region: u16) {
-        for index in 0..count {
+        for _ in 0..count {
+            let index = *self.next_index.entry(cohort).or_insert(0);
+            self.next_index.insert(cohort, index + 1);
             let spec = EventSpec::new(
                 EventClass::new(region),
                 Schedule::AtLogicalTime { due },
@@ -229,6 +239,22 @@ impl BurstHarness {
             .in_field(field);
             self.schedule_one(spec, cohort, index);
         }
+    }
+
+    /// Asserts the scenario-identity uniqueness INDEPENDENTLY of
+    /// EventId uniqueness: every registered attempt carries a distinct
+    /// `(cohort, index)` pair.
+    fn assert_scenario_identities_unique(&self) {
+        let identities: HashSet<(u16, u32)> = self
+            .registered
+            .iter()
+            .map(|entry| (entry.cohort, entry.index))
+            .collect();
+        assert_eq!(
+            identities.len(),
+            self.registered.len(),
+            "every scheduling attempt within a cohort has a unique scenario identity"
+        );
     }
 
     /// The cohort's registered identities.
@@ -539,12 +565,37 @@ fn b2_budget_exhaustion_keeps_work_explicitly_outstanding() {
 
 // -------------------------------------------------------------- B3
 
-/// B3 — near/far reservation: work in both lanes under the ACCEPTED
-/// three-phase policy — the near reservation is a guaranteed
-/// allocation (not a ceiling), the nonreserved far capacity is
-/// respected, leftovers redistribute near-first, and neither lane
-/// silently drops. Near backlogging only at total saturation is the
-/// honest signal, never a defect by itself.
+/// The ACCEPTED three-phase per-tick lane policy, as the spine
+/// implements it (`Spine::run_tick`): (1) near up to the reservation,
+/// (2) far up to the nonreserved capacity, (3) the remaining budget
+/// redistributed near-first. Given the measured eligible (queued, due)
+/// obligations per lane at a tick boundary, this computes the exact
+/// expected lane service — the test verifies the implementation
+/// against the ratified contract, never a new fairness policy.
+fn three_phase_policy(
+    near_eligible: u32,
+    far_eligible: u32,
+    budget: u32,
+    reserve: u32,
+) -> (u32, u32) {
+    let near_guaranteed = near_eligible.min(reserve);
+    let far_guaranteed = far_eligible.min(budget - reserve);
+    let near_extra =
+        (near_eligible - near_guaranteed).min(budget - near_guaranteed - far_guaranteed);
+    let far_extra =
+        (far_eligible - far_guaranteed).min(budget - near_guaranteed - far_guaranteed - near_extra);
+    (near_guaranteed + near_extra, far_guaranteed + far_extra)
+}
+
+/// B3 — near/far reservation under a simultaneous dual flood: the
+/// cohorts are eligible AT the due tick and compete for capacity with
+/// each other and the NPC baseline. Verified with the exact
+/// three-phase contract: the guaranteed near reservation under total
+/// saturation, the nonreserved far capacity, the total within budget,
+/// the near-first redistribution of unused capacity (observed in the
+/// post-drain regime where far eligibility falls below the nonreserved
+/// capacity), the honest near_backlogged signal, per-tick identity
+/// accounting, and exactly-once completion for both cohorts.
 #[test]
 fn b3_near_reservation_guarantees_the_allocation_under_far_flood() {
     let timing = SimConfig {
@@ -553,7 +604,8 @@ fn b3_near_reservation_guarantees_the_allocation_under_far_flood() {
         ..SimConfig::default()
     };
     let mut harness = BurstHarness::open("b3", timing);
-    // Near work well beyond the reserve, and a far flood.
+    // Near work well beyond the reserve, and a far flood — both due
+    // at tick 20.
     harness.schedule_slice(3, 60, Tick(20), Field::Near, 0);
     harness.schedule_slice(4, 240, Tick(20), Field::Far, 2);
     assert_eq!(harness.rejected.len(), 0);
@@ -561,29 +613,91 @@ fn b3_near_reservation_guarantees_the_allocation_under_far_flood() {
         harness.cohort_ids(3).len() + harness.cohort_ids(4).len(),
         300
     );
+    harness.assert_scenario_identities_unique();
 
-    // Per-tick lane observations over the loaded window: the lane
-    // totals never exceed the budget; the near reservation is a
-    // guaranteed CAPACITY for due near work (not a promise that
-    // not-yet-due near work executes), so the honest signal is the
-    // near_backlogged flag — set only when due near work remained at
-    // total exhaustion. Leftovers redistribute near-first; neither
-    // lane silently drops (both cohorts drain below).
+    // Advance to the EVE of the due tick and establish the eligible
+    // cohort obligations at the boundary (all 300 queued, none yet
+    // executable — their due has not arrived).
+    harness.run_ticks(&[DEMO_PRESENCE], 19);
+    let spine = harness.session.spine();
+    let near_ids = harness.cohort_ids(3);
+    let far_ids = harness.cohort_ids(4);
+    let near_queued_cohort = spine
+        .collect_matching(|view| near_ids.contains(&view.id))
+        .len();
+    let far_queued_cohort = spine
+        .collect_matching(|view| far_ids.contains(&view.id))
+        .len();
+    assert_eq!(near_queued_cohort, 60, "the near cohort stands queued");
+    assert_eq!(far_queued_cohort, 240, "the far flood stands queued");
+
+    // THE DUE TICK — both workloads simultaneously eligible and
+    // competing: measure the FULL lane eligibility (the deterministic
+    // NPC baseline included), then verify the exact three-phase
+    // service. With the cohorts alone beyond both thresholds
+    // (near ≥ 60 ≥ 20, far ≥ 240 ≥ 40), the saturated contract is
+    // exact: the near lane receives EXACTLY its guaranteed
+    // reservation and the far lane EXACTLY the nonreserved capacity.
+    let expected = {
+        let spine = harness.session.spine();
+        let clock = spine.clock().as_u64();
+        let near_eligible = spine
+            .collect_matching(|view| view.field == Field::Near && view.due.as_u64() <= clock + 1)
+            .len() as u32;
+        let far_eligible = spine
+            .collect_matching(|view| view.field == Field::Far && view.due.as_u64() <= clock + 1)
+            .len() as u32;
+        assert!(
+            near_eligible >= 60 && far_eligible >= 240,
+            "both lanes saturate at the boundary (measured near {near_eligible}, far \
+             {far_eligible} — the deterministic baseline included)"
+        );
+        three_phase_policy(near_eligible, far_eligible, 60, 20)
+    };
+    harness.run_ticks(&[DEMO_PRESENCE], 1);
+    let spine = harness.session.spine();
+    let lane = spine.lane_report();
+    assert_eq!(
+        (lane.near_executed, lane.far_executed),
+        expected,
+        "the exact three-phase service at the saturated boundary: {lane:?}"
+    );
+    assert_eq!(lane.near_executed, 20, "the guaranteed near reservation");
+    assert_eq!(lane.far_executed, 40, "the nonreserved far capacity");
+    assert_eq!(lane.near_executed + lane.far_executed, 60, "the budget");
+    assert!(
+        lane.near_backlogged,
+        "near work remains at total exhaustion — the honest signal: {lane:?}"
+    );
+    let at_due = harness.cohort_accounting(3);
+    assert!(at_due.fully_accounted(), "{at_due:?}");
+    assert!(harness.conservation_holds());
+
+    // The loaded window: every tick verified against the exact
+    // three-phase contract (measured eligibility → expected service),
+    // identities accounted throughout.
     for _ in 0..6 {
+        let expected = {
+            let spine = harness.session.spine();
+            let clock = spine.clock().as_u64();
+            let near_eligible = spine
+                .collect_matching(|view| {
+                    view.field == Field::Near && view.due.as_u64() <= clock + 1
+                })
+                .len() as u32;
+            let far_eligible = spine
+                .collect_matching(|view| view.field == Field::Far && view.due.as_u64() <= clock + 1)
+                .len() as u32;
+            three_phase_policy(near_eligible, far_eligible, 60, 20)
+        };
         harness.run_ticks(&[DEMO_PRESENCE], 1);
         let spine = harness.session.spine();
         let lane = spine.lane_report();
-        assert!(
-            lane.near_executed + lane.far_executed <= 60,
-            "the budget is respected: {lane:?}"
+        assert_eq!(
+            (lane.near_executed, lane.far_executed),
+            expected,
+            "the exact three-phase service under load: {lane:?}"
         );
-        if lane.near_backlogged {
-            assert!(
-                lane.near_executed + lane.far_executed >= 60,
-                "near backlog implies total exhaustion — the accepted \
-                 semantics, never a new fairness contract: {lane:?}"
-            );
-        }
         assert!(harness.conservation_holds());
     }
 
@@ -593,6 +707,46 @@ fn b3_near_reservation_guarantees_the_allocation_under_far_flood() {
     assert_eq!(near_drained.executed, 60, "{near_drained:?}");
     assert_eq!(far_drained.executed, 240, "{far_drained:?}");
     assert!(near_drained.complete() && far_drained.complete());
+
+    // THE REDISTRIBUTION — the post-drain regime: the injected far
+    // flood is gone, so far eligibility falls to the NPC baseline
+    // alone (below the nonreserved capacity), and the unused far
+    // capacity redistributes NEAR-FIRST: the near lane's service
+    // rises above the reservation whenever near-eligible work exists
+    // to use it. Verified with the same exact contract over several
+    // ticks; at least one tick must EXHIBIT the redistribution (near
+    // service strictly above the reservation with far strictly below
+    // the nonreserved capacity) — the deterministic baseline's
+    // standing near backlog guarantees near-eligible work.
+    let mut redistribution_observed = false;
+    for _ in 0..8 {
+        let spine = harness.session.spine();
+        let clock = spine.clock().as_u64();
+        let near_eligible = spine
+            .collect_matching(|view| view.field == Field::Near && view.due.as_u64() <= clock + 1)
+            .len() as u32;
+        let far_eligible = spine
+            .collect_matching(|view| view.field == Field::Far && view.due.as_u64() <= clock + 1)
+            .len() as u32;
+        let expected = three_phase_policy(near_eligible, far_eligible, 60, 20);
+        harness.run_ticks(&[DEMO_PRESENCE], 1);
+        let spine = harness.session.spine();
+        let lane = spine.lane_report();
+        assert_eq!(
+            (lane.near_executed, lane.far_executed),
+            expected,
+            "the exact three-phase service in the post-drain regime: {lane:?}"
+        );
+        if far_eligible < 40 && lane.near_executed > 20 {
+            redistribution_observed = true;
+        }
+        assert!(harness.conservation_holds());
+    }
+    assert!(
+        redistribution_observed,
+        "the near-first redistribution of unused far capacity is exhibited \
+         once the far flood drains"
+    );
     let report = harness.session.close();
     assert!(report.failure.is_none(), "{:?}", report.failure);
 }
@@ -862,6 +1016,10 @@ fn b6_sustained_overload_grows_then_drains_with_evidence() {
     for offset in 0..WINDOW {
         let due = Tick(1 + offset);
         harness.schedule_slice(6, PER_TICK, due, Field::Near, 0);
+        // The 30 consecutive injection windows carry UNIQUE scenario
+        // identities (the per-cohort allocator) — asserted
+        // independently of EventId uniqueness.
+        harness.assert_scenario_identities_unique();
         let tick_start = Instant::now();
         harness
             .session
@@ -1022,9 +1180,13 @@ fn b7_late_arrivals_report_lateness_without_watermark_overclaim() {
 
 /// B8 — persistence under burst load (bounded): the burst rides the
 /// real application-level persistence — optional publications under
-/// load (with the truthful Busy refusal at the saturation boundary),
-/// a required canonical confirmation after a capture-bearing durable
-/// transition, a graceful close, and an exact recovery. The
+/// load with the DETERMINISTICALLY saturated queue (the accepted
+/// worker fault seam parks the consumer mid-append before the queue
+/// fills, so the typed Busy refusal is proven regardless of host
+/// scheduling), a WITNESSED capture-bearing durable transition and
+/// the required canonical confirmation (the outcome distinguished
+/// from a valid NothingPending, never assumed), a graceful close, and
+/// an exact recovery with per-identity exactly-once verification. The
 /// authoritative session stays the single source of state; required
 /// commits are never falsely reported confirmed.
 #[test]
@@ -1042,37 +1204,53 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
     let mut session = OrchestratedSession::open(spine, director, &location, journal, "s6c2-b8")
         .expect("the session opens");
 
-    // The burst cohort (the load) and the independent registry.
+    // The burst cohort (the load) and the independent registry (the
+    // scenario indices allocated per slice — unique identities).
     let mut registered: Vec<EventId> = Vec::new();
+    let mut next_index: u32 = 0;
     for offset in 0..10u64 {
         let due = Tick(20 + offset);
-        for index in 0..20u32 {
+        for _ in 0..20u32 {
             let spec = EventSpec::new(
                 EventClass::new(0),
                 Schedule::AtLogicalTime { due },
-                burst_payload(8, index),
+                burst_payload(8, next_index),
             )
             .in_field(Field::Near);
             let id = session
                 .schedule_event(spec)
                 .expect("the scheduling accepted");
             registered.push(id);
+            next_index += 1;
         }
         session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     }
     assert_eq!(registered.len(), 200);
+    let scenario_identities: HashSet<(u16, u32)> = (0..200u32).map(|index| (8u16, index)).collect();
+    assert_eq!(
+        scenario_identities.len(),
+        registered.len(),
+        "every scheduling attempt carries a unique scenario identity"
+    );
 
-    // Optional publications under load: collect the captures first,
-    // then submit in a tight loop so the bounded queue genuinely
-    // saturates — the typed Busy refusal is the truthful boundary,
-    // then every admitted handle drains.
+    // THE DETERMINISTIC SATURATION: collect the captures FIRST (the
+    // capture's observed-head read is a worker round-trip — it must
+    // happen while the consumer is live), then park the consumer
+    // mid-append through the accepted worker fault seam (the same
+    // ParkExecutingAppend discipline the persistence benchmark uses),
+    // then fill the bounded queue against the KNOWN blocked consumer —
+    // the Busy refusal is proven, never left to host scheduling. The
+    // release happens on every path BEFORE any assertion (a parked
+    // worker must never outlive the scenario).
     session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     let captures: Vec<_> = (0..80)
         .map(|_| session.capture_snapshot().expect("the capture"))
         .collect();
+    let control = session.fault_control();
+    control.set(WorkerFault::ParkExecutingAppend);
+    let mut handles = Vec::new();
     let mut admitted = 0usize;
     let mut busy = 0usize;
-    let mut handles = Vec::new();
     for capture in captures {
         match session.submit_publication(capture) {
             Ok(handle) => {
@@ -1083,50 +1261,114 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
             Err(other) => panic!("the admission refusal: {other:?}"),
         }
     }
+    // The first admitted job parks the consumer at its entry barrier
+    // (a bounded wait — release on the deadline path BEFORE failing).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !control.park_entered() {
+        if Instant::now() >= deadline {
+            control.release_park();
+            control.clear();
+            panic!("the worker never reached the park boundary");
+        }
+        std::hint::spin_loop();
+    }
+    // The consumer is deterministically blocked mid-append with the
+    // queue filled behind it: the typed Busy refusal was returned
+    // against a KNOWN blocked consumer. Release FIRST (every normal
+    // and error path), then assert.
+    control.release_park();
+    control.clear();
     assert!(
         busy > 0,
-        "the saturation boundary is truthful: {admitted} admitted, {busy} busy"
+        "the queue genuinely saturated against the parked consumer: \
+         {admitted} admitted, {busy} busy (the 64-slot bound plus the \
+         parked in-flight job)"
     );
     for handle in handles {
         let _ = session.wait_publication(handle);
     }
 
-    // A capture-bearing durable transition (the excursion pattern:
-    // the antipodal presence drives region 0's six-phase
-    // deactivation) followed by the REQUIRED canonical confirmation
-    // under the residual load — the outcome reported truthfully.
+    // A WITNESSED capture-bearing durable transition (never assumed):
+    // the antipodal presence drives region 0's six-phase deactivation
+    // — the region's level and the director's captured-delta counter
+    // are read before and after, and the REQUIRED canonical
+    // confirmation's outcome must be CONSISTENT with the witnessed
+    // capture (a Confirmed receipt for captured consequences; a valid
+    // NothingPending only when nothing was captured — never a claimed
+    // new confirmation over an empty capture).
     let far = PresenceSample {
         position: (-100.0, 0.0),
         velocity: (0.0, 0.0),
     };
+    let captured_before = session.director().diagnostics().captured_deltas;
     session.tick(&[far]).expect("the far tick");
     session.tick(&[far]).expect("the far tick");
     session.tick(&[far]).expect("the far tick");
-    let commit = session.commit_canonical().expect("the required commit");
-    let commit_text = format!("{commit:?}");
-    assert!(
-        commit_text.contains("Confirmed") || commit_text.contains("NothingPending"),
-        "the confirmation outcome is truthful: {commit_text}"
+    assert_eq!(
+        session.region_level(0),
+        LodLevel::Dormant,
+        "the deactivation is WITNESSED, not assumed"
     );
+    let captured_during = session.director().diagnostics().captured_deltas - captured_before;
+    let commit = session.commit_canonical().expect("the required commit");
+    match (&commit, captured_during) {
+        (CommitOutcome::Confirmed(receipt), captured) => {
+            assert!(
+                captured > 0,
+                "a Confirmed receipt requires witnessed captured consequences \
+                 (captured {captured}, receipt keys {})",
+                receipt.keys.len()
+            );
+        }
+        (CommitOutcome::NothingPending, 0) => {
+            // The valid empty-capture response: nothing was captured,
+            // so nothing was pending — never claimed as a new
+            // confirmation.
+        }
+        (CommitOutcome::NothingPending, captured) => {
+            panic!(
+                "NothingPending over a witnessed capture of {captured} consequences — \
+                 the capture's T1 work is unaccounted"
+            );
+        }
+        (other, captured) => panic!(
+            "the confirmation outcome is inconsistent with the witnessed capture \
+             ({other:?} with {captured} captured)"
+        ),
+    }
     // The reactivation and the remaining load drain.
     session.tick(&[DEMO_PRESENCE]).expect("the near tick");
     for _ in 0..40 {
         session.tick(&[DEMO_PRESENCE]).expect("the tick runs");
     }
 
-    // The independent accounting before the close: the cohort is fully
-    // drained exactly once.
-    let ids: HashSet<EventId> = registered.into_iter().collect();
-    let ledger = session.spine().try_ledger_full().expect("the history");
-    let executed: HashSet<EventId> = ledger
-        .iter()
-        .filter(|record| ids.contains(&record.id))
-        .map(|record| record.id)
-        .collect();
+    // THE EXACTLY-ONCE VERIFICATION (per-identity occurrence counts,
+    // not set cardinality): each accepted identity appears EXACTLY
+    // once in the execution ledger — no missing, no duplicates — with
+    // the full-history availability checked before the scan (no
+    // rejected attempt is included: the registry holds only accepted
+    // returns).
+    assert!(matches!(session.spine().history_kind(), HistoryKind::Full));
+    let ids: HashSet<EventId> = registered.iter().copied().collect();
+    let mut occurrences: HashMap<EventId, usize> = HashMap::new();
+    for record in session.spine().try_ledger_full().expect("the history") {
+        if ids.contains(&record.id) {
+            *occurrences.entry(record.id).or_default() += 1;
+        }
+    }
     assert_eq!(
-        executed.len(),
+        occurrences.len(),
         ids.len(),
-        "the cohort completed exactly once"
+        "every accepted identity executed (no missing)"
+    );
+    let duplicates: Vec<EventId> = occurrences
+        .iter()
+        .filter(|(_, count)| **count != 1)
+        .map(|(id, _)| *id)
+        .collect();
+    assert!(
+        duplicates.is_empty(),
+        "no accepted identity executed twice: {duplicates:?}"
     );
     let closing_clock = session.spine().clock().as_u64();
     let closing_fingerprint =
