@@ -10,6 +10,7 @@ pub mod frame_timing;
 pub mod math;
 pub mod npc;
 pub mod orchestration;
+pub mod persist_demo;
 pub mod region;
 pub mod region_render;
 pub mod render_demo;

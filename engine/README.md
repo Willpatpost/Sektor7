@@ -181,6 +181,10 @@ The first build compiles vendored SDL 3.4.18 (a few minutes). Expected: a 1280×
 
 **Testing on macOS:** `cargo test --workspace --exclude engine-shell` runs everything multi-threaded; the three SDL-touching engine-shell suites must run one test per process (SDL3 on Apple platforms requires every video (re)init in a process to share the thread that first initialized SDL, while the Rust test harness gives each test a fresh thread — the CI job on this branch does this automatically). To run them manually: `cargo test -p engine-shell --test input_dispatch -- --list --format terse`, then invoke each listed test with `--exact <name>`; same for `lifecycle` and `soak`.
 
+## Slice 0 integration demonstration (`--demo-persist`)
+
+ONE authoritative, persistently-orchestrated campaign behind the render loop — the first composed graphical + production-persistence execution path (the PP-B1 SQLite store and the PP-B4 orchestrated session over the Stage 1–4 mechanisms). `Space` triggers the camera region's durable consequence cycle (the deactivation capture → the required canonical confirmation → the reactivation's exactly-once credits); the overlay reports the truthful pending-vs-confirmed lifecycle; exit runs the graceful durable close; a relaunch against the same directory recovers exactly (no input replay, no duplicated consequences). Headless evidence path: `--demo-persist <dir> --headless --ticks 240 --action-at 100`, then `--demo-persist <dir> --headless --ticks 60` (the same directory). Full run/review instructions and the physical-rig procedure: [`docs/SLICE0-INTEGRATION-DEMO.md`](../docs/SLICE0-INTEGRATION-DEMO.md) (delivered on `slice0-integration-demo` for independent review — NOT YET PHYSICALLY ACCEPTED).
+
 ## Tested environments
 
 | Environment | Method | Result |

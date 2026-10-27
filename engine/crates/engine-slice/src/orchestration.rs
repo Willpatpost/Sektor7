@@ -71,7 +71,7 @@ use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 use engine_core::{EventId, EventSpec, LodLevel, PresenceSample, ScheduleError, Spine, Tick};
 use engine_persist::checkpoint::peek_object_domain;
 use engine_persist::{
-    AppendOutcome, CanonicalMedium, CommitOutcome, Hash, JournalRotation, MediumError,
+    AppendOutcome, CanonicalMedium, CommitOutcome, Hash, JournalRotation, KeyPhase, MediumError,
     PipelineError, ReconcileOutcome, Reconciliation, RevisionRecord, StoredObject, SyncTier,
     T1Journal, TransactionId, UnknownReason, active_journal_path,
 };
@@ -925,6 +925,33 @@ impl OrchestratedSession {
     /// One region's current LOD level (read-only).
     pub fn region_level(&self, region: usize) -> LodLevel {
         self.director.levels()[region]
+    }
+
+    /// Read-only spine access — the Slice 0 integration
+    /// demonstration's narrow read-only seam: the session remains the
+    /// ONLY owner and mutator of the authoritative state; derived
+    /// rendering, overlays, and run reports read downstream through
+    /// this reference (the same read-only surface the pipeline-free
+    /// render demo consumes from its own driver). No mutable access
+    /// to the spine escapes this type.
+    pub fn spine(&self) -> &Spine<NpcWorld> {
+        &self.spine
+    }
+
+    /// Read-only region-director access — levels, config, the capture
+    /// ledger, diagnostics, and activation-latency percentiles for
+    /// derived rendering and overlays (the same read-only surface the
+    /// nonpersistent render demo consumes from its own driver).
+    pub fn director(&self) -> &RegionDirector {
+        &self.director
+    }
+
+    /// The per-key durable status passthrough
+    /// (`SessionCrossing::key_phase`): the per-consequence
+    /// pending-vs-confirmed display input — the truthful gating
+    /// surface (a key is confirmed only `InConfirmedChain`).
+    pub fn key_phase(&self, id: engine_persist::ConsequenceId) -> Option<KeyPhase> {
+        self.crossing.key_phase(id)
     }
 
     /// Test-only: the worker's per-instance fault control.

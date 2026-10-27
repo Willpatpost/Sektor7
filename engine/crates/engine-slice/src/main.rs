@@ -11,9 +11,17 @@
 //! <hz>|irregular`, and the Stage 4 region scenarios `--presence
 //! stationary|walk|tour`), and the Stage 5 Batch 1 canonical-save
 //! self-test (`--save-selftest`: the fixed demo scenario's save length
-//! and FNV-1a digest over the canonical bytes).
+//! and FNV-1a digest over the canonical bytes), and the Slice 0
+//! integration demonstration (`--demo-persist <dir>`: ONE
+//! authoritative, persistently-orchestrated campaign behind the
+//! render loop — founded-and-anchored or recovered from the durable
+//! state, the Space action on the nearest citizen, the truthful
+//! pending-vs-confirmed persistence overlay, and the graceful durable
+//! close on exit; `--headless --ticks <n> [--action-at <tick>]` runs
+//! the same lifecycle deterministically without a GPU).
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use engine_slice::region::PresenceScenario;
 use engine_slice::session::{Outcome, Session, run_selftest};
@@ -149,6 +157,112 @@ fn main() {
         return;
     }
 
+    if let Some(position) = args.iter().position(|arg| arg == "--demo-persist") {
+        // Slice 0 integration demonstration: ONE authoritative,
+        // persistently-orchestrated campaign behind the render loop
+        // (founded-and-anchored or recovered; the Space action; the
+        // truthful persistence overlay; the graceful durable close).
+        let Some(dir) = args.get(position + 1) else {
+            eprintln!(
+                "usage: --demo-persist <campaign-dir> [--headless --ticks <n> \
+                 [--action-at <tick>]] [--fps <n>|uncapped] [--frames <n>] \
+                 [--validation auto|on|off] [--present auto|fifo|mailbox|immediate] \
+                 [--no-overlay]"
+            );
+            std::process::exit(1);
+        };
+        let mut options = engine_slice::persist_demo::DemoOptions {
+            campaign_dir: PathBuf::from(dir),
+            fps: 60,
+            present: engine_renderer::PresentModePreference::Auto,
+            frames: None,
+            overlay: true,
+            validation: engine_renderer::ValidationPreference::Auto,
+            headless: false,
+            headless_ticks: 600,
+            action_at: None,
+        };
+        let mut index = position + 2;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--headless" => options.headless = true,
+                "--ticks" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(ticks) = value.parse::<u64>()
+                    {
+                        options.headless_ticks = ticks.clamp(1, 1_000_000);
+                        index += 1;
+                    }
+                }
+                "--action-at" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(tick) = value.parse::<u64>()
+                    {
+                        options.action_at = Some(tick);
+                        index += 1;
+                    }
+                }
+                "--fps" => {
+                    if let Some(value) = args.get(index + 1) {
+                        if value == "uncapped" {
+                            options.fps = 0;
+                            index += 1;
+                        } else if let Ok(fps) = value.parse::<u32>() {
+                            options.fps = fps.clamp(1, 1000);
+                            index += 1;
+                        }
+                    }
+                }
+                "--frames" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(frames) = value.parse::<u64>()
+                    {
+                        options.frames = Some(frames.clamp(1, 1_000_000));
+                        index += 1;
+                    }
+                }
+                "--no-overlay" => options.overlay = false,
+                "--validation" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(preference) =
+                            engine_renderer::ValidationPreference::parse(value)
+                    {
+                        options.validation = preference;
+                        index += 1;
+                    }
+                }
+                "--present" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(mode) = engine_renderer::PresentModePreference::parse(value)
+                    {
+                        options.present = mode;
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if options.headless {
+            match engine_slice::persist_demo::run_persist_demo_headless(options) {
+                Ok(report) => {
+                    report.print();
+                    if report.close.failure.is_some() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+            }
+        } else if let Err(message) = engine_slice::persist_demo::run_persist_demo(options) {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--render") {
         let mut options = engine_slice::render_demo::RenderOptions::default();
         let mut index = 1;
@@ -261,6 +375,7 @@ fn main() {
     println!(
         "Sektor7 original engine — interactive slice (stdin CLI; \
          --render for the Stage 2 Vulkan demo; \
+         --demo-persist <dir> for the Slice 0 integration demonstration; \
          --window / --window --dummy for the Stage 1 shell; \
          --soak <secs> for the loop soak; --fingerprint-selftest for determinism)"
     );
