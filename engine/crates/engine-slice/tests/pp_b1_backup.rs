@@ -464,12 +464,21 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
     // refusal deterministic on every machine.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer_stop = stop.clone();
+    // The deterministic writer-activity evidence (the CI corrective):
+    // every append attempt and every ACCEPTED append are counted —
+    // the race is proven firsthand, never assumed from thread
+    // scheduling.
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer_attempts = attempts.clone();
+    let writer_accepted = accepted.clone();
     let writer = std::thread::spawn(move || {
         let mut medium = SqliteMedium::open(db_path).unwrap();
         let mut head = start_head;
         let mut epoch = start_epoch;
         let mut index = 0u64;
         while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) && index < 10_000 {
+            writer_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut enc = Encoder::new();
             enc.write_str("sektor7/engine-slice/backup-race/1");
             enc.write_bytes(&index.to_le_bytes());
@@ -479,6 +488,7 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
                 .with_content_refs(vec![object.hash()]);
             match medium.append(&record, std::slice::from_ref(&object), Some(head)) {
                 Ok(AppendOutcome::Accepted { id, .. }) => {
+                    writer_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     head = id;
                     epoch += 1;
                 }
@@ -496,13 +506,53 @@ fn concurrent_canonical_writer_never_yields_a_coherent_backup() {
     let result = backup_campaign(&dir.db(), &dir.journal(), &dir.output());
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
-    let refusal = result.expect_err("the concurrent writer never yields a usable backup");
+    // The writer demonstrably ran during the capture window — the
+    // deterministic activity proof.
     assert!(
-        matches!(
-            refusal,
-            BackupError::Quiescence { .. } | BackupError::Medium(MediumError::Contention { .. })
-        ),
-        "the refusal is the boundary at work: {refusal:?}"
+        attempts.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the concurrent writer demonstrably ran"
+    );
+    let refusal = result.expect_err("the concurrent writer never yields a usable backup");
+    // THE REFUSAL CLASSES — three legitimate fail-closed outcomes of
+    // the one boundary. Quiescence: the canonical head moved across
+    // the stability reads. Contention: the capture's TRUNCATE
+    // checkpoint contended the writer's SQLite write lock. Incoherent
+    // (the macOS CI evidence 2026-10-27, run 40445534468): the writer
+    // committed BETWEEN the source validation and the first head read
+    // — the stability pair then straddles a quiet interval while the
+    // captured chain differs from the pre-capture validated summary,
+    // and the audit refuses the set as not cohering with the source
+    // chain BEFORE any manifest is written. That admission is
+    // constrained to exactly the proven race condition and carries
+    // its committed-mutation proof; every other outcome remains a
+    // failure.
+    match &refusal {
+        BackupError::Quiescence { .. } | BackupError::Medium(MediumError::Contention { .. }) => {}
+        BackupError::Incoherent { detail } => {
+            assert!(
+                detail.contains("the captured database does not validate to the source chain"),
+                "only the proven race condition's Incoherent is admitted: {detail}"
+            );
+            assert!(
+                accepted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "the Incoherent refusal requires a committed concurrent revision — \
+                 the captured chain differs from the validated source chain"
+            );
+        }
+        other => panic!("the refusal is the boundary at work: {other:?}"),
+    }
+    // A refused backup never publishes a completion manifest (the
+    // manifest is written LAST — every refusal above precedes it) and
+    // is never usable: the verification path refuses the set.
+    assert!(
+        !dir.output().join("MANIFEST").is_file(),
+        "the refused backup never publishes a completion manifest"
+    );
+    let verification = verify_backup(&dir.output());
+    assert!(
+        matches!(verification, Err(BackupError::Incomplete { .. })),
+        "the refused set is refused by the verification path (the manifest is \
+         absent — the capture never completed): {verification:?}"
     );
 }
 
