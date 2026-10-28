@@ -591,12 +591,24 @@ impl From<JournalError> for PipelineError {
 /// authoritative effects, and the confirming revision with its epoch
 /// — the full provenance the receipt reports and the conflict checks
 /// compare.
-struct ConfirmedEntry {
-    coverage: Vec<ClassifiedSpan>,
-    transaction: TransactionId,
-    effect: Hash,
-    revision: Hash,
-    epoch: u64,
+pub struct ConfirmedEntry {
+    pub coverage: Vec<ClassifiedSpan>,
+    pub transaction: TransactionId,
+    pub effect: Hash,
+    pub revision: Hash,
+    pub epoch: u64,
+}
+
+/// The read-only confirmed-evidence view the actionable-key
+/// derivation, the remaining-keys filter, and the key-phase promotion
+/// run over. The verifier's truth map implements it (the synchronous
+/// facade passes the verifier itself); a future actor composition
+/// passes a receipt-fed mirror instead — over-inclusion is always
+/// corrected by the verifier's own filter, never trusted from the
+/// view.
+pub trait ConfirmedView {
+    /// The chain-confirmed evidence for one identity, if any.
+    fn confirmed(&self, id: &ConsequenceId) -> Option<&ConfirmedEntry>;
 }
 
 /// One attempted key's exact-provenance evidence: the occurrence
@@ -604,7 +616,23 @@ struct ConfirmedEntry {
 /// commitment (identity-level equality is content-blind; the
 /// commitment binds the actual authoritative effects — the tuple the
 /// foreign-confirmation and confirmed-recovery equivalence compares).
-type AttemptedKey = (Vec<ClassifiedSpan>, TransactionId, Hash);
+pub type AttemptedKey = (Vec<ClassifiedSpan>, TransactionId, Hash);
+
+/// One immutable commit request: the actionable keys' frozen evidence
+/// plus the journal-derived position ticks — everything the
+/// submission derives from the journal, so the verifier itself is
+/// journal-blind (the authority half remains the journal's sole
+/// owner).
+#[derive(Clone)]
+pub struct CommitRequest {
+    /// The actionable, unconfirmed journaled keys: identity →
+    /// (coverage, producing transaction, effect commitment).
+    pub keys: BTreeMap<ConsequenceId, AttemptedKey>,
+    /// The producing transactions' journal position ticks (a
+    /// transaction's position is fixed at capture, so the frozen
+    /// snapshot equals any later live lookup).
+    pub ticks: BTreeMap<TransactionId, u64>,
+}
 
 /// A retained canonical attempt — the exact revision, the batch's
 /// content identity, and the per-key identities (the batch bytes
@@ -617,17 +645,33 @@ struct PendingAttempt {
     /// The attempted per-key evidence: identity → (coverage,
     /// producing transaction, effect commitment).
     keys: BTreeMap<ConsequenceId, AttemptedKey>,
+    /// The producing transactions' journal position ticks, frozen at
+    /// submission (the retry's re-derivation uses the retained
+    /// snapshot — identical to a live lookup by position
+    /// immutability).
+    ticks: BTreeMap<TransactionId, u64>,
 }
 
-/// The commit pipeline over a canonical medium and the durable T1
-/// journal.
-pub struct CommitPipeline<M: CanonicalMedium> {
-    medium: M,
+/// The authority-owned half of the commit pipeline: the T1 journal,
+/// the staged in-memory accrual, and the per-key phase tracking.
+/// Journal-only — no medium I/O lives here. This is the half a future
+/// verification actor leaves on the authority thread.
+pub struct CommitAuthority {
     journal: T1Journal,
     /// The staged in-memory accrual — no I/O touches this path; a
     /// crash loses it honestly (P0-5).
     staged: Vec<ConsequenceEnvelope>,
     keys: BTreeMap<ConsequenceId, KeyStatus>,
+}
+
+/// The medium-owned half of the commit pipeline: the canonical
+/// medium, the chain-derived confirmed key set (the session's
+/// verified view), the trusted cursor, and the retained unresolved
+/// canonical attempts. No journal access — everything journal-derived
+/// arrives inside the immutable request. This is the half a future
+/// verification actor owns on its own thread.
+pub struct CommitVerifier<M: CanonicalMedium> {
+    medium: M,
     /// The chain-derived confirmed key set (the session's verified
     /// view — rebuilt at open, extended by the walks).
     confirmed: BTreeMap<ConsequenceId, ConfirmedEntry>,
@@ -640,43 +684,51 @@ pub struct CommitPipeline<M: CanonicalMedium> {
     /// The retained unresolved canonical attempt, if any.
     pending: Option<PendingAttempt>,
     tier: SyncTier,
+    /// Completed walks (incremented only when `walk_chain` runs to
+    /// its end). The facade promotes tracked keys exactly when this
+    /// advances during an operation — today's walk-closing promotion
+    /// loop ran precisely per completed walk.
+    walk_rounds: u64,
 }
 
-impl<M: CanonicalMedium> CommitPipeline<M> {
-    /// Opens the pipeline: the journal's committed transactions seed
-    /// the per-key tracking (the T1 state is durable across sessions),
-    /// then the session-open chain walk (O(chain), documented honestly
-    /// — never per tick) collects every chain-confirmed key from the
-    /// `consequence-batch/1` objects, promotes them, and establishes
-    /// the founding authority.
-    pub fn open(medium: M, journal: T1Journal) -> Result<Self, PipelineError> {
-        let tier = medium.durability_tier();
-        let mut pipeline = CommitPipeline {
-            medium,
+/// The synchronous composition — behaviorally identical to the
+/// accepted single-struct pipeline. Every published operation
+/// delegates to the half that owns the state; the commit-family
+/// operations compose: the authority derives the immutable request
+/// (journal + the verifier's confirmed truth), the verifier processes
+/// it (append → confirm → walk — strict full-object verification
+/// throughout), and the authority promotes tracked keys from the
+/// verifier's post-operation truth exactly when a walk completed. A
+/// future verification actor replaces this composition's middle step
+/// with a queue and a receipt; the halves themselves are unchanged.
+pub struct CommitPipeline<M: CanonicalMedium> {
+    authority: CommitAuthority,
+    verifier: CommitVerifier<M>,
+}
+
+impl CommitAuthority {
+    /// Opens the authority half: the journal's committed transactions
+    /// seed the per-key tracking (the T1 state is durable across
+    /// sessions).
+    pub fn open(journal: T1Journal) -> Self {
+        let mut authority = CommitAuthority {
             journal,
             staged: Vec::new(),
             keys: BTreeMap::new(),
-            confirmed: BTreeMap::new(),
-            verified_head: None,
-            verified_epoch: 0,
-            founding: None,
-            pending: None,
-            tier,
         };
-        for transaction in pipeline.journal.transactions() {
+        for transaction in authority.journal.transactions() {
             for envelope in &transaction.envelopes {
-                pipeline.keys.entry(envelope.id).or_insert(KeyStatus {
+                authority.keys.entry(envelope.id).or_insert(KeyStatus {
                     phase: KeyPhase::JournaledT1,
                     transaction: Some(transaction.id),
                     revision: None,
                 });
             }
         }
-        pipeline.walk_chain()?;
-        Ok(pipeline)
+        authority
     }
 
-    /// The pipeline's journal (read-only access — the rotation's
+    /// The authority's journal (read-only access — the rotation's
     /// classification and the diagnostics read the durable T1
     /// state; the instance and its sidecar lock stay owned here).
     pub fn journal(&self) -> &T1Journal {
@@ -788,7 +840,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     }
 
     /// Appends a validated, durable, reason-coded cancellation for a
-    /// journaled transaction (the pipeline proxies the journal —
+    /// journaled transaction (the authority proxies the journal —
     /// supersession is the explicit durable record, never a higher
     /// sequence).
     pub fn cancel_transaction(
@@ -828,12 +880,176 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         Ok(())
     }
 
-    /// Prepares the canonical batch from every actionable,
-    /// unconfirmed journaled key and submits it against the verified
-    /// head. Canceled transactions are excluded (superseded — never
-    /// canonically committed); chain-confirmed keys are never
-    /// re-batched.
-    pub fn commit_canonical(&mut self) -> Result<CommitOutcome, PipelineError> {
+    /// One key's pipeline view.
+    pub fn status(&self, id: ConsequenceId) -> Option<KeyStatus> {
+        self.keys.get(&id).cloned()
+    }
+
+    /// Collects the actionable, unconfirmed journaled keys — the
+    /// batch candidates — over a confirmed VIEW (the verifier's truth
+    /// through the synchronous facade; a receipt-fed mirror in a
+    /// future actor composition — the verifier's own remaining-keys
+    /// filter corrects any over-inclusion, never trusting the view).
+    /// A key claimed by two journal transactions is a conflicting
+    /// reuse and fails closed.
+    pub fn collect_actionable(
+        &self,
+        confirmed: &dyn ConfirmedView,
+    ) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
+        let mut keys: BTreeMap<ConsequenceId, AttemptedKey> = BTreeMap::new();
+        for transaction in self.journal.transactions() {
+            if !self.journal.is_actionable(transaction.id) {
+                continue;
+            }
+            for envelope in &transaction.envelopes {
+                let effect = envelope
+                    .effect_commitment()
+                    .map_err(PipelineError::Format)?;
+                if let Some(entry) = confirmed.confirmed(&envelope.id) {
+                    // Exact provenance: the journal envelope must
+                    // match the canonical entry — the same producing
+                    // transaction, coverage, and EFFECT COMMITMENT
+                    // (identity-level equality is content-blind; the
+                    // effect commitment binds the actual authoritative
+                    // effects); a mismatch is a conflicting claim,
+                    // never silently skipped.
+                    if entry.transaction == transaction.id
+                        && entry.coverage == envelope.sub_spans
+                        && entry.effect == effect
+                    {
+                        continue;
+                    }
+                    return Err(PipelineError::ConfirmedProvenanceMismatch { id: envelope.id });
+                }
+                if keys.contains_key(&envelope.id) {
+                    return Err(PipelineError::ConflictingReuse { id: envelope.id });
+                }
+                keys.insert(
+                    envelope.id,
+                    (envelope.sub_spans.clone(), transaction.id, effect),
+                );
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The producing transactions' journal position ticks for one
+    /// collected key set — everything the submission derives from the
+    /// journal, frozen into the immutable request (a transaction's
+    /// position is fixed at capture, so this snapshot equals any
+    /// later live lookup).
+    pub fn transaction_ticks(
+        &self,
+        keys: &BTreeMap<ConsequenceId, AttemptedKey>,
+    ) -> BTreeMap<TransactionId, u64> {
+        let mut ticks: BTreeMap<TransactionId, u64> = BTreeMap::new();
+        for (_, transaction, _) in keys.values() {
+            if let Some(committed) = self
+                .journal
+                .transactions()
+                .iter()
+                .find(|committed| committed.id == *transaction)
+            {
+                ticks.insert(*transaction, committed.position.tick);
+            }
+        }
+        ticks
+    }
+
+    /// Promotes every tracked key the view holds confirmed evidence
+    /// for — today's walk-closing promotion loop, run by the facade
+    /// exactly when a walk completed (idempotent; the entry's
+    /// confirming revision is the validated one).
+    pub fn promote_from(&mut self, confirmed: &dyn ConfirmedView) {
+        for (id, status) in &mut self.keys {
+            if let Some(entry) = confirmed.confirmed(id) {
+                status.phase = KeyPhase::InConfirmedChain;
+                status.revision = Some(entry.revision);
+            }
+        }
+    }
+}
+
+impl<M: CanonicalMedium> ConfirmedView for CommitVerifier<M> {
+    fn confirmed(&self, id: &ConsequenceId) -> Option<&ConfirmedEntry> {
+        self.confirmed.get(id)
+    }
+}
+
+/// The attempted keys still unconfirmed after a re-filter (the rebase
+/// set — identical identities and coverages) over a confirmed VIEW. A
+/// foreign confirmation satisfies the local attempt only under EXACT
+/// provenance equivalence: the canonical entry must carry the
+/// attempt's own producing transaction, coverage, and EFFECT
+/// COMMITMENT — a mismatched transaction, coverage, or
+/// consequential payload is a conflicting claim, never silently
+/// absorbed.
+fn remaining_keys(
+    attempted: BTreeMap<ConsequenceId, AttemptedKey>,
+    confirmed: &dyn ConfirmedView,
+) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
+    let mut remaining = BTreeMap::new();
+    for (id, (coverage, transaction, effect)) in attempted {
+        if let Some(entry) = confirmed.confirmed(&id) {
+            if entry.transaction == transaction
+                && entry.coverage == coverage
+                && entry.effect == effect
+            {
+                // Confirmed by another writer's batch carrying
+                // exactly this attempt — never re-submitted; the
+                // per-key status promotes.
+                continue;
+            }
+            return Err(PipelineError::ConfirmedProvenanceMismatch { id });
+        }
+        remaining.insert(id, (coverage, transaction, effect));
+    }
+    Ok(remaining)
+}
+
+impl<M: CanonicalMedium> CommitVerifier<M> {
+    /// Opens the verifier: the session-open chain walk (O(chain),
+    /// documented honestly — never per tick) collects every
+    /// chain-confirmed key from the `consequence-batch/1` objects and
+    /// establishes the founding authority.
+    pub fn open(medium: M) -> Result<Self, PipelineError> {
+        let tier = medium.durability_tier();
+        let mut verifier = CommitVerifier {
+            medium,
+            confirmed: BTreeMap::new(),
+            verified_head: None,
+            verified_epoch: 0,
+            founding: None,
+            pending: None,
+            tier,
+            walk_rounds: 0,
+        };
+        verifier.walk_chain()?;
+        Ok(verifier)
+    }
+
+    /// The retained unresolved canonical attempt's revision, if any.
+    pub fn pending_revision(&self) -> Option<Hash> {
+        self.pending.as_ref().map(|attempt| attempt.record.id())
+    }
+
+    /// The trusted cursor (the last walk-processed revision — the
+    /// append basis; `None` on an unfounded medium).
+    pub fn verified_head(&self) -> Option<Hash> {
+        self.verified_head
+    }
+
+    /// Completed walks — the facade's promotion trigger (today's
+    /// walk-closing promotion loop ran precisely per completed walk).
+    pub fn completed_walks(&self) -> u64 {
+        self.walk_rounds
+    }
+
+    /// Processes one immutable commit request to a terminal outcome:
+    /// the remaining-keys filter (exact provenance against THIS
+    /// truth — a view that over-included is corrected here, never
+    /// trusted), then the submit/rebase machinery.
+    pub fn submit(&mut self, request: CommitRequest) -> Result<CommitOutcome, PipelineError> {
         if let Some(pending) = &self.pending {
             return Err(PipelineError::AttemptUnresolved {
                 revision: pending.record.id(),
@@ -842,11 +1058,18 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         let Some(parent) = self.verified_head else {
             return Err(PipelineError::UnfoundedMedium);
         };
-        let keys = self.collect_pending_keys()?;
+        let attempted: Vec<ConsequenceId> = request.keys.keys().copied().collect();
+        let keys = remaining_keys(request.keys, self)?;
         if keys.is_empty() {
-            return Ok(CommitOutcome::NothingPending);
+            // Every requested key is already chain-confirmed under
+            // exact provenance (a lagged view's over-inclusion,
+            // corrected here — unreachable through the synchronous
+            // facade, whose collection runs over this same truth and
+            // reports NothingPending first).
+            let receipt = self.foreign_receipt(attempted)?;
+            return Ok(CommitOutcome::Confirmed(receipt));
         }
-        self.submit_keys(keys, parent)
+        self.submit_keys(keys, parent, &request.ticks)
     }
 
     /// Reconciles a retained unknown attempt under the medium's lock:
@@ -859,7 +1082,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// a CLONE — the slot keeps the candidate until confirmation
     /// succeeds, so a readback failure (worker death included) retains
     /// it, never a discarded unresolved obligation.
-    pub fn reconcile_pending(&mut self) -> Result<ReconcileOutcome, PipelineError> {
+    pub fn reconcile(&mut self) -> Result<ReconcileOutcome, PipelineError> {
         let Some(attempt) = self.pending.clone() else {
             return Ok(ReconcileOutcome::NothingPending);
         };
@@ -896,13 +1119,13 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// while any possibly-installed B REPLACES A (append_for's
     /// write-at-uncertainty-or-acceptance) and is never overwritten
     /// back.
-    pub fn retry_pending(&mut self) -> Result<CommitOutcome, PipelineError> {
+    pub fn retry(&mut self) -> Result<CommitOutcome, PipelineError> {
         let Some(attempt) = self.pending.clone() else {
             return Ok(CommitOutcome::NothingPending);
         };
         self.walk_chain()?;
         let attempted: Vec<ConsequenceId> = attempt.keys.keys().copied().collect();
-        let remaining = self.remaining_keys(attempt.keys)?;
+        let remaining = remaining_keys(attempt.keys, self)?;
         if remaining.is_empty() {
             // Every attempted key is now chain-confirmed (another
             // writer's batch) — confirmed without our revision. The
@@ -912,12 +1135,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             return Ok(CommitOutcome::Confirmed(receipt));
         }
         let parent = self.verified_head.ok_or(PipelineError::UnfoundedMedium)?;
-        self.submit_keys(remaining, parent)
-    }
-
-    /// One key's pipeline view.
-    pub fn status(&self, id: ConsequenceId) -> Option<KeyStatus> {
-        self.keys.get(&id).cloned()
+        self.submit_keys(remaining, parent, &attempt.ticks)
     }
 
     /// Whether the identity is individually validated inside the
@@ -926,25 +1144,21 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         self.confirmed.contains_key(&id)
     }
 
-    /// The chain-confirmed occurrence coverage for one identity (the
-    /// per-key evidence — never a batch aggregate alone).
+    /// One confirmed key's exact occurrence coverage (the suppression
+    /// authority's span-exact form).
     pub fn confirmed_coverage(&self, id: ConsequenceId) -> Option<&[ClassifiedSpan]> {
         self.confirmed
             .get(&id)
             .map(|entry| entry.coverage.as_slice())
     }
 
-    /// The producing transaction for one chain-confirmed identity
-    /// (the per-key provenance — the transaction whose captured
-    /// effects the confirming batch installed).
+    /// One confirmed key's producing transaction.
     pub fn confirmed_transaction(&self, id: ConsequenceId) -> Option<TransactionId> {
         self.confirmed.get(&id).map(|entry| entry.transaction)
     }
 
-    /// The chain-confirmed canonical evidence per identity — the
-    /// recovery interface's provenance input (the coverage, producing
-    /// transaction, and effect commitment; a bare identity set cannot
-    /// validate journal envelopes against the canonical entries).
+    /// The confirmed evidence export (the recovery composition's
+    /// chain-side input).
     pub fn confirmed_evidence(&self) -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
         self.confirmed
             .iter()
@@ -961,19 +1175,17 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             .collect()
     }
 
-    /// The confirmed key set (the pipeline's session view).
+    /// Every chain-confirmed identity.
     pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
         self.confirmed.keys().copied().collect()
     }
 
-    /// The actual durability tier of the underlying medium (the
-    /// honest platform boundary — Windows carries the process-crash
-    /// tier, never presented as power-loss durability).
+    /// What `Accepted` establishes on this medium.
     pub fn sync_tier(&self) -> SyncTier {
         self.tier
     }
 
-    /// The authority mode from the founding record (never assumed).
+    /// The founding authority mode and campaign id.
     pub fn authority(&self) -> Option<(AuthorityMode, &str)> {
         self.founding
             .as_ref()
@@ -981,78 +1193,6 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     }
 
     // ---------------------------------------------------------- internals
-
-    /// Collects the actionable, unconfirmed journaled keys — the
-    /// batch candidates. A key claimed by two journal transactions is
-    /// a conflicting reuse and fails closed.
-    fn collect_pending_keys(&self) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
-        let mut keys: BTreeMap<ConsequenceId, AttemptedKey> = BTreeMap::new();
-        for transaction in self.journal.transactions() {
-            if !self.journal.is_actionable(transaction.id) {
-                continue;
-            }
-            for envelope in &transaction.envelopes {
-                let effect = envelope
-                    .effect_commitment()
-                    .map_err(PipelineError::Format)?;
-                if let Some(confirmed) = self.confirmed.get(&envelope.id) {
-                    // Exact provenance: the journal envelope must
-                    // match the canonical entry — the same producing
-                    // transaction, coverage, and EFFECT COMMITMENT
-                    // (identity-level equality is content-blind; the
-                    // effect commitment binds the actual authoritative
-                    // effects); a mismatch is a conflicting claim,
-                    // never silently skipped.
-                    if confirmed.transaction == transaction.id
-                        && confirmed.coverage == envelope.sub_spans
-                        && confirmed.effect == effect
-                    {
-                        continue;
-                    }
-                    return Err(PipelineError::ConfirmedProvenanceMismatch { id: envelope.id });
-                }
-                if keys.contains_key(&envelope.id) {
-                    return Err(PipelineError::ConflictingReuse { id: envelope.id });
-                }
-                keys.insert(
-                    envelope.id,
-                    (envelope.sub_spans.clone(), transaction.id, effect),
-                );
-            }
-        }
-        Ok(keys)
-    }
-
-    /// The attempted keys still unconfirmed after a re-walk (the
-    /// rebase set — identical identities and coverages). A foreign
-    /// confirmation satisfies the local attempt only under EXACT
-    /// provenance equivalence: the canonical entry must carry the
-    /// attempt's own producing transaction, coverage, and EFFECT
-    /// COMMITMENT — a mismatched transaction, coverage, or
-    /// consequential payload is a conflicting claim, never silently
-    /// absorbed.
-    fn remaining_keys(
-        &self,
-        attempted: BTreeMap<ConsequenceId, AttemptedKey>,
-    ) -> Result<BTreeMap<ConsequenceId, AttemptedKey>, PipelineError> {
-        let mut remaining = BTreeMap::new();
-        for (id, (coverage, transaction, effect)) in attempted {
-            if let Some(confirmed) = self.confirmed.get(&id) {
-                if confirmed.transaction == transaction
-                    && confirmed.coverage == coverage
-                    && confirmed.effect == effect
-                {
-                    // Confirmed by another writer's batch carrying
-                    // exactly this attempt — never re-submitted; the
-                    // per-key status promotes.
-                    continue;
-                }
-                return Err(PipelineError::ConfirmedProvenanceMismatch { id });
-            }
-            remaining.insert(id, (coverage, transaction, effect));
-        }
-        Ok(remaining)
-    }
 
     /// Builds the batch for `keys`, submits it against `parent`, and
     /// handles the stale-rebase once. The idempotency key is the
@@ -1063,8 +1203,9 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         &mut self,
         keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
+        ticks: &BTreeMap<TransactionId, u64>,
     ) -> Result<CommitOutcome, PipelineError> {
-        let (attempt, outcome) = self.append_for(keys.clone(), parent)?;
+        let (attempt, outcome) = self.append_for(keys.clone(), parent, ticks)?;
         match outcome {
             AppendOutcome::Accepted { id, tier: _ } => {
                 if id != attempt.record.id() {
@@ -1080,7 +1221,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 // determines the now-confirmed keys.
                 self.walk_chain()?;
                 let attempted: Vec<ConsequenceId> = keys.keys().copied().collect();
-                let remaining = self.remaining_keys(keys)?;
+                let remaining = remaining_keys(keys, self)?;
                 if remaining.is_empty() {
                     // Every attempted key is now chain-confirmed (another
                     // writer's batch) — confirmed without our revision. The
@@ -1097,7 +1238,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 let observed_parent = observed
                     .or(self.verified_head)
                     .ok_or(PipelineError::UnfoundedMedium)?;
-                let (attempt, outcome) = self.append_for(remaining, observed_parent)?;
+                let (attempt, outcome) = self.append_for(remaining, observed_parent, ticks)?;
                 match outcome {
                     AppendOutcome::Accepted { id, tier: _ } => {
                         if id != attempt.record.id() {
@@ -1158,8 +1299,9 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
 
     /// Builds the batch content object and the revision record for
     /// `keys` on `parent`, and appends. The tick derives
-    /// deterministically from the batched transactions (retry
-    /// stability).
+    /// deterministically from the batched transactions' journaled
+    /// positions (retry stability — carried frozen in the request and
+    /// the retained attempt).
     ///
     /// THE CANDIDATE-STATE RULE (PP-B4 checkpoint 2, the preflight's
     /// four-state lifecycle): a DEFINITE pre-commit failure (the
@@ -1176,6 +1318,7 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         &mut self,
         keys: BTreeMap<ConsequenceId, AttemptedKey>,
         parent: Hash,
+        ticks: &BTreeMap<TransactionId, u64>,
     ) -> Result<(PendingAttempt, AppendOutcome), PipelineError> {
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(keys.len());
         let mut tick: u64 = 0;
@@ -1186,8 +1329,8 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 coverage: coverage.clone(),
                 effect: *effect,
             });
-            if let Some(status) = self.journal_transactions_lookup(*transaction) {
-                tick = tick.max(status);
+            if let Some(position) = ticks.get(transaction) {
+                tick = tick.max(*position);
             }
         }
         let batch = ConsequenceBatch { entries };
@@ -1207,22 +1350,13 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             record,
             batch_hash,
             keys,
+            ticks: ticks.clone(),
         };
         // Write-at-uncertainty-or-acceptance: the retained candidate
         // precedes every further fallible step (the readback included);
         // cleared only by verified confirmation.
         self.pending = Some(attempt.clone());
         Ok((attempt, outcome))
-    }
-
-    /// The position tick of one journal transaction (retry-stable
-    /// record derivation).
-    fn journal_transactions_lookup(&self, transaction: TransactionId) -> Option<u64> {
-        self.journal
-            .transactions()
-            .iter()
-            .find(|committed| committed.id == transaction)
-            .map(|committed| committed.position.tick)
     }
 
     /// The confirmation procedure: the verified read-back walk (a
@@ -1266,12 +1400,10 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 });
             }
         }
-        for id in attempt.keys.keys() {
-            if let Some(status) = self.keys.get_mut(id) {
-                status.phase = KeyPhase::InConfirmedChain;
-                status.revision = Some(revision);
-            }
-        }
+        // The attempted keys' phase promotion (today's in-confirm
+        // loop) is the facade's post-operation promote_from — the
+        // walk completed, so it runs; the entry's confirming revision
+        // is the validated one.
         let (authority, _) = self
             .founding
             .as_ref()
@@ -1461,12 +1593,10 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             self.verified_head = Some(id);
             self.verified_epoch = record.epoch;
         }
-        for (id, status) in &mut self.keys {
-            if let Some(confirmed) = self.confirmed.get(id) {
-                status.phase = KeyPhase::InConfirmedChain;
-                status.revision = Some(confirmed.revision);
-            }
-        }
+        // A completed walk (today's walk-closing promotion trigger —
+        // the facade promotes tracked keys exactly when this
+        // advances).
+        self.walk_rounds += 1;
         Ok(())
     }
 
@@ -1499,6 +1629,215 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// them exactly as before.
     fn read_verified(&mut self, hash: &Hash) -> Result<Vec<u8>, PipelineError> {
         Ok(self.medium.read_object(hash)?)
+    }
+}
+
+impl<M: CanonicalMedium> CommitPipeline<M> {
+    /// Opens the pipeline: the journal's committed transactions seed
+    /// the per-key tracking (the T1 state is durable across sessions),
+    /// then the session-open chain walk (O(chain), documented honestly
+    /// — never per tick) collects every chain-confirmed key from the
+    /// `consequence-batch/1` objects, promotes them, and establishes
+    /// the founding authority.
+    pub fn open(medium: M, journal: T1Journal) -> Result<Self, PipelineError> {
+        let mut authority = CommitAuthority::open(journal);
+        let verifier = CommitVerifier::open(medium)?;
+        authority.promote_from(&verifier);
+        Ok(CommitPipeline {
+            authority,
+            verifier,
+        })
+    }
+
+    /// The pipeline's journal (read-only access — the rotation's
+    /// classification and the diagnostics read the durable T1
+    /// state; the instance and its sidecar lock stay owned here).
+    pub fn journal(&self) -> &T1Journal {
+        self.authority.journal()
+    }
+
+    /// Stages one consequential envelope — the in-memory accrual
+    /// (never guaranteed across a crash). A tracked identity staged
+    /// again with different content is a conflicting reuse and fails
+    /// closed; a byte-identical restage is a no-op.
+    pub fn stage(&mut self, envelope: ConsequenceEnvelope) -> Result<(), PipelineError> {
+        self.authority.stage(envelope)
+    }
+
+    /// Discards staged (in-memory, uncaptured) envelopes for the given
+    /// identities — the failed-boundary path: effects staged but never
+    /// captured are in-memory pending only; discarding them never
+    /// touches journaled or confirmed keys (P0-5 — in-memory state is
+    /// honestly lost). A retried boundary re-stages identical bytes.
+    pub fn discard_staged(&mut self, ids: &[ConsequenceId]) {
+        self.authority.discard_staged(ids)
+    }
+
+    /// The capture boundary: journals the staged consequences as one
+    /// T1 transaction (the receipt returns only after the journal's
+    /// fsync). An ambiguous commit outcome is reconciled immediately
+    /// — reread and verified, never guessed; the recovery of a valid
+    /// committed frame is **not** a fabricated acknowledgment. An
+    /// aborted capture is retry-safe with the staged set retained.
+    pub fn capture(
+        &mut self,
+        position: SourcePosition,
+        classification: DurabilityClass,
+        dependencies: Vec<TransactionId>,
+        frontier: Vec<FrontierEntry>,
+        plan: Vec<u8>,
+    ) -> Result<CaptureReceipt, PipelineError> {
+        self.authority
+            .capture(position, classification, dependencies, frontier, plan)
+    }
+
+    /// Appends a validated, durable, reason-coded cancellation for a
+    /// journaled transaction (the pipeline proxies the journal —
+    /// supersession is the explicit durable record, never a higher
+    /// sequence).
+    pub fn cancel_transaction(
+        &mut self,
+        target: TransactionId,
+        reason: CancellationReason,
+        detail: &[u8],
+    ) -> Result<u64, PipelineError> {
+        self.authority.cancel_transaction(target, reason, detail)
+    }
+
+    /// The application reports effects applied to the live
+    /// authoritative state (the pending-vs-confirmed distinction —
+    /// never conflated with durability). A key must be journaled
+    /// first (durable-before-discard).
+    pub fn mark_applied(&mut self, keys: &[ConsequenceId]) -> Result<(), PipelineError> {
+        self.authority.mark_applied(keys)
+    }
+
+    /// Prepares the canonical batch from every actionable,
+    /// unconfirmed journaled key and submits it against the verified
+    /// head. Canceled transactions are excluded (superseded — never
+    /// canonically committed); chain-confirmed keys are never
+    /// re-batched.
+    pub fn commit_canonical(&mut self) -> Result<CommitOutcome, PipelineError> {
+        // Today's walk-closing promotion: the authority promotes
+        // tracked keys exactly when a walk completed during the
+        // operation (the truth only advances inside completed walks,
+        // so an unchanged count means no promotion is due — today's
+        // error paths before any walk promoted nothing).
+        let before = self.verifier.completed_walks();
+        let result = self.commit_canonical_inner();
+        if self.verifier.completed_walks() != before {
+            self.authority.promote_from(&self.verifier);
+        }
+        result
+    }
+
+    fn commit_canonical_inner(&mut self) -> Result<CommitOutcome, PipelineError> {
+        if let Some(revision) = self.verifier.pending_revision() {
+            return Err(PipelineError::AttemptUnresolved { revision });
+        }
+        if self.verifier.verified_head().is_none() {
+            return Err(PipelineError::UnfoundedMedium);
+        }
+        let keys = self.authority.collect_actionable(&self.verifier)?;
+        if keys.is_empty() {
+            return Ok(CommitOutcome::NothingPending);
+        }
+        let ticks = self.authority.transaction_ticks(&keys);
+        self.verifier.submit(CommitRequest { keys, ticks })
+    }
+
+    /// Reconciles a retained unknown attempt under the medium's lock:
+    /// `Installed` still requires the full read-back walk and the
+    /// individual per-key validation before confirmation; otherwise
+    /// the attempt is retained (retry-safe or unverifiable — never
+    /// falsely confirmed).
+    ///
+    /// PP-B4 checkpoint 2's exception safety: the verification runs on
+    /// a CLONE — the slot keeps the candidate until confirmation
+    /// succeeds, so a readback failure (worker death included) retains
+    /// it, never a discarded unresolved obligation.
+    pub fn reconcile_pending(&mut self) -> Result<ReconcileOutcome, PipelineError> {
+        let before = self.verifier.completed_walks();
+        let result = self.verifier.reconcile();
+        if self.verifier.completed_walks() != before {
+            self.authority.promote_from(&self.verifier);
+        }
+        result
+    }
+
+    /// Retries a retained attempt (after `NotInstalled`, or a stale
+    /// parent): re-walks the chain first (determining keys another
+    /// writer may have confirmed — never re-submitted), then
+    /// re-submits the remaining per-key identities — the same record
+    /// bytes when the parent still matches, the rebase (identical
+    /// identities and coverages, new parent) when it does not.
+    ///
+    /// PP-B4 checkpoint 2's exception safety: the ORIGINAL candidate
+    /// stays in the slot through every pre-submission fallible step
+    /// (the walk, the remaining-keys derivation, the foreign receipt —
+    /// the slot clears only after that receipt verifies); the
+    /// re-submission then owns the transition — a definite pre-commit
+    /// failure of candidate B leaves the original A (its
+    /// `NotInstalled` disposition stands; a later retry re-derives),
+    /// while any possibly-installed B REPLACES A (append_for's
+    /// write-at-uncertainty-or-acceptance) and is never overwritten
+    /// back.
+    pub fn retry_pending(&mut self) -> Result<CommitOutcome, PipelineError> {
+        let before = self.verifier.completed_walks();
+        let result = self.verifier.retry();
+        if self.verifier.completed_walks() != before {
+            self.authority.promote_from(&self.verifier);
+        }
+        result
+    }
+
+    /// One key's pipeline view.
+    pub fn status(&self, id: ConsequenceId) -> Option<KeyStatus> {
+        self.authority.status(id)
+    }
+
+    /// Whether the identity is individually validated inside the
+    /// verified canonical chain (the suppression authority).
+    pub fn is_confirmed(&self, id: ConsequenceId) -> bool {
+        self.verifier.is_confirmed(id)
+    }
+
+    /// The chain-confirmed occurrence coverage for one identity (the
+    /// per-key evidence — never a batch aggregate alone).
+    pub fn confirmed_coverage(&self, id: ConsequenceId) -> Option<&[ClassifiedSpan]> {
+        self.verifier.confirmed_coverage(id)
+    }
+
+    /// The producing transaction for one chain-confirmed identity
+    /// (the per-key provenance — the transaction whose captured
+    /// effects the confirming batch installed).
+    pub fn confirmed_transaction(&self, id: ConsequenceId) -> Option<TransactionId> {
+        self.verifier.confirmed_transaction(id)
+    }
+
+    /// The chain-confirmed canonical evidence per identity — the
+    /// recovery interface's provenance input (the coverage, producing
+    /// transaction, and effect commitment; a bare identity set cannot
+    /// validate journal envelopes against the canonical entries).
+    pub fn confirmed_evidence(&self) -> BTreeMap<ConsequenceId, ConfirmedEvidence> {
+        self.verifier.confirmed_evidence()
+    }
+
+    /// The confirmed key set (the pipeline's session view).
+    pub fn confirmed_keys(&self) -> Vec<ConsequenceId> {
+        self.verifier.confirmed_keys()
+    }
+
+    /// The actual durability tier of the underlying medium (the
+    /// honest platform boundary — Windows carries the process-crash
+    /// tier, never presented as power-loss durability).
+    pub fn sync_tier(&self) -> SyncTier {
+        self.verifier.sync_tier()
+    }
+
+    /// The authority mode from the founding record (never assumed).
+    pub fn authority(&self) -> Option<(AuthorityMode, &str)> {
+        self.verifier.authority()
     }
 }
 
@@ -1770,9 +2109,10 @@ mod tests {
             record: RevisionRecord::regular(confirmation.revision, confirmation.epoch, 101),
             batch_hash: object.hash(),
             keys,
+            ticks: BTreeMap::new(),
         };
         assert!(matches!(
-            pipeline.confirm(attempt),
+            pipeline.verifier.confirm(attempt),
             Err(PipelineError::ConfirmationInvalid {
                 detail: "payload-mismatch-in-confirmed-batch"
             })
@@ -1800,9 +2140,10 @@ mod tests {
             record: RevisionRecord::regular(confirmation.revision, confirmation.epoch, 101),
             batch_hash,
             keys,
+            ticks: BTreeMap::new(),
         };
         assert!(matches!(
-            pipeline.confirm(attempt),
+            pipeline.verifier.confirm(attempt),
             Err(PipelineError::ConfirmationInvalid {
                 detail: "batch-key-set-mismatch"
             })
@@ -2002,13 +2343,13 @@ mod tests {
             Err(PipelineError::ConflictingReuse { .. })
         ));
         // A byte-identical restage is a no-op.
-        let staged = pipeline.staged.len();
+        let staged = pipeline.authority.staged.len();
         pipeline.stage(staged_envelope(2)).unwrap();
-        assert_eq!(pipeline.staged.len(), staged + 1);
-        let before = pipeline.staged.len();
+        assert_eq!(pipeline.authority.staged.len(), staged + 1);
+        let before = pipeline.authority.staged.len();
         pipeline.stage(staged_envelope(2)).unwrap();
         assert_eq!(
-            pipeline.staged.len(),
+            pipeline.authority.staged.len(),
             before,
             "the identical restage is a no-op"
         );
@@ -2819,25 +3160,26 @@ mod tests {
         // each classify each object they examine at most once).
         assert!(
             pipeline
+                .verifier
                 .medium
                 .classify_calls
                 .values()
                 .all(|count| *count == 1),
             "no object classified more than once per walk: {:?}",
-            pipeline.medium.classify_calls
+            pipeline.verifier.medium.classify_calls
         );
         // The classification covered the three snapshots (the
         // internal verified reads) — the implied internal volume is
         // honest, NOT zero.
-        assert!(pipeline.medium.classify_volume >= 3 * 24 * 1024);
+        assert!(pipeline.verifier.medium.classify_volume >= 3 * 24 * 1024);
         // The caller-visible transfer excludes the snapshot bodies:
         // only the consequence batch (small) was read back in full.
         assert!(
-            pipeline.medium.read_bytes < 8 * 1024,
+            pipeline.verifier.medium.read_bytes < 8 * 1024,
             "the snapshot bodies must not transfer to the caller: {} bytes",
-            pipeline.medium.read_bytes
+            pipeline.verifier.medium.read_bytes
         );
-        assert_eq!(pipeline.medium.read_calls.len(), 1);
+        assert_eq!(pipeline.verifier.medium.read_calls.len(), 1);
     }
 
     /// The deferred-walk shape done properly (the hardware finding's
@@ -2926,6 +3268,364 @@ mod tests {
         assert!(
             error.to_string().contains("missing") || error.to_string().contains("Missing"),
             "the missing object fails the walk: {error}"
+        );
+    }
+
+    // ------------------------------------------------ the 1-A split composition
+    //
+    // The five focused proofs that the authority/verifier composition
+    // produces the same decisions and outputs as the accepted
+    // single-struct pipeline — each drives the HALVES explicitly
+    // (the future actor's exact protocol: derive the immutable
+    // request on the authority, process it in the verifier, promote
+    // from the verifier's post-operation truth), then checks the
+    // facade over the same state agrees.
+
+    /// A captured transaction subsequently canceled before any
+    /// canonical submission is never collected, never submitted, and
+    /// stays T1-pending — through the explicit composition and the
+    /// facade alike.
+    #[test]
+    fn split_composition_captured_then_canceled_never_submitted() {
+        let dir = TestDir::new("split-canceled");
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let mut authority = CommitAuthority::open(journal);
+        let verifier = CommitVerifier::open(clean_medium(&dir)).unwrap();
+        authority.promote_from(&verifier);
+        authority.stage(staged_envelope(1)).unwrap();
+        let boundary = boundary(1);
+        let receipt = authority
+            .capture(
+                boundary.position,
+                boundary.classification,
+                boundary.dependencies,
+                boundary.frontier,
+                boundary.plan,
+            )
+            .unwrap();
+        authority
+            .cancel_transaction(
+                receipt.journal.id,
+                CancellationReason::ApplicationPolicy,
+                b"policy",
+            )
+            .unwrap();
+        // The authority's actionable derivation excludes the canceled
+        // transaction: nothing to submit.
+        let keys = authority.collect_actionable(&verifier).unwrap();
+        assert!(keys.is_empty(), "the canceled capture is not actionable");
+        // The facade over the SAME halves agrees — and the canceled
+        // key's phase never advances past T1.
+        let mut pipeline = CommitPipeline {
+            authority,
+            verifier,
+        };
+        assert!(matches!(
+            pipeline.commit_canonical().unwrap(),
+            CommitOutcome::NothingPending
+        ));
+        assert_eq!(
+            pipeline.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
+            KeyPhase::JournaledT1,
+            "the canceled transaction's key stays T1-pending, never submitted"
+        );
+    }
+
+    /// Multiple actionable transactions compose into one batch
+    /// through the split; two journal transactions claiming ONE
+    /// identity fail the collection closed — the halves and the
+    /// facade produce the same decisions.
+    #[test]
+    fn split_composition_overlapping_and_conflicting_transactions() {
+        let dir = TestDir::new("split-overlap");
+        let mut pipeline = fresh_pipeline(&dir);
+        // Two actionable transactions (adjacent coverages, distinct
+        // identities): the explicit derivation collects BOTH and
+        // freezes BOTH producing transactions' ticks into the
+        // request.
+        capture_index(&mut pipeline, 1);
+        capture_index(&mut pipeline, 2);
+        let keys = pipeline
+            .authority
+            .collect_actionable(&pipeline.verifier)
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+        let ticks = pipeline.authority.transaction_ticks(&keys);
+        assert_eq!(
+            ticks.len(),
+            2,
+            "each producing transaction's tick is frozen"
+        );
+        let CommitOutcome::Confirmed(receipt) = pipeline.commit_canonical().unwrap() else {
+            panic!("expected confirmation");
+        };
+        assert_eq!(
+            receipt.keys,
+            vec![ConsequenceId::new(1, 1, 1), ConsequenceId::new(1, 2, 1)]
+        );
+        assert!(pipeline.is_confirmed(ConsequenceId::new(1, 1, 1)));
+        assert!(pipeline.is_confirmed(ConsequenceId::new(1, 2, 1)));
+
+        // Conflicting identities: a second journal transaction
+        // claiming an already-captured (unconfirmed) identity — built
+        // directly through the journal (the pipeline is dropped
+        // first: the journal's flock is held for the instance
+        // lifetime). Both the authority's derivation and the facade
+        // fail closed.
+        capture_index(&mut pipeline, 3);
+        drop(pipeline);
+        let mut raw = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let boundary = boundary(9);
+        let input = TransactionInput {
+            envelopes: vec![staged_envelope(3)],
+            position: boundary.position,
+            classification: boundary.classification,
+            dependencies: boundary.dependencies,
+            frontier: boundary.frontier,
+            plan: b"plan-other".to_vec(),
+        };
+        raw.append_transaction(&input).unwrap();
+        drop(raw);
+        let mut pipeline = fresh_pipeline(&dir);
+        assert!(matches!(
+            pipeline.authority.collect_actionable(&pipeline.verifier),
+            Err(PipelineError::ConflictingReuse { .. })
+        ));
+        assert!(matches!(
+            pipeline.commit_canonical(),
+            Err(PipelineError::ConflictingReuse { .. })
+        ));
+    }
+
+    /// A retained unknown attempt survives the failed verification
+    /// (the lost acknowledgment) in the VERIFIER half — visible
+    /// through the halves, refusing new submissions — and the retry
+    /// re-derives the record from the FROZEN request ticks (the
+    /// verifier is journal-blind; the retained snapshot must carry
+    /// everything).
+    #[test]
+    fn split_composition_unknown_attempt_survives_and_retries_from_frozen_ticks() {
+        let dir = TestDir::new("split-unknown-retry");
+        // Founded through a clean instance; the pipeline's medium
+        // fails BEFORE the rename — Unknown, nothing installed.
+        ensure_founded(&dir);
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let medium = LocalFileMedium::open_with(
+            dir.store(),
+            Some(FaultControl::new().arm(FaultPoint::HeadTmpWritten, FaultAction::InjectError)),
+        )
+        .unwrap();
+        let mut pipeline = CommitPipeline::open(medium, journal).unwrap();
+        capture_index(&mut pipeline, 1);
+        let revision = match pipeline.commit_canonical().unwrap() {
+            CommitOutcome::Unknown { revision, .. } => revision,
+            other => panic!("expected Unknown, observed {other:?}"),
+        };
+        // The attempt is RETAINED in the verifier half — never
+        // dropped by the failed verification.
+        assert_eq!(pipeline.verifier.pending_revision(), Some(revision));
+        // A new submission is refused while the attempt is
+        // unresolved (identity exactness) — through the facade AND
+        // the verifier's own submit.
+        assert!(matches!(
+            pipeline.commit_canonical(),
+            Err(PipelineError::AttemptUnresolved { revision: pending }) if pending == revision
+        ));
+        assert!(matches!(
+            pipeline.verifier.submit(CommitRequest {
+                keys: BTreeMap::new(),
+                ticks: BTreeMap::new(),
+            }),
+            Err(PipelineError::AttemptUnresolved { revision: pending }) if pending == revision
+        ));
+        // The verified absence, then the retry FROM THE RETAINED
+        // ATTEMPT: on the still-faulted medium the retry stays
+        // ambiguous — and the re-derived record is IDENTITY-STABLE
+        // (the same parent, epoch, and FROZEN request ticks re-derive
+        // the identical record bytes — the verifier is journal-blind;
+        // the retained snapshot carries everything).
+        assert_eq!(
+            pipeline.reconcile_pending().unwrap(),
+            ReconcileOutcome::NotInstalled
+        );
+        match pipeline.retry_pending().unwrap() {
+            CommitOutcome::Unknown {
+                revision: retried, ..
+            } => {
+                assert_eq!(
+                    retried, revision,
+                    "the retry re-derives the identical record from the frozen ticks"
+                );
+            }
+            other => {
+                panic!("expected the retry to stay ambiguous on the faulted medium: {other:?}")
+            }
+        }
+        // The attempt SURVIVED the second failed verification too —
+        // never dropped, never confirmed.
+        assert_eq!(pipeline.verifier.pending_revision(), Some(revision));
+        assert_eq!(
+            pipeline.reconcile_pending().unwrap(),
+            ReconcileOutcome::NotInstalled
+        );
+        // Recovery through a clean instance (the crash-recovery
+        // shape): the same content identity installs exactly once —
+        // the same journal evidence, one revision.
+        drop(pipeline);
+        let mut recovered = fresh_pipeline(&dir);
+        let CommitOutcome::Confirmed(confirmation) = recovered.commit_canonical().unwrap() else {
+            panic!("expected confirmation");
+        };
+        assert_eq!(confirmation.keys, vec![ConsequenceId::new(1, 1, 1)]);
+        assert_eq!(
+            recovered.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
+            KeyPhase::InConfirmedChain
+        );
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(check.validate().unwrap().records, 2, "one revision only");
+    }
+
+    /// No confirmation exists before the full individual-key
+    /// verification: a lying attempt (a coverage the confirmed batch
+    /// never carried) fails the per-key validation through the
+    /// verifier half, and the authority's tracked phase never
+    /// advances — never a false T3.
+    #[test]
+    fn split_composition_no_receipt_before_individual_key_verification() {
+        let dir = TestDir::new("split-no-false-receipt");
+        let mut pipeline = fresh_pipeline(&dir);
+        let transaction = capture_index(&mut pipeline, 1);
+        let CommitOutcome::Confirmed(confirmation) = pipeline.commit_canonical().unwrap() else {
+            panic!("expected confirmation");
+        };
+        // A second captured key stays pending while the lying attempt
+        // is rejected — the honest key is never conflated.
+        let pending = capture_index(&mut pipeline, 2);
+        let _ = pending;
+        // The lying attempt: the identity the confirmed batch DID
+        // carry, but with a coverage it never did.
+        let real = ConsequenceBatch {
+            entries: vec![BatchEntry {
+                id: ConsequenceId::new(1, 1, 1),
+                transaction,
+                coverage: vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(0, 2).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                effect: staged_envelope(1).effect_commitment().unwrap(),
+            }],
+        };
+        let object = StoredObject::new(real.canonical_bytes().unwrap()).unwrap();
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            ConsequenceId::new(1, 1, 1),
+            (
+                vec![ClassifiedSpan {
+                    span: OccurrenceSpan::new(99, 100).unwrap(),
+                    class: DurabilityClass::DurableEligible,
+                }],
+                transaction,
+                staged_envelope(1).effect_commitment().unwrap(),
+            ),
+        );
+        let attempt = PendingAttempt {
+            record: RevisionRecord::regular(confirmation.revision, confirmation.epoch, 101),
+            batch_hash: object.hash(),
+            keys,
+            ticks: BTreeMap::new(),
+        };
+        // The individual validation fails closed through the verifier
+        // half — no Confirmed receipt, no promotion on the authority
+        // side.
+        assert!(matches!(
+            pipeline.verifier.confirm(attempt),
+            Err(PipelineError::ConfirmationInvalid {
+                detail: "payload-mismatch-in-confirmed-batch"
+            })
+        ));
+        assert_eq!(
+            pipeline.status(ConsequenceId::new(1, 2, 1)).unwrap().phase,
+            KeyPhase::JournaledT1,
+            "the honestly captured key is never promoted by a rejected attempt"
+        );
+        assert!(!pipeline.is_confirmed(ConsequenceId::new(1, 2, 1)));
+    }
+
+    /// The explicit composition protocol end-to-end: the authority
+    /// derives the immutable request, the verifier processes it to a
+    /// verified Confirmed, and the authority's promote_from advances
+    /// every tracked key to InConfirmedChain at exactly the
+    /// confirming revision — the facade's semantics, driven by hand.
+    #[test]
+    fn split_composition_promotes_confirmed_keys_after_verification() {
+        let dir = TestDir::new("split-promotion");
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let mut authority = CommitAuthority::open(journal);
+        let mut verifier = CommitVerifier::open(clean_medium(&dir)).unwrap();
+        authority.promote_from(&verifier);
+        // Two captured keys, one reported applied to live state (the
+        // pending-vs-confirmed distinction survives the split).
+        authority.stage(staged_envelope(1)).unwrap();
+        let first = boundary(1);
+        authority
+            .capture(
+                first.position,
+                first.classification,
+                first.dependencies,
+                first.frontier,
+                first.plan,
+            )
+            .unwrap();
+        authority.stage(staged_envelope(2)).unwrap();
+        let second = boundary(2);
+        authority
+            .capture(
+                second.position,
+                second.classification,
+                second.dependencies,
+                second.frontier,
+                second.plan,
+            )
+            .unwrap();
+        authority
+            .mark_applied(&[ConsequenceId::new(1, 1, 1)])
+            .unwrap();
+        assert_eq!(
+            authority.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
+            KeyPhase::AppliedToLivePending
+        );
+        // The composition: derive → submit → promote.
+        let keys = authority.collect_actionable(&verifier).unwrap();
+        assert_eq!(keys.len(), 2);
+        let ticks = authority.transaction_ticks(&keys);
+        let CommitOutcome::Confirmed(receipt) =
+            verifier.submit(CommitRequest { keys, ticks }).unwrap()
+        else {
+            panic!("expected confirmation");
+        };
+        assert_eq!(
+            receipt.keys,
+            vec![ConsequenceId::new(1, 1, 1), ConsequenceId::new(1, 2, 1)]
+        );
+        assert_eq!(
+            verifier.completed_walks(),
+            2,
+            "the open walk plus the confirmation walk"
+        );
+        authority.promote_from(&verifier);
+        // Both keys promoted at exactly the confirming revision.
+        for id in [ConsequenceId::new(1, 1, 1), ConsequenceId::new(1, 2, 1)] {
+            let status = authority.status(id).unwrap();
+            assert_eq!(status.phase, KeyPhase::InConfirmedChain);
+            assert_eq!(status.revision, Some(receipt.revision));
+            assert!(verifier.is_confirmed(id));
+        }
+        // A SECOND promotion pass is idempotent (the facade runs it
+        // after every operation).
+        authority.promote_from(&verifier);
+        assert_eq!(
+            authority.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
+            KeyPhase::InConfirmedChain
         );
     }
 }

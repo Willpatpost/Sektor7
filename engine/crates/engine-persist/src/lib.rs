@@ -93,9 +93,10 @@ pub use migrate::{
     cutover_seal_activate, migrate_local_to_sqlite,
 };
 pub use pipeline::{
-    BatchEntry, CONSEQUENCE_BATCH_DOMAIN, CaptureReceipt, CommitOutcome, CommitPipeline,
-    ConfirmationLabel, ConfirmationReceipt, ConsequenceBatch, KeyPhase, KeyStatus, PipelineError,
-    ReconcileOutcome,
+    AttemptedKey, BatchEntry, CONSEQUENCE_BATCH_DOMAIN, CaptureReceipt, CommitAuthority,
+    CommitOutcome, CommitPipeline, CommitRequest, CommitVerifier, ConfirmationLabel,
+    ConfirmationReceipt, ConfirmedEntry, ConfirmedView, ConsequenceBatch, KeyPhase, KeyStatus,
+    PipelineError, ReconcileOutcome,
 };
 pub use reclaim::{
     RECLAMATION_LEDGER_DOMAIN, RECLAMATION_LEDGER_KEY_DOMAIN, RECLAMATION_LEDGER_VERSION,
