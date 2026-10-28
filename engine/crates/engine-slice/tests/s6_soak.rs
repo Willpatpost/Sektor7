@@ -33,12 +33,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use engine_core::{EventClass, EventSpec, Field, LodLevel, Schedule, Tick};
+use engine_core::{EventClass, EventId, EventSpec, Field, LodLevel, Schedule, Tick};
 use engine_persist::{
     AuthorityMode, CanonicalMedium, DurabilityClass, RevisionRecord, SourcePosition, T1Journal,
     TransactionInput,
 };
-use engine_slice::crossing::DeactivationPlan;
+use engine_slice::crossing::{DeactivationPlan, PlanObligation};
 use engine_slice::orchestration::{OrchestratedSession, PublicationOutcome};
 use engine_slice::persist_demo::{
     DEMO_PRESENCE, DemoOptions, PersistDemo, SoakDrain, demo_scenario, publish_soak_summary,
@@ -741,25 +741,25 @@ fn an_interrupted_run_recovers_from_the_durable_state() {
 // interruption a pure function of the LOGICAL tick: the identical
 // campaign state on every platform.
 
-/// §7D (deterministic): the controlled hard exit (reserved code 9)
-/// at the completed tick-1025 boundary — after region 0's first
-/// journaled deactivation (the plan whose journal-verified
-/// from_level differs from the anchor snapshot's live level — the
-/// unjournaled live-to-live reclassification the recovery replay
-/// must reconstruct) and before the next publication. The relaunch
-/// must recover and continue coherently for 30 additional ticks.
-///
-/// Known boundary (honest, deliberately NOT asserted here): the
-/// post-close state of this early-window recovery currently fails a
-/// THIRD process's restore at the spine allocation-frontier gate —
-/// a separate, pre-existing latent defect in the replay install's
-/// bookkeeping (the reconstructed obligations' ids post-date the
-/// snapshot's allocation frontier, which the recovery never
-/// adopts). This regression pins the first-recovery contract — the
-/// snapshot-plus-journal assessment the corrective owns; the
-/// frontier adoption is the documented follow-up.
+/// §7D (deterministic, the D-guard interim semantics): the
+/// controlled hard exit (reserved code 9) at the completed
+/// tick-1025 boundary — after region 0's first journaled
+/// deactivation and before the next publication. The plan's
+/// obligation identities (seqs 21380..21786) lie far beyond the
+/// anchor snapshot's allocation frontier (1000): the lost session's
+/// allocation and execution history for that range was never
+/// durably saved, so NO coherent identity-preserving reconstruction
+/// exists. **THE TEMPORARY D-ONLY LIMITATION, UNMISTAKABLE:** this
+/// early-window campaign is NOT recovered by the fail-closed guard
+/// — the recovery REFUSES with the typed insufficient-evidence
+/// error, honestly, BEFORE any mutation or publication (never the
+/// pre-guard behavior: a misleading successful close followed by a
+/// corrupt reopen). Durable recovery of this campaign shape awaits
+/// the covering-publication protocol (the C design, held); the
+/// guard is the interim safety contract, never a claim of
+/// successful recovery.
 #[test]
-fn deterministic_early_window_hard_exit_recovers() {
+fn deterministic_early_window_hard_exit_refused_with_typed_insufficient_evidence() {
     let root = std::env::temp_dir().join(format!(
         "s7-s6c4-early-window-{}",
         std::time::SystemTime::now()
@@ -801,26 +801,43 @@ fn deterministic_early_window_hard_exit_recovers() {
     let stdout = String::from_utf8_lossy(&relaunch.stdout);
     let stderr = String::from_utf8_lossy(&relaunch.stderr);
     assert!(
-        relaunch.status.success(),
-        "the early-window interrupted campaign recovers and continues \
-         (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        relaunch.status.code()
-    );
-    assert!(stdout.contains("campaign: recovered"), "{stdout}");
-    // The snapshot-plus-journal contract: the anchor snapshot's spine
-    // (tick 0) — the post-snapshot execution history was never
-    // durably saved and is honestly not reproduced.
-    assert!(stdout.contains("recovered at tick 0"), "{stdout}");
-    // The coherent 30-tick continuation and the graceful close: the
-    // whole-campaign conservation holds, no debt outstanding, and the
-    // required settlement left no T1-durable consequence unresolved.
-    assert!(
-        stdout.contains("closed at tick 30 · ticks due 30 · outstanding 0 · conservation true"),
-        "{stdout}"
+        !relaunch.status.success(),
+        "the early-window campaign is REFUSED (the D-only interim — \
+         never a misleading successful close):\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("required settled true · failure None"),
-        "{stdout}"
+        stdout.is_empty(),
+        "the refusal precedes any report or publication: {stdout}"
+    );
+    // The typed, distinguishable insufficient-evidence class with
+    // the exact measured numbers (the deterministic scenario's
+    // allocation at tick 1020 vs the anchor's founding frontier).
+    assert!(
+        stderr.contains("RecoveryInsufficient { region: 0, identity: 21380, frontier: 1000 }"),
+        "the typed refusal with the fixture's measured values:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the durable state is untouched"),
+        "the refusal preserves the durable campaign state:\n{stderr}"
+    );
+    // NO new snapshot was written: a second relaunch observes the
+    // IDENTICAL refusal — the campaign state did not move.
+    let relaunch2 = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "30",
+        ])
+        .output()
+        .expect("the second relaunch spawns");
+    let stderr2 = String::from_utf8_lossy(&relaunch2.stderr);
+    assert!(
+        !relaunch2.status.success()
+            && stderr2.replace(root.to_str().unwrap(), "<dir>")
+                == stderr.replace(root.to_str().unwrap(), "<dir>"),
+        "the refusal is idempotent — no snapshot, no state change:\n{stderr2}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -895,15 +912,72 @@ fn deterministic_late_window_hard_exit_control_recovers() {
         stdout.contains("required settled true · failure None"),
         "{stdout}"
     );
+    // C' — the THIRD process reopens the B'-close and continues
+    // (the repeated-recovery integrity contract).
+    let third = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "10",
+        ])
+        .output()
+        .expect("the third process spawns");
+    let stdout3 = String::from_utf8_lossy(&third.stdout);
+    let stderr3 = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        third.status.success(),
+        "the B'-close reopens (exit {:?}):\nstdout:\n{stdout3}\nstderr:\n{stderr3}",
+        third.status.code()
+    );
+    assert!(stdout3.contains("recovered at tick 3084"), "{stdout3}");
+    assert!(
+        stdout3
+            .contains("closed at tick 3094 · ticks due 3094 · outstanding 0 · conservation true"),
+        "{stdout3}"
+    );
+    // D' — the FOURTH process reopens again: the repeated-recovery
+    // integrity holds through every generation (the central
+    // acceptance condition — recovery never produces a durably
+    // saved campaign that is structurally invalid on its reopen).
+    let fourth = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "5",
+        ])
+        .output()
+        .expect("the fourth process spawns");
+    let stdout4 = String::from_utf8_lossy(&fourth.stdout);
+    let stderr4 = String::from_utf8_lossy(&fourth.stderr);
+    assert!(
+        fourth.status.success(),
+        "the C'-close reopens again (exit {:?}):\nstdout:\n{stdout4}\nstderr:\n{stderr4}",
+        fourth.status.code()
+    );
+    assert!(stdout4.contains("recovered at tick 3094"), "{stdout4}");
+    assert!(
+        stdout4
+            .contains("closed at tick 3099 · ticks due 3099 · outstanding 0 · conservation true"),
+        "{stdout4}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The negative matrix's campaign crafter: a founded campaign with
 /// the verified anchor snapshot (region 0 Full, episode 0 — the
 /// demo's initial presence) and ONE crafted journal transaction
-/// carrying the adversarial plan. The recovery's treatment of the
-/// crafted plan is what the negatives assert.
-fn craft_negative_campaign(root: &std::path::Path, plan_bytes: Vec<u8>) -> StoreLocation {
+/// carrying the adversarial plan. Returns the location and the
+/// crafted transaction's identity (for the cancellation variants).
+/// The recovery's treatment of the crafted plan is what the
+/// negatives assert.
+fn craft_negative_campaign(
+    root: &std::path::Path,
+    plan_bytes: Vec<u8>,
+) -> (StoreLocation, engine_persist::TransactionId) {
     let location = StoreLocation::Database(root.join("campaign.db"));
     let mut store = SessionStore::open(&location).unwrap();
     store
@@ -925,20 +999,21 @@ fn craft_negative_campaign(root: &std::path::Path, plan_bytes: Vec<u8>) -> Store
     };
     drop(session);
     let mut raw = T1Journal::open(root.join("journal.t1")).unwrap();
-    raw.append_transaction(&TransactionInput {
-        envelopes: vec![],
-        position: SourcePosition {
-            head: None,
-            tick: 1020,
-        },
-        classification: DurabilityClass::DurableEligible,
-        dependencies: vec![],
-        frontier: vec![],
-        plan: plan_bytes,
-    })
-    .unwrap();
+    let receipt = raw
+        .append_transaction(&TransactionInput {
+            envelopes: vec![],
+            position: SourcePosition {
+                head: None,
+                tick: 1020,
+            },
+            classification: DurabilityClass::DurableEligible,
+            dependencies: vec![],
+            frontier: vec![],
+            plan: plan_bytes,
+        })
+        .unwrap();
     drop(raw);
-    location
+    (location, receipt.id)
 }
 
 fn negative_root(label: &str) -> PathBuf {
@@ -970,7 +1045,7 @@ fn recovery_rejects_an_episode_skipping_plan_before_any_inferred_transition() {
         entries: vec![],
         captures: vec![],
     };
-    let location = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let (location, _) = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
     let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
     assert!(
         matches!(
@@ -1004,7 +1079,7 @@ fn recovery_rejects_a_deactivation_claimed_from_dormant() {
         entries: vec![],
         captures: vec![],
     };
-    let location = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let (location, _) = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
     let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
     assert!(
         matches!(
@@ -1027,7 +1102,7 @@ fn recovery_rejects_a_deactivation_claimed_from_dormant() {
 #[test]
 fn recovery_rejects_an_undecodable_plan() {
     let root = negative_root("corrupt-plan");
-    let location = craft_negative_campaign(&root, b"not-a-deactivation-plan".to_vec());
+    let (location, _) = craft_negative_campaign(&root, b"not-a-deactivation-plan".to_vec());
     let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
     assert!(
         matches!(
@@ -1038,6 +1113,306 @@ fn recovery_rejects_an_undecodable_plan() {
         ),
         "the corrupt plan fails the strict decode (never a guessed \
          interpretation)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The frontier guard's own negative: a plan whose obligation
+/// identities lie at or beyond the anchor's allocation frontier
+/// (1000) is refused with the typed insufficient-evidence class —
+/// before any inferred mutation or install, with the measured
+/// numbers — regardless of the plan's level/episode coherence (the
+/// guard precedes the relevel path).
+#[test]
+fn recovery_rejects_a_beyond_frontier_plan_with_the_typed_refusal() {
+    let root = negative_root("beyond-frontier");
+    let plan = DeactivationPlan {
+        region: 1,
+        from_level: LodLevel::EventDriven,
+        episode: 1,
+        tick: Tick(1500),
+        obligations: (0..5)
+            .map(|i| PlanObligation {
+                id: EventId { seq: 5000 + i },
+                due: Tick(2000 + i),
+                schedule: Schedule::AtLogicalTime {
+                    due: Tick(2000 + i),
+                },
+                class: EventClass::new(1),
+                payload: 0x5346_524F,
+                field: Field::Far,
+                depends_on: vec![],
+            })
+            .collect(),
+        entries: vec![],
+        captures: vec![],
+    };
+    let (location, _) = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(
+                engine_slice::crossing::TransitionError::RecoveryInsufficient {
+                    region: 1,
+                    identity: 5000,
+                    frontier: 1000
+                }
+            )
+        ),
+        "the beyond-frontier obligations are the typed refusal (never \
+         a reconstruction the next reopen would refuse)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A dependency beyond the frontier is refused identically — the
+/// guard covers the plan's dependency references, not only its
+/// obligations (a within-frontier obligation depending on a
+/// lost-session identity carries unreconstructable evidence).
+#[test]
+fn recovery_rejects_a_beyond_frontier_dependency_reference() {
+    let root = negative_root("beyond-frontier-dep");
+    let plan = DeactivationPlan {
+        region: 1,
+        from_level: LodLevel::EventDriven,
+        episode: 1,
+        tick: Tick(1500),
+        obligations: vec![PlanObligation {
+            id: EventId { seq: 900 },
+            due: Tick(2000),
+            schedule: Schedule::AtLogicalTime { due: Tick(2000) },
+            class: EventClass::new(1),
+            payload: 0,
+            field: Field::Far,
+            depends_on: vec![EventId { seq: 999_999 }],
+        }],
+        entries: vec![],
+        captures: vec![],
+    };
+    let (location, _) = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(
+                engine_slice::crossing::TransitionError::RecoveryInsufficient {
+                    region: 1,
+                    identity: 999_999,
+                    frontier: 1000
+                }
+            )
+        ),
+        "the beyond-frontier dependency is the typed refusal"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A DURABLY CANCELED beyond-frontier plan is not an actionable
+/// recovery obligation: the cancellation filter precedes the guard,
+/// and the campaign recovers over the anchor alone.
+#[test]
+fn a_canceled_beyond_frontier_plan_is_not_an_actionable_recovery_obligation() {
+    let root = negative_root("canceled-beyond-frontier");
+    let plan = DeactivationPlan {
+        region: 1,
+        from_level: LodLevel::EventDriven,
+        episode: 1,
+        tick: Tick(1500),
+        obligations: vec![PlanObligation {
+            id: EventId { seq: 5000 },
+            due: Tick(2000),
+            schedule: Schedule::AtLogicalTime { due: Tick(2000) },
+            class: EventClass::new(1),
+            payload: 0,
+            field: Field::Far,
+            depends_on: vec![],
+        }],
+        entries: vec![],
+        captures: vec![],
+    };
+    let (location, transaction) = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let mut raw = T1Journal::open(root.join("journal.t1")).unwrap();
+    raw.append_cancellation(
+        transaction,
+        engine_persist::CancellationReason::ApplicationPolicy,
+        b"superseded before the crash",
+    )
+    .unwrap();
+    drop(raw);
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        result.is_ok(),
+        "the canceled plan never reaches the guard — the campaign \
+         recovers over the anchor)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A legitimate WITHIN-frontier plan continues through the normal
+/// integrity checks: the plan built from the anchor's ACTUAL
+/// region-1 obligations (identity-exact, within the frontier by
+/// construction) passes the guard, installs coherently, passes the
+/// final reconstructed-state roundtrip, and recovers REPEATEDLY
+/// (the second recovery over the identical durable state).
+#[test]
+fn a_within_frontier_plan_continues_through_the_normal_checks_and_recovers_repeatedly() {
+    let root = negative_root("within-frontier");
+    let location = StoreLocation::Database(root.join("campaign.db"));
+    let mut store = SessionStore::open(&location).unwrap();
+    store
+        .append(
+            &RevisionRecord::founding(AuthorityMode::Standalone, "s6c4-negative", 0),
+            &[],
+            None,
+        )
+        .unwrap();
+    drop(store);
+    let (spine, director) = demo_scenario(&SimConfig::default(), &[DEMO_PRESENCE]).unwrap();
+    // The anchor's ACTUAL region-1 obligations — the exact set the
+    // live deactivation would have planned (identity-exact: the same
+    // ids, dues, schedules, classes, payloads, lanes, and
+    // dependencies the snapshot's queues hold).
+    let class = EventClass::new(1);
+    let obligations: Vec<PlanObligation> = spine
+        .collect_matching(|view| view.class == class)
+        .iter()
+        .map(|view| PlanObligation {
+            id: view.id,
+            due: view.due,
+            schedule: view.schedule,
+            class: view.class,
+            payload: view.payload,
+            field: view.field,
+            depends_on: view.depends_on.to_vec(),
+        })
+        .collect();
+    let plan = DeactivationPlan {
+        region: 1,
+        from_level: LodLevel::EventDriven,
+        episode: 1,
+        tick: Tick(50),
+        obligations,
+        entries: vec![],
+        captures: vec![],
+    };
+    let journal = T1Journal::open(root.join("journal.t1")).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "s6c4-negative").unwrap();
+    let capture = session.capture_snapshot().unwrap();
+    let handle = session.submit_publication(capture).unwrap();
+    let Some(PublicationOutcome::Accepted { .. }) = session.wait_publication(handle) else {
+        panic!("the anchor publication must be accepted");
+    };
+    drop(session);
+    let mut raw = T1Journal::open(root.join("journal.t1")).unwrap();
+    raw.append_transaction(&TransactionInput {
+        envelopes: vec![],
+        position: SourcePosition {
+            head: None,
+            tick: 50,
+        },
+        classification: DurabilityClass::DurableEligible,
+        dependencies: vec![],
+        frontier: vec![],
+        plan: plan.canonical_bytes().unwrap(),
+    })
+    .unwrap();
+    drop(raw);
+    // The first recovery: the guard passes (within-frontier), the
+    // install reconstructs identity-exactly, the final
+    // reconstructed-state roundtrip passes — a coherent recovered
+    // session.
+    let first = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        first.is_ok(),
+        "the within-frontier plan recovers (the guard passed, the install was identity-exact, \
+         the final roundtrip validated)"
+    );
+    drop(first);
+    // The repeated recovery over the identical durable state (the
+    // recovery itself writes nothing): coherent again.
+    let second = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(second.is_ok(), "the repeated recovery is coherent");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The final reconstructed-state validation's negative: a plan whose
+/// obligations are within the frontier but NOT the identity-exact
+// set (a 3-of-N prefix — the counts diverge from the dense
+// allocation the decoder enforces) passes the frontier guard,
+// installs, and is then REFUSED by the save/restore roundtrip
+// with the typed validation error — the state the decoder would
+// refuse after publication is refused BEFORE publication.
+#[test]
+fn an_incoherent_reconstruction_fails_the_final_validation() {
+    let root = negative_root("incoherent-reconstruction");
+    let location = StoreLocation::Database(root.join("campaign.db"));
+    let mut store = SessionStore::open(&location).unwrap();
+    store
+        .append(
+            &RevisionRecord::founding(AuthorityMode::Standalone, "s6c4-negative", 0),
+            &[],
+            None,
+        )
+        .unwrap();
+    drop(store);
+    let (spine, director) = demo_scenario(&SimConfig::default(), &[DEMO_PRESENCE]).unwrap();
+    let class = EventClass::new(1);
+    let mut obligations: Vec<PlanObligation> = spine
+        .collect_matching(|view| view.class == class)
+        .iter()
+        .map(|view| PlanObligation {
+            id: view.id,
+            due: view.due,
+            schedule: view.schedule,
+            class: view.class,
+            payload: view.payload,
+            field: view.field,
+            depends_on: view.depends_on.to_vec(),
+        })
+        .collect();
+    obligations.truncate(3);
+    let plan = DeactivationPlan {
+        region: 1,
+        from_level: LodLevel::EventDriven,
+        episode: 1,
+        tick: Tick(50),
+        obligations,
+        entries: vec![],
+        captures: vec![],
+    };
+    let journal = T1Journal::open(root.join("journal.t1")).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "s6c4-negative").unwrap();
+    let capture = session.capture_snapshot().unwrap();
+    let handle = session.submit_publication(capture).unwrap();
+    let Some(PublicationOutcome::Accepted { .. }) = session.wait_publication(handle) else {
+        panic!("the anchor publication must be accepted");
+    };
+    drop(session);
+    let mut raw = T1Journal::open(root.join("journal.t1")).unwrap();
+    raw.append_transaction(&TransactionInput {
+        envelopes: vec![],
+        position: SourcePosition {
+            head: None,
+            tick: 50,
+        },
+        classification: DurabilityClass::DurableEligible,
+        dependencies: vec![],
+        frontier: vec![],
+        plan: plan.canonical_bytes().unwrap(),
+    })
+    .unwrap();
+    drop(raw);
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(engine_slice::crossing::TransitionError::RecoveryInvalid { .. })
+        ),
+        "the incoherent reconstruction is refused by the final \
+         save/restore validation (never published)"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -1129,6 +1129,15 @@ fn the_captured_frontier_follows_the_active_journal_generation() {
     crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("the checkpoint publishes the anchor");
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): the outstanding plans' obligations
+    // are allocated by the boundary accruals — beyond the anchor
+    // SK's frontier. The covering snapshot (a few ticks past the
+    // anchor to differentiate the content hash, then the
+    // publication) puts T2's identities within the recovered
+    // frontier; T3 gets its own below.
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // T2 — the second far boundary: the NEW outstanding unconfirmed
     // transaction over the post-reactivation accrual.
     durable_boundary_receipts(
@@ -1160,6 +1169,8 @@ fn the_captured_frontier_follows_the_active_journal_generation() {
         &mut journaled,
     );
     run_ticks_near(&mut spine, &mut director, &near, 100);
+    // T3's covering publication (the same discipline).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,

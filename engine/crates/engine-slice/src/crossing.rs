@@ -408,6 +408,33 @@ pub enum TransitionError {
     /// ("maintenance-active" or "closing"). Constructed only by the
     /// orchestrated session.
     PhaseRefused { detail: &'static str },
+    /// The recovery's allocation-evidence refusal (the S6-C4 stage
+    /// 1-A frontier guard): an actionable post-snapshot deactivation
+    /// plan references an event identity at or beyond the recovered
+    /// snapshot's allocation frontier — the lost session allocated
+    /// and executed that identity range after the snapshot, and
+    /// that history was never durably saved, so no coherent
+    /// identity-preserving reconstruction exists. Refused BEFORE
+    /// any inferred mutation or install; the durable campaign state
+    /// is untouched; the covering-publication protocol (the C
+    /// design) is the durable remedy. Distinguishable from
+    /// [`Self::InstallIncompatible`] (a live-state mismatch the
+    /// replay COULD have handled) and from
+    /// [`Self::RecoveryInvalid`] (a reconstructed state the strict
+    /// save/restore contract refuses).
+    RecoveryInsufficient {
+        region: usize,
+        identity: u64,
+        frontier: u64,
+    },
+    /// The recovery's final reconstructed-state validation refusal:
+    /// the replayed state fails the engine's own strict
+    /// session save/restore roundtrip — the same integrity contract
+    /// that would refuse the snapshot after publication. Refused
+    /// BEFORE any authoritative progression or canonical
+    /// publication; never normalized, repaired, or published. The
+    /// detail carries the decoder's own diagnostic.
+    RecoveryInvalid { detail: String },
 }
 
 /// The explicit session compaction's report (PP-B2 — the GO's §2/§3
@@ -2074,6 +2101,17 @@ impl<S: MediumSource> SessionCrossing<S> {
         // recovery both resolve from this one root.
         crossing.journal_root = journal_path.to_path_buf();
         let mut restored = vec![false; NPC_COUNT];
+        // THE RECOVERED SNAPSHOT'S ALLOCATION FRONTIER (the S6-C4
+        // stage 1-A frontier guard's input): the restored spine
+        // passed `Spine::restore()`'s dense-allocation gate —
+        // `stats.scheduled == next_seq` — so on a RESTORED spine the
+        // scheduled count IS the allocation frontier (the
+        // equivalence established by the restore's own integrity
+        // contract, never assumed elsewhere). Captured ONCE, BEFORE
+        // the replay mutates anything: every identity the durable
+        // evidence can coherently account for lies strictly below
+        // this bound.
+        let allocation_frontier = spine.stats().scheduled;
         for transaction in &scan.committed {
             if canceled.contains(&transaction.id) {
                 continue;
@@ -2091,6 +2129,44 @@ impl<S: MediumSource> SessionCrossing<S> {
                 // A pre-snapshot deactivation: already materialized in
                 // the snapshot's ledger and world — never re-applied.
                 continue;
+            }
+            // THE ALLOCATION-FRONTIER PREFLIGHT (the S6-C4 stage 1-A
+            // repeated-recovery blocker's fail-closed guard): the
+            // plan's obligation and dependency identities were
+            // allocated by the LOST session; the recovered snapshot's
+            // allocation frontier bounds every identity the durable
+            // snapshot-plus-journal evidence can coherently account
+            // for. A plan referencing identities at or beyond that
+            // frontier carries obligations whose allocation and
+            // execution history was never durably saved —
+            // reconstructing them would produce a state the strict
+            // save/restore contract refuses on the next reopen (the
+            // measured failure: reconstructed obligations at seqs
+            // 21380..21786 against a frontier of 1000). Refuse
+            // BEFORE any inferred reclassification, reactivation, or
+            // install — a typed, distinguishable error; the durable
+            // campaign state is untouched; no renumbering, no
+            // invented history. This guard is a necessary
+            // precondition, not proof that reconstruction is
+            // otherwise correct — the final reconstructed-state
+            // validation below still runs for everything that passes.
+            for obligation in &plan.obligations {
+                if obligation.id.seq >= allocation_frontier {
+                    return Err(TransitionError::RecoveryInsufficient {
+                        region: plan.region,
+                        identity: obligation.id.seq,
+                        frontier: allocation_frontier,
+                    });
+                }
+                for dep in &obligation.depends_on {
+                    if dep.seq >= allocation_frontier {
+                        return Err(TransitionError::RecoveryInsufficient {
+                            region: plan.region,
+                            identity: dep.seq,
+                            frontier: allocation_frontier,
+                        });
+                    }
+                }
             }
             // The implicit reactivation between episodes, DERIVED from
             // this plan's own from-level (the durable evidence the
@@ -2210,6 +2286,23 @@ impl<S: MediumSource> SessionCrossing<S> {
                 detail: "confirmed-recovered-planless-unsupported",
             });
         }
+        // 5a. THE FINAL RECONSTRUCTED-STATE VALIDATION (the
+        // repeated-recovery blocker's second guard): the recovered
+        // session must satisfy the engine's own strict
+        // save/restore contract BEFORE any authoritative progression
+        // or canonical publication — a reconstructed state the
+        // decoder would refuse after publication is refused HERE,
+        // never published, never a misleading successful recovery.
+        // The roundtrip uses the existing serialization machinery
+        // verbatim (no new canonical representation, no
+        // counter-only shortcut, both history forms); a failure is
+        // the typed validation error carrying the decoder's own
+        // diagnostic — never a normalization, repair, or fabricated
+        // history.
+        let recovered_bytes = save_session(&spine, &director).map_err(PipelineError::Format)?;
+        restore_session(&recovered_bytes).map_err(|error| TransitionError::RecoveryInvalid {
+            detail: format!("{error:?}"),
+        })?;
         // 5. The recovered session, with the re-opened crossing.
         Ok((spine, director, crossing))
     }

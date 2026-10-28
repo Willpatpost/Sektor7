@@ -693,6 +693,16 @@ fn recovery_from_an_older_anchor_restores_post_snapshot_crossings() {
         director.apply(&mut spine, std::slice::from_ref(&near));
         spine.run_tick();
     }
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): the plan's obligations include the
+    // accrual's follow-up identities — beyond the tick-50 anchor's
+    // allocation frontier. The covering snapshot (after the accrual,
+    // before the boundary) puts them within the recovered frontier;
+    // the crossings-restore arithmetic below is exercised over the
+    // covering snapshot's nonzero scratch (the same restore path the
+    // zero-scratch anchor case exercised — the exact-match
+    // assertions are base-independent).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
     // THE CRASH + the recovery.
     drop(crossing);
@@ -925,6 +935,18 @@ fn recovery_does_not_reapply_presnapshot_episode_crossings() {
         director.apply(&mut spine, std::slice::from_ref(&near));
         spine.run_tick();
     }
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): episode 2's plan will carry
+    // obligations allocated during the accrual — identities beyond
+    // the mid-episodes snapshot's allocation frontier. Publishing
+    // the covering snapshot here (after the accrual, before the
+    // durable boundary) puts every identity the plan references
+    // below the recovered frontier — the within-frontier class the
+    // recovery can reconstruct coherently. WITHOUT it the recovery
+    // is correctly refused (the typed insufficient-evidence class);
+    // this is exactly the ordering the covering-publication design
+    // mandates at the real boundary.
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
     // THE CRASH + the recovery from the mid-session snapshot.
     drop(crossing);
@@ -968,17 +990,27 @@ fn recovery_does_not_reapply_presnapshot_episode_crossings() {
     assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
 }
 
-/// The multi-episode interleave (the same corrective's other half):
-/// ONE snapshot before BOTH episodes. The recovery must interleave
-/// per transaction — episode 1's restore (the claimed delta minus the
-/// snapshot's scratch), its install (capturing and zeroing the
-/// scratch), then episode 2's restore (the FULL delta — the prior
-/// install rebased the scratch exactly as the live capture did) and
-/// its install. Per-envelope arithmetic against the snapshot's stale
-/// scratch without the interleave under-restores the second episode
-/// and fails its install's scratch re-validation.
+/// The multi-episode interleave — NOW THE FRONTIER GUARD'S REFUSAL
+/// CASE (the S6-C4 stage 1-A interim): ONE snapshot before BOTH
+/// episodes means BOTH plans' obligations (the accrual follow-ups
+/// allocated after that snapshot) lie beyond its allocation
+/// frontier — the incoherent class the recovery must refuse (the
+/// pre-guard behavior — a "successful" interleaved recovery whose
+/// state the next reopen's strict decoder refuses — is exactly the
+/// repeated-recovery integrity failure the guard eliminates). The
+/// interleave arithmetic itself (the per-transaction envelope-base
+/// restore: episode 1's delta minus the snapshot's scratch, its
+/// install zeroing the scratch, episode 2's full delta) is genuine
+/// engine behavior whose MULTI-post-snapshot-episode coverage is
+/// INHERENTLY beyond-frontier — no within-frontier fixture can carry
+/// two post-snapshot episodes (a covering publication before the
+/// second boundary makes the first episode pre-snapshot). That
+/// coverage is EXPLICITLY DEFERRED to the covering-publication
+/// protocol's acceptance (the C design's §7 matrix); the guard's
+/// refusal here is the honest interim, never a claim that the
+/// interleave is wrong.
 #[test]
-fn recovery_restores_both_episodes_from_an_older_snapshot() {
+fn recovery_restores_both_episodes_from_an_older_snapshot_is_refused() {
     let near = near_region_4();
     let far = far_from_region_4();
     let (mut spine, mut director) = scenario_pair(150, &near);
@@ -997,60 +1029,27 @@ fn recovery_restores_both_episodes_from_an_older_snapshot() {
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
     durable_boundary(&mut crossing, &mut spine, &mut director, &near);
     // Episode 2: accrual, then the second durable far boundary —
-    // the accrual long enough for the threshold crossings to recur
-    // (under the spine's budget a Full region executes ~0.15
-    // activities per NPC per tick, so a MILESTONE_PERIOD crossing
-    // needs ~a hundred ticks; a short accrual would make episode 2's
-    // deactivation empty-scratch — unjournaled,
-    // presence-re-derivable — and the multi-episode interleave
-    // would never be exercised).
+    // the accrual long enough for the threshold crossings to recur.
     for _ in 0..160 {
         director.apply(&mut spine, std::slice::from_ref(&near));
         spine.run_tick();
     }
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
-    // THE CRASH + the recovery from the pre-episode snapshot.
+    // THE CRASH + the recovery: the beyond-frontier interleaved
+    // plans are REFUSED with the typed insufficient-evidence class —
+    // before any inferred mutation or install, the durable state
+    // untouched.
     drop(crossing);
-    let (recovered_spine, recovered_director, mut recovered_crossing) =
-        SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign")
-            .expect("the interleaved recovery succeeds");
-    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
-    assert_eq!(
-        recovered_director.states()[4].checkpoint,
-        director.states()[4].checkpoint,
-        "episode 2's checkpoint matches the lost state's exactly"
+    let result = SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign");
+    assert!(
+        matches!(
+            result,
+            Err(TransitionError::RecoveryInsufficient { region: 4, .. })
+        ),
+        "the two-post-snapshot-episode interleave is the incoherent \
+         class the guard refuses (the C protocol's acceptance will \
+         restore the durable form of this coverage)"
     );
-    // The milestones: the snapshot's plus BOTH episodes'
-    // post-snapshot crossings — exactly the lost state's.
-    assert_eq!(
-        recovered_spine.world().milestones(),
-        spine.world().milestones(),
-        "the milestones match the lost state's exactly across both episodes"
-    );
-    // The durable lanes: episode 1's captures are APPLIED (the
-    // derived reactivation replayed the lost session's application —
-    // the credits match the lost state's exactly), episode 2's are
-    // pending.
-    assert_eq!(
-        recovered_director.ledger().pending_total(),
-        director.ledger().pending_total(),
-        "episode 2's captures are pending — matching the lost state's exactly"
-    );
-    assert_eq!(
-        recovered_director.ledger().applied_count(),
-        director.ledger().applied_count(),
-        "episode 1's applied identities match the lost state's exactly"
-    );
-    assert_eq!(
-        recovered_spine.world().credits(),
-        spine.world().credits(),
-        "the credits match the lost state's exactly — the derived reactivation applied them"
-    );
-    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
-        panic!("the re-drive confirms both episodes' recovered captures");
-    };
-    assert!(receipt.keys.contains(&ConsequenceId::new(4, 1, 4)));
-    assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
 }
 
 /// The cancellation integration (the review's second corrective): a

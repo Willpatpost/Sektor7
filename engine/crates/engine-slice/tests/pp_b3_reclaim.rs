@@ -1950,14 +1950,27 @@ fn shared_directory_campaigns_never_cross_journal_ownership() {
         rotated_two_checkpoint_campaign_at(&a_store, &a_root, "shared-a");
     durable_boundary(&mut crossing_a, &mut spine_a, &mut director_a, &near);
     run_ticks_near(&mut spine_a, &mut director_a, &near, 100);
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): the outstanding plan's obligations
+    // are allocated by the accrual above — beyond the rotated
+    // fixture's last snapshot's frontier. The covering snapshot puts
+    // them within the recovered frontier; without it A's recovery is
+    // correctly refused (the typed insufficient-evidence class).
+    crossing_a.publish_snapshot(&spine_a, &director_a).unwrap();
     durable_boundary(&mut crossing_a, &mut spine_a, &mut director_a, &far);
     let rotation_a2 = crossing_a.rotate_journal().expect("A's second rotation");
     drop(spine_a);
     drop(director_a);
     // CAMPAIGN B: the rotated two-checkpoint campaign (one
     // rotation), its pending plan outstanding.
-    let (spine_b, director_b, crossing_b, _s1, b_active) =
+    let (spine_b, director_b, mut crossing_b, _s1, b_active) =
         rotated_two_checkpoint_campaign_at(&b_store, &b_root, "shared-b");
+    // B's covering publication (same discipline): B's outstanding
+    // plan is created inside the shared fixture — the post-plan
+    // snapshot makes its identities pre-snapshot (episode-filtered),
+    // and B's recovery carries the plan's installed state through
+    // the snapshot instead of replaying it.
+    crossing_b.publish_snapshot(&spine_b, &director_b).unwrap();
     drop(spine_b);
     drop(director_b);
     // The unowned, ambiguously named file — real journal bytes under
@@ -2090,6 +2103,18 @@ fn pp_b3_reclaim_child_durability_closed() {
         Path::new(&journal),
         "child-durability-closed",
     );
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): the outstanding plans' obligations
+    // are allocated by the boundary accruals — beyond the fixture's
+    // last checkpoint snapshot's allocation frontier. The covering
+    // snapshot (after the fixture, before the boundary) puts plan 1's
+    // identities within the recovered frontier; plan 2 (after the
+    // post-repair accrual) gets its own covering publication below.
+    // The five ticks first differentiate the state from SK2's — an
+    // identical state derives the same content hash and the chain's
+    // duplicate-idempotency-key rejection.
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // The outstanding unconfirmed transaction, then the rotation
     // under the armed pointer-durability fault.
     POINTER_DIR_SYNC_FAULT.store(true, Ordering::SeqCst);
@@ -2120,6 +2145,9 @@ fn pp_b3_reclaim_child_durability_closed() {
         .expect("the repair re-establishes the pointer durability");
     durable_boundary(&mut crossing, &mut spine, &mut director, &near);
     run_ticks_near(&mut spine, &mut director, &near, 100);
+    // Plan 2's covering publication (same discipline): the accrual's
+    // follow-up identities below the recovered frontier.
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
 }
 

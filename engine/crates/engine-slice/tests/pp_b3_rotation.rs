@@ -272,6 +272,15 @@ fn the_rotation_retires_the_subsumed_and_preserves_the_outstanding() {
     crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("the checkpoint publishes the anchor");
+    // THE COVERING PUBLICATION (the frontier guard's discipline, the
+    // C protocol's manual form): the outstanding plans' obligations
+    // are allocated by the boundary accruals — beyond the anchor
+    // SK's allocation frontier. The covering snapshot (a few ticks
+    // past the anchor to differentiate the content hash, then the
+    // publication) puts T2's identities within the recovered
+    // frontier; T3 gets its own covering publication below.
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // T2 — the second far boundary: a NEW outstanding unconfirmed
     // transaction over the post-reactivation accrual.
     durable_boundary_receipts(
@@ -333,6 +342,9 @@ fn the_rotation_retires_the_subsumed_and_preserves_the_outstanding() {
         &mut journaled,
     );
     run_ticks_near(&mut spine, &mut director, &near, 100);
+    // T3's covering publication (same discipline): the post-rotation
+    // accrual's identities below the recovered frontier.
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
@@ -504,6 +516,15 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         .last()
         .copied()
         .expect("the far boundary journals");
+    // THE COVERING PUBLICATION (the frontier guard's discipline):
+    // this fixture's far boundaries allocate their plans' obligations
+    // DURING the boundary's own accrual — beyond any pre-boundary
+    // snapshot — so the covering publication lands AFTER the
+    // boundary (the plan's installed state inside it; the recovery
+    // carries the outstanding plans' effects through the snapshot
+    // instead of replaying them — the pointer-resolution property
+    // under test is unchanged).
+    crossing.publish_snapshot(&spine, &director).unwrap();
 
     // ROTATION 1: the pointer lands at the ROOT.
     let rotation1 = crossing.rotate_journal().expect("the first rotation");
@@ -537,6 +558,8 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         .copied()
         .expect("the second boundary journals");
     assert_ne!(t1, t2);
+    // T2's covering publication (the same discipline).
+    crossing.publish_snapshot(&spine, &director).unwrap();
 
     // ROTATION 2: the pointer RE-LANDS at the root (never beside
     // the rotated first generation); the outstanding survivors
@@ -572,6 +595,8 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         .last()
         .copied()
         .expect("the third boundary journals");
+    // T3's covering publication (the same discipline).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     let rotation3 = crossing.rotate_journal().expect("the third rotation");
     assert_eq!(rotation3.retained.len(), 3, "t1, t2, and t3 all survive");
     assert!(rotation3.retained.contains(&t3));
@@ -611,11 +636,18 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
 
     // THE POST-RESTART CYCLE: the reactivation installs over the
     // recovered checkpoint; the accrual runs; the far boundary
-    // deactivates — an EMPTY-SCRATCH deactivation by the accepted B2
-    // design (a post-crash boundary re-derives the LOD against the
-    // snapshot; the region's captured content is already durably
-    // protected in the outstanding transactions — the boundary never
-    // re-journals what the journal already holds).
+    // deactivates. NOTE (the covering-publication interim): the
+    // recovery above carries the outstanding plans' effects through
+    // the covering SNAPSHOT (the D-guard's within-frontier route —
+    // the plan-installed state inside it), not through the replay —
+    // so the recovered scratch is the snapshot's (zeroed by the
+    // install), and the post-restart far boundary is an ORDINARY
+    // durable boundary (the accrual re-crosses the threshold, one
+    // new transaction journals) — not the replay route's
+    // empty-scratch shape (whose envelope reconstruction re-seeds
+    // the scratch and suppresses re-journaling). Both are
+    // legitimate recoveries; the pointer-resolution and re-anchoring
+    // properties under test are identical.
     let mut post_restart = Vec::new();
     durable_boundary_receipts(
         &mut recovered_crossing,
@@ -630,6 +662,12 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         "the reactivation installs over the recovered checkpoint"
     );
     run_ticks_near(&mut recovered_spine, &mut recovered_director, &near, 100);
+    // The post-restart boundary's covering publication (the same
+    // discipline — the backup's verification below recovers over the
+    // captured set).
+    recovered_crossing
+        .publish_snapshot(&recovered_spine, &recovered_director)
+        .unwrap();
     durable_boundary_receipts(
         &mut recovered_crossing,
         &mut recovered_spine,
@@ -642,9 +680,12 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         LodLevel::Dormant,
         "the post-restart far boundary re-derives against the snapshot"
     );
-    assert!(
-        post_restart.is_empty(),
-        "the post-restart boundaries are empty-scratch by the B2 design — the captured content is already durably journaled"
+    assert_eq!(
+        post_restart.len(),
+        1,
+        "the snapshot-route recovery's post-restart far boundary is an \
+         ordinary durable boundary (the replay route's empty-scratch \
+         shape is the replay-specific scratch seeding)"
     );
 
     // THE POST-RESTART JOURNAL EVOLUTION: the fourth rotation through
@@ -658,8 +699,8 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
         .expect("the post-restart rotation completes");
     assert_eq!(
         rotation4.retained.len(),
-        3,
-        "the outstanding survivors re-anchor through the restarted session"
+        4,
+        "the outstanding survivors plus the post-restart boundary re-anchor through the restarted session"
     );
     assert!(rotation4.retained.contains(&t1));
     assert_eq!(
@@ -671,8 +712,8 @@ fn three_successive_rotations_keep_one_authoritative_active_path() {
     let scan = T1Journal::scan_file(&rotation4.new_path).unwrap();
     assert_eq!(
         scan.committed.len(),
-        3,
-        "the re-anchored survivors land in the fourth generation"
+        4,
+        "the re-anchored survivors plus the post-restart boundary land in the fourth generation"
     );
     drop(recovered_crossing);
     drop(recovered_spine);
@@ -723,6 +764,12 @@ fn an_interrupted_later_flip_selects_the_previous_authoritative_journal() {
         .last()
         .copied()
         .expect("the far boundary journals");
+    // THE COVERING PUBLICATION (the frontier guard's discipline):
+    // the boundary's own accrual allocates the plan's obligations
+    // beyond the anchor — the post-boundary snapshot carries the
+    // plan's installed state (the recovery route the D interim
+    // mandates for this fixture shape).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // ROTATION 1.
     let rotation1 = crossing.rotate_journal().expect("the first rotation");
     assert_eq!(rotation1.retained, vec![t1]);
@@ -747,6 +794,8 @@ fn an_interrupted_later_flip_selects_the_previous_authoritative_journal() {
         .last()
         .copied()
         .expect("the second boundary journals");
+    // T2's covering publication (the same discipline).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // ROTATION 2 — completed in-process (its journal file stands on
     // disk, its survivors re-anchored).
     let rotation2 = crossing.rotate_journal().expect("the second rotation");
@@ -845,6 +894,9 @@ fn pp_b3_rotation_child_manifest_fault() {
         &far,
         &mut journaled,
     );
+    // T1's covering publication (the frontier guard's discipline —
+    // see the matching comment below).
+    crossing.publish_snapshot(&spine, &director).unwrap();
     // THE INJECTED PRE-FLIP FAILURE: the ownership record's I/O
     // error — with the record maintained BEFORE the flip, the error
     // returns with the authority unchanged.
@@ -867,6 +919,11 @@ fn pp_b3_rotation_child_manifest_fault() {
         Path::new(&journal_path)
     );
     assert_eq!(crossing.pipeline_journal_path(), Path::new(&journal_path));
+    // THE COVERING PUBLICATION before the post-failure far boundary
+    // (the frontier guard's discipline; T1's covering publication
+    // above already carries its installed state): the accrual's
+    // identities below the recovered frontier for the parent's
+    // recovery.
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
@@ -875,6 +932,7 @@ fn pp_b3_rotation_child_manifest_fault() {
         &mut journaled,
     );
     run_ticks_near(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
@@ -1052,6 +1110,12 @@ fn pp_b3_rotation_child_dir_sync_fault() {
         .reestablish_pointer_durability()
         .expect("the repair re-establishes the pointer durability");
     assert_eq!(crossing.pipeline_journal_path(), active);
+    // THE COVERING PUBLICATIONS (the frontier guard's discipline —
+    // the post-boundary snapshots carry the plans' installed state
+    // for the parent's recovery; T1's own covering publication is
+    // impossible here: the crossing was fail-closed from its
+    // boundary onward until the repair, and the recovery's newest
+    // snapshot post-dates T1's plan either way).
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
@@ -1060,6 +1124,7 @@ fn pp_b3_rotation_child_dir_sync_fault() {
         &mut journaled,
     );
     run_ticks_near(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
     durable_boundary_receipts(
         &mut crossing,
         &mut spine,
