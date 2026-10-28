@@ -1986,30 +1986,30 @@ fn emit_memory_evidence(demo: &PersistDemo, evidence: &EvidenceCollector) {
 /// The S6-C3 measured wall-clock window's state (the §6 termination
 /// protocol's observational bookkeeping — never logical state).
 #[derive(Debug)]
-struct SoakMeasurement {
-    wall_seconds: u64,
-    start: Instant,
+pub struct SoakMeasurement {
+    pub wall_seconds: u64,
+    pub start: Instant,
     /// Whether the loop ended AT the wall boundary (false = the run
     /// was interrupted by quit/frames/failure before the cutoff — an
     /// incomplete measurement, honestly reported).
-    cutoff_reached: bool,
-    cutoff: Option<SoakCutoff>,
-    drain: Option<SoakDrain>,
+    pub cutoff_reached: bool,
+    pub cutoff: Option<SoakCutoff>,
+    pub drain: Option<SoakDrain>,
 }
 
 /// The cutoff observations — recorded BEFORE the post-soak drain
 /// advances anything (the in-window truth; phases reached during the
 /// drain are post-soak catch-up, never in-window evidence).
 #[derive(Debug, Clone)]
-struct SoakCutoff {
-    wall_duration_ms: f64,
-    campaign_tick: u64,
-    outstanding_debt: u32,
+pub struct SoakCutoff {
+    pub wall_duration_ms: f64,
+    pub campaign_tick: u64,
+    pub outstanding_debt: u32,
     /// The scripted ticks consumed INSIDE the measured window (the
     /// scenario's own counter at the cutoff — never the post-drain
     /// terminal count).
-    scenario_tick_at_cutoff: u64,
-    coverage: Option<CoverageReport>,
+    pub scenario_tick_at_cutoff: u64,
+    pub coverage: Option<CoverageReport>,
 }
 
 /// The publication workload's terminal observations (C3-F3D), read
@@ -2109,6 +2109,42 @@ pub fn soak_evidence_verification_failure(
     }
 }
 
+/// The formal validation-enabled soak's configuration gate (the
+/// hardware-readiness corrective's narrow rule): a soak that
+/// REQUESTED the validation layer (`--validation on`) must also
+/// ACHIEVE it — the renderer's transparent-fallback behavior is
+/// unchanged for every other mode, but here a requested-but-
+/// unavailable layer fails the soak's configuration gate (the
+/// validation error/warning counts are recorded either way).
+pub fn soak_validation_gate(requested: bool, active: bool) -> Option<String> {
+    if requested && !active {
+        return Some(
+            "the validation layer was REQUESTED (--validation on) but is not ACTIVE \
+             on this environment — the formal validation-enabled soak fails its \
+             configuration gate"
+                .into(),
+        );
+    }
+    None
+}
+
+/// The soak summary's provenance and validation inputs (the
+/// hardware-readiness corrective): the ACTUAL configured evidence
+/// directory (never an inferred path), the independently verified
+/// package's schema version, the verified-complete status, and the
+/// validation layer's requested/achieved state with its error and
+/// warning counts.
+#[derive(Debug, Clone, Default)]
+pub struct SoakSummaryContext {
+    pub evidence_dir: Option<PathBuf>,
+    pub evidence_schema: Option<String>,
+    pub evidence_verified: bool,
+    pub validation_requested: bool,
+    pub validation_active: bool,
+    pub validation_errors: u64,
+    pub validation_warnings: u64,
+}
+
 /// C3-F2C: the soak summary's safe publication — written to a
 /// temporary sibling and atomically renamed, so a failed write can
 /// never truncate an existing accepted summary, an incomplete summary
@@ -2135,15 +2171,17 @@ fn json_escape(text: &str) -> String {
 /// Serializes the S6-C3 soak summary (`s6-soak-summary/1`, written to
 /// the CAMPAIGN directory — the evidence package stays the pure
 /// s6-evidence/2 five-stream contract, and this summary identifies
-/// it). Honest fields only: measured values as measured, verdicts as
-/// verdicts.
+/// it: the ACTUAL configured evidence directory, the independently
+/// verified package's schema version, and the verified-complete
+/// status — never an inferred path). Honest fields only: measured
+/// values as measured, verdicts as verdicts.
 #[allow(clippy::too_many_arguments)]
-fn soak_summary_json(
+pub fn soak_summary_json(
     measurement: &SoakMeasurement,
     scenario: Option<&ScenarioRunReport>,
     close_failure: Option<&crate::orchestration::CloseFailure>,
     evidence_complete: Option<bool>,
-    evidence_verified: bool,
+    context: &SoakSummaryContext,
     workload_gate: Option<&str>,
     timing: &SimConfig,
     git_commit: &str,
@@ -2197,9 +2235,13 @@ fn soak_summary_json(
                     )
                 })
                 .collect();
+            let horizon = scenario.map_or(0, |report| report.horizon);
+            let workload_complete = scenario.map_or(0, |report| report.workload_complete_tick);
             json.push_str(&format!(
-                ",\"coverage\":{{\"horizon_reached\":{},\"phases\":[{}]}}",
+                ",\"coverage\":{{\"horizon_reached\":{},\"missing_to_horizon\":{},\"workload_complete_tick\":{},\"phases\":[{}]}}",
                 coverage.horizon_reached,
+                horizon.saturating_sub(cutoff.scenario_tick_at_cutoff),
+                workload_complete,
                 phases.join(",")
             ));
         }
@@ -2216,6 +2258,28 @@ fn soak_summary_json(
             drain.time_accounting_holds
         ));
     }
+    // The evidence provenance (the hardware-readiness corrective):
+    // the ACTUAL configured directory, the independently verified
+    // package's schema version, and the verified-complete status —
+    // the summary identifies the raw evidence bundle unambiguously.
+    if let Some(dir) = &context.evidence_dir {
+        json.push_str(&format!(
+            ",\"evidence\":{{\"dir\":\"{}\",\"schema\":\"{}\",\"verified\":{}}}",
+            json_escape(&dir.display().to_string()),
+            context.evidence_schema.as_deref().unwrap_or("not verified"),
+            context.evidence_verified
+        ));
+    }
+    // The validation layer's requested/achieved state with its error
+    // and warning counts (the formal validation-enabled soak's
+    // configuration gate inputs — recorded either way).
+    json.push_str(&format!(
+        ",\"validation\":{{\"requested\":{},\"active\":{},\"errors\":{},\"warnings\":{}}}",
+        context.validation_requested,
+        context.validation_active,
+        context.validation_errors,
+        context.validation_warnings
+    ));
     if let Some(scenario) = scenario {
         json.push_str(&format!(
             ",\"scenario\":\"{}\",\"scenario_seed\":{},\"scripted_ticks\":{},\"horizon\":{},\"registered\":{},\"rejected\":{}",
@@ -2254,10 +2318,9 @@ fn soak_summary_json(
         json.push_str(",\"workload_gate\":\"PASS\"");
     }
     json.push_str(&format!(
-        ",\"close_failure\":{},\"evidence_complete\":{},\"evidence_verified\":{}}}",
+        ",\"close_failure\":{},\"evidence_complete\":{}}}",
         close_failure.is_some(),
-        evidence_complete.unwrap_or(true),
-        evidence_verified
+        evidence_complete.unwrap_or(true)
     ));
     json
 }
@@ -3096,14 +3159,19 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             // C3-F5A: the IN-WINDOW scripted count (the scenario's own
             // counter captured at the cutoff) — the terminal count,
             // including the drain's post-cutoff ticks, is reported
-            // separately and never conflated with this one.
+            // separately and never conflated with this one. The
+            // missing-to-horizon count is the actual logical-tick
+            // progress statement (§4 of the hardware-readiness
+            // corrective).
+            let horizon = scenario_report.as_ref().map_or(0, |report| report.horizon);
             println!(
                 "  cutoff state: campaign tick {} · fixed-step debt {} · scripted ticks \
-                 {} in window (horizon {})",
+                 {} in window · missing to horizon {} (horizon {})",
                 cutoff.campaign_tick,
                 cutoff.outstanding_debt,
                 cutoff.scenario_tick_at_cutoff,
-                scenario_report.as_ref().map_or(0, |report| report.horizon)
+                horizon.saturating_sub(cutoff.scenario_tick_at_cutoff),
+                horizon
             );
             if let Some(coverage) = &cutoff.coverage {
                 let entered = coverage.phases.iter().filter(|phase| phase.entered).count();
@@ -3114,6 +3182,15 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                     entered,
                     coverage.phases.len(),
                     coverage.horizon_reached
+                );
+                println!(
+                    "  coverage threshold: the workload-completeness boundary ({} ticks) \
+                     is a workload-CORRECTNESS threshold — it is NOT evidence of \
+                     sustained 10 Hz performance throughout the measured window; the \
+                     performance tolerance is S6-C4's separate owner decision",
+                    scenario_report
+                        .as_ref()
+                        .map_or(0, |report| report.workload_complete_tick)
                 );
                 for phase in &coverage.phases {
                     if !phase.entered {
@@ -3229,6 +3306,27 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             soak_gate_failure =
                 Some("the integrated soak ran without its scenario coverage".into());
         }
+        // The hardware-readiness corrective's validation gates: the
+        // formal validation-enabled soak must have REQUESTED the
+        // layer AND achieved it (the renderer's transparent fallback
+        // is unchanged for every other mode — here, requested-but-
+        // unavailable fails the configuration gate); an active layer
+        // with errors fails the run; the counts are recorded either
+        // way.
+        let validation_requested = options.validation == ValidationPreference::On;
+        println!(
+            "  validation: requested {} · active {} · err/warn {}/{}",
+            validation_requested,
+            stats.validation_active,
+            stats.validation_errors,
+            stats.validation_warnings
+        );
+        if let Some(failure) = soak_validation_gate(validation_requested, stats.validation_active) {
+            if soak_gate_failure.is_none() {
+                soak_gate_failure = Some(failure.clone());
+            }
+            println!("  workload gate: FAIL — {failure}");
+        }
         if soak_gate_failure.is_none() && stats.validation_active && stats.validation_errors > 0 {
             soak_gate_failure = Some(format!(
                 "the validation layer reported {} error(s) while active",
@@ -3276,7 +3374,21 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         // accepted summary; a failed publication is a terminal
         // diagnostic plus a failed run (the failed summary cannot
         // record its own failure), so it composes into the gate AFTER
-        // the summary content is final.
+        // the summary content is final. The summary's provenance
+        // names the ACTUAL configured evidence directory and the
+        // verified package's schema.
+        let summary_context = SoakSummaryContext {
+            evidence_dir: options.evidence.as_ref().map(|config| config.dir.clone()),
+            evidence_schema: match &evidence_verification {
+                Some(Ok(package)) => Some(package.schema_version.clone()),
+                _ => None,
+            },
+            evidence_verified,
+            validation_requested,
+            validation_active: stats.validation_active,
+            validation_errors: stats.validation_errors,
+            validation_warnings: stats.validation_warnings,
+        };
         let summary = soak_summary_json(
             measurement,
             scenario_report.as_ref(),
@@ -3285,7 +3397,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
                 .evidence
                 .as_ref()
                 .map(|outcome| outcome.is_complete()),
-            evidence_verified,
+            &summary_context,
             soak_gate_failure.as_deref(),
             &timing_config,
             env!("S7_GIT_COMMIT"),

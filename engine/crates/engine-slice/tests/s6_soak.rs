@@ -39,7 +39,7 @@ use engine_slice::orchestration::OrchestratedSession;
 use engine_slice::persist_demo::{
     DemoOptions, PersistDemo, SoakDrain, demo_scenario, publish_soak_summary, region_credit_sum,
     run_persist_demo, run_persist_demo_headless, soak_drain_gate,
-    soak_evidence_verification_failure,
+    soak_evidence_verification_failure, soak_validation_gate,
 };
 use engine_slice::sim::SimConfig;
 use engine_slice::soak_evidence::{
@@ -1340,4 +1340,108 @@ fn top_level_soak_flags_reject_other_modes() {
     // no persistence).
     let (code, _stderr) = run(&["--soak", "1"]);
     assert_eq!(code, 0, "the Stage 1 --soak legacy command is preserved");
+}
+
+/// The hardware-readiness corrective: the formal validation-enabled
+/// soak's configuration gate — a soak that REQUESTED the validation
+/// layer must also ACHIEVE it. Requested-but-unavailable fails the
+/// gate; an unrequested (validation-disabled) soak never fails on
+/// availability; the renderer's transparent fallback is unchanged
+/// for every other mode.
+#[test]
+fn the_validation_availability_gate_fails_a_requested_but_inactive_layer() {
+    assert!(
+        soak_validation_gate(true, false).is_some_and(|failure| {
+            failure.contains("REQUESTED") && failure.contains("configuration gate")
+        }),
+        "requested-but-unavailable fails the formal soak's configuration gate"
+    );
+    assert!(
+        soak_validation_gate(true, true).is_none(),
+        "requested and achieved passes"
+    );
+    assert!(
+        soak_validation_gate(false, false).is_none(),
+        "a validation-DISABLED soak never fails on availability"
+    );
+    assert!(
+        soak_validation_gate(false, true).is_none(),
+        "an unrequested-but-available layer is fine (auto behavior unchanged)"
+    );
+}
+
+/// The hardware-readiness corrective: the published soak summary
+/// IDENTIFIES the verified evidence package — the ACTUAL configured
+/// directory (never an inferred path), the independently verified
+/// package's schema version, the verified-complete status, the
+/// validation requested/achieved state with its counts, and the
+/// missing-to-horizon progress at the cutoff.
+#[test]
+fn the_published_summary_identifies_the_verified_evidence_package() {
+    let cleaner = TestDir::new("summary-provenance");
+    let report = run_persist_demo_headless(scenario_options(
+        &cleaner,
+        SoakScenarioId::Stage6V1Short,
+        None,
+    ))
+    .expect("the scenario run completes");
+    let scenario = report.scenario.as_ref().expect("the scenario report");
+    let measurement = engine_slice::persist_demo::SoakMeasurement {
+        wall_seconds: 900,
+        start: std::time::Instant::now(),
+        cutoff_reached: true,
+        cutoff: Some(engine_slice::persist_demo::SoakCutoff {
+            wall_duration_ms: 900_012.5,
+            campaign_tick: 8999,
+            outstanding_debt: 0,
+            scenario_tick_at_cutoff: 299,
+            coverage: Some(engine_slice::soak_scenario::CoverageReport {
+                phases: Vec::new(),
+                horizon_reached: false,
+            }),
+        }),
+        drain: None,
+    };
+    let evidence_dir = cleaner.root.join("evidence");
+    let context = engine_slice::persist_demo::SoakSummaryContext {
+        evidence_dir: Some(evidence_dir.clone()),
+        evidence_schema: Some("s6-evidence/2".into()),
+        evidence_verified: true,
+        validation_requested: true,
+        validation_active: true,
+        validation_errors: 0,
+        validation_warnings: 0,
+    };
+    let summary = engine_slice::persist_demo::soak_summary_json(
+        &measurement,
+        Some(scenario),
+        None,
+        Some(true),
+        &context,
+        None,
+        &SimConfig::default(),
+        "0123abcd",
+        false,
+    );
+    assert!(
+        summary.contains(&format!(
+            "\"evidence\":{{\"dir\":\"{}\",\"schema\":\"s6-evidence/2\",\"verified\":true}}",
+            evidence_dir.display()
+        )),
+        "the summary names the ACTUAL configured evidence directory, the schema \
+         version, and the verified status: {summary}"
+    );
+    assert!(
+        summary.contains(
+            "\"validation\":{\"requested\":true,\"active\":true,\"errors\":0,\"warnings\":0}"
+        ),
+        "the validation state and counts are recorded: {summary}"
+    );
+    assert!(
+        summary.contains("\"missing_to_horizon\":1"),
+        "the missing-to-horizon progress at the cutoff is reported: {summary}"
+    );
+    assert!(summary.contains("\"workload_complete_tick\":266"));
+    assert!(summary.contains("\"cutoff_scripted_ticks_in_window\":299"));
+    assert!(summary.contains("\"cutoff_campaign_tick\":8999"));
 }

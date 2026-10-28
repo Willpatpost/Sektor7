@@ -236,7 +236,17 @@ compressed horizon — reached; a formal 900 s exact-horizon window
 reports 8999/9000 — unreached by the structural one tick). No
 logical tick is fabricated, no post-cutoff work is attributed to the
 window, the 900-second requirement and the 9000-tick schedule are
-unchanged.
+unchanged. **The threshold's meaning, stated explicitly: the
+workload-completeness boundary is a WORKLOAD-CORRECTNESS threshold —
+it proves the scripted workload ran inside the measured window; it
+is NOT evidence of sustained 10 Hz performance throughout the 900
+seconds.** The runner reports the actual logical-tick progress at
+the cutoff — the in-window scripted count and the
+missing-to-horizon count (stdout and the summary's
+`cutoff_scripted_ticks_in_window` / `coverage.missing_to_horizon`) —
+and any S6-C4 performance tolerance (how much sub-10 Hz progress is
+acceptable in a formal measurement) is a SEPARATE owner decision,
+not encoded here.
 
 **The owner decision offered (NOT implemented):** if an
 in-window-complete horizon is wanted for the formal gate, the
