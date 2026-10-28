@@ -1423,10 +1423,14 @@ fn the_published_summary_identifies_the_verified_evidence_package() {
         "0123abcd",
         false,
     );
+    // The serializer JSON-escapes the path's backslashes (Windows:
+    // "C:\\Users\\..." in the document) — the expected substring must
+    // be the JSON-escaped form of the directory, not the raw path.
+    let expected_dir = evidence_dir.display().to_string().replace('\\', "\\\\");
     assert!(
         summary.contains(&format!(
             "\"evidence\":{{\"dir\":\"{}\",\"schema\":\"s6-evidence/2\",\"verified\":true}}",
-            evidence_dir.display()
+            expected_dir
         )),
         "the summary names the ACTUAL configured evidence directory, the schema \
          version, and the verified status: {summary}"
