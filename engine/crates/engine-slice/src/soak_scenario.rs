@@ -267,12 +267,72 @@ impl SoakScenarioId {
         }
     }
 
-    /// Whether `tick` (the just-executed scenario tick) is a
+    /// Whether the scenario tick (the just-executed scenario tick) is a
     /// controlled checkpoint boundary.
     pub fn is_checkpoint(self, tick: u64) -> bool {
         self.checkpoints().contains(&tick)
     }
+
+    /// The workload-completeness boundary — the start of the final
+    /// stabilization phase: the tick through which the workload
+    /// proper must complete INSIDE the measured window. The horizon's
+    /// final boundary tick is structurally post-cutoff (the window's
+    /// accrual stops strictly before the last frame's interval — see
+    /// the runner doc's feasibility analysis), so the gate stops at
+    /// this boundary while `horizon_reached` stays an honest
+    /// observation.
+    pub fn workload_complete_tick(self) -> u64 {
+        match self {
+            SoakScenarioId::Stage6V1 => 7800,
+            SoakScenarioId::Stage6V1Short => 266,
+        }
+    }
+
+    /// The expected per-cohort injection totals — the versioned
+    /// schedule's own definition, derived independently of the run
+    /// (the workload-completeness gate compares the actual registry
+    /// against exactly these; the calibration runs cross-check the
+    /// derivation against the driver's emission logic).
+    pub fn expected_cohort_totals(self) -> &'static [(u16, usize)] {
+        match self {
+            SoakScenarioId::Stage6V1 => &STAGE6_V1_EXPECTED_COHORTS,
+            SoakScenarioId::Stage6V1Short => &STAGE6_V1_SHORT_EXPECTED_COHORTS,
+        }
+    }
+
+    /// The scripted consequential-action ticks (two cycles in the full
+    /// profile; one in the compressed fixture — the documented
+    /// difference).
+    pub fn expected_action_ticks(self) -> &'static [u64] {
+        match self {
+            SoakScenarioId::Stage6V1 => &[3050, 7750],
+            SoakScenarioId::Stage6V1Short => &[115],
+        }
+    }
+
+    /// The scripted optional-publication attempt count.
+    pub fn expected_publication_count(self) -> usize {
+        match self {
+            SoakScenarioId::Stage6V1 => 30,
+            SoakScenarioId::Stage6V1Short => 2,
+        }
+    }
 }
+
+const STAGE6_V1_EXPECTED_COHORTS: [(u16, usize); 5] = [
+    (CLUSTER_COHORT, 200),
+    (STREAM_COHORT, 540),
+    (DRAIN_COHORT, 280),
+    (OVERLOAD_COHORT, 288_000),
+    (HELD_COHORT, 40),
+];
+const STAGE6_V1_SHORT_EXPECTED_COHORTS: [(u16, usize); 5] = [
+    (CLUSTER_COHORT, 200),
+    (STREAM_COHORT, 60),
+    (DRAIN_COHORT, 40),
+    (OVERLOAD_COHORT, 9_600),
+    (HELD_COHORT, 20),
+];
 
 /// Encodes one cohort member's payload: `magic(16) | cohort(16) |
 /// index(32)` (the accepted S6-C2 encoding, re-stated for the
@@ -341,12 +401,25 @@ pub struct Rejected {
     pub reason: String,
 }
 
-/// One scripted action attempt's observed outcome.
+/// One scripted action attempt's observed outcome: the attempt at its
+/// scripted tick plus — once the accepted lifecycle reaches a
+/// terminal phase — the completion evidence. `completed` is
+/// `Some(true)` ONLY for the APPLIED-with-credits completion (genuine
+/// capture → attributed confirmation → reactivation-gated
+/// exactly-once credits); `Some(false)` for an honest non-applied
+/// terminal (zero-capture, awaiting-reactivation, or incomplete);
+/// `None` while the action is still pending — a pending or refused
+/// action is never counted complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionObservation {
     pub scenario_tick: u64,
     pub accepted: bool,
     pub detail: String,
+    /// The action lifecycle's identity — the completion is matched to
+    /// the attempt through it.
+    pub started_at: u64,
+    pub completed: Option<bool>,
+    pub outcome: Option<String>,
 }
 
 /// One scripted optional-publication attempt (the outcome lands in
@@ -463,6 +536,47 @@ impl CoverageReport {
     }
 }
 
+/// The in-window workload-coverage gate (C3-F4): the workload proper
+/// must complete INSIDE the measured window — every phase entered AND
+/// the scripted-tick count at the cutoff reaching the
+/// workload-completeness boundary (the final stabilization phase's
+/// start). The horizon's final boundary tick is structurally
+/// post-cutoff — the window's accrual stops strictly before the last
+/// frame's interval, so no healthy run can execute the horizon's
+/// final tick in-window — and `horizon_reached` at the cutoff stays
+/// an honest observation, never this gate.
+pub fn coverage_gate_failure(
+    coverage: &CoverageReport,
+    scripted_at_cutoff: u64,
+    workload_complete_tick: u64,
+) -> Option<String> {
+    if !coverage.all_phases_entered() {
+        return Some(
+            "the measured window did not cover every workload phase — phases reached \
+             during the post-soak drain are catch-up, NOT in-window evidence"
+                .into(),
+        );
+    }
+    if scripted_at_cutoff < workload_complete_tick {
+        return Some(format!(
+            "the workload proper did not complete inside the measured window: \
+             {scripted_at_cutoff} scripted ticks at the cutoff, the workload-completeness \
+             boundary is {workload_complete_tick}"
+        ));
+    }
+    None
+}
+
+/// The publication workload's terminal observations (C3-F3D): the
+/// in-flight pending count and whether the tracked publication is
+/// still unresolved at the terminal read — attempted calls are never
+/// confused with completed durable publications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationTerminal {
+    pub pending: usize,
+    pub tracked_pending: bool,
+}
+
 /// The scenario's end-of-run report (application-level — the evidence
 /// package stays the pure s6-evidence/2 five-stream contract; scenario
 /// outcomes never enter the evidence schema).
@@ -479,25 +593,202 @@ pub struct ScenarioRunReport {
     pub terminal: ScenarioCheckpoint,
     pub actions: Vec<ActionObservation>,
     pub publications: usize,
+    /// The versioned expectations (derived from the scenario identity,
+    /// never from the run): the workload-completeness gate compares
+    /// the actual registry, actions, and publications against exactly
+    /// these.
+    pub expected_cohorts: &'static [(u16, usize)],
+    pub expected_actions: &'static [u64],
+    pub expected_publications: usize,
+    pub workload_complete_tick: u64,
+    /// The publication terminal observations (None when the caller
+    /// could not read them).
+    pub publication_terminal: Option<PublicationTerminal>,
+    /// The CONFIRMED durable completions the graceful close harvested
+    /// (set by the runner AFTER the finalization — the pre-close
+    /// `pending` count is the session's unpolled ledger, which can
+    /// never distinguish a completed publication from an unpolled
+    /// one; only the close's confirmed dispositions can).
+    pub publication_completions: Option<usize>,
 }
 
 impl ScenarioRunReport {
-    /// The hard scenario gates (never the NPC campaign draining): the
-    /// whole-campaign conservation identity at EVERY checkpoint and at
-    /// the terminal boundary, and the zero-silent-drop verdict — no
-    /// missing identity, no duplicate execution, every accepted
-    /// identity accounted in exactly the spine's states.
-    pub fn verdict_ok(&self) -> bool {
-        self.checkpoints
+    /// The hard scenario gates, each failure named (an empty list is
+    /// the PASS): the conservation identity at EVERY checkpoint and at
+    /// the terminal boundary; the identity-level zero-silent-drop
+    /// verdict REQUIRING full execution history (a by-subtraction
+    /// accounting is preserved and labeled but can never upgrade to an
+    /// exact-once PASS); the finite workload's completeness against
+    /// the versioned expectations (every intended injection attempted
+    /// and admitted, every required cohort present and drained,
+    /// exactly-once per identity, no missing, no duplicates); the
+    /// consequential actions attempted at their scripted ticks,
+    /// accepted, and COMPLETED through the applied-credits lifecycle;
+    /// and the publication workload attempted in full with nothing
+    /// left in flight. The recurring NPC campaign is never required
+    /// to drain globally.
+    pub fn verdict_failures(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        if !self
+            .checkpoints
             .iter()
             .all(|checkpoint| checkpoint.conservation)
-            && self.terminal.conservation
-            && self.terminal.cohorts.iter().all(|cohort| {
-                cohort.missing == 0
-                    && cohort.duplicate_executions == 0
-                    && cohort.executed + cohort.queued + cohort.blocked + cohort.held
-                        == cohort.expected
-            })
+        {
+            failures.push("the conservation identity failed at a checkpoint".into());
+        }
+        if !self.terminal.conservation {
+            failures.push("the terminal conservation identity failed".into());
+        }
+        if self.terminal.identity_evidence != "full-ledger" {
+            failures.push(
+                "the identity-level zero-silent-drop verdict is NOT VERIFIED — only \
+                 by-subtraction accounting is available (compacted history); an exact-once \
+                 PASS requires the full execution ledger"
+                    .into(),
+            );
+        }
+        for (cohort, expected) in self.expected_cohorts {
+            let Some(accounting) = self
+                .terminal
+                .cohorts
+                .iter()
+                .find(|entry| entry.cohort == *cohort)
+            else {
+                failures.push(format!(
+                    "the required cohort {cohort} is missing (expected {expected} identities)"
+                ));
+                continue;
+            };
+            if accounting.expected != *expected {
+                failures.push(format!(
+                    "cohort {cohort}: {}/{} intended injections were attempted",
+                    accounting.expected, expected
+                ));
+            }
+            if accounting.missing > 0 {
+                failures.push(format!(
+                    "cohort {cohort}: {} accepted identities are in NO state (silent drop)",
+                    accounting.missing
+                ));
+            }
+            if accounting.duplicate_executions > 0 {
+                failures.push(format!(
+                    "cohort {cohort}: {} duplicate executions",
+                    accounting.duplicate_executions
+                ));
+            }
+            if accounting.executed + accounting.queued + accounting.blocked + accounting.held
+                != accounting.expected
+            {
+                failures.push(format!(
+                    "cohort {cohort}: the identity accounting does not close \
+                     ({} + {} + {} + {} != {})",
+                    accounting.executed,
+                    accounting.queued,
+                    accounting.blocked,
+                    accounting.held,
+                    accounting.expected
+                ));
+            }
+            if accounting.queued + accounting.blocked + accounting.held != 0 {
+                failures.push(format!(
+                    "cohort {cohort}: {} identities remain outstanding at the terminal \
+                     boundary (the drainable cohort must drain)",
+                    accounting.queued + accounting.blocked + accounting.held
+                ));
+            }
+        }
+        for accounting in &self.terminal.cohorts {
+            if !self
+                .expected_cohorts
+                .iter()
+                .any(|(cohort, _)| *cohort == accounting.cohort)
+            {
+                failures.push(format!(
+                    "cohort {} is not part of the versioned schedule",
+                    accounting.cohort
+                ));
+            }
+        }
+        if self.rejected > 0 {
+            failures.push(format!(
+                "{} planned injection(s) were rejected — the scenario admits every \
+                 cohort member; a rejection is an unexpected refusal",
+                self.rejected
+            ));
+        }
+        if self.actions.len() != self.expected_actions.len() {
+            failures.push(format!(
+                "{}/{} scripted consequential actions were attempted",
+                self.actions.len(),
+                self.expected_actions.len()
+            ));
+        }
+        for (observation, expected_tick) in self.actions.iter().zip(self.expected_actions) {
+            if observation.scenario_tick != *expected_tick {
+                failures.push(format!(
+                    "a scripted action fired at tick {} (the versioned schedule says {})",
+                    observation.scenario_tick, expected_tick
+                ));
+            }
+            if !observation.accepted {
+                failures.push(format!(
+                    "the scripted action at tick {} was REFUSED: {}",
+                    observation.scenario_tick, observation.detail
+                ));
+            }
+            if observation.completed != Some(true) {
+                failures.push(format!(
+                    "the scripted action at tick {} did not COMPLETE through the \
+                     applied-credits lifecycle ({})",
+                    observation.scenario_tick,
+                    observation.outcome.as_deref().unwrap_or("still pending")
+                ));
+            }
+        }
+        if self.publications != self.expected_publications {
+            failures.push(format!(
+                "{}/{} scripted publication attempts were made",
+                self.publications, self.expected_publications
+            ));
+        }
+        if let Some(publications) = &self.publication_terminal
+            && publications.tracked_pending
+        {
+            failures.push(
+                "the tracked publication is still unresolved (pending, not a \
+                     completed durable publication)"
+                    .into(),
+            );
+        }
+        // C3-F3D: attempted is never confused with completed — every
+        // scripted publication attempt (plus the founding anchor and
+        // each applied action's own publication) must have a CONFIRMED
+        // durable completion in the close's harvest; the pre-close
+        // `pending` count is only the unpolled ledger (an observation,
+        // never this gate).
+        if let Some(confirmed) = self.publication_completions {
+            let applied = self
+                .actions
+                .iter()
+                .filter(|action| action.completed == Some(true))
+                .count();
+            let floor = 1 + applied + self.publications;
+            if confirmed < floor {
+                failures.push(format!(
+                    "the publication workload did not complete durably: {confirmed} \
+                     confirmed completions were harvested against at least {floor} \
+                     submitted publications (an attempted call is not a completed \
+                     durable publication)"
+                ));
+            }
+        }
+        failures
+    }
+
+    /// The verdict's boolean form (an empty failure list).
+    pub fn verdict_ok(&self) -> bool {
+        self.verdict_failures().is_empty()
     }
 
     /// The finite cohorts' terminal drain status (outstanding work is
@@ -639,13 +930,41 @@ impl SoakScenario {
         }
     }
 
-    /// Records one scripted action attempt's observed outcome.
-    pub fn record_action(&mut self, scenario_tick: u64, accepted: bool, detail: String) {
+    /// Records one scripted action attempt's observed outcome (the
+    /// attempt, at its scripted tick — the completion is recorded
+    /// separately through [`SoakScenario::complete_action`]).
+    pub fn record_action(
+        &mut self,
+        scenario_tick: u64,
+        accepted: bool,
+        detail: String,
+        started_at: u64,
+    ) {
         self.actions_fired.push(ActionObservation {
             scenario_tick,
             accepted,
             detail,
+            started_at,
+            completed: None,
+            outcome: None,
         });
+    }
+
+    /// Records an action lifecycle's terminal outcome, matched to its
+    /// attempt through `started_at`: `applied` is true ONLY for the
+    /// APPLIED-with-credits completion (genuine capture → attributed
+    /// confirmation → reactivation-gated exactly-once credits) — an
+    /// honest non-applied terminal (zero-capture, awaiting, or
+    /// incomplete) records `false` and never counts complete.
+    pub fn complete_action(&mut self, started_at: u64, applied: bool, outcome: String) {
+        if let Some(observation) = self
+            .actions_fired
+            .iter_mut()
+            .find(|observation| observation.started_at == started_at)
+        {
+            observation.completed = Some(applied);
+            observation.outcome = Some(outcome);
+        }
     }
 
     /// Records one scripted optional-publication attempt.
@@ -662,8 +981,12 @@ impl SoakScenario {
 
     /// Assembles the end-of-run report around the terminal
     /// accounting (computed by the caller while the session still
-    /// lives).
-    pub fn run_report(&self, terminal: ScenarioCheckpoint) -> ScenarioRunReport {
+    /// lives) and the publication terminal observations.
+    pub fn run_report(
+        &self,
+        terminal: ScenarioCheckpoint,
+        publications: PublicationTerminal,
+    ) -> ScenarioRunReport {
         ScenarioRunReport {
             scenario: self.id.as_str(),
             seed: self.seed,
@@ -676,6 +999,12 @@ impl SoakScenario {
             terminal,
             actions: self.actions_fired.clone(),
             publications: self.publications_fired.len(),
+            expected_cohorts: self.id.expected_cohort_totals(),
+            expected_actions: self.id.expected_action_ticks(),
+            expected_publications: self.id.expected_publication_count(),
+            workload_complete_tick: self.id.workload_complete_tick(),
+            publication_terminal: Some(publications),
+            publication_completions: None,
         }
     }
 

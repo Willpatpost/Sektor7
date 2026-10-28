@@ -28,6 +28,31 @@ use engine_slice::session::{Outcome, Session, run_selftest};
 use engine_slice::window_demo;
 
 fn main() {
+    // C3-F5B: the namespaced integrated-soak flags are valid ONLY
+    // within `--demo-persist` — outside it they reject every top-level
+    // mode with a visible nonzero error instead of falling through to
+    // another command path (the Stage 1 `--soak` legacy command and
+    // all other accepted modes are unchanged; this guard precedes the
+    // whole dispatch cascade).
+    const INTEGRATED_SOAK_FLAGS: [&str; 5] = [
+        "--soak-wall-seconds",
+        "--scenario",
+        "--scenario-seed",
+        "--evidence-dir",
+        "--stabilization-deadline-secs",
+    ];
+    let raw_args: Vec<String> = std::env::args().collect();
+    let uses_soak_flags = INTEGRATED_SOAK_FLAGS
+        .iter()
+        .any(|flag| raw_args.iter().any(|arg| arg == flag));
+    if uses_soak_flags && !raw_args.iter().any(|arg| arg == "--demo-persist") {
+        eprintln!(
+            "error: the integrated-soak flags ({}) require --demo-persist \
+             (the integrated persistence demo)",
+            INTEGRATED_SOAK_FLAGS.join(" ")
+        );
+        std::process::exit(1);
+    }
     if std::env::args().any(|arg| arg == "--fingerprint-selftest") {
         let (engine, state) = run_selftest();
         println!("engine={engine}");

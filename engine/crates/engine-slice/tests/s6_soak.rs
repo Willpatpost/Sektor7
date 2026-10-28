@@ -37,14 +37,17 @@ use engine_core::{EventClass, EventSpec, Field, Schedule, Tick};
 use engine_persist::{AuthorityMode, CanonicalMedium, RevisionRecord, T1Journal};
 use engine_slice::orchestration::OrchestratedSession;
 use engine_slice::persist_demo::{
-    DemoOptions, PersistDemo, demo_scenario, region_credit_sum, run_persist_demo_headless,
+    DemoOptions, PersistDemo, SoakDrain, demo_scenario, publish_soak_summary, region_credit_sum,
+    run_persist_demo, run_persist_demo_headless, soak_drain_gate,
+    soak_evidence_verification_failure,
 };
 use engine_slice::sim::SimConfig;
 use engine_slice::soak_evidence::{
-    EvidenceConfig, EvidenceRecord, PersistenceKind, verify_package,
+    EvidenceConfig, EvidenceError, EvidenceRecord, PackageVerification, PersistenceKind,
+    VerifiedStream, verify_package,
 };
 use engine_slice::soak_scenario::{
-    STAGE6_SCENARIO_SEED, SoakOptions, SoakScenario, SoakScenarioId,
+    STAGE6_SCENARIO_SEED, SoakOptions, SoakScenario, SoakScenarioId, coverage_gate_failure,
 };
 use engine_slice::store::{SessionStore, StoreLocation};
 
@@ -182,7 +185,14 @@ fn drive(tag: &str, pattern: Pattern, seed: u64) -> DriveOutcome {
     demo.wait_current();
     let scenario = demo.scenario().expect("the scenario ran");
     let terminal = scenario.terminal_accounting(demo.session());
-    let report = scenario.run_report(terminal);
+    let publications = engine_slice::soak_scenario::PublicationTerminal {
+        pending: demo.session().pending_publications(),
+        tracked_pending: matches!(
+            demo.publication_state(),
+            Some(engine_slice::persist_demo::PublicationState::Pending { .. })
+        ),
+    };
+    let report = scenario.run_report(terminal, publications);
     let accepted_seqs = {
         let mut seqs: Vec<u64> = scenario
             .registered()
@@ -784,4 +794,550 @@ fn the_watermark_retreats_on_late_arrivals() {
     assert!(session.spine().is_executed(id) || session.spine().pending_count() > 0);
     let close = session.close();
     assert!(close.failure.is_none(), "the close completes");
+}
+
+/// C3-F1: the checkpoint regression — checkpoint N is the state AFTER
+/// precisely N intended logical ticks (the actual campaign clock AND
+/// scenario tick both equal the boundary), never the pre-tick state
+/// and never N−1. The initial, burst, dormancy, and final boundaries
+/// are covered, with the off-by-one discriminators: a cohort whose
+/// first injection is the INPUT for tick N+1 must be ABSENT from
+/// checkpoint N and fully present at the later boundary.
+#[test]
+fn checkpoints_observe_the_state_after_precisely_n_logical_ticks() {
+    let cleaner = TestDir::new("checkpoint-boundary");
+    let report = run_persist_demo_headless(scenario_options(
+        &cleaner,
+        SoakScenarioId::Stage6V1Short,
+        None,
+    ))
+    .expect("the scenario run completes");
+    let scenario = report.scenario.as_ref().expect("the scenario report");
+    // The recorded boundaries, in order: [60, 110, 150, 190, 230,
+    // 234, 240, 266] — each must record the AFTER-tick state.
+    let boundaries = SoakScenarioId::Stage6V1Short.checkpoints();
+    assert_eq!(scenario.checkpoints.len(), boundaries.len());
+    for (checkpoint, boundary) in scenario.checkpoints.iter().zip(boundaries) {
+        assert_eq!(
+            checkpoint.campaign_tick, *boundary,
+            "the actual campaign clock at the checkpoint is the completed boundary tick"
+        );
+        assert_eq!(
+            checkpoint.scenario_tick, *boundary,
+            "the scripted-tick count at the checkpoint is the completed boundary tick"
+        );
+        assert!(checkpoint.conservation);
+    }
+    let has_cohort = |index: usize, cohort: u16| {
+        scenario.checkpoints[index]
+            .cohorts
+            .iter()
+            .find(|entry| entry.cohort == cohort)
+    };
+    // The initial boundary (60): the cluster's injection is the INPUT
+    // for tick 61 — absent at 60, fully present at 110 (with the
+    // stream cohort).
+    assert!(
+        has_cohort(0, engine_slice::soak_scenario::CLUSTER_COHORT).is_none(),
+        "the cluster (input 60) is NOT yet applied at the tick-60 checkpoint"
+    );
+    let at_110 = has_cohort(1, engine_slice::soak_scenario::CLUSTER_COHORT)
+        .expect("the cluster is accounted at the tick-110 checkpoint");
+    assert_eq!(at_110.expected, 200);
+    assert_eq!(
+        has_cohort(1, engine_slice::soak_scenario::STREAM_COHORT)
+            .expect("the stream cohort at 110")
+            .expected,
+        60
+    );
+    // The burst boundary (150): the overload's first injection is the
+    // INPUT for tick 151 — absent at 150, fully expected at 190.
+    assert!(
+        has_cohort(2, engine_slice::soak_scenario::OVERLOAD_COHORT).is_none(),
+        "the overload (first input 150) is NOT yet applied at the tick-150 checkpoint"
+    );
+    let at_190 = has_cohort(3, engine_slice::soak_scenario::OVERLOAD_COHORT)
+        .expect("the overload is accounted at the tick-190 checkpoint");
+    assert_eq!(at_190.expected, 9600);
+    // The dormancy boundaries (234 mid-hold, 240 released) and the
+    // final boundary (266) are asserted by the checkpoint-series test.
+}
+
+/// C3-F2A: the independent evidence verification fails closed on
+/// EVERY outcome — only `Ok(verified complete)` passes; an incomplete
+/// verification and a TYPED VERIFIER ERROR both fail the run with the
+/// actual failure preserved (an error is never swallowed into a
+/// None).
+#[test]
+fn evidence_verification_fails_closed_on_every_outcome() {
+    let complete = PackageVerification {
+        schema_version: "s6-evidence/2".into(),
+        scenario: "stage6-v1-short".into(),
+        declared_complete: true,
+        streams: Vec::<VerifiedStream>::new(),
+        problems: Vec::<String>::new(),
+    };
+    assert!(soak_evidence_verification_failure(&Ok(complete)).is_none());
+    let incomplete = PackageVerification {
+        schema_version: "s6-evidence/2".into(),
+        scenario: "stage6-v1-short".into(),
+        declared_complete: false,
+        streams: Vec::<VerifiedStream>::new(),
+        problems: vec!["the ticks stream lost 3 records".into()],
+    };
+    let failure = soak_evidence_verification_failure(&Ok(incomplete))
+        .expect("an incomplete verification fails the run");
+    assert!(failure.contains("did not verify complete"));
+    assert!(
+        failure.contains("ticks stream lost 3 records"),
+        "the actual problem is preserved: {failure}"
+    );
+    let error = soak_evidence_verification_failure(&Err(EvidenceError::Decode(
+        "the manifest is not parseable".into(),
+    )))
+    .expect("a typed verifier error fails the run");
+    assert!(
+        error.contains("independent evidence verification failed"),
+        "the typed error is preserved: {error}"
+    );
+    assert!(error.contains("manifest is not parseable"));
+}
+
+/// C3-F2A: a graphical soak without its required evidence
+/// configuration fails visibly BEFORE anything opens (the library's
+/// own fail-closed check, ahead of the renderer and the campaign).
+#[test]
+fn a_graphical_soak_without_its_required_configuration_fails_before_the_window() {
+    let cleaner = TestDir::new("soak-missing-evidence");
+    let mut options = scenario_options(&cleaner, SoakScenarioId::Stage6V1Short, None);
+    options.headless = false;
+    options.soak_wall_seconds = Some(30);
+    options.evidence = None;
+    let error = run_persist_demo(options).expect_err("the missing configuration fails");
+    assert!(
+        error.contains("requires --scenario and --evidence-dir"),
+        "the visible error names the requirement: {error}"
+    );
+}
+
+/// C3-F2C: the soak summary's publication is atomic and fails closed
+/// — a failed write never truncates an existing accepted summary (the
+/// tmp-then-rename protocol), and an error is returned, never
+/// swallowed.
+#[test]
+fn the_soak_summary_publication_is_atomic_and_fails_closed() {
+    let cleaner = TestDir::new("summary-publication");
+    let campaign = cleaner.root.join("campaign");
+    std::fs::create_dir_all(&campaign).unwrap();
+    // The healthy publication: the final name appears, no staging
+    // file remains.
+    let path = publish_soak_summary(&campaign, "{\"schema\":\"s6-soak-summary/1\"}")
+        .expect("the healthy publication succeeds");
+    assert_eq!(path, campaign.join("soak-summary.json"));
+    assert!(path.exists());
+    assert!(!campaign.join("soak-summary.json.tmp").exists());
+    // The accepted summary is never truncated by a failed write: the
+    // staging path is blocked, the publication fails, and the prior
+    // summary is byte-identical.
+    let prior = std::fs::read_to_string(&path).unwrap();
+    std::fs::create_dir_all(campaign.join("soak-summary.json.tmp")).unwrap();
+    let error = publish_soak_summary(&campaign, "{\"schema\":\"broken\"")
+        .expect_err("the blocked staging path fails the publication");
+    assert!(!error.to_string().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        prior,
+        "the prior accepted summary is untouched"
+    );
+}
+
+/// C3-F2B: the drain gate — a completed drain MUST also hold the
+/// absolute time accounting; a false conservation fails the workload
+/// gate exactly like an incomplete drain or a refusal.
+#[test]
+fn a_completed_drain_with_false_time_conservation_fails_the_gate() {
+    let healthy = SoakDrain {
+        deadline_secs: 300,
+        drain_ms: 1.0,
+        outstanding_before: 12,
+        outstanding_after: 0,
+        executed_ticks: 12,
+        completed: true,
+        time_accounting_holds: true,
+        refused: None,
+    };
+    assert!(soak_drain_gate(&healthy).is_none());
+    let false_conservation = SoakDrain {
+        time_accounting_holds: false,
+        ..healthy.clone()
+    };
+    let failure = soak_drain_gate(&false_conservation)
+        .expect("a completed drain with false time accounting fails");
+    assert!(failure.contains("time accounting does not hold"));
+    let incomplete = SoakDrain {
+        completed: false,
+        outstanding_after: 5,
+        ..healthy
+    };
+    assert!(soak_drain_gate(&incomplete).is_some_and(|failure| failure.contains("did not drain")));
+}
+
+/// C3-F3: the scenario verdict requires the FULL versioned workload —
+/// each failure named. The arms are exercised against a real healthy
+/// report (one mutated field per arm): a missing required cohort, an
+/// unexpected rejection, a refused action, a pending (never
+/// completed) action, a compacted-history downgrade, an outstanding
+/// drainable cohort, and a publication workload without durable
+/// completions.
+#[test]
+fn the_scenario_verdict_requires_the_full_workload() {
+    let cleaner = TestDir::new("verdict-arms");
+    let report = run_persist_demo_headless(scenario_options(
+        &cleaner,
+        SoakScenarioId::Stage6V1Short,
+        None,
+    ))
+    .expect("the scenario run completes");
+    let healthy = report.scenario.as_ref().expect("the scenario report");
+    assert!(healthy.verdict_ok(), "the healthy run passes every gate");
+    let mut missing_cohort = healthy.clone();
+    missing_cohort
+        .terminal
+        .cohorts
+        .retain(|cohort| cohort.cohort != engine_slice::soak_scenario::OVERLOAD_COHORT);
+    assert!(
+        missing_cohort
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("required cohort 5 is missing"))
+    );
+    let mut rejected = healthy.clone();
+    rejected.rejected = 1;
+    assert!(
+        rejected
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("planned injection(s) were rejected"))
+    );
+    let mut refused_action = healthy.clone();
+    refused_action.actions[0].accepted = false;
+    assert!(
+        refused_action
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("was REFUSED"))
+    );
+    let mut pending_action = healthy.clone();
+    pending_action.actions[0].completed = None;
+    pending_action.actions[0].outcome = None;
+    assert!(
+        pending_action
+            .verdict_failures()
+            .iter()
+            .any(
+                |failure| failure.contains("did not COMPLETE") && failure.contains("still pending")
+            )
+    );
+    let mut compacted = healthy.clone();
+    compacted.terminal.identity_evidence = "by-subtraction";
+    compacted.terminal.history_full = false;
+    assert!(
+        compacted
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("NOT VERIFIED") && failure.contains("by-subtraction"))
+    );
+    let mut outstanding = healthy.clone();
+    for cohort in &mut outstanding.terminal.cohorts {
+        if cohort.cohort == engine_slice::soak_scenario::DRAIN_COHORT {
+            cohort.queued = 7;
+            cohort.executed -= 7;
+        }
+    }
+    assert!(
+        outstanding
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("remain outstanding at the terminal boundary"))
+    );
+    let mut unpublished = healthy.clone();
+    unpublished.publication_completions = Some(1);
+    assert!(
+        unpublished
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("did not complete durably"))
+    );
+}
+
+/// C3-F3 (real induction): an INTERRUPTED scenario — the replay capped
+/// mid-lifecycle — fails the workload verdict with the honest named
+/// failures: the pending (never-completed) action, the cohorts that
+/// were never injected, and the drainable cohort still outstanding.
+#[test]
+fn an_interrupted_scenario_fails_the_workload_verdict() {
+    let cleaner = TestDir::new("interrupted-verdict");
+    let mut options = scenario_options(&cleaner, SoakScenarioId::Stage6V1Short, None);
+    options.headless_ticks = 118; // the action fired at 115 — mid-lifecycle
+    let report = run_persist_demo_headless(options).expect("the run completes");
+    let scenario = report.scenario.as_ref().expect("the scenario report");
+    let failures = scenario.verdict_failures();
+    assert!(
+        !failures.is_empty(),
+        "the interrupted scenario fails the verdict"
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure
+                .contains("did not COMPLETE through the applied-credits lifecycle")),
+        "the pending action is named: {failures:?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("required cohort 5 is missing")),
+        "the never-injected overload cohort is named: {failures:?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("remain outstanding")),
+        "the drainable cohort still outstanding is named: {failures:?}"
+    );
+    assert!(report.scenario_failed());
+    // The observational accounting is preserved — the verdict fails on
+    // the workload, never by hiding the state.
+    assert!(scenario.terminal.conservation);
+}
+
+/// C3-F3B (real induction): a COMPACTED execution history downgrades
+/// the identity-level verdict to NOT VERIFIED — the observational
+/// by-subtraction accounting is preserved and labeled, and never
+/// silently upgraded to an exact-once PASS.
+#[test]
+fn a_compacted_history_downgrades_the_identity_verdict() {
+    let cleaner = TestDir::new("compacted-downgrade");
+    let location = StoreLocation::Database(cleaner.root.join("campaign.db"));
+    let mut store = SessionStore::open(&location).unwrap();
+    store
+        .append(
+            &RevisionRecord::founding(AuthorityMode::Standalone, "s6c3-compacted", 0),
+            &[],
+            None,
+        )
+        .unwrap();
+    let (spine, director) = demo_scenario(
+        &SimConfig::default(),
+        &[engine_slice::persist_demo::DEMO_PRESENCE],
+    )
+    .expect("the scenario builds");
+    let journal = T1Journal::open(cleaner.root.join("journal.t1")).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "s6c3-compacted")
+            .expect("the session opens");
+    let mut scenario = SoakScenario::new(
+        SoakScenarioId::Stage6V1Short,
+        STAGE6_SCENARIO_SEED,
+        session.director().config().centers,
+    );
+    // The manual harness drives the accepted interface sequence (the
+    // same input ordering `run_ticks` applies) — bursts and ticks
+    // only; the action/publication lifecycles are PersistDemo-level
+    // and are not this regression's subject.
+    for tick in 0..SoakScenarioId::Stage6V1Short.horizon() {
+        let step = scenario.step();
+        for burst in step.bursts {
+            let spec = EventSpec::new(
+                EventClass::new(burst.region),
+                Schedule::AtLogicalTime {
+                    due: Tick(tick + 1 + burst.due_offset),
+                },
+                engine_slice::soak_scenario::burst_payload(burst.cohort, burst.index),
+            )
+            .in_field(burst.field);
+            let result = session.schedule_event(spec);
+            scenario.record_scheduled(burst.cohort, burst.index, result);
+        }
+        session.tick(&[step.presence]).expect("the tick runs");
+        // A genuine publication (the accepted interfaces), so the
+        // maintenance checkpoint's reclaimable range is nonempty —
+        // an explicit checkpoint that indexes nothing refuses by
+        // design.
+        if tick == 200 {
+            let capture = session.capture_snapshot().expect("the capture");
+            let handle = session.submit_publication(capture).expect("the submission");
+            session
+                .wait_publication(handle)
+                .expect("the publication completes");
+        }
+        // Compact mid-run through the accepted maintenance interface:
+        // the retained tail replaces the full history.
+        if tick == 270 {
+            session
+                .publish_checkpoint(64)
+                .expect("the checkpoint maintenance runs");
+        }
+    }
+    let terminal = scenario.terminal_accounting(&session);
+    assert_eq!(
+        terminal.identity_evidence, "by-subtraction",
+        "the compacted history is labeled honestly"
+    );
+    assert!(!terminal.history_full);
+    for cohort in &terminal.cohorts {
+        assert!(
+            cohort.by_subtraction,
+            "the accounting is preserved: {cohort:?}"
+        );
+    }
+    let publications = engine_slice::soak_scenario::PublicationTerminal {
+        pending: session.pending_publications(),
+        tracked_pending: false,
+    };
+    let report = scenario.run_report(terminal, publications);
+    assert!(
+        report
+            .verdict_failures()
+            .iter()
+            .any(|failure| failure.contains("NOT VERIFIED") && failure.contains("by-subtraction")),
+        "the identity gate is downgraded, never silently upgraded"
+    );
+    let close = session.close();
+    assert!(close.failure.is_none());
+}
+
+/// C3-F4 + C3-F5A: the cutoff feasibility and attribution regression.
+/// The window's accrual stops STRICTLY before the last frame's
+/// interval (the cutoff fires at the frame top, before
+/// `begin_frame`), so at an exact-horizon window the horizon's final
+/// scripted tick is structurally NEVER consumed — the in-window
+/// scripted count is horizon − 1 (or less), no accrued debt remains
+/// for the drain, and the workload-completeness gate still passes
+/// with its documented headroom while the horizon is honestly
+/// reported unreached.
+#[test]
+fn the_cutoff_attributed_feasibility_holds_at_an_exact_horizon_window() {
+    // The structural arithmetic, for the frame-rate matrix (the full
+    // profile's 900 s window at 10 Hz): the in-window tick count is
+    // floor((window − frame_interval) / period) — strictly below the
+    // horizon for EVERY frame interval, and far above the
+    // workload-completeness boundary.
+    let window_ms = 900_000.0_f64;
+    for frame_ms in [6.944_f64, 8.333, 16.667, 33.333, 100.0] {
+        let in_window = ((window_ms - frame_ms) / 100.0).floor() as u64;
+        assert!(
+            in_window < 9000,
+            "the horizon's final tick is structurally post-cutoff at {frame_ms}ms frames"
+        );
+        assert!(
+            in_window >= 7800,
+            "the workload-completeness boundary is covered with headroom at {frame_ms}ms frames"
+        );
+    }
+    // The behavioral regression over the real driver: the compressed
+    // profile's exact-horizon window (300 ticks = 30.0 s), emulating
+    // the graphical loop's cutoff rule (the frame that would cross
+    // the boundary never accrues).
+    let cleaner = TestDir::new("cutoff-feasibility");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&cleaner.root, SimConfig::default()).expect("the open");
+    demo.attach_scenario(SoakScenario::new(
+        SoakScenarioId::Stage6V1Short,
+        STAGE6_SCENARIO_SEED,
+        demo.session().director().config().centers,
+    ));
+    let frame = Duration::from_millis(16);
+    let window = Duration::from_millis(30_000);
+    let mut accrued = Duration::ZERO;
+    while accrued + frame < window {
+        demo.advance(frame).expect("the frame advance runs");
+        accrued += frame;
+    }
+    let scripted_at_cutoff = demo.scenario().expect("the scenario ran").scenario_tick();
+    assert!(
+        scripted_at_cutoff < 300,
+        "the horizon is structurally post-cutoff (scripted {scripted_at_cutoff} in window)"
+    );
+    assert!(
+        scripted_at_cutoff >= 266,
+        "the workload-completeness boundary is covered in window"
+    );
+    let coverage = demo.scenario().expect("the scenario ran").coverage();
+    assert!(coverage.all_phases_entered());
+    assert!(
+        !coverage.horizon_reached,
+        "the horizon is honestly NOT reached at the cutoff"
+    );
+    assert!(
+        coverage_gate_failure(&coverage, scripted_at_cutoff, 266).is_none(),
+        "the corrected coverage gate passes the healthy exact-horizon window"
+    );
+    assert!(
+        coverage_gate_failure(&coverage, 200, 266).is_some(),
+        "a window short of the workload boundary fails the gate"
+    );
+    // The drain settles the ACCRUED debt — and at an exact-horizon
+    // window there is none: the accrual stopped strictly (sub-tick)
+    // short of the horizon's final tick, and no new wall time accrues
+    // post-cutoff, so the horizon's final scripted input is honestly
+    // NEVER consumed — in-window, in-drain, or otherwise. The
+    // workload-completeness gate (266) passes; the horizon is
+    // reported unreached; the campaign closes one tick short with
+    // every workload obligation long since complete.
+    let drain = demo.drain_bounded(60);
+    assert!(
+        drain.completed,
+        "the drain settles (there is no accrued debt)"
+    );
+    assert_eq!(
+        drain.executed_ticks, 0,
+        "the accrual is sub-tick short of the horizon — no debt remains"
+    );
+    assert_eq!(
+        demo.scenario().expect("the scenario ran").scenario_tick(),
+        scripted_at_cutoff,
+        "the terminal scripted count equals the in-window count (the horizon's final \
+         input is never consumed)"
+    );
+    let finalization = demo.finalize(None);
+    assert!(finalization.close_summary().failure.is_none());
+}
+
+/// C3-F5B: the namespaced integrated-soak flags reject every
+/// top-level mode outside `--demo-persist` (a visible nonzero error),
+/// while the Stage 1 `--soak` legacy command is preserved.
+#[test]
+fn top_level_soak_flags_reject_other_modes() {
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+            .args(args)
+            .output()
+            .expect("the binary spawns");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for args in [
+        vec!["--soak-wall-seconds", "900"],
+        vec!["--scenario", "stage6-v1"],
+        vec!["--scenario-seed", "7"],
+        vec!["--evidence-dir", "/tmp/s7-unused"],
+        vec!["--stabilization-deadline-secs", "30"],
+        vec!["--sim", "--scenario", "stage6-v1"],
+        vec!["--render", "--soak-wall-seconds", "30"],
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, 1, "the top-level flags reject ({args:?}):\n{stderr}");
+        assert!(
+            stderr.contains("require --demo-persist"),
+            "the visible error names the requirement: {stderr}"
+        );
+    }
+    // The Stage 1 legacy command is unchanged: the paced SDL shell
+    // soak still runs (the dummy driver — no Vulkan, no simulation,
+    // no persistence).
+    let (code, _stderr) = run(&["--soak", "1"]);
+    assert_eq!(code, 0, "the Stage 1 --soak legacy command is preserved");
 }

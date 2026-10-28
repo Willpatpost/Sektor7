@@ -1,14 +1,20 @@
 # STAGE 6 — S6-C3 AUTOMATED INTEGRATED SOAK RUNNER
 
-> **Status:** v1 · 2026-10-27 · **S6-C3 implementation artifact** — the
+> **Status:** v2 · 2026-10-27 · **S6-C3 implementation artifact** — the
 > deterministic integrated scenario, the automated wall-clock soak
 > runner, the corrected time-debt termination protocol, the
 > checkpoint-scale identity accounting, and the bounded CI smokes
-> (Stage 6 Checkpoint 3, the owner GO of 2026-10-27). Delivered on the
-> `s6-c3-integrated-soak` branch; NOT yet independently reviewed or
-> owner-accepted. S6-C4 (physical hardware measurements) and S6-C5
-> (the report) remain gated; this document never claims physical
-> performance acceptance from pod or CI observations.
+> (Stage 6 Checkpoint 3, the owner GO of 2026-10-27), CORRECTED per
+> the source review's five findings (C3-F1 the after-tick checkpoint
+> observation, C3-F2 the fail-closed evidence verification / time
+> accounting / summary publication / final-verdict ordering, C3-F3
+> the workload-completeness gates, C3-F4 the coverage-feasibility
+> correction, C3-F5 the cutoff attribution and top-level CLI
+> consistency). Delivered on the `s6-c3-integrated-soak` branch; NOT
+> yet independently re-reviewed or owner-accepted. S6-C4 (physical
+> hardware measurements) and S6-C5 (the report) remain gated; this
+> document never claims physical performance acceptance from pod or
+> CI observations.
 
 ## 1. The interface
 
@@ -139,10 +145,19 @@ stamps are offsets from it). At the wall boundary the loop breaks
 BEFORE the next frame's interval reaches the accumulator: no further
 wall time accrues and no further scripted inputs apply. The cutoff
 state is recorded first — the actual wall duration, the campaign
-tick, the fixed-step debt, and the OBSERVED in-window coverage
-(whether each phase ran INSIDE the measured window; phases reached
-during post-soak catch-up are catch-up, never in-window evidence —
-the wall-time versus tick-time distinction is never conflated).
+tick, the fixed-step debt, the scripted ticks completed INSIDE the
+window (the scenario's own counter at the cutoff — the drain's
+post-cutoff ticks are reported separately, never conflated), and the
+OBSERVED in-window coverage (whether each phase ran INSIDE the
+measured window; phases reached during post-soak catch-up are
+catch-up, never in-window evidence).
+
+The controlled checkpoints are captured ONLY AFTER the boundary tick
+has actually executed (and its confirmation and action lifecycle
+processed): checkpoint N is the state after precisely N intended
+logical ticks — the actual campaign clock, scenario tick, and
+fixed-step debt at that boundary, aligned; a failed authoritative
+tick can never be represented as a completed checkpoint.
 
 The post-soak stabilization phase is DISTINCT and bounded: the
 ALREADY-ACCRUED fixed-step debt drains through the accepted tick
@@ -152,41 +167,119 @@ executes it under the separately configurable
 `--stabilization-deadline-secs`, default 300). Unexecuted fixed-step
 debt is NOT a canonical recovered obligation (the recovery
 initializes the accumulator anew) — draining it here is the only
-honest completion. The completion checks: `outstanding == 0` and the
-absolute accounting `ticks due == campaign clock + outstanding`. A
-debt that cannot drain by the deadline marks the workload gate
-FAILED/INCOMPLETE — the remainder reported, the measurements
+honest completion. The completion checks: `outstanding == 0` AND the
+absolute accounting `ticks due == campaign clock + outstanding` (a
+completed drain with false time conservation FAILS the workload
+gate). A debt that cannot drain by the deadline marks the workload
+gate FAILED/INCOMPLETE — the remainder reported, the measurements
 preserved, the graceful close still attempted — never silently
 discarded, never a manufactured success. A drain tick refusal
 surfaces as an application failure through the single finalization
-site. Event-spine queued/blocked/held work is separate and keeps its
-accepted durability contract.
+site. The drain's executed ticks consume the deterministic scripted
+inputs for already-accrued logical time — honestly attributed to the
+drain, never counted as in-window coverage. Event-spine
+queued/blocked/held work is separate and keeps its accepted
+durability contract.
 
-Then, in order: the finite cohorts' terminal outcomes confirmed (or
-their outstanding work explicitly recorded) · the existing graceful
-canonical close exactly once (the single `PersistDemo::finalize`
-site) · the evidence package finalized and independently verified ·
-recovery in a fresh process (the runbook's relaunch; the test
-binary's fresh-process pair proves the exact durable state restored).
+Then, in order: the finite cohorts' terminal outcomes confirmed
+against the versioned expectations (or their failures named) · the
+existing graceful canonical close exactly once (the single
+`PersistDemo::finalize` site) · the evidence package finalized AND
+independently verified from disk (fail-closed: `Ok(verified
+complete)` is the only passing outcome; an incomplete verification
+OR a typed verifier error fails the run with the failure preserved —
+never swallowed) · recovery in a fresh process (the runbook's
+relaunch; the test binary's fresh-process pair proves the exact
+durable state restored).
 
-## 4. The checkpoint-scale accounting
+**The final verdict is computed once, over all checks, before the
+summary is published** — the window, the drain with its time
+conservation, the in-window workload coverage, the scenario's hard
+gates, the validation layer, and the independent evidence
+verification — so stdout, the summary, and the exit status never
+contradict (the close outcome and the in-run evidence verdict
+compose through the accepted `Finalization::combined()` mechanism).
+The summary's publication is atomic (staging file + rename — a
+failed write can never truncate an existing accepted summary) and a
+failed publication is a terminal diagnostic plus a failed run: the
+failed summary cannot record its own failure.
+
+## 3a. The 900-second coverage-feasibility analysis (C3-F4)
+
+**The structural fact:** the cutoff fires at the frame top, BEFORE
+`begin_frame` — so the window's accrued time is the LAST ADVANCED
+frame's start minus the measurement origin, which is STRICTLY less
+than the window. At an exact-horizon window (9000 ticks = 900.000 s
+of logical time at 10 Hz inside a 900 s window), the horizon's final
+tick needs the full 900.000 s of accrual — which no run can ever
+reach: the in-window scripted count is `floor((window −
+frame_interval) / tick_period)`, strictly below the horizon for
+EVERY frame interval (144 FPS, 60 FPS, irregular, or arbitrarily
+fast — the final frame's interval is never accrued), and no accrued
+debt remains for the drain (the shortfall is sub-tick). The
+horizon's final scripted input is therefore NEVER consumed inside an
+exact-horizon-window run — in-window, in-drain, or otherwise. This
+is proven deterministically by the cutoff-feasibility regression
+(the exact-horizon window over the real driver: 299/300 scripted
+in-window, the drain settles zero debt, the honest unreached
+horizon) and by the frame-rate arithmetic matrix.
+
+**The gate correction (implemented):** the workload gate requires
+the WORKLOAD PROPER to complete inside the measured window — every
+phase entered AND the scripted count at the cutoff reaching the
+workload-completeness boundary (the final stabilization phase's
+start: tick 7800 in the full profile, 266 in the compressed fixture
+— ~120 s / ~3.4 s of headroom respectively at the 10 Hz cadence).
+`horizon_reached` at the cutoff stays an honest observation (the
+CI's lavapipe smoke shows both truths: a 40 s window overruns the
+compressed horizon — reached; a formal 900 s exact-horizon window
+reports 8999/9000 — unreached by the structural one tick). No
+logical tick is fabricated, no post-cutoff work is attributed to the
+window, the 900-second requirement and the 9000-tick schedule are
+unchanged.
+
+**The owner decision offered (NOT implemented):** if an
+in-window-complete horizon is wanted for the formal gate, the
+smallest truthful adjustment is a versioned schedule revision —
+`stage6-v1-r1` with the stabilization phase ending at 8990 ticks
+(10 ticks = 1.0 s of planned headroom; the workload proper is
+unchanged) — presented for separate owner review; the current
+gate semantics make it unnecessary for a truthful PASS.
+
+## 4. The checkpoint-scale accounting and the workload gates
 
 The S6-C2 per-identity oracle is O(ledger)+O(queue) — correct at
 controlled checkpoints and finalization, never per tick. Every
 checkpoint verifies the O(1) whole-campaign conservation identity
-with the spine's own definitions (`scheduled == executed + queued +
-blocked + held`; the living NPC campaign's recurring obligations are
-part of the accounted state and never required to drain). The
-per-cohort live states come from single queue/held passes bucketed
-by the registry's identity→cohort map (never a per-cohort rescan).
-The full identity-level zero-silent-drop verdict (executed
-exactly-once, duplicate detection, missing detection, per-identity
-lateness) is established at finalization through the FULL ledger
-when `HistoryKind::Full` holds (the demo scenarios never compact) —
-and honestly by subtraction plus the live sets if a future policy
-compacts (labeled `by-subtraction`, never silently claimed as
-full-history evidence). Fixed-step time debt is reported separately
-from event-spine backlog at every boundary.
+with the spine's own definitions (the living NPC campaign's
+recurring obligations are part of the accounted state and never
+required to drain). The per-cohort live states come from single
+queue/held passes bucketed by the registry's identity→cohort map
+(never a per-cohort rescan). The full identity-level zero-silent-drop
+verdict (executed exactly-once, duplicate detection, missing
+detection, per-identity lateness) is established at finalization
+through the FULL ledger when `HistoryKind::Full` holds (the demo
+scenarios never compact — the full profile's 289,060 identities and
+~1.5 M ledger records retain Full with ample headroom) — and a
+compacted history DOWNGRADES the identity gate to NOT VERIFIED (the
+by-subtraction accounting preserved and labeled, never silently
+upgraded to an exact-once PASS). Fixed-step time debt is reported
+separately from event-spine backlog at every boundary.
+
+**The scenario verdict proves the WORKLOAD, not just arithmetic**
+(each failure named; an empty list is the PASS): every intended
+injection attempted and admitted against the versioned expected
+totals (an unexpected rejection fails); every required cohort
+present, fully accounted, and DRAINED at the terminal boundary;
+exactly-once per identity with no missing and no duplicates under
+the full-history proof; the consequential actions attempted at their
+scripted ticks, accepted, and COMPLETED through the
+applied-credits lifecycle (a pending, refused, awaiting, or
+zero-capture action never passes); and the publication workload
+attempted in full with every submission carrying a CONFIRMED durable
+completion in the close's harvest (the pre-close pending count is
+the unpolled ledger — an observation; an attempted call is never
+confused with a completed durable publication).
 
 ## 5. Evidence, provenance, and the summary
 
@@ -211,14 +304,25 @@ scenario, close, and evidence verdicts into the run's exit code.
 
 ## 6. Verification
 
-`tests/s6_soak.rs` (10 tests, all platforms, headless): the strict
+`tests/s6_soak.rs` (20 tests, all platforms, headless): the strict
 CLI rejections · the four-pattern frame-cadence equivalence · the
 seed sensitivity · the checkpoint conservation/hold/backlog series ·
-the failed-evidence visibility · the verified package with the
-single-site close · the unable-to-drain honesty · the fresh-process
-recovery (the real binary, exact durable state restored) · the
-externally terminated run's honest recovery · the S6-C2-deferred
-watermark-retreat check at checkpoint precision. The pod and CI
+the after-tick checkpoint boundary with the off-by-one
+discriminators · the failed-evidence visibility · the fail-closed
+evidence verification (complete / incomplete / typed error) · the
+missing soak configuration failing before the window · the verified
+package with the single-site close · the atomic fail-closed summary
+publication · the drain gate with the false time conservation · the
+workload-verdict arms (the missing cohort, the rejection, the
+refused and pending actions, the compacted downgrade, the
+outstanding cohort, the unpublished workload) · the interrupted
+scenario's named failures · the compacted-history downgrade over a
+real maintenance compaction · the unable-to-drain honesty · the
+cutoff feasibility and attribution at an exact-horizon window · the
+fresh-process recovery (the real binary, exact durable state
+restored) · the externally terminated run's honest recovery · the
+S6-C2-deferred watermark-retreat check · the top-level flag
+rejection with the Stage 1 `--soak` legacy preserved. The pod and CI
 carry no Vulkan loader for the graphical path — the bounded lavapipe
 graphical smoke (below) belongs to CI's Linux runners, and physical
 graphical acceptance belongs to the owner's rigs (the runbooks).
@@ -238,9 +342,12 @@ smoke only, never GPU performance evidence.
   window; graphical measurements belong to the soak and the rig.
 - The formal 900-second wall-clock soak is NOT executed in CI or on
   the pod — S6-C4 (physical hardware) is separately gated.
-- The workload gate's coverage check requires the full horizon
-  inside the measured window; a slow runner reports the honest
-  partial coverage (a failed gate, preserved measurements).
+- The workload gate's coverage check requires the WORKLOAD PROPER
+  (all phases + the workload-completeness boundary) inside the
+  measured window — NOT the horizon's final tick, which is
+  structurally post-cutoff at an exact-horizon window (§3a); a slow
+  runner reports the honest partial coverage (a failed gate,
+  preserved measurements).
 - The sustained-overload calibration (240/tick against the 200
   budget) is sized to the demo's 1000-NPC baseline; it exercises the
   budget machinery, not worst-case game scale.
