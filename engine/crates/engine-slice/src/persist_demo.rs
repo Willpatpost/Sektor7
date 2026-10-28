@@ -623,6 +623,10 @@ pub struct HeadlessReport {
     pub boundary_p95: f64,
     pub boundary_max: f64,
     pub boundary_samples: usize,
+    /// The FULL-RUN maximum complete-boundary duration and its
+    /// campaign tick (survives past the rolling window).
+    pub boundary_run_max: f64,
+    pub boundary_run_max_tick: u64,
     pub close: CloseSummary,
     /// The evidence package's verdict (S6-C1) — `None` when the run
     /// collected no evidence.
@@ -691,6 +695,10 @@ impl HeadlessReport {
         println!(
             "  complete boundary time (tick + confirmation + action lifecycle): p50 {:.3} ms · p95 {:.3} ms · max {:.3} ms ({} samples)",
             self.boundary_p50, self.boundary_p95, self.boundary_max, self.boundary_samples
+        );
+        println!(
+            "  full-run boundary max {:.3} ms at campaign tick {} (survives the rolling window)",
+            self.boundary_run_max, self.boundary_run_max_tick
         );
         println!(
             "  closed at tick {} · ticks due {} · outstanding {} · conservation {} · stage4 fingerprint {}",
@@ -837,6 +845,14 @@ pub struct PersistDemo {
     /// schema field (the confirmation latency already lives in the
     /// persistence evidence family).
     boundary_ms_history: Vec<f64>,
+    /// The FULL-RUN maximum complete-boundary duration and its
+    /// campaign tick (the S6-C4 review corrective): unlike the
+    /// rolling 600-tick window — whose percentiles lose an early
+    /// hitch once ~600 ordinary ticks follow — the full-run maximum
+    /// survives to the terminal report (a late-run summary can never
+    /// hide an early stall). Never fingerprinted; observational only.
+    boundary_max_ms: f64,
+    boundary_max_tick: u64,
     /// The presence the next tick boundary consumes — explicit
     /// simulation input, never wall-clock (the graphical loop feeds
     /// the camera; the headless path feeds the fixed demo presence).
@@ -874,6 +890,8 @@ impl PersistDemo {
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
             boundary_ms_history: Vec::new(),
+            boundary_max_ms: 0.0,
+            boundary_max_tick: 0,
             presence: vec![DEMO_PRESENCE],
             founded: false,
             action: None,
@@ -1374,6 +1392,10 @@ impl PersistDemo {
             let boundary_len = self.boundary_ms_history.len();
             if boundary_len > 600 {
                 self.boundary_ms_history.drain(0..boundary_len - 600);
+            }
+            if boundary_ms > self.boundary_max_ms {
+                self.boundary_max_ms = boundary_ms;
+                self.boundary_max_tick = report.tick.as_u64();
             }
         }
         Ok(())
@@ -1926,6 +1948,13 @@ impl PersistDemo {
 
     pub fn boundary_sample_count(&self) -> usize {
         self.boundary_ms_history.len()
+    }
+
+    /// The FULL-RUN maximum complete-boundary duration and its
+    /// campaign tick (survives past the rolling window — an early
+    /// hitch is never lost to later ordinary ticks).
+    pub fn boundary_max(&self) -> (f64, u64) {
+        (self.boundary_max_ms, self.boundary_max_tick)
     }
 
     /// THE single finalization site (HOLD-1): attempt the accepted
@@ -3072,6 +3101,11 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             demo.boundary_ms_percentile(1.00),
             demo.boundary_sample_count()
         );
+        let (run_max, run_max_tick) = demo.boundary_max();
+        println!(
+            "full-run boundary max {:.3} ms at campaign tick {} (survives the rolling window)",
+            run_max, run_max_tick
+        );
         println!(
             "watermark max_executed_due {} · processed_through {}",
             spine
@@ -3677,6 +3711,7 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
     let boundary_p95 = demo.boundary_ms_percentile(0.95);
     let boundary_max = demo.boundary_ms_percentile(1.00);
     let boundary_samples = demo.boundary_sample_count();
+    let (boundary_run_max, boundary_run_max_tick) = demo.boundary_max();
     // THE SINGLE FINALIZATION SITE (HOLD-1) — every path.
     let finalization = demo.finalize(application_failure);
     // C3-F3D: the publication workload's durable-completion proof —
@@ -3699,6 +3734,8 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         boundary_p95,
         boundary_max,
         boundary_samples,
+        boundary_run_max,
+        boundary_run_max_tick,
         close,
         evidence: finalization.evidence,
         scenario,

@@ -1449,3 +1449,170 @@ fn the_published_summary_identifies_the_verified_evidence_package() {
     assert!(summary.contains("\"cutoff_scripted_ticks_in_window\":299"));
     assert!(summary.contains("\"cutoff_campaign_tick\":8999"));
 }
+
+/// The S6-C4 review corrective: the FULL-RUN maximum complete-boundary
+/// duration and its campaign tick survive past the rolling 600-tick
+/// window — a large boundary delay followed by more than 600 ordinary
+/// ticks still reports the original maximum and tick, while the
+/// rolling percentiles (and `tick_ms`, whose meaning is unchanged)
+/// move on. The stall is induced deterministically through the
+/// accepted `WorkerFault::StallEach` seam, inflating the action's
+/// capture-bearing confirmation inside the measured boundary.
+#[test]
+fn the_full_run_boundary_max_survives_the_rolling_window() {
+    let cleaner = TestDir::new("boundary-run-max");
+    let (mut demo, _launch) =
+        PersistDemo::open_or_recover(&cleaner.root, SimConfig::default()).expect("the open");
+    // Let the region accrue consequential signals (the calibration
+    // showed ~120 ticks suffices for a capture-bearing excursion).
+    for _ in 0..120 {
+        demo.run_headless(1).expect("the warmup tick");
+    }
+    // Arm the worker stall: every canonical job (the excursion's
+    // journal append, the confirmation's append and walk operations)
+    // sleeps 40ms INSIDE the worker — the boundary that contains the
+    // confirmation inflates deterministically.
+    demo.session()
+        .fault_control()
+        .set(engine_slice::worker::WorkerFault::StallEach { ms: 40 });
+    demo.excursion().expect("the action fires");
+    for _ in 0..8 {
+        demo.run_headless(1).expect("the stalled tick");
+    }
+    demo.session().fault_control().clear();
+    let (max_after_stall, tick_after_stall) = demo.boundary_max();
+    assert!(
+        max_after_stall >= 40.0,
+        "the stalled boundary is recorded: {max_after_stall}"
+    );
+    assert!(
+        (121..=130).contains(&tick_after_stall),
+        "the max is attributed to the action's tick: {tick_after_stall}"
+    );
+    // More than 600 ordinary ticks follow — the rolling window loses
+    // the stall; the full-run maximum keeps it.
+    for _ in 0..650 {
+        demo.run_headless(1).expect("the ordinary tick");
+    }
+    let (run_max, run_max_tick) = demo.boundary_max();
+    assert!(
+        run_max >= max_after_stall,
+        "the full-run max never decays: {run_max} < {max_after_stall}"
+    );
+    assert_eq!(run_max_tick, tick_after_stall);
+    assert!(
+        demo.boundary_ms_percentile(1.00) < run_max,
+        "the rolling window has moved on ({}), the full-run max has not ({run_max})",
+        demo.boundary_ms_percentile(1.00)
+    );
+    let finalization = demo.finalize(None);
+    assert!(finalization.close_summary().failure.is_none());
+}
+
+/// The S6-C4 review corrective: the worker-backed SQLite
+/// `classify_object` path — the actual `WorkerMedium` proxy over the
+/// SQLite provider (not the file medium). The full object-hash
+/// verification happens inside the worker; the response carries only
+/// the small classification (never the body — the type has none); a
+/// corrupted non-batch object with an intact domain prefix is
+/// rejected; a missing object fails closed.
+#[test]
+fn the_worker_backed_sqlite_classification_verifies_and_stays_small() {
+    let cleaner = TestDir::new("worker-classify");
+    let db_path = cleaner.root.join("campaign.db");
+    let location = StoreLocation::Database(db_path.clone());
+    let worker = engine_slice::worker::IoWorker::spawn(&location).expect("the worker spawns");
+    let source = worker.source().expect("the source");
+    let mut medium = source.open_medium().expect("the worker medium");
+    use engine_slice::store::MediumSource;
+    // Found the campaign and append one publication revision with a
+    // large non-batch object (the session-snapshot shape).
+    let founding = engine_persist::RevisionRecord::founding(
+        engine_persist::AuthorityMode::Standalone,
+        "s6c4-worker-classify",
+        0,
+    );
+    use engine_persist::CanonicalMedium;
+    assert!(matches!(
+        medium.append(&founding, &[], None).expect("the founding"),
+        engine_persist::AppendOutcome::Accepted { .. }
+    ));
+    let parent = medium.head().expect("the head").expect("founded");
+    let mut enc = engine_core::Encoder::new();
+    enc.write_str("s6c4-worker-clone");
+    enc.write_bytes(&vec![7u8; 48 * 1024]);
+    let object = engine_persist::StoredObject::new(enc.into_bytes()).expect("the object");
+    let record = engine_persist::RevisionRecord::regular(parent, 0, 100)
+        .with_content_refs(vec![object.hash()]);
+    assert!(matches!(
+        medium
+            .append(&record, &[object], Some(parent))
+            .expect("the publication"),
+        engine_persist::AppendOutcome::Accepted { .. }
+    ));
+    let hash = {
+        // Recompute the object's identity for the corruption probe.
+        let mut enc = engine_core::Encoder::new();
+        enc.write_str("s6c4-worker-clone");
+        enc.write_bytes(&vec![7u8; 48 * 1024]);
+        let rebuilt = engine_persist::StoredObject::new(enc.into_bytes()).unwrap();
+        rebuilt.hash()
+    };
+    // The happy path: the classification returns the domain and the
+    // length — a small value type, never the ~48KB body.
+    let class = medium.classify_object(&hash).expect("the classification");
+    assert_eq!(class.domain.as_deref(), Some("s6c4-worker-clone"));
+    assert!(class.length >= 48 * 1024);
+    // A corrupted non-batch object with an INTACT domain prefix: the
+    // mid-body bytes are modified in the stored row; the worker's
+    // full-object hash check must reject it.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("the direct connection");
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT bytes FROM objects WHERE hash = ?1",
+                [hash.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("the stored row");
+        let mut corrupted = stored.clone();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] = corrupted[mid].wrapping_add(1);
+        conn.execute(
+            "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+            rusqlite::params![corrupted, hash.as_bytes()],
+        )
+        .expect("the corruption");
+    }
+    let error = medium
+        .classify_object(&hash)
+        .expect_err("the corruption is rejected");
+    assert!(
+        format!("{error:?}").contains("HashMismatch"),
+        "the full-object hash check fires inside the worker: {error:?}"
+    );
+    // A missing object fails closed.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("the direct connection");
+        conn.execute("DELETE FROM objects WHERE hash = ?1", [hash.as_bytes()])
+            .expect("the deletion");
+    }
+    let error = medium
+        .classify_object(&hash)
+        .expect_err("the missing object is rejected");
+    assert!(
+        format!("{error:?}").contains("Missing"),
+        "the missing object fails closed: {error:?}"
+    );
+    // The worker's health survives the failed operations (the
+    // fault/health semantics unchanged — the head still reads).
+    assert!(
+        medium
+            .head()
+            .expect("the head after the failures")
+            .is_some()
+    );
+    drop(medium);
+    drop(source);
+    worker.join().expect("the worker joins cleanly");
+}

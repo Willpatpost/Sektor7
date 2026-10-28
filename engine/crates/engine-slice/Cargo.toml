@@ -11,5 +11,11 @@ engine-persist = { path = "../engine-persist" }
 engine-renderer = { path = "../engine-renderer" }
 engine-shell = { path = "../engine-shell" }
 
+[dev-dependencies]
+# Test-only: direct row access for the S6-C4 worker-backed SQLite
+# classification regressions (the same SQLite library the workspace
+# already builds — never linked into the binary).
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
 [lints]
 workspace = true
