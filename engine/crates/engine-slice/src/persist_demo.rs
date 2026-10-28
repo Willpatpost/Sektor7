@@ -615,6 +615,14 @@ pub struct HeadlessReport {
     /// The action region's (signals, credits) sums at close — the
     /// durable-outcome witness for the deliberate consequence.
     pub closed_region: Option<(usize, u64, u64)>,
+    /// The S6-C4 complete-boundary observations (the separately
+    /// named measurement: the authoritative tick PLUS its
+    /// capture-bearing confirmation and action lifecycle — where
+    /// `tick_ms` alone structurally excludes the confirmation).
+    pub boundary_p50: f64,
+    pub boundary_p95: f64,
+    pub boundary_max: f64,
+    pub boundary_samples: usize,
     pub close: CloseSummary,
     /// The evidence package's verdict (S6-C1) — `None` when the run
     /// collected no evidence.
@@ -680,6 +688,10 @@ impl HeadlessReport {
         if let Some((region, signals, credits)) = &self.closed_region {
             println!("  closed action region r{region}: signals {signals} · credits {credits}");
         }
+        println!(
+            "  complete boundary time (tick + confirmation + action lifecycle): p50 {:.3} ms · p95 {:.3} ms · max {:.3} ms ({} samples)",
+            self.boundary_p50, self.boundary_p95, self.boundary_max, self.boundary_samples
+        );
         println!(
             "  closed at tick {} · ticks due {} · outstanding {} · conservation {} · stage4 fingerprint {}",
             self.closed_at_tick.as_u64(),
@@ -815,6 +827,16 @@ pub struct PersistDemo {
     total_advanced_ns: u128,
     headless_ticks: u64,
     tick_ms_history: Vec<f64>,
+    /// The separately named COMPLETE-boundary measurement (the S6-C4
+    /// corrective's instrumentation): the authoritative tick PLUS its
+    /// capture-bearing confirmation and action lifecycle — the full
+    /// `run_ticks` per-tick work — measured independently of `tick_ms`
+    /// (whose existing meaning — the `session.tick` call alone — is
+    /// preserved exactly). Rolling 600 samples, percentile-read like
+    /// `tick_ms_history`; never fingerprinted, never an evidence
+    /// schema field (the confirmation latency already lives in the
+    /// persistence evidence family).
+    boundary_ms_history: Vec<f64>,
     /// The presence the next tick boundary consumes — explicit
     /// simulation input, never wall-clock (the graphical loop feeds
     /// the camera; the headless path feeds the fixed demo presence).
@@ -851,6 +873,7 @@ impl PersistDemo {
             total_advanced_ns: 0,
             headless_ticks: 0,
             tick_ms_history: Vec::new(),
+            boundary_ms_history: Vec::new(),
             presence: vec![DEMO_PRESENCE],
             founded: false,
             action: None,
@@ -1233,6 +1256,12 @@ impl PersistDemo {
             if len > 600 {
                 self.tick_ms_history.drain(0..len - 600);
             }
+            // The COMPLETE-boundary sample (the S6-C4 instrumentation):
+            // the same `start`, elapsed AFTER the confirmation and the
+            // action lifecycle — the full per-tick `run_ticks` work,
+            // including any capture-bearing canonical confirmation
+            // that `tick_ms` alone structurally excludes. Recorded
+            // when the loop body reaches the emission point below.
             // The excursion state advances AFTER the tick consumed its
             // presence: the far window counts down, and the first
             // post-excursion tick (the live presence again — the
@@ -1332,6 +1361,19 @@ impl PersistDemo {
                 if let (Some(scenario), Some(checkpoint)) = (&mut self.scenario, checkpoint) {
                     scenario.record_checkpoint(checkpoint);
                 }
+            }
+            // The COMPLETE-boundary sample (the S6-C4 instrumentation):
+            // elapsed from the same `start` as `tick_ms`, but AFTER
+            // the confirmation, the action lifecycle, and the
+            // checkpoint observation — the full per-tick work, with
+            // any capture-bearing canonical confirmation included that
+            // `tick_ms` (the `session.tick` call alone, its existing
+            // meaning preserved) structurally excludes.
+            let boundary_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.boundary_ms_history.push(boundary_ms);
+            let boundary_len = self.boundary_ms_history.len();
+            if boundary_len > 600 {
+                self.boundary_ms_history.drain(0..boundary_len - 600);
             }
         }
         Ok(())
@@ -1860,6 +1902,30 @@ impl PersistDemo {
 
     pub fn tick_sample_count(&self) -> usize {
         self.tick_ms_history.len()
+    }
+
+    /// The COMPLETE-boundary duration percentiles (the S6-C4
+    /// instrumentation): the authoritative tick PLUS its
+    /// capture-bearing confirmation and action lifecycle — the full
+    /// per-tick `run_ticks` work — under its own separately named
+    /// measurement (the confirmation latency already lives in the
+    /// persistence evidence family; this surfaces the composed
+    /// boundary in the run summaries, where `tick_ms` alone
+    /// structurally excludes the confirmation).
+    pub fn boundary_ms_percentile(&self, quantile: f64) -> f64 {
+        if self.boundary_ms_history.is_empty() {
+            return 0.0;
+        }
+        let mut sorted = self.boundary_ms_history.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let index = ((quantile * sorted.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        sorted[index]
+    }
+
+    pub fn boundary_sample_count(&self) -> usize {
+        self.boundary_ms_history.len()
     }
 
     /// THE single finalization site (HOLD-1): attempt the accepted
@@ -3000,6 +3066,13 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
             demo.tick_sample_count()
         );
         println!(
+            "complete boundary time (tick + confirmation + action lifecycle): p50 {:.3} ms · p95 {:.3} ms · max {:.3} ms (per-tick, {} samples)",
+            demo.boundary_ms_percentile(0.50),
+            demo.boundary_ms_percentile(0.95),
+            demo.boundary_ms_percentile(1.00),
+            demo.boundary_sample_count()
+        );
+        println!(
             "watermark max_executed_due {} · processed_through {}",
             spine
                 .max_executed_due()
@@ -3595,6 +3668,15 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
             region_credit_sum(world, record.region),
         )
     });
+    // The S6-C4 complete-boundary observations, read before the
+    // finalization consumes the driver (the separately named
+    // measurement: the tick + its capture-bearing confirmation +
+    // the action lifecycle — where `tick_ms` alone structurally
+    // excludes the confirmation).
+    let boundary_p50 = demo.boundary_ms_percentile(0.50);
+    let boundary_p95 = demo.boundary_ms_percentile(0.95);
+    let boundary_max = demo.boundary_ms_percentile(1.00);
+    let boundary_samples = demo.boundary_sample_count();
     // THE SINGLE FINALIZATION SITE (HOLD-1) — every path.
     let finalization = demo.finalize(application_failure);
     // C3-F3D: the publication workload's durable-completion proof —
@@ -3613,6 +3695,10 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         closed_outstanding,
         closed_fingerprint,
         closed_region,
+        boundary_p50,
+        boundary_p95,
+        boundary_max,
+        boundary_samples,
         close,
         evidence: finalization.evidence,
         scenario,

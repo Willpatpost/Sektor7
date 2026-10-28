@@ -35,8 +35,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use engine_persist::{
-    AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ReclaimUnit, Reconciliation,
-    RevisionRecord, StoredObject, SyncTier, UnknownReason,
+    AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ObjectClass, ReclaimUnit,
+    Reconciliation, RevisionRecord, StoredObject, SyncTier, UnknownReason,
 };
 
 use crate::store::{MediumSource, SessionStore, StoreLocation};
@@ -61,6 +61,14 @@ pub enum MediumOp {
         id: Hash,
     },
     ReadObject {
+        hash: Hash,
+    },
+    /// The verified classification of a stored content object (the
+    /// S6-C4 read-path corrective): the worker performs the SAME
+    /// full-object hash verification as `ReadObject` and returns only
+    /// the small classification — the byte transfer to the caller is
+    /// eliminated, the verification is not.
+    ClassifyObject {
         hash: Hash,
     },
     Validate,
@@ -88,6 +96,7 @@ pub enum WorkerReply {
     Append(AppendOutcome),
     ReadRecord(RevisionRecord),
     ReadObject(Vec<u8>),
+    ClassifyObject(ObjectClass),
     Validate(ChainSummary),
     Reconcile(Reconciliation),
     Reclaim(u64),
@@ -479,6 +488,9 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
             .map(WorkerReply::Append),
         MediumOp::ReadRecord { id } => store.read_record(&id).map(WorkerReply::ReadRecord),
         MediumOp::ReadObject { hash } => store.read_object(&hash).map(WorkerReply::ReadObject),
+        MediumOp::ClassifyObject { hash } => store
+            .classify_object(&hash)
+            .map(WorkerReply::ClassifyObject),
         MediumOp::Validate => store.validate().map(WorkerReply::Validate),
         MediumOp::ReconcileUnknown { candidate } => store
             .reconcile_unknown(&candidate)
@@ -497,6 +509,7 @@ fn job_kind(op: &MediumOp) -> Option<JobKind> {
         MediumOp::Append { .. } => Some(JobKind::Append),
         MediumOp::ReconcileUnknown { .. } => Some(JobKind::Reconcile),
         MediumOp::ReadObject { .. } => Some(JobKind::ReadObject),
+        MediumOp::ClassifyObject { .. } => Some(JobKind::ReadObject),
         _ => None,
     }
 }
@@ -621,6 +634,13 @@ impl CanonicalMedium for WorkerMedium {
         match self.request(MediumOp::ReadObject { hash: *hash })? {
             WorkerReply::ReadObject(bytes) => Ok(bytes),
             other => unreachable!("the read-object request returned {other:?}"),
+        }
+    }
+
+    fn classify_object(&mut self, hash: &Hash) -> Result<ObjectClass, MediumError> {
+        match self.request(MediumOp::ClassifyObject { hash: *hash })? {
+            WorkerReply::ClassifyObject(class) => Ok(class),
+            other => unreachable!("the classify request returned {other:?}"),
         }
     }
 

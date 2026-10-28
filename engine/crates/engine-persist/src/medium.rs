@@ -343,6 +343,37 @@ pub struct ChainSummary {
     pub reclaimed_keys: u64,
 }
 
+/// The verified classification of a stored content object: the
+/// leading domain tag and the total byte length, established under
+/// the same full-object hash verification as
+/// [`CanonicalMedium::read_object`] (the store itself remains
+/// domain-agnostic — the tag is an observational property of the
+/// encoded content, not trusted metadata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectClass {
+    /// The object's leading domain tag, when the leading bytes decode
+    /// as one (`None` for a non-decoding prefix — intact content with
+    /// no recognizable tag).
+    pub domain: Option<String>,
+    /// The object's total byte length (an honest size witness for
+    /// read-amplification accounting).
+    pub length: u64,
+}
+
+impl ObjectClass {
+    /// Classifies intact, already-verified content.
+    pub fn of(bytes: &[u8]) -> Self {
+        let domain = Decoder::new(bytes)
+            .read_str(MAX_TAG_LEN, "content-peek")
+            .ok()
+            .map(str::to_owned);
+        ObjectClass {
+            domain,
+            length: bytes.len() as u64,
+        }
+    }
+}
+
 /// The storage boundary the future CommitPipeline will operate over
 /// (§4.2's contract, typed). Every operation — including reads —
 /// serializes on the medium's OS-managed coordination, so a concurrent
@@ -371,6 +402,22 @@ pub trait CanonicalMedium {
 
     /// Reads and hash-verifies a content object by identity.
     fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError>;
+
+    /// Classifies a content object under COMPLETE hash verification:
+    /// the full object bytes are read and hash-checked against the
+    /// requested identity exactly as [`CanonicalMedium::read_object`]
+    /// does — a missing object fails `MissingObject`, a corrupted
+    /// object fails `HashMismatch`, and a classification result is
+    /// only returned for intact content. The default implementation
+    /// delegates to `read_object` (every existing implementation is
+    /// source-compatible); a provider MAY perform the verified read
+    /// internally and return only the small [`ObjectClass`], which
+    /// eliminates the byte transfer while preserving the
+    /// verification. Never a prefix-only read.
+    fn classify_object(&mut self, hash: &Hash) -> Result<ObjectClass, MediumError> {
+        let bytes = self.read_object(hash)?;
+        Ok(ObjectClass::of(&bytes))
+    }
 
     /// Cold, complete validation of the authoritative chain — the
     /// session-open walk (founding → HEAD, every record and every

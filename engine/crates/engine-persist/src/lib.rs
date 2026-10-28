@@ -85,8 +85,8 @@ pub use journal::{
 };
 pub use local::{AppendTimings, LocalFileMedium, WalkStats};
 pub use medium::{
-    AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
-    SyncTier, UnknownReason,
+    AppendOutcome, CanonicalMedium, ChainSummary, MediumError, ObjectClass, Reconciliation,
+    StoredObject, SyncTier, UnknownReason,
 };
 pub use migrate::{
     CopiedChain, MigrationError, MigrationReport, archive_legacy, copy_legacy_chain,

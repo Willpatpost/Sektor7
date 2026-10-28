@@ -64,10 +64,9 @@
 //! documented honestly — never per tick); staging performs no I/O;
 //! the pipeline never decides gameplay policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use engine_core::wire::MAX_TAG_LEN;
 use engine_core::{Decoder, Encoder, SaveError};
 
 use crate::checkpoint::{CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata};
@@ -79,8 +78,8 @@ use crate::journal::{
     TransactionInput, WriteReconciliation,
 };
 use crate::medium::{
-    AppendOutcome, CanonicalMedium, MediumError, Reconciliation, StoredObject, SyncTier,
-    UnknownReason,
+    AppendOutcome, CanonicalMedium, MediumError, ObjectClass, Reconciliation, StoredObject,
+    SyncTier, UnknownReason,
 };
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 use crate::recovery::ConfirmedEvidence;
@@ -1359,6 +1358,18 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         // the confirmed-evidence collection reach the batches BELOW
         // reclaimed ranges through the permanent skips.
         let mut skip_table: Option<(Hash, CheckpointMetadata)> = None;
+        // THE S6-C4 READ-PATH CORRECTIVE (the within-walk verified
+        // classification memo): each referenced object is examined —
+        // and its FULL content hash verified through the medium's
+        // verified-classification operation — AT MOST ONCE per walk;
+        // the same walk's later examination of the same object reuses
+        // the classification. The memo is walk-local: EVERY walk
+        // re-verifies every object it examines (a corruption
+        // introduced between two walks is detected by the second
+        // walk — the accepted timing guarantee preserved); objects
+        // whose content the walk CONSUMES (consequence batches,
+        // checkpoint metadata) always receive the full verified read.
+        let mut classified: HashMap<Hash, ObjectClass> = HashMap::new();
         loop {
             if self.verified_head == Some(cursor) {
                 break;
@@ -1367,8 +1378,9 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
             let parent = record.parent;
             let current = cursor;
             if let Some(object) = record.content_refs.first() {
-                let bytes = self.medium.read_object(object)?;
-                if peek_domain(&bytes).as_deref() == Some(CHECKPOINT_METADATA_DOMAIN) {
+                let class = self.classify_once(object, &mut classified)?;
+                if class.domain.as_deref() == Some(CHECKPOINT_METADATA_DOMAIN) {
+                    let bytes = self.read_verified(object)?;
                     let metadata =
                         CheckpointMetadata::decode(&bytes).map_err(PipelineError::Format)?;
                     skip_table = Some((current, metadata));
@@ -1414,8 +1426,9 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
                 self.founding = Some((*authority, campaign_id.clone()));
             }
             for content in &record.content_refs {
-                let bytes = self.medium.read_object(content)?;
-                if peek_domain(&bytes).as_deref() == Some(CONSEQUENCE_BATCH_DOMAIN) {
+                let class = self.classify_once(content, &mut classified)?;
+                if class.domain.as_deref() == Some(CONSEQUENCE_BATCH_DOMAIN) {
+                    let bytes = self.read_verified(content)?;
                     let batch = ConsequenceBatch::decode(&bytes).map_err(PipelineError::Format)?;
                     for entry in batch.entries {
                         if let Some(existing) = self.confirmed.get(&entry.id) {
@@ -1456,15 +1469,37 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
         }
         Ok(())
     }
-}
 
-/// Peeks a content object's domain tag (the store is domain-agnostic;
-/// only `consequence-batch/1` objects carry keys).
-fn peek_domain(bytes: &[u8]) -> Option<String> {
-    let mut dec = Decoder::new(bytes);
-    dec.read_str(MAX_TAG_LEN, "content-peek")
-        .ok()
-        .map(str::to_owned)
+    /// One walk's verified classification of a referenced object,
+    /// memoized within that walk (the S6-C4 read-path corrective):
+    /// the FIRST examination performs the medium's verified
+    /// classification — the full object bytes hash-checked against
+    /// the identity, exactly as `read_object` does — and later
+    /// examinations of the same object within the SAME walk reuse
+    /// the result. The memo is walk-local by construction: the next
+    /// walk starts empty, so every object it examines is re-verified
+    /// (the corruption-between-walks timing guarantee preserved).
+    fn classify_once(
+        &mut self,
+        hash: &Hash,
+        memo: &mut HashMap<Hash, ObjectClass>,
+    ) -> Result<ObjectClass, PipelineError> {
+        if let Some(class) = memo.get(hash) {
+            return Ok(class.clone());
+        }
+        let class = self.medium.classify_object(hash)?;
+        memo.insert(*hash, class.clone());
+        Ok(class)
+    }
+
+    /// The full verified read for an object whose content this walk
+    /// CONSUMES (a consequence batch or checkpoint metadata) — never
+    /// memoized, never bypassed: the complete bytes are read back and
+    /// hash-verified, and the existing semantic validation runs over
+    /// them exactly as before.
+    fn read_verified(&mut self, hash: &Hash) -> Result<Vec<u8>, PipelineError> {
+        Ok(self.medium.read_object(hash)?)
+    }
 }
 
 #[cfg(test)]
@@ -2609,5 +2644,288 @@ mod tests {
         let mut descending = batch.clone();
         descending.entries.reverse();
         assert!(descending.canonical_bytes().is_err());
+    }
+
+    // ---------------------------------------- the S6-C4 read-path corrective
+
+    /// A counting medium wrapper (the S6-C4 test seam): every
+    /// `read_object` and `classify_object` is counted per content
+    /// hash, distinguishing the CALLER-VISIBLE byte transfer (the
+    /// bytes read_object returns) from the implied internal read
+    /// volume (the classified lengths — each classification performs
+    /// the full verified read provider-side). A reduction in the
+    /// transfer is never misreported as a reduction in the physical
+    /// reads.
+    struct CountingMedium<M: CanonicalMedium> {
+        inner: M,
+        read_calls: std::collections::HashMap<Hash, u32>,
+        read_bytes: u64,
+        classify_calls: std::collections::HashMap<Hash, u32>,
+        classify_volume: u64,
+    }
+
+    impl<M: CanonicalMedium> CountingMedium<M> {
+        fn wrap(inner: M) -> Self {
+            CountingMedium {
+                inner,
+                read_calls: std::collections::HashMap::new(),
+                read_bytes: 0,
+                classify_calls: std::collections::HashMap::new(),
+                classify_volume: 0,
+            }
+        }
+    }
+
+    impl<M: CanonicalMedium> CanonicalMedium for CountingMedium<M> {
+        fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+            self.inner.head()
+        }
+        fn append(
+            &mut self,
+            record: &RevisionRecord,
+            objects: &[StoredObject],
+            expected_parent: Option<Hash>,
+        ) -> Result<AppendOutcome, MediumError> {
+            self.inner.append(record, objects, expected_parent)
+        }
+        fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+            self.inner.read_record(id)
+        }
+        fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            let bytes = self.inner.read_object(hash)?;
+            *self.read_calls.entry(*hash).or_insert(0) += 1;
+            self.read_bytes += bytes.len() as u64;
+            Ok(bytes)
+        }
+        fn classify_object(&mut self, hash: &Hash) -> Result<ObjectClass, MediumError> {
+            let class = self.inner.classify_object(hash)?;
+            *self.classify_calls.entry(*hash).or_insert(0) += 1;
+            self.classify_volume += class.length;
+            Ok(class)
+        }
+        fn validate(&mut self) -> Result<crate::medium::ChainSummary, MediumError> {
+            self.inner.validate()
+        }
+        fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
+            self.inner.reconcile_unknown(candidate)
+        }
+        fn durability_tier(&self) -> SyncTier {
+            self.inner.durability_tier()
+        }
+        fn reclaim(&mut self, units: &[crate::reclaim::ReclaimUnit]) -> Result<u64, MediumError> {
+            self.inner.reclaim(units)
+        }
+        fn reclaim_pending(
+            &mut self,
+            units: &[crate::reclaim::ReclaimUnit],
+        ) -> Result<bool, MediumError> {
+            self.inner.reclaim_pending(units)
+        }
+    }
+
+    /// One publication revision's content object: a well-formed
+    /// domain-tagged NON-batch payload (the session-snapshot shape —
+    /// a domain string distinct from every batch or
+    /// checkpoint-metadata domain, followed by filler).
+    fn publication_object(index: u64, size: usize) -> StoredObject {
+        let mut enc = Encoder::new();
+        enc.write_str(&format!("s6c4-publication-clone-{index}"));
+        enc.write_bytes(&vec![index as u8; size]);
+        StoredObject::new(enc.into_bytes()).unwrap()
+    }
+
+    fn append_publication<M: CanonicalMedium>(
+        medium: &mut M,
+        parent: Option<Hash>,
+        index: u64,
+        epoch: u64,
+        size: usize,
+    ) -> Hash {
+        let object = publication_object(index, size);
+        let parent = parent.expect("the chain is founded before the cluster");
+        let record = RevisionRecord::regular(parent, epoch, 100 + index)
+            .with_content_refs(vec![object.hash()]);
+        match medium.append(&record, &[object], Some(parent)).unwrap() {
+            AppendOutcome::Accepted { id, .. } => id,
+            other => panic!("the publication must accept: {other:?}"),
+        }
+    }
+
+    /// A publication cluster over a founded medium: `count` snapshot
+    /// revisions appended to the chain (the deferred-walk shape the
+    /// hardware finding reproduced), each with a well-formed
+    /// domain-tagged non-batch content object of `size` bytes.
+    fn append_publications<M: CanonicalMedium>(medium: &mut M, count: u64, size: usize) {
+        let mut parent = medium.head().unwrap();
+        for index in 1..=count {
+            // The parent's epoch: the founding is epoch 0, each
+            // publication's own epoch is parent + 1.
+            parent = Some(append_publication(medium, parent, index, index - 1, size));
+        }
+    }
+
+    /// The staged capture + boundary fixture over ANY medium (the
+    /// `capture_index` helper's medium-generic form).
+    fn capture_index_on<M: CanonicalMedium>(
+        pipeline: &mut CommitPipeline<M>,
+        index: u64,
+    ) -> TransactionId {
+        pipeline.stage(staged_envelope(index)).unwrap();
+        let boundary = boundary(index);
+        let receipt = pipeline
+            .capture(
+                boundary.position,
+                boundary.classification,
+                boundary.dependencies,
+                boundary.frontier,
+                boundary.plan,
+            )
+            .unwrap();
+        assert!(!receipt.reconciled);
+        receipt.journal.id
+    }
+
+    /// The stored file path of a content object in the local medium
+    /// (the `objects/<hex>` layout).
+    fn object_file(dir: &TestDir, object: &StoredObject) -> std::path::PathBuf {
+        dir.store().join("objects").join(object.hash().hex())
+    }
+
+    /// The S6-C4 corrective's read-amplification gate: after a
+    /// publication cluster, the confirmation's chain walk verifies
+    /// every referenced object (the classification counts) but
+    /// transfers only the CONSUMED content (the batch) — the
+    /// caller-visible read volume excludes the snapshot bodies, and
+    /// no object is classified more than once within the walk.
+    #[test]
+    fn verified_classification_verifies_each_object_once_per_walk() {
+        let dir = TestDir::new("s6c4-amplification");
+        let mut medium = CountingMedium::wrap(clean_medium(&dir));
+        // The publication cluster: three large snapshot revisions on
+        // the chain (the deferred-walk shape the hardware finding
+        // reproduced).
+        append_publications(&mut medium, 3, 24 * 1024);
+        // The pending consequence + the confirmation.
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let mut pipeline = CommitPipeline::open(medium, journal).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        let outcome = pipeline.commit_canonical().unwrap();
+        let CommitOutcome::Confirmed(receipt) = outcome else {
+            panic!("the commit must confirm: {outcome:?}")
+        };
+        assert_eq!(receipt.keys.len(), 1);
+        // Every referenced object was verified EXACTLY once per
+        // examination walk (the cold open walk and the commit walk
+        // each classify each object they examine at most once).
+        assert!(
+            pipeline
+                .medium
+                .classify_calls
+                .values()
+                .all(|count| *count == 1),
+            "no object classified more than once per walk: {:?}",
+            pipeline.medium.classify_calls
+        );
+        // The classification covered the three snapshots (the
+        // internal verified reads) — the implied internal volume is
+        // honest, NOT zero.
+        assert!(pipeline.medium.classify_volume >= 3 * 24 * 1024);
+        // The caller-visible transfer excludes the snapshot bodies:
+        // only the consequence batch (small) was read back in full.
+        assert!(
+            pipeline.medium.read_bytes < 8 * 1024,
+            "the snapshot bodies must not transfer to the caller: {} bytes",
+            pipeline.medium.read_bytes
+        );
+        assert_eq!(pipeline.medium.read_calls.len(), 1);
+    }
+
+    /// The deferred-walk shape done properly (the hardware finding's
+    /// exact structure): the pipeline opens over the founded chain,
+    /// THEN a concurrent writer appends publication revisions, and
+    /// the next confirmation's incremental walk examines them.
+    fn open_then_publish(
+        dir: &TestDir,
+        publications: u64,
+        size: usize,
+    ) -> CommitPipeline<LocalFileMedium> {
+        let journal = T1Journal::open(dir.path().join("journal.t1")).unwrap();
+        let pipeline = CommitPipeline::open(clean_medium(dir), journal).unwrap();
+        let mut writer = clean_medium(dir);
+        append_publications(&mut writer, publications, size);
+        pipeline
+    }
+
+    /// The strict integrity guarantee: a corrupted snapshot object —
+    /// corrupted BEYOND any domain prefix, mid-body — is detected AT
+    /// the walk that examines it (the classification's full-object
+    /// hash check, never a prefix-only read).
+    #[test]
+    fn corrupted_snapshot_detected_at_the_first_examination() {
+        let dir = TestDir::new("s6c4-corrupt-first");
+        let mut pipeline = open_then_publish(&dir, 2, 16 * 1024);
+        // Corrupt the newest snapshot's stored bytes on disk,
+        // mid-body (the domain prefix stays intact).
+        let target = publication_object(2, 16 * 1024);
+        let path = object_file(&dir, &target);
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] = bytes[mid].wrapping_add(1);
+        fs::write(&path, bytes).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        let error = pipeline.commit_canonical().unwrap_err();
+        assert!(
+            error.to_string().contains("hash") || error.to_string().contains("Hash"),
+            "the corrupted object is detected at the walk: {error}"
+        );
+    }
+
+    /// The corruption-between-walks guarantee: an object referenced
+    /// by a revision that a LATER walk examines for the first time,
+    /// corrupted after the earlier walk, is detected by that later
+    /// walk (the memo is walk-local — every walk re-verifies what it
+    /// examines; no session-wide cache exists).
+    #[test]
+    fn corruption_between_walks_detected_by_the_second_walk() {
+        let dir = TestDir::new("s6c4-corrupt-second");
+        let mut pipeline = open_then_publish(&dir, 1, 16 * 1024);
+        capture_index_on(&mut pipeline, 1);
+        let outcome = pipeline.commit_canonical().unwrap();
+        assert!(matches!(outcome, CommitOutcome::Confirmed { .. }));
+        // A second publication appended after the first walk — its
+        // object corrupted before the second walk examines it. (The
+        // parent is the first confirmation: epoch 2 of the chain.)
+        let mut writer = clean_medium(&dir);
+        let head = writer.head().unwrap();
+        append_publication(&mut writer, head, 2, 2, 16 * 1024);
+        let target = publication_object(2, 16 * 1024);
+        let path = object_file(&dir, &target);
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] = bytes[mid].wrapping_add(1);
+        fs::write(&path, bytes).unwrap();
+        capture_index_on(&mut pipeline, 2);
+        let error = pipeline.commit_canonical().unwrap_err();
+        assert!(
+            error.to_string().contains("hash") || error.to_string().contains("Hash"),
+            "the second walk detects the intervening corruption: {error}"
+        );
+    }
+
+    /// A missing referenced object fails the walk closed (the
+    /// classification's existence check — the existing
+    /// `MissingObject`, through the new path).
+    #[test]
+    fn missing_referenced_object_fails_the_walk() {
+        let dir = TestDir::new("s6c4-missing");
+        let mut pipeline = open_then_publish(&dir, 2, 16 * 1024);
+        let target = publication_object(1, 16 * 1024);
+        fs::remove_file(object_file(&dir, &target)).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        let error = pipeline.commit_canonical().unwrap_err();
+        assert!(
+            error.to_string().contains("missing") || error.to_string().contains("Missing"),
+            "the missing object fails the walk: {error}"
+        );
     }
 }

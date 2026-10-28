@@ -77,8 +77,8 @@ use crate::checkpoint::{
 use crate::hash::{Hash, hash_object};
 use crate::local::WalkStats;
 use crate::medium::{
-    AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
-    SyncTier, UnknownReason,
+    AppendOutcome, CanonicalMedium, ChainSummary, MediumError, ObjectClass, Reconciliation,
+    StoredObject, SyncTier, UnknownReason,
 };
 use crate::reclaim::ReclaimUnit;
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
@@ -829,6 +829,17 @@ impl CanonicalMedium for SqliteMedium {
 
     fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
         load_object_verified(&self.conn, hash)
+    }
+
+    fn classify_object(&mut self, hash: &Hash) -> Result<ObjectClass, MediumError> {
+        // The SAME full verified read as read_object — the complete
+        // object bytes are loaded and hash-checked against the
+        // identity (a missing object fails MissingObject, a corrupted
+        // object fails HashMismatch); only the small classification
+        // crosses back to the caller, eliminating the byte transfer
+        // without eliminating the verification.
+        let bytes = load_object_verified(&self.conn, hash)?;
+        Ok(ObjectClass::of(&bytes))
     }
 
     fn validate(&mut self) -> Result<ChainSummary, MediumError> {
