@@ -219,6 +219,7 @@ fn main() {
             headless_ticks: 600,
             action_at: None,
             poison_at_tick: None,
+            abort_at_tick: None,
             evidence: None,
             evidence_fail_writes: false,
             scenario: None,
@@ -245,6 +246,18 @@ fn main() {
                         && let Ok(tick) = value.parse::<u64>()
                     {
                         options.action_at = Some(tick);
+                        index += 1;
+                    }
+                }
+                // Test-only (the S6-C4 deterministic interruption
+                // seam — see DemoOptions::abort_at_tick): the
+                // controlled hard exit at a completed tick boundary,
+                // reserved code 9.
+                "--abort-after-tick" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(tick) = value.parse::<u64>()
+                    {
+                        options.abort_at_tick = Some(tick);
                         index += 1;
                     }
                 }

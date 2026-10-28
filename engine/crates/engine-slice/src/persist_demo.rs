@@ -177,6 +177,21 @@ pub struct DemoOptions {
     /// path's finalization deterministically. Never set by the binary.
     #[doc(hidden)]
     pub poison_at_tick: Option<u64>,
+    /// Test-only (the S6-C4 stage 1-A deterministic interruption
+    /// seam): hard-exit (reserved code 9) at the COMPLETED logical-tick
+    /// boundary whose campaign clock reaches this value — after the
+    /// tick's crossings, confirmation, and evidence emission, BEFORE
+    /// any graceful close, final publication, or destructor-based
+    /// settlement. A controlled hard exit at a coherent boundary —
+    /// unlike SIGKILL or power loss it cannot land mid-operation,
+    /// mid-fsync, or mid-install, so it cannot produce torn writes or
+    /// partial installs; it exercises the recovery REPLAY over a
+    /// coherent-but-unpublished campaign state (the crash-window
+    /// matrix stays with the process-kill tests). Exposed through the
+    /// binary's hidden `--abort-after-tick` for the cross-platform
+    /// interrupted-run regressions.
+    #[doc(hidden)]
+    pub abort_at_tick: Option<u64>,
     /// S6-C1 observational evidence collection (opt-in; `None` is the
     /// default — zero cost, zero behavior change): when set, the run
     /// carries a [`EvidenceCollector`] whose bounded non-blocking
@@ -3672,6 +3687,15 @@ pub fn run_persist_demo_headless(options: DemoOptions) -> Result<HeadlessReport,
         if let Err(error) = demo.run_headless(1) {
             application_failure = Some(format!("tick {tick_index} refused: {error:?}"));
             break;
+        }
+        // The S6-C4 deterministic interruption seam (see
+        // DemoOptions::abort_at_tick): the controlled hard exit at
+        // the COMPLETED tick boundary whose campaign clock reaches
+        // the target — reserved code 9, no graceful close, no final
+        // publication, no destructor-based settlement (never set
+        // outside the interrupted-run regressions).
+        if options.abort_at_tick == Some(demo.session().clock().as_u64()) {
+            std::process::exit(9);
         }
     }
     // Complete the tracked publication (the headless paths' blocking

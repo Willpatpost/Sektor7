@@ -2113,6 +2113,47 @@ impl<S: MediumSource> SessionCrossing<S> {
                     plan.tick,
                 )?;
             }
+            // THE MISSING LIVE-TO-LIVE RECLASSIFICATION (the S6-C4
+            // stage 1-A interrupted-run corrective): the snapshot's
+            // level for the region is a LIVE level that differs from
+            // the plan's journal-verified `from_level` — the lost
+            // session reclassified the region between the snapshot
+            // and this deactivation through the director's own
+            // active-to-active transition, which is deliberately
+            // unjournaled and unpublished (only dormant crossings are
+            // durable). The plan's `from_level` is the durable
+            // evidence of the level AT the deactivation — the same
+            // evidence the dormant case above already trusts — so the
+            // replay reconstructs the reclassification through the
+            // SAME machinery the live session used, BEFORE the
+            // install: a level-and-scheduling-lane change only. No
+            // activation, checkpoint, capture, ledger entry, or
+            // consequence is invented (the region was never dormant;
+            // there is nothing to reactivate). The episode
+            // relationship is validated FIRST — a plan skipping
+            // episodes is genuinely inconsistent state and fails
+            // closed HERE, before any inferred mutation; the
+            // install's own preconditions (level, episode, ledger
+            // keys, scratch) then run unchanged over the releveled
+            // state, and the subsequent identity-exact
+            // `reconstruct_held` replacement rebuilds the region's
+            // obligations from the plan's own data, so the
+            // intermediate lane change never alters the reconstructed
+            // identities, conservation, or consequence
+            // materialization.
+            let current_level = director.levels()[plan.region];
+            if current_level != LodLevel::Dormant
+                && plan.from_level != LodLevel::Dormant
+                && current_level != plan.from_level
+            {
+                if director.states()[plan.region].episode + 1 != plan.episode {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: plan.region,
+                        detail: "episode-advanced",
+                    });
+                }
+                director.transition_region(&mut spine, plan.region, plan.from_level, plan.tick);
+            }
             for envelope in &transaction.envelopes {
                 let npc = envelope.id.npc as usize;
                 let base = if restored[npc] {

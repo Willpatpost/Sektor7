@@ -33,12 +33,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use engine_core::{EventClass, EventSpec, Field, Schedule, Tick};
-use engine_persist::{AuthorityMode, CanonicalMedium, RevisionRecord, T1Journal};
-use engine_slice::orchestration::OrchestratedSession;
+use engine_core::{EventClass, EventSpec, Field, LodLevel, Schedule, Tick};
+use engine_persist::{
+    AuthorityMode, CanonicalMedium, DurabilityClass, RevisionRecord, SourcePosition, T1Journal,
+    TransactionInput,
+};
+use engine_slice::crossing::DeactivationPlan;
+use engine_slice::orchestration::{OrchestratedSession, PublicationOutcome};
 use engine_slice::persist_demo::{
-    DemoOptions, PersistDemo, SoakDrain, demo_scenario, publish_soak_summary, region_credit_sum,
-    run_persist_demo, run_persist_demo_headless, soak_drain_gate,
+    DEMO_PRESENCE, DemoOptions, PersistDemo, SoakDrain, demo_scenario, publish_soak_summary,
+    region_credit_sum, run_persist_demo, run_persist_demo_headless, soak_drain_gate,
     soak_evidence_verification_failure, soak_validation_gate,
 };
 use engine_slice::sim::SimConfig;
@@ -110,6 +114,7 @@ fn scenario_options(dir: &TestDir, scenario: SoakScenarioId, seed: Option<u64>) 
         headless_ticks: scenario.horizon(),
         action_at: None,
         poison_at_tick: None,
+        abort_at_tick: None,
         evidence: None,
         evidence_fail_writes: false,
         scenario: Some(scenario),
@@ -713,13 +718,327 @@ fn an_interrupted_run_recovers_from_the_durable_state() {
         .output()
         .expect("the relaunch spawns");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "the interrupted campaign recovers (exit {:?}):\n{stdout}",
+        "the interrupted campaign recovers (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
     assert!(stdout.contains("campaign: recovered"));
     assert!(stdout.contains("conservation true"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ------------------------------------------------ the S6-C4 stage 1-A
+// deterministic interrupted-run regressions (the recovery
+// corrective).
+//
+// The fixed-time kill above cannot place every platform inside the
+// early hazard window — the kill lands after the first journaled
+// deactivation but before the next publication only when the
+// platform's speed puts the fixed 2 s there (the Windows CI failure
+// of run 40765308136). The `--abort-after-tick` seam makes the
+// interruption a pure function of the LOGICAL tick: the identical
+// campaign state on every platform.
+
+/// §7D (deterministic): the controlled hard exit (reserved code 9)
+/// at the completed tick-1025 boundary — after region 0's first
+/// journaled deactivation (the plan whose journal-verified
+/// from_level differs from the anchor snapshot's live level — the
+/// unjournaled live-to-live reclassification the recovery replay
+/// must reconstruct) and before the next publication. The relaunch
+/// must recover and continue coherently for 30 additional ticks.
+///
+/// Known boundary (honest, deliberately NOT asserted here): the
+/// post-close state of this early-window recovery currently fails a
+/// THIRD process's restore at the spine allocation-frontier gate —
+/// a separate, pre-existing latent defect in the replay install's
+/// bookkeeping (the reconstructed obligations' ids post-date the
+/// snapshot's allocation frontier, which the recovery never
+/// adopts). This regression pins the first-recovery contract — the
+/// snapshot-plus-journal assessment the corrective owns; the
+/// frontier adoption is the documented follow-up.
+#[test]
+fn deterministic_early_window_hard_exit_recovers() {
+    let root = std::env::temp_dir().join(format!(
+        "s7-s6c4-early-window-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--scenario",
+            "stage6-v1",
+            "--abort-after-tick",
+            "1025",
+        ])
+        .output()
+        .expect("the interrupted child spawns");
+    assert_eq!(
+        child.status.code(),
+        Some(9),
+        "the controlled hard exit at the completed tick-1025 boundary \
+         (never a graceful close — stdout:\n{}\nstderr:\n{})",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let relaunch = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "30",
+        ])
+        .output()
+        .expect("the relaunch spawns");
+    let stdout = String::from_utf8_lossy(&relaunch.stdout);
+    let stderr = String::from_utf8_lossy(&relaunch.stderr);
+    assert!(
+        relaunch.status.success(),
+        "the early-window interrupted campaign recovers and continues \
+         (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        relaunch.status.code()
+    );
+    assert!(stdout.contains("campaign: recovered"), "{stdout}");
+    // The snapshot-plus-journal contract: the anchor snapshot's spine
+    // (tick 0) — the post-snapshot execution history was never
+    // durably saved and is honestly not reproduced.
+    assert!(stdout.contains("recovered at tick 0"), "{stdout}");
+    // The coherent 30-tick continuation and the graceful close: the
+    // whole-campaign conservation holds, no debt outstanding, and the
+    // required settlement left no T1-durable consequence unresolved.
+    assert!(
+        stdout.contains("closed at tick 30 · ticks due 30 · outstanding 0 · conservation true"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("required settled true · failure None"),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// §7D (deterministic, the control): the hard exit AFTER the first
+/// post-deactivation publication (tick 3305 — past the tick-3300
+/// scripted publication) — the recovery path that already worked
+/// (the episode filter skips the pre-snapshot plans) must be
+/// unchanged by the corrective.
+#[test]
+fn deterministic_late_window_hard_exit_control_recovers() {
+    let root = std::env::temp_dir().join(format!(
+        "s7-s6c4-late-window-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--scenario",
+            "stage6-v1",
+            "--abort-after-tick",
+            "3305",
+        ])
+        .output()
+        .expect("the interrupted child spawns");
+    assert_eq!(
+        child.status.code(),
+        Some(9),
+        "the controlled hard exit at the completed tick-3305 boundary \
+         (stdout:\n{}\nstderr:\n{})",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let relaunch = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "30",
+        ])
+        .output()
+        .expect("the relaunch spawns");
+    let stdout = String::from_utf8_lossy(&relaunch.stdout);
+    let stderr = String::from_utf8_lossy(&relaunch.stderr);
+    assert!(
+        relaunch.status.success(),
+        "the late-window interrupted campaign recovers and continues \
+         (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        relaunch.status.code()
+    );
+    assert!(stdout.contains("campaign: recovered"), "{stdout}");
+    // Deterministic on every platform: the tick-3300 scripted
+    // publication is still IN FLIGHT (admitted, its WAL fsync not
+    // yet committed) when the hard exit at 3305 lands — the pure-sim
+    // ticks between always outrun the fsync — so the newest LANDED
+    // snapshot is the action's tick-3054 publication, which
+    // post-dates the region-0 deactivations (the episode filter
+    // skips them: the passing path, unchanged by the corrective).
+    assert!(stdout.contains("recovered at tick 3054"), "{stdout}");
+    assert!(
+        stdout.contains("closed at tick 3084 · ticks due 3084 · outstanding 0 · conservation true"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("required settled true · failure None"),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The negative matrix's campaign crafter: a founded campaign with
+/// the verified anchor snapshot (region 0 Full, episode 0 — the
+/// demo's initial presence) and ONE crafted journal transaction
+/// carrying the adversarial plan. The recovery's treatment of the
+/// crafted plan is what the negatives assert.
+fn craft_negative_campaign(root: &std::path::Path, plan_bytes: Vec<u8>) -> StoreLocation {
+    let location = StoreLocation::Database(root.join("campaign.db"));
+    let mut store = SessionStore::open(&location).unwrap();
+    store
+        .append(
+            &RevisionRecord::founding(AuthorityMode::Standalone, "s6c4-negative", 0),
+            &[],
+            None,
+        )
+        .unwrap();
+    drop(store);
+    let (spine, director) = demo_scenario(&SimConfig::default(), &[DEMO_PRESENCE]).unwrap();
+    let journal = T1Journal::open(root.join("journal.t1")).unwrap();
+    let mut session =
+        OrchestratedSession::open(spine, director, &location, journal, "s6c4-negative").unwrap();
+    let capture = session.capture_snapshot().unwrap();
+    let handle = session.submit_publication(capture).unwrap();
+    let Some(PublicationOutcome::Accepted { .. }) = session.wait_publication(handle) else {
+        panic!("the anchor publication must be accepted");
+    };
+    drop(session);
+    let mut raw = T1Journal::open(root.join("journal.t1")).unwrap();
+    raw.append_transaction(&TransactionInput {
+        envelopes: vec![],
+        position: SourcePosition {
+            head: None,
+            tick: 1020,
+        },
+        classification: DurabilityClass::DurableEligible,
+        dependencies: vec![],
+        frontier: vec![],
+        plan: plan_bytes,
+    })
+    .unwrap();
+    drop(raw);
+    location
+}
+
+fn negative_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "s7-s6c4-negative-{label}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// Negative: an episode-skipping plan (episode 2 against the
+/// snapshot's episode 0 — the episode-1 deactivation never happened)
+/// is genuinely inconsistent state: the inferred live-to-live
+/// reconstruction refuses BEFORE any inferred mutation (the episode
+/// relationship is validated first), with the precise diagnostic.
+#[test]
+fn recovery_rejects_an_episode_skipping_plan_before_any_inferred_transition() {
+    let root = negative_root("episode-skip");
+    let plan = DeactivationPlan {
+        region: 0,
+        from_level: LodLevel::EventDriven,
+        episode: 2,
+        tick: Tick(1020),
+        obligations: vec![],
+        entries: vec![],
+        captures: vec![],
+    };
+    let location = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(
+                engine_slice::crossing::TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "episode-advanced"
+                }
+            )
+        ),
+        "the episode relationship gates the inferred transition (the \
+         recovery must refuse before any inferred mutation)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Negative: a deactivation claimed FROM Dormant is not a live-level
+/// relationship — the inferred relevel path does not apply (both
+/// LODs must be live), and the install's own level precondition
+/// rejects the unsupported claim.
+#[test]
+fn recovery_rejects_a_deactivation_claimed_from_dormant() {
+    let root = negative_root("from-dormant");
+    let plan = DeactivationPlan {
+        region: 0,
+        from_level: LodLevel::Dormant,
+        episode: 1,
+        tick: Tick(1020),
+        obligations: vec![],
+        entries: vec![],
+        captures: vec![],
+    };
+    let location = craft_negative_campaign(&root, plan.canonical_bytes().unwrap());
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(
+                engine_slice::crossing::TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "level-moved"
+                }
+            )
+        ),
+        "a Dormant from_level is unsupported (both LODs must be live \
+         for the inferred reclassification)"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Negative: an undecodable plan blob fails the replay closed at the
+/// plan's own strict decode — never a guessed interpretation.
+#[test]
+fn recovery_rejects_an_undecodable_plan() {
+    let root = negative_root("corrupt-plan");
+    let location = craft_negative_campaign(&root, b"not-a-deactivation-plan".to_vec());
+    let result = OrchestratedSession::recover(&location, &root.join("journal.t1"), "s6c4-negative");
+    assert!(
+        matches!(
+            result,
+            Err(engine_slice::crossing::TransitionError::JournalFailed(
+                engine_persist::PipelineError::Format(_)
+            ))
+        ),
+        "the corrupt plan fails the strict decode (never a guessed \
+         interpretation)"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

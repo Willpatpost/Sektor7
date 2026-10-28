@@ -1242,6 +1242,7 @@ fn overhead_options(root: &Path, evidence: Option<EvidenceConfig>) -> DemoOption
         headless_ticks: 600,
         action_at: Some(300),
         poison_at_tick: None,
+        abort_at_tick: None,
         evidence,
         evidence_fail_writes: false,
         scenario: None,
