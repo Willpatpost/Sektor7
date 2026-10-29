@@ -18,9 +18,10 @@
 
 use std::path::PathBuf;
 
-use engine_core::{PresenceSample, Spine};
+use engine_core::wire::{SAVE_DOMAIN, SAVE_DOMAIN_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN};
+use engine_core::{Encoder, PresenceSample, Spine};
 use engine_persist::T1Journal;
-use engine_slice::crossing::{SessionCrossing, save_session};
+use engine_slice::crossing::{SESSION_SNAPSHOT_DOMAIN, SessionCrossing, save_session};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
 use engine_slice::session_chunks::{self, ChunkPolicy, HistoryForm};
@@ -518,6 +519,186 @@ fn the_hand_mangled_chunk_fails_the_strict_restoration() {
     assert!(
         session_chunks::validate_composed(&chunks).is_err(),
         "the mangled record fails the strict restoration closed"
+    );
+}
+
+// ---------------------------------------- the count-arithmetic corrective
+
+/// A well-framed legacy session byte stream with a CONTROLLED
+/// execution-ledger count: the envelope, a valid spine header,
+/// empty lanes and obligation sections, the chosen history form's
+/// framing, and the count — with `trailing_bytes` of arbitrary
+/// payload after the count (the read-count remaining bound's
+/// input). The stream is well-framed but malformed wherever the
+/// count lies: the walk must fail with a TYPED error, never a
+/// panic, a wrap, or an unbounded allocation.
+fn crafted_session_with_ledger_count(
+    form: HistoryForm,
+    ledger_count: u64,
+    trailing_bytes: usize,
+) -> Vec<u8> {
+    let mut spine = Encoder::new();
+    match form {
+        HistoryForm::Full => {
+            spine.write_str(SAVE_DOMAIN);
+            spine.write_u32(1); // the save-format version
+            spine.write_str(SPINE_DOMAIN);
+        }
+        HistoryForm::Compacted => {
+            spine.write_str(SAVE_DOMAIN_V2);
+            spine.write_u32(2);
+            spine.write_str(SPINE_HISTORY_DOMAIN);
+        }
+    }
+    spine.write_u64(150); // clock
+    spine.write_u64(1000); // next_seq
+    spine.write_u32(60); // budget
+    spine.write_u32(20); // near_reserve
+    for _ in 0..7 {
+        spine.write_u64(0); // the counters
+    }
+    spine.write_u64(0); // near count
+    spine.write_u64(0); // far count
+    spine.write_u64(0); // blocked count
+    spine.write_u64(0); // held count
+    if form == HistoryForm::Compacted {
+        spine.write_u8(0); // no carried max
+        spine.write_u64(0); // the empty prefix summary
+        spine.write_u64(0); // summarized records
+    }
+    spine.write_u64(ledger_count);
+    // The trailing payload after the count — RAW wire words (never
+    // length-prefixed: the region is what the record-count's
+    // remaining bound sees, and zero trailing bytes must leave the
+    // world section immediately next).
+    for _ in 0..trailing_bytes.div_ceil(8) {
+        spine.write_u64(0);
+    }
+    // The world section's framing (the walk reads the tag and the
+    // blob without interpreting them — the global validation is
+    // the composed restoration's business).
+    spine.write_str("engine-slice/npc-world-save/1");
+    spine.write_bytes(&[]);
+    let spine_bytes = spine.into_bytes();
+
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_SNAPSHOT_DOMAIN);
+    enc.write_bytes(&spine_bytes);
+    enc.write_bytes(&[]); // the director blob
+    enc.into_bytes()
+}
+
+#[test]
+fn the_u64_max_ledger_count_fails_typed_never_panics() {
+    // THE mandated regression: a well-framed stream with the
+    // execution-ledger count set to u64::MAX — the wire count's own
+    // remaining bound rejects it with a typed Limit (no record
+    // bytes exist to satisfy the count), in BOTH history forms. A
+    // panic, a wrap, or an unbounded allocation fails this test
+    // naturally.
+    for form in [HistoryForm::Full, HistoryForm::Compacted] {
+        let stream = crafted_session_with_ledger_count(form, u64::MAX, 0);
+        let error = match session_chunks::chunk_session(&stream, &ChunkPolicy::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("{form:?}: the u64::MAX count must fail the walk"),
+        };
+        assert!(
+            matches!(error, engine_core::SaveError::Limit { .. }),
+            "{form:?}: the typed limit class, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_count_that_exceeds_the_available_records_fails_typed() {
+    // A count that passes the wire-count remaining bound (enough
+    // trailing bytes exist) and fits every arithmetic plane, but
+    // exceeds the AVAILABLE ENCODED RECORDS (the trailing bytes are
+    // not valid fixed-width records): the buffer bound rejects it
+    // with the typed Truncated class.
+    let stream = crafted_session_with_ledger_count(HistoryForm::Full, 5, 8);
+    let error = match session_chunks::chunk_session(&stream, &ChunkPolicy::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("the exceeding count must fail the walk"),
+    };
+    assert!(
+        matches!(error, engine_core::SaveError::Truncated),
+        "the typed buffer-bound rejection: {error:?}"
+    );
+}
+
+#[test]
+fn the_overflowing_byte_length_count_fails_typed() {
+    // A count whose byte length cannot be represented on the wire
+    // plane (count × 31 overflowing u64): the constant-division
+    // bound rejects it with a typed Limit NAMING THE COUNT. The
+    // trailing bytes satisfy the wire-count remaining bound only
+    // partially — the class is the pre-multiplication bound, whose
+    // error construction never multiplies (the corrective's core
+    // invariant). Constructed at the largest representable count so
+    // the check's ordering is exercised regardless of the buffer.
+    let beyond = u64::MAX / 31 + 1;
+    let stream = crafted_session_with_ledger_count(HistoryForm::Full, beyond, 16);
+    let error = match session_chunks::chunk_session(&stream, &ChunkPolicy::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("the overflowing count must fail the walk"),
+    };
+    match error {
+        engine_core::SaveError::Limit { value, .. } => {
+            assert_eq!(value, beyond, "the error names the COUNT, never a product");
+        }
+        other => panic!("the typed limit class, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_valid_counts_still_walk_and_compose() {
+    // The corrective preserves the VALID count handling in both
+    // history forms: the empty ledger (the zero count — one uniform
+    // empty tail chunk) and an exact-boundary ledger (a real
+    // fixture whose count is an exact policy multiple — the full
+    // final chunk).
+    let stream = crafted_session_with_ledger_count(HistoryForm::Full, 0, 0);
+    let chunks = session_chunks::chunk_session(&stream, &ChunkPolicy::default())
+        .expect("the crafted empty ledger walks");
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+    assert_eq!(chunks.ledger_chunks[0].payload.len(), 0);
+    assert_eq!(
+        chunks.sealed_prefix_identities().len(),
+        0,
+        "the empty tail is partial (zero records below the boundary) — excluded"
+    );
+    let stream = crafted_session_with_ledger_count(HistoryForm::Compacted, 0, 0);
+    let chunks = session_chunks::chunk_session(&stream, &ChunkPolicy::default())
+        .expect("the crafted compacted empty ledger walks");
+    assert_eq!(chunks.form, HistoryForm::Compacted);
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+
+    // The real exact-boundary ledger over the accepted fixture.
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let legacy = save_session(&spine, &director).unwrap();
+    let records = spine.stats().executed;
+    let policy = ChunkPolicy {
+        ledger_records: records,
+    };
+    let chunks = session_chunks::chunk_session(&legacy, &policy).unwrap();
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+    assert_eq!(
+        chunks.sealed_prefix_identities().len(),
+        1,
+        "the exactly-full final chunk is SEALED — its identity is stable under the append-only history"
+    );
+    // The partial-tail exclusion: the same fixture one record below
+    // the boundary keeps the final chunk out of the sealed prefix.
+    let policy = ChunkPolicy {
+        ledger_records: records + 1,
+    };
+    let chunks = session_chunks::chunk_session(&legacy, &policy).unwrap();
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+    assert_eq!(
+        chunks.sealed_prefix_identities().len(),
+        0,
+        "the partial final chunk (records below the boundary) is excluded — the conservative cache policy"
     );
 }
 

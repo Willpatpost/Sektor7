@@ -150,6 +150,10 @@ pub struct ChunkedSession {
     /// The execution ledger's count prefix (the full-history count,
     /// or the `/2` retained-tail count).
     pub ledger_header: SectionChunk,
+    /// The chunk policy's record boundary the walk used (records
+    /// per sealed chunk) — the sealed-prefix classification's
+    /// reference.
+    pub ledger_boundary: u64,
     /// The ledger record stream in bounded chunks: every chunk below
     /// the last is sealed (immutable for the history's lifetime);
     /// the last is the partial tail.
@@ -183,9 +187,29 @@ impl ChunkedSession {
 
     /// The ledger's sealed-prefix chunk identities — the
     /// content-addressed reuse surface (stable across saves while
-    /// the history form and the append-only prefix hold).
+    /// the history form and the append-only prefix hold). A final
+    /// chunk holding EXACTLY the configured boundary's records is
+    /// FULL and therefore sealed: its bytes are immutable under the
+    /// append-only history (the next record opens a NEW chunk), so
+    /// its identity is stable and it joins the sealed prefix. A
+    /// partial final chunk (fewer records than the boundary) is
+    /// EXCLUDED conservatively: its bytes change on the next save,
+    /// and the eventual K2 identity cache must never reuse a partial
+    /// chunk whose content has changed.
     pub fn sealed_prefix_identities(&self) -> Vec<Hash> {
-        let sealed = self.ledger_chunks.len().saturating_sub(1);
+        let sealed = match self.ledger_chunks.split_last() {
+            Some((last, prefix)) => {
+                let last_records = (last.payload.len() / LEDGER_RECORD_BYTES) as u64;
+                if last_records == self.ledger_boundary {
+                    // The full final chunk is sealed.
+                    prefix.len() + 1
+                } else {
+                    // The partial tail is the mutable surface.
+                    prefix.len()
+                }
+            }
+            None => 0,
+        };
         self.ledger_chunks[..sealed]
             .iter()
             .map(|chunk| chunk.identity)
@@ -207,6 +231,20 @@ impl ChunkedSession {
 
 fn consumed(dec: &Decoder<'_>, total: usize) -> usize {
     total - dec.remaining()
+}
+
+/// Converts a wire count to a host index, checked (the same failure
+/// class audited across the walker: a count that cannot be
+/// represented as a host index fails with a typed `Limit` naming
+/// the COUNT — never a derived product, so the error construction
+/// itself cannot overflow).
+fn wire_count_to_index(value: u64, kind: &'static str) -> Result<usize, SaveError> {
+    usize::try_from(value).map_err(|_| SaveError::Limit {
+        section: "k1-chunk/walk",
+        kind,
+        value,
+        max: usize::MAX as u64,
+    })
 }
 
 fn walk_event(dec: &mut Decoder<'_>) -> Result<(), SaveError> {
@@ -284,7 +322,10 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
     dec.read_domain(SESSION_SNAPSHOT_DOMAIN)?;
     // The spine blob's framing.
     let spine_start = consumed(&dec, total);
-    let spine_len = dec.read_count(u64::MAX, "k1-chunk/walk", "spine-length")? as usize;
+    let spine_len = wire_count_to_index(
+        dec.read_count(u64::MAX, "k1-chunk/walk", "spine-length")?,
+        "spine-length",
+    )?;
     let spine_payload_start = spine_start + 8;
     let spine_end = spine_payload_start
         .checked_add(spine_len)
@@ -295,7 +336,10 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
     let spine = &bytes[spine_payload_start..spine_end];
     // The director blob's framing.
     let mut dec = Decoder::new(&bytes[spine_end..]);
-    let director_len = dec.read_count(u64::MAX, "k1-chunk/walk", "director-length")? as usize;
+    let director_len = wire_count_to_index(
+        dec.read_count(u64::MAX, "k1-chunk/walk", "director-length")?,
+        "director-length",
+    )?;
     let director_start = spine_end + 8;
     let director_end = director_start
         .checked_add(director_len)
@@ -372,7 +416,10 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
         if has_max != 0 {
             dec.read_tick()?;
         }
-        let summary_len = dec.read_count(u64::MAX, "k1-chunk/walk", "summary-length")? as usize;
+        let summary_len = wire_count_to_index(
+            dec.read_count(u64::MAX, "k1-chunk/walk", "summary-length")?,
+            "summary-length",
+        )?;
         if dec.remaining() < summary_len {
             return Err(SaveError::Truncated);
         }
@@ -391,22 +438,39 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
     };
 
     // The ledger: the count prefix, then the fixed-width record
-    // stream (advanced arithmetically — the count is bounded by the
-    // remaining bytes, so the offsets are overflow-safe checked
-    // adds over a slice that exists).
-    let ledger_count = dec.read_count(u64::MAX, "k1-chunk/walk", "ledger-count")?;
+    // stream. The count arithmetic is checked at EVERY step, and the
+    // failure values name the COUNT — never a derived byte product,
+    // so the error construction itself cannot overflow: a count
+    // whose byte length cannot be represented on the wire plane
+    // (count × record-width overflowing u64) fails the constant
+    // division bound; a count that cannot be represented as a host
+    // index fails the checked conversion; a count that fits the
+    // arithmetic but exceeds the available encoded records fails
+    // the buffer bound. No malformed count panics or wraps, in
+    // debug or release.
+    let ledger_count_raw = dec.read_count(u64::MAX, "k1-chunk/walk", "ledger-count")?;
+    const MAX_LEDGER_RECORDS: u64 = u64::MAX / LEDGER_RECORD_BYTES as u64;
+    if ledger_count_raw > MAX_LEDGER_RECORDS {
+        return Err(SaveError::Limit {
+            section: "k1-chunk/walk",
+            kind: "ledger-count",
+            value: ledger_count_raw,
+            max: MAX_LEDGER_RECORDS,
+        });
+    }
+    let ledger_count = wire_count_to_index(ledger_count_raw, "ledger-count")?;
     let ledger_header = make_chunk(
         TAG_LEDGER_HEADER,
         &spine[section_start..consumed(&dec, spine_total)],
     );
     let records_start = consumed(&dec, spine_total);
-    let record_bytes = (ledger_count as usize)
+    let record_bytes = ledger_count
         .checked_mul(LEDGER_RECORD_BYTES)
         .ok_or(SaveError::Limit {
             section: "k1-chunk/walk",
             kind: "ledger-bytes",
-            value: ledger_count * LEDGER_RECORD_BYTES as u64,
-            max: u64::MAX,
+            value: ledger_count_raw,
+            max: (usize::MAX / LEDGER_RECORD_BYTES) as u64,
         })?;
     let records_end = records_start
         .checked_add(record_bytes)
@@ -416,8 +480,9 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
     }
     let records = &spine[records_start..records_end];
 
-    // The bounded chunk split.
-    let boundary = (policy.ledger_records.max(1)) as usize;
+    // The bounded chunk split (the policy's boundary is a host
+    // parameter — checked with the same discipline).
+    let boundary = wire_count_to_index(policy.ledger_records.max(1), "chunk-boundary")?;
     let mut ledger_chunks = Vec::new();
     let mut offset = 0usize;
     while offset < record_bytes {
@@ -437,7 +502,10 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
     // the stream must end exactly at the spine payload's end.
     let mut dec = Decoder::new(&spine[records_end..]);
     let _ = dec.read_str(u32::MAX as u64, "domain-tag")?;
-    let world_len = dec.read_count(u64::MAX, "k1-chunk/walk", "world-length")? as usize;
+    let world_len = wire_count_to_index(
+        dec.read_count(u64::MAX, "k1-chunk/walk", "world-length")?,
+        "world-length",
+    )?;
     if dec.remaining() < world_len {
         return Err(SaveError::Truncated);
     }
@@ -462,6 +530,7 @@ pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSessio
         held,
         compacted_meta,
         ledger_header,
+        ledger_boundary: policy.ledger_records.max(1),
         ledger_chunks,
         world,
         director: director_chunk,
