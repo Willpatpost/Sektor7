@@ -38,6 +38,7 @@
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
 pub mod checkpoint;
+pub mod composite_manifest;
 pub mod consequence;
 pub mod encounter;
 pub mod envelope;

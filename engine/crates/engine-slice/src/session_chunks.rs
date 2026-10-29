@@ -58,21 +58,28 @@
 
 use engine_core::wire::{SAVE_DOMAIN, SAVE_DOMAIN_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN};
 use engine_core::{Decoder, Encoder, SaveError, Spine, Tick};
+use engine_persist::composite_manifest::{
+    self, CompositeManifest, HistoryKind, ManifestEntry, SectionKind, TAG_BLOCKED,
+    TAG_COMPACTED_META, TAG_DIRECTOR, TAG_FAR, TAG_HEADER, TAG_HELD, TAG_LEDGER_META,
+    TAG_LEDGER_RECORDS, TAG_NEAR, TAG_WORLD,
+};
 use engine_persist::{Hash, StoredObject};
 
 use crate::crossing::SESSION_SNAPSHOT_DOMAIN;
 use crate::npc::NpcWorld;
 use crate::region::RegionDirector;
 
-/// The prospective `session-snapshot/2` root's domain (INTERNAL to
-/// K1 — never written to canonical storage in this checkpoint).
-pub const SESSION_SNAPSHOT_V2_DOMAIN: &str = "engine-slice/session-snapshot/2";
-const V2_VERSION: u32 = 2;
+/// The prospective `session-snapshot/2` root's domain — the
+/// ENGINE-PERSIST-OWNED canonical schema (K2-A: one definition; this
+/// module consumes it). Never written to canonical storage.
+pub use engine_persist::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN;
 
 /// The chunk object envelope's domain: every prospective canonical
 /// chunk object is `{domain} + {section tag} + {payload}` — the
-/// content identity is the SHA-256 of exactly those bytes.
-pub const SESSION_CHUNK_DOMAIN: &str = "engine-slice/session-chunk/1";
+/// content identity is the SHA-256 of exactly those bytes. The
+/// envelope codec and the section tags are owned by the engine-persist
+/// manifest schema; this module re-exports them for its producers.
+pub use engine_persist::composite_manifest::SESSION_CHUNK_DOMAIN;
 
 /// The ratified default ledger chunk boundary: the record count per
 /// sealed chunk. The boundary study compares candidate values; the
@@ -282,32 +289,17 @@ fn walk_lane(dec: &mut Decoder<'_>) -> Result<(), SaveError> {
     Ok(())
 }
 
-// The section tags (the manifest's ordering keys — also the
-// prospective chunk envelopes' section domains).
-const TAG_HEADER: &str = "engine-slice/session-chunk/header/1";
-const TAG_NEAR: &str = "engine-slice/session-chunk/near/1";
-const TAG_FAR: &str = "engine-slice/session-chunk/far/1";
-const TAG_BLOCKED: &str = "engine-slice/session-chunk/blocked/1";
-const TAG_HELD: &str = "engine-slice/session-chunk/held/1";
-const TAG_COMPACTED_META: &str = "engine-slice/session-chunk/compacted-meta/1";
-const TAG_LEDGER_HEADER: &str = "engine-slice/session-chunk/ledger-meta/1";
-const TAG_LEDGER_RECORDS: &str = "engine-slice/session-chunk/ledger-records/1";
-const TAG_WORLD: &str = "engine-slice/session-chunk/world/1";
-const TAG_DIRECTOR: &str = "engine-slice/session-chunk/director/1";
+// The section tags are owned by the engine-persist manifest schema
+// (K2-A: one canonical definition) — imported above. The ledger-meta
+// tag's local historical name is aliased for the walker's use.
+const TAG_LEDGER_HEADER: &str = TAG_LEDGER_META;
 
 fn make_chunk(tag: &'static str, payload: &[u8]) -> SectionChunk {
-    let mut enc = Encoder::new();
-    enc.write_str(SESSION_CHUNK_DOMAIN);
-    enc.write_str(tag);
-    enc.write_bytes(payload);
-    let envelope = enc.into_bytes();
-    let identity = StoredObject::new(envelope)
-        .expect("the chunk envelope is a valid content object")
-        .hash();
+    let envelope = composite_manifest::encode_chunk_envelope(tag, payload);
     SectionChunk {
         tag,
         payload: payload.to_vec(),
-        identity,
+        identity: envelope.hash(),
     }
 }
 
@@ -584,26 +576,61 @@ pub fn compose_session(chunks: &ChunkedSession) -> Vec<u8> {
     enc.into_bytes()
 }
 
-/// The internal root manifest (the prospective
+/// Builds the RATIFIED K2-A root manifest (the prospective
 /// `session-snapshot/2` publication root — NEVER written to
-/// canonical storage in K1): the history form, the chunk count, and
-/// each chunk's section tag, content identity, and payload length.
-pub fn root_manifest(chunks: &ChunkedSession) -> Vec<u8> {
-    let sections: Vec<&SectionChunk> = chunks.section_list();
-    let mut enc = Encoder::new();
-    enc.write_str(SESSION_SNAPSHOT_V2_DOMAIN);
-    enc.write_u32(V2_VERSION);
-    enc.write_u8(match chunks.form {
-        HistoryForm::Full => 0,
-        HistoryForm::Compacted => 1,
-    });
-    enc.write_count(sections.len());
-    for section in sections {
-        enc.write_str(section.tag);
-        enc.write_bytes(section.identity.as_bytes());
-        enc.write_u64(section.payload.len() as u64);
+/// canonical storage): the engine-persist-owned
+/// [`CompositeManifest`] schema with the history form, the walked
+/// ledger boundary, the checked composed length (the payload sum),
+/// and the entries in the grammar's fixed order with their section
+/// kinds (the singletons; the ledger run's sealed and partial-tail
+/// classification).
+pub fn build_manifest(chunks: &ChunkedSession) -> CompositeManifest {
+    let sealed_width = (chunks.ledger_boundary as usize)
+        .checked_mul(LEDGER_RECORD_BYTES)
+        .expect("the walked boundary is bounded below the manifest maximum");
+    let entries: Vec<ManifestEntry> = chunks
+        .section_list()
+        .iter()
+        .map(|section| ManifestEntry {
+            tag: section.tag,
+            identity: section.identity,
+            payload_length: section.payload.len() as u64,
+            kind: if section.tag == TAG_LEDGER_RECORDS {
+                if section.payload.len() == sealed_width {
+                    SectionKind::LedgerSealed
+                } else {
+                    SectionKind::LedgerTail
+                }
+            } else {
+                SectionKind::Singleton
+            },
+        })
+        .collect();
+    let composed_length =
+        entries
+            .iter()
+            .map(|entry| entry.payload_length)
+            .fold(0u64, |sum, len| {
+                sum.checked_add(len)
+                    .expect("the walked payload sum is bounded below the manifest maximum")
+            });
+    CompositeManifest {
+        history_kind: match chunks.form {
+            HistoryForm::Full => HistoryKind::Full,
+            HistoryForm::Compacted => HistoryKind::Compacted,
+        },
+        ledger_boundary: chunks.ledger_boundary,
+        composed_length,
+        entries,
     }
-    enc.into_bytes()
+}
+
+/// The root manifest's canonical bytes (the prospective
+/// `session-snapshot/2` publication root — NEVER written to
+/// canonical storage; the K2-A ratified schema, superseding the K1
+/// prototype root).
+pub fn root_manifest(chunks: &ChunkedSession) -> Vec<u8> {
+    composite_manifest::encode(&build_manifest(chunks))
 }
 
 /// The root's content identity — the prospective snapshot identity
@@ -614,6 +641,13 @@ pub fn root_identity(chunks: &ChunkedSession) -> Hash {
     StoredObject::new(root_manifest(chunks))
         .expect("the root manifest is a valid content object")
         .hash()
+}
+
+/// Strictly decodes this module's own root through the ratified
+/// schema (the differential's self-check: the produced manifest is
+/// decodable and grammar-valid).
+pub fn decode_root_manifest(bytes: &[u8]) -> Result<CompositeManifest, SaveError> {
+    composite_manifest::decode(bytes)
 }
 
 /// The local chunk verification: the payload re-hashes to the

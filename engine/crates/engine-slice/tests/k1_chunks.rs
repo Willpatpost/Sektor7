@@ -20,7 +20,8 @@ use std::path::PathBuf;
 
 use engine_core::wire::{SAVE_DOMAIN, SAVE_DOMAIN_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN};
 use engine_core::{Encoder, PresenceSample, Spine};
-use engine_persist::T1Journal;
+use engine_persist::composite_manifest::{self, ClosureError, CompositeClosure};
+use engine_persist::{Hash, RevisionRecord, StoredObject, T1Journal};
 use engine_slice::crossing::{SESSION_SNAPSHOT_DOMAIN, SessionCrossing, save_session};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector, stage4_state_fingerprint};
@@ -356,6 +357,117 @@ fn the_compacted_history_form_round_trips() {
         full_chunks.ledger_header.identity, chunks.ledger_header.identity,
         "the compaction rewrote the record stream — the count prefixes differ"
     );
+}
+
+// ------------------------------------------- the K2-A closure differential
+
+#[test]
+fn the_ratified_manifest_and_closure_validate_over_the_corpus() {
+    // The K2-A differential over the real corpus: the produced root
+    // decodes through the ratified engine-persist schema (the
+    // grammar, the cardinalities, the run rules, the composed
+    // length); the root deterministically identifies the chunk
+    // sequence; the pure closure validator accepts the full closure
+    // (the record referencing the root, every chunk supplied as new)
+    // and carries a reuse split's dependencies as UNVERIFIED; and
+    // the closure negatives (a missing, extraneous, or repeated
+    // chunk) refuse typed.
+    for ticks in [5u64, 150, 600] {
+        let (spine, director) = scenario_pair(ticks, &near_region_4());
+        let legacy = save_session(&spine, &director).unwrap();
+        let chunks = session_chunks::chunk_session(&legacy, &ChunkPolicy::default()).unwrap();
+
+        // The produced root strictly decodes (the self-check) and
+        // its entry order is the composition order.
+        let root_bytes = session_chunks::root_manifest(&chunks);
+        let manifest = session_chunks::decode_root_manifest(&root_bytes)
+            .expect("the produced root decodes through the ratified schema");
+        let section_tags: Vec<_> = chunks.section_list().iter().map(|s| s.tag).collect();
+        let entry_tags: Vec<_> = manifest.entries.iter().map(|e| e.tag).collect();
+        assert_eq!(
+            entry_tags, section_tags,
+            "the manifest's fixed order is the composition order"
+        );
+        assert_eq!(
+            manifest.composed_length as usize,
+            chunks
+                .section_list()
+                .iter()
+                .map(|s| s.payload.len())
+                .sum::<usize>(),
+            "the composed length is the payload sum"
+        );
+
+        // The root identity is deterministic and the closure
+        // validates with every chunk supplied as new.
+        let root = StoredObject::new(root_bytes.clone()).unwrap();
+        assert_eq!(root.hash(), session_chunks::root_identity(&chunks));
+        let record = RevisionRecord::regular(Hash::from_bytes(&[9u8; 32]).unwrap(), 4, 77)
+            .with_idempotency_key(root.hash().as_bytes().to_vec())
+            .with_content_refs(vec![root.hash()]);
+        let new_chunks: Vec<StoredObject> = chunks
+            .section_list()
+            .iter()
+            .map(|section| {
+                StoredObject::new({
+                    let mut enc = Encoder::new();
+                    enc.write_str(session_chunks::SESSION_CHUNK_DOMAIN);
+                    enc.write_str(section.tag);
+                    enc.write_bytes(&section.payload);
+                    enc.into_bytes()
+                })
+                .unwrap()
+            })
+            .collect();
+        let closure = CompositeClosure {
+            root: root.clone(),
+            new_chunks,
+            reused_chunks: Vec::new(),
+        };
+        let validated = composite_manifest::validate_composite_closure(&record, &closure)
+            .unwrap_or_else(|error| panic!("ticks {ticks}: the closure validates: {error:?}"));
+        assert_eq!(validated.root_identity, root.hash());
+        assert!(validated.unverified_dependencies.is_empty());
+
+        // The reuse split: the last chunk becomes a reused identity —
+        // carried as an unverified dependency, never claimed durable.
+        let mut split = closure.clone();
+        let reused = split.new_chunks.pop().expect("at least one chunk");
+        split.reused_chunks.push(reused.hash());
+        let validated = composite_manifest::validate_composite_closure(&record, &split)
+            .unwrap_or_else(|error| panic!("ticks {ticks}: the reuse split validates: {error:?}"));
+        assert_eq!(validated.unverified_dependencies, vec![reused.hash()]);
+
+        // The negatives: a missing chunk, an extraneous chunk, a
+        // repeated chunk — each refuses the typed ClosureSet.
+        let mut missing = closure.clone();
+        missing.new_chunks.pop();
+        assert_eq!(
+            composite_manifest::validate_composite_closure(&record, &missing),
+            Err(ClosureError::ClosureSet),
+            "ticks {ticks}: the missing chunk refuses"
+        );
+        let mut extra = closure.clone();
+        extra
+            .new_chunks
+            .push(composite_manifest::encode_chunk_envelope(
+                engine_persist::composite_manifest::TAG_NEAR,
+                &[99u8; 4],
+            ));
+        assert_eq!(
+            composite_manifest::validate_composite_closure(&record, &extra),
+            Err(ClosureError::ClosureSet),
+            "ticks {ticks}: the extraneous chunk refuses"
+        );
+        let mut repeated = closure.clone();
+        let first = repeated.new_chunks[0].clone();
+        repeated.new_chunks.push(first);
+        assert_eq!(
+            composite_manifest::validate_composite_closure(&record, &repeated),
+            Err(ClosureError::ClosureSet),
+            "ticks {ticks}: the repeated chunk refuses"
+        );
+    }
 }
 
 // ------------------------------------------------------ the chunk invariants
