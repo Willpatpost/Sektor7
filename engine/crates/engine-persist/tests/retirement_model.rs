@@ -495,17 +495,61 @@ impl ProtocolModel {
     /// Idempotent under a repeated commit of the SAME
     /// reconciliation (the restart rule); a CONFLICTING
     /// re-supersession refuses typed.
+    ///
+    /// **The R3 correction — the idempotency comparison covers the
+    /// COMPLETE reconciliation evidence, never the deletion set
+    /// alone:** a repeated commit is idempotent only when the
+    /// legacy audit identity, the committed required-identity set,
+    /// the reconciled successor units, AND the successor
+    /// relationship ALL match the already-committed transition.
+    /// Different reconciliation views can produce the SAME
+    /// deletion set — those are DIFFERENT claims, and a changed
+    /// view can never inherit the authority of a previously
+    /// committed view merely because the resulting units happen to
+    /// match.
+    ///
+    /// **The preparation-to-commit freshness check:** the commit
+    /// RE-VALIDATES the prepared reconciliation against the CURRENT
+    /// live-required set — a preparation whose reconciled units
+    /// have become live-required between prepare and commit (the
+    /// modeled liveness input changed) is now STALE and REFUSES.
+    /// In production this window lives inside the provider's atomic
+    /// supersession transaction (the documented unproven
+    /// obligation); the model enforces re-validation at commit as
+    /// the fail-closed belt — no provider-level concurrency
+    /// guarantee is invented here.
     fn migrate_commit(&mut self, prepared: &PreparedSupersession) -> Result<u64, ProtocolError> {
         let old_id = prepared.old_audit;
+        // The freshness re-validation (every path — repeated
+        // attempts included): the prepared reconciliation must
+        // still avoid every CURRENTLY live-required identity.
+        if prepared
+            .successor_units
+            .intersection(&self.live_required)
+            .next()
+            .is_some()
+        {
+            return Err(ProtocolError::MigrationBlocked {
+                reason: "the prepared reconciliation is stale: a reconciled unit is now live-required",
+            });
+        }
         if let Some(existing) = self.supersession_records.get(&old_id) {
-            // A repeated commit (a restart's re-attempt): the SAME
-            // reconciliation is idempotent; anything else conflicts.
-            let existing_successor = self
-                .audits
-                .iter()
-                .find(|audit| audit.id == existing.successor)
-                .expect("the invariants guarantee the successor exists");
-            if existing_successor.units == prepared.successor_units {
+            // A repeated commit (a restart's re-attempt) is
+            // idempotent ONLY on the COMPLETE evidence: the same
+            // required set AND the same successor units under the
+            // same successor relationship. Anything else —
+            // including a different view producing the SAME units —
+            // is a conflicting supersession attempt.
+            let evidence_matches = existing.committed_required == prepared.required_at_preparation
+                && {
+                    let existing_successor = self
+                        .audits
+                        .iter()
+                        .find(|audit| audit.id == existing.successor)
+                        .expect("the invariants guarantee the successor exists");
+                    existing_successor.units == prepared.successor_units
+                };
+            if evidence_matches {
                 return Ok(existing.successor);
             }
             return Err(ProtocolError::SupersessionConflict { audit: old_id });
@@ -520,7 +564,10 @@ impl ProtocolModel {
         }
         // THE atomic durable commit: both facts — the successor's
         // installation AND the old audit's supersession — establish
-        // together, with no model-visible intermediate state.
+        // together, with no model-visible intermediate state. The
+        // immutable audit manifest and the original idempotency key
+        // are never replaced; the successor carries its own
+        // distinct key.
         let old_key = old_audit.key.clone();
         old_audit.phase = AuditPhase::Superseded;
         let new_id = self.next_id;
@@ -1145,4 +1192,180 @@ fn the_supersession_key_discipline_scenario() {
     model.delete_step(superseding, y).unwrap();
     model.write_terminal(superseding).unwrap();
     assert!(model.store.contains(&x));
+}
+
+// ------------------- the R3 and freshness final-review regressions
+
+#[test]
+fn the_r3_idempotency_compares_the_complete_reconciliation_evidence() {
+    // R3: a repeated commit is idempotent ONLY on the complete
+    // evidence — the same required set AND the same successor units
+    // under the same successor relationship. Different
+    // reconciliation views producing the SAME deletion set are
+    // DIFFERENT claims: the changed view can never inherit the
+    // committed view's authority.
+    let (mut model, legacy, x, y) = ambiguous_model();
+    // View 1: required {X} → the reconciled successor units {Y}.
+    let prepared_first = model.migrate_prepare(legacy, &verified_view(&[x])).unwrap();
+    assert_eq!(
+        prepared_first.successor_units,
+        [y].into_iter().collect::<BTreeSet<Hash>>()
+    );
+    let superseding = model.migrate_commit(&prepared_first).unwrap();
+
+    // (1) The EXACT repeat of the same prepared supersession is
+    // idempotent.
+    assert_eq!(model.migrate_commit(&prepared_first).unwrap(), superseding);
+
+    // (4) The repeat after a process-model restart is idempotent
+    // for identical evidence only.
+    model.restart().unwrap();
+    assert_eq!(model.migrate_commit(&prepared_first).unwrap(), superseding);
+
+    // (2) A DIFFERENT required set producing DIFFERENT successor
+    // units — conflict.
+    let mut different_units = prepared_first.clone();
+    different_units.required_at_preparation = [x, identity(3)].into_iter().collect();
+    different_units.successor_units = [y, identity(4)].into_iter().collect();
+    assert_eq!(
+        model.migrate_commit(&different_units),
+        Err(ProtocolError::SupersessionConflict { audit: legacy })
+    );
+
+    // (3) THE R3 CORE: a different required set producing the
+    // IDENTICAL successor units {Y} — still a conflict (a different
+    // reconciliation claim, never authority inheritance).
+    let mut same_units = prepared_first.clone();
+    same_units.required_at_preparation = [x, identity(5)].into_iter().collect();
+    assert_ne!(
+        same_units.required_at_preparation, prepared_first.required_at_preparation,
+        "the adversarial fixture carries a different required set"
+    );
+    assert_eq!(
+        same_units.successor_units, prepared_first.successor_units,
+        "the adversarial fixture produces the same deletion set"
+    );
+    assert_eq!(
+        model.migrate_commit(&same_units),
+        Err(ProtocolError::SupersessionConflict { audit: legacy }),
+        "the same deletion set under a different view is a conflict, never idempotent"
+    );
+
+    // (6) + (7) The rejected conflict mutated NOTHING: the original
+    // audit, the successor, the supersession record, and the
+    // active reservations are all unchanged.
+    assert_eq!(model.audit(legacy).unwrap().phase, AuditPhase::Superseded);
+    assert_eq!(
+        model.audit(superseding).unwrap().units,
+        [y].into_iter().collect::<BTreeSet<Hash>>()
+    );
+    let record = model.supersession_records.get(&legacy).unwrap();
+    assert_eq!(record.successor, superseding);
+    assert_eq!(
+        record.committed_required,
+        [x].into_iter().collect::<BTreeSet<Hash>>()
+    );
+    assert_eq!(model.audits.len(), 2, "no phantom successor was installed");
+    // The reservation behavior is unchanged: Y stays fenced by the
+    // successor.
+    assert_eq!(
+        model.reintroduce(y),
+        Err(ProtocolError::Fenced {
+            by: vec![superseding]
+        })
+    );
+
+    // (5) The repeat after TERMINAL confirmation never resurrects
+    // deletion authority: the exact repeat still returns the
+    // successor's identity, the successor stays Terminal (its
+    // record), and deletion through it still refuses.
+    model.begin_delete(superseding).unwrap();
+    model.delete_step(superseding, y).unwrap();
+    model.write_terminal(superseding).unwrap();
+    assert_eq!(model.migrate_commit(&prepared_first).unwrap(), superseding);
+    model.restart().unwrap();
+    assert_eq!(
+        model.audit(superseding).unwrap().phase,
+        AuditPhase::Terminal
+    );
+    assert_eq!(
+        model.delete_step(superseding, y),
+        Err(ProtocolError::NotDeletable { audit: superseding })
+    );
+}
+
+#[test]
+fn the_preparation_to_commit_freshness_check_refuses_stale_reconciliations() {
+    // The targeted freshness check: a reconciliation VERIFIED at
+    // preparation can go stale before the commit — the modeled
+    // live-required set grows to include a reconciled unit between
+    // the two steps. The commit REFUSES the now-stale preparation
+    // (fail-closed); the legacy audit keeps its conservative fence;
+    // a FRESH preparation under the updated view commits cleanly.
+    // The production counterpart of this window lives inside the
+    // provider's atomic supersession transaction — the documented
+    // unproven obligation; the model invents no provider-level
+    // concurrency guarantee, only the commit-time re-validation.
+    // The realistic staleness shape: the pre-protocol audit crashed
+    // BEFORE any deletion — both units remain present, X's presence
+    // against the reservation makes it ambiguous — and the
+    // preparation's view {X} is INCOMPLETE: another retained root's
+    // requirement for Y is discovered only after the preparation.
+    let mut model = ProtocolModel::new();
+    let (x, y) = (identity(1), identity(2));
+    model.publish(&[x, y]).unwrap();
+    let legacy = model.install(&[x, y], true).unwrap();
+    model.live_required.insert(x);
+    assert!(model.detect_legacy_ambiguity(legacy).unwrap());
+    assert_eq!(
+        model.audit(legacy).unwrap().phase,
+        AuditPhase::LegacyAmbiguous
+    );
+    let prepared = model.migrate_prepare(legacy, &verified_view(&[x])).unwrap();
+    assert_eq!(
+        prepared.successor_units,
+        [y].into_iter().collect::<BTreeSet<Hash>>()
+    );
+
+    // The liveness change: Y (present all along) joins the
+    // live-required set — the prepared reconciliation would now
+    // delete live content.
+    model.live_required.insert(y);
+
+    // The stale commit REFUSES.
+    assert_eq!(
+        model.migrate_commit(&prepared),
+        Err(ProtocolError::MigrationBlocked {
+            reason: "the prepared reconciliation is stale: a reconciled unit is now live-required",
+        })
+    );
+    // The legacy audit keeps its conservative protection: still
+    // maintenance-blocked, still fencing both units.
+    assert_eq!(
+        model.audit(legacy).unwrap().phase,
+        AuditPhase::LegacyAmbiguous
+    );
+    assert_eq!(
+        model.reintroduce(x),
+        Err(ProtocolError::Fenced { by: vec![legacy] })
+    );
+    assert_eq!(
+        model.reintroduce(y),
+        Err(ProtocolError::Fenced { by: vec![legacy] })
+    );
+    assert!(!model.supersession_records.contains_key(&legacy));
+
+    // The recovery path: a FRESH preparation under the UPDATED view
+    // {X, Y} reconciles to NOTHING and commits cleanly (an empty
+    // successor deletion set — the audit is fully superseded with
+    // nothing left to delete).
+    let fresh = model
+        .migrate_prepare(legacy, &verified_view(&[x, y]))
+        .unwrap();
+    assert!(fresh.successor_units.is_empty());
+    let superseding = model.migrate_commit(&fresh).unwrap();
+    model.begin_delete(superseding).unwrap();
+    assert!(model.complete(superseding).unwrap());
+    model.write_terminal(superseding).unwrap();
+    assert!(model.store.contains(&x) && model.store.contains(&y));
 }

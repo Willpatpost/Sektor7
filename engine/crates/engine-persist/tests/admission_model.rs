@@ -49,12 +49,16 @@ use engine_persist::record::RevisionRecord;
 
 struct MapSource {
     objects: HashMap<Hash, Vec<u8>>,
+    /// Identities the source FAILS on without proving absence (the
+    /// R2 case-5 injection: a transport/provider error).
+    unavailable: std::collections::HashSet<Hash>,
 }
 
 impl MapSource {
     fn new() -> Self {
         MapSource {
             objects: HashMap::new(),
+            unavailable: std::collections::HashSet::new(),
         }
     }
 
@@ -65,10 +69,19 @@ impl MapSource {
     fn remove(&mut self, identity: &Hash) {
         self.objects.remove(identity);
     }
+
+    fn mark_unavailable(&mut self, identity: &Hash) {
+        self.unavailable.insert(*identity);
+    }
 }
 
 impl ObjectSource for MapSource {
     fn read_object(&mut self, identity: &Hash) -> Result<Vec<u8>, ObjectSourceError> {
+        if self.unavailable.contains(identity) {
+            return Err(ObjectSourceError::Unavailable(
+                "the model marked this identity unavailable".to_owned(),
+            ));
+        }
         self.objects
             .get(identity)
             .cloned()
@@ -178,26 +191,60 @@ fn shared_chunk() -> (Hash, Vec<u8>) {
 
 // ------------------------------------------------------- the policy model
 
-/// The admission verdict under the modeled policy.
+/// The admission verdict under the modeled policy. The stages are
+/// EXPLICIT about what is and is not proven (the R2 correction):
+/// reservation clearance and dependency verification are DISTINCT
+/// claims — a fence-clear result never implies that every
+/// dependency has been verified, and a hash appearing in a
+/// manifest is never evidence that its bytes exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AdmissionVerdict {
-    /// The authenticated closure does not intersect the
-    /// reservation — the admission may proceed (the model grants
-    /// nothing; the future production path decides).
-    Admitted { closure: Vec<Hash> },
-    /// The AUTHENTICATED closure intersects the reservation: the
-    /// admission is rejected, naming the reserved identities.
+    /// The COMPLETE dependency closure is authenticated (every
+    /// dependency — newly supplied AND reused — verified against
+    /// its bytes) and does not intersect the reservation. This
+    /// proves exactly: the closure's identities are authentic and
+    /// fence-clear AGAINST THIS MODEL'S reservation input. It does
+    /// NOT prove canonical durability, publication readiness
+    /// beyond this model, or absence of reservations the caller
+    /// did not supply.
+    VerifiedUnreserved { closure: Vec<Hash> },
+    /// The DECLARED closure (new ∪ reused) does not intersect the
+    /// reservation, but one or more REUSED dependencies remain
+    /// UNVERIFIED — their bytes have not been read or
+    /// hash-checked. Reservation clearance is NOT publication
+    /// readiness; the unverified identities are named so no caller
+    /// can silently promote them to verified.
+    ClearedWithUnverifiedDependencies {
+        declared: Vec<Hash>,
+        unverified: Vec<Hash>,
+    },
+    /// The declared or authenticated closure intersects the
+    /// reservation: the admission is rejected, naming the reserved
+    /// identities. A known intersection is rejectable on the
+    /// DECLARED identities alone (verified or not).
     Rejected { reserved: Vec<Hash> },
-    /// The closure could not be authenticated (missing, corrupt, or
-    /// unverifiable dependencies): the admission is conservatively
-    /// blocked — never granted on an unverified closure.
+    /// The stored root's returned bytes hash to a DIFFERENT
+    /// identity than the one requested (the R1 correction): a
+    /// dishonest or defective source cannot substitute a
+    /// completely valid wrong root. Both identities are preserved
+    /// in the evidence.
+    RootIdentityMismatch { requested: Hash, observed: Hash },
+    /// The closure (or the root) could not be authenticated —
+    /// missing, corrupt, malformed, or unavailable: the admission
+    /// is conservatively blocked, never granted on an unverified
+    /// closure. A source failure is never proof of reservation
+    /// absence.
     BlockedUnverified { detail: String },
 }
 
 /// The ALREADY-STORED reintroduction path: the root is read back
-/// from the store by identity and the K2-B dark reader
-/// authenticates the FULL closure from the stored bytes — the
-/// verified dependency set is what fences.
+/// from the store by identity — its returned bytes are FRAMED and
+/// their COMPLETE SHA-256 identity RECALCULATED and compared with
+/// the REQUESTED identity (the R1 correction: a substituted valid
+/// root refuses, never admits) — and the K2-B dark reader then
+/// authenticates the FULL closure from the stored bytes, every
+/// chunk hash-verified independently. The verified dependency set
+/// is what fences.
 fn admit_stored(
     source: &mut MapSource,
     root_identity: &Hash,
@@ -219,6 +266,19 @@ fn admit_stored(
             };
         }
     };
+    // THE R1 identity authentication: the returned bytes' complete
+    // SHA-256 (the existing content-addressing primitive — the
+    // StoredObject's own hash over its whole canonical bytes) must
+    // equal the REQUESTED identity. A mismatch refuses with both
+    // identities preserved — never an admission on a wrong root,
+    // however valid its closure.
+    let observed_identity = root.hash();
+    if observed_identity != *root_identity {
+        return AdmissionVerdict::RootIdentityMismatch {
+            requested: *root_identity,
+            observed: observed_identity,
+        };
+    }
     let verified =
         match composite_reader::read_composite_closure(source, &root, &ReadLimits::default()) {
             Ok(verified) => verified,
@@ -235,22 +295,98 @@ fn admit_stored(
         .copied()
         .collect();
     if reserved.is_empty() {
-        AdmissionVerdict::Admitted { closure }
+        AdmissionVerdict::VerifiedUnreserved { closure }
     } else {
         AdmissionVerdict::Rejected { reserved }
     }
 }
 
+/// Verifies ONE reused dependency through the source (the R2
+/// verification for the reused identities): the bytes are read,
+/// hash-verified against the declared identity, framed, and their
+/// envelope's section tag checked against the manifest's entry. A
+/// missing, corrupt, malformed, or unavailable dependency refuses
+/// — an unverified reused identity is never silently promoted to a
+/// verified one.
+fn verify_reused_dependency(
+    source: &mut MapSource,
+    identity: &Hash,
+    manifest: &composite_manifest::CompositeManifest,
+) -> Result<(), String> {
+    let bytes = match source.read_object(identity) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(format!(
+                "the reused dependency {identity} could not be read: {error:?}"
+            ));
+        }
+    };
+    let object = match StoredObject::new(bytes) {
+        Ok(object) => object,
+        Err(error) => {
+            return Err(format!(
+                "the reused dependency {identity} could not be framed: {error:?}"
+            ));
+        }
+    };
+    if object.hash() != *identity {
+        return Err(format!(
+            "the reused dependency {identity} bytes do not hash to its declared identity"
+        ));
+    }
+    let Some(entry) = manifest
+        .entries
+        .iter()
+        .find(|entry| &entry.identity == identity)
+    else {
+        return Err(format!(
+            "the reused dependency {identity} is not declared by the manifest"
+        ));
+    };
+    let mut decoder = engine_core::Decoder::new(object.bytes());
+    let observed_domain = decoder
+        .read_str(engine_core::wire::MAX_TAG_LEN, "k2b-admission-reused")
+        .map_err(|error| format!("the reused dependency {identity} envelope: {error:?}"))?;
+    if observed_domain != composite_manifest::SESSION_CHUNK_DOMAIN {
+        return Err(format!(
+            "the reused dependency {identity} carries the foreign domain {observed_domain}"
+        ));
+    }
+    let observed_tag = decoder
+        .read_str(engine_core::wire::MAX_TAG_LEN, "k2b-admission-reused")
+        .map_err(|error| format!("the reused dependency {identity} envelope: {error:?}"))?;
+    if observed_tag != entry.tag {
+        return Err(format!(
+            "the reused dependency {identity} is tagged {observed_tag}, the manifest declares {}",
+            entry.tag
+        ));
+    }
+    Ok(())
+}
+
 /// The NEW-SUPPLY path: the caller supplies the root and the chunk
 /// objects (plus the REUSED identities); the K2-A pure closure
-/// validator authenticates the supplied bytes against the manifest
+/// validator authenticates the SUPPLIED bytes against the manifest
 /// and the record's root reference — and the DECLARED set (new ∪
 /// reused) is what fences (content addressing makes a reused
-/// identity and a same-hash new supply the same identity).
+/// identity and a same-hash new supply the same identity; both
+/// fence equally, verified or not).
+///
+/// The verification completeness is EXPLICIT (the R2 correction):
+/// an all-new closure is fully authenticated by the validator; a
+/// closure with REUSED identities is fully verified only when
+/// `verify_reused_through` supplies a source AND every reused
+/// dependency reads, hash-verifies, and envelope-checks against
+/// its manifest entry — otherwise the verdict is the DISTINCT
+/// fence-clear-but-unverified stage (reservation clearance is NOT
+/// publication readiness). The fence check itself uses the
+/// declared identities, so a source failure is never interpreted
+/// as proof of reservation absence.
 fn admit_supplied(
     record: &RevisionRecord,
     closure: &CompositeClosure,
     reservation: &BTreeSet<Hash>,
+    verify_reused_through: Option<&mut MapSource>,
 ) -> AdmissionVerdict {
     let validated = match composite_manifest::validate_composite_closure(record, closure) {
         Ok(validated) => validated,
@@ -262,15 +398,37 @@ fn admit_supplied(
     };
     let mut declared = validated.new_identities.clone();
     declared.extend(validated.unverified_dependencies.iter().copied());
+    // The fence: the DECLARED set (new ∪ reused), verified or not —
+    // a known reservation intersection is rejectable on the
+    // declared identities alone.
     let reserved: Vec<Hash> = declared
         .iter()
         .filter(|identity| reservation.contains(*identity))
         .copied()
         .collect();
-    if reserved.is_empty() {
-        AdmissionVerdict::Admitted { closure: declared }
-    } else {
-        AdmissionVerdict::Rejected { reserved }
+    if !reserved.is_empty() {
+        return AdmissionVerdict::Rejected { reserved };
+    }
+    let unverified: Vec<Hash> = validated.unverified_dependencies.clone();
+    if unverified.is_empty() {
+        // An all-new closure: the validator authenticated every
+        // supplied chunk against the manifest.
+        return AdmissionVerdict::VerifiedUnreserved { closure: declared };
+    }
+    match verify_reused_through {
+        None => AdmissionVerdict::ClearedWithUnverifiedDependencies {
+            declared,
+            unverified,
+        },
+        Some(source) => {
+            for identity in &unverified {
+                if let Err(detail) = verify_reused_dependency(source, identity, &validated.manifest)
+                {
+                    return AdmissionVerdict::BlockedUnverified { detail };
+                }
+            }
+            AdmissionVerdict::VerifiedUnreserved { closure: declared }
+        }
     }
 }
 
@@ -339,7 +497,7 @@ fn the_direct_reference_check_is_insufficient_the_indirect_closure_fences() {
         reused_chunks: Vec::new(),
     };
     assert_eq!(
-        admit_supplied(&record, &closure, &reservation),
+        admit_supplied(&record, &closure, &reservation, None),
         AdmissionVerdict::Rejected {
             reserved: vec![shared]
         },
@@ -367,7 +525,10 @@ fn the_admission_passes_when_nothing_intersects() {
     )
     .with_content_refs(vec![composite.root.hash()]);
     let verdict = admit_stored(&mut source, &composite.root.hash(), &reservation);
-    assert!(matches!(verdict, AdmissionVerdict::Admitted { .. }));
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
 
     let new_chunks: Vec<StoredObject> = composite
         .chunk_objects
@@ -379,8 +540,11 @@ fn the_admission_passes_when_nothing_intersects() {
         new_chunks,
         reused_chunks: Vec::new(),
     };
-    let verdict = admit_supplied(&record, &closure, &reservation);
-    assert!(matches!(verdict, AdmissionVerdict::Admitted { .. }));
+    let verdict = admit_supplied(&record, &closure, &reservation, None);
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
 }
 
 #[test]
@@ -445,23 +609,36 @@ fn the_mixed_new_and_reused_supply_fences_on_the_declared_set() {
     };
     let reservation: BTreeSet<Hash> = [shared].into_iter().collect();
     assert_eq!(
-        admit_supplied(&record, &closure, &reservation),
+        admit_supplied(&record, &closure, &reservation, None),
         AdmissionVerdict::Rejected {
             reserved: vec![shared]
         },
         "the declared set fences the reused identity exactly like a new supply"
     );
-    // With NOTHING reserved, the same mixed closure admits — and
-    // the validator carries X as an unverified dependency (never
-    // claimed durable).
+    // With NOTHING reserved, the same mixed closure is
+    // fence-CLEAR but NOT publication-ready (the R2 corrected
+    // semantics): the reused X has not been read or verified, and
+    // the verdict names it — the old test's bare success claim was
+    // unjustified and is revised, not renamed.
     let empty: BTreeSet<Hash> = BTreeSet::new();
-    let verdict = admit_supplied(&record, &closure, &empty);
+    let verdict = admit_supplied(&record, &closure, &empty, None);
     match verdict {
-        AdmissionVerdict::Admitted { closure } => {
-            assert!(closure.contains(&shared));
+        AdmissionVerdict::ClearedWithUnverifiedDependencies {
+            declared,
+            unverified,
+        } => {
+            assert!(declared.contains(&shared));
+            assert_eq!(unverified, vec![shared]);
         }
-        other => panic!("the unreserved mixed closure admits: {other:?}"),
+        other => panic!("the unreserved mixed closure is cleared-but-unverified: {other:?}"),
     }
+    // With the source supplied AND X's bytes stored and intact, the
+    // same closure reaches the FULL verified stage.
+    let verdict = admit_supplied(&record, &closure, &empty, Some(&mut source));
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
 }
 
 #[test]
@@ -533,7 +710,7 @@ fn the_unverifiable_closure_blocks_conservatively() {
         new_chunks,
         reused_chunks: Vec::new(),
     };
-    let verdict = admit_supplied(&record, &closure, &reservation);
+    let verdict = admit_supplied(&record, &closure, &reservation, None);
     assert!(
         matches!(verdict, AdmissionVerdict::BlockedUnverified { .. }),
         "the incoherent supplied closure blocks the admission: {verdict:?}"
@@ -569,8 +746,245 @@ fn the_already_stored_root_reintroduction_is_fenced_like_new_supply() {
     );
 
     // The fence lifts only when the reservation does: with nothing
-    // reserved, the same stored root admits.
+    // reserved, the same stored root reaches the FULL verified
+    // stage (the R1 identity check passes, the reader verifies
+    // every chunk).
     let empty: BTreeSet<Hash> = BTreeSet::new();
     let verdict = admit_stored(&mut source, &composite.root.hash(), &empty);
-    assert!(matches!(verdict, AdmissionVerdict::Admitted { .. }));
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
+}
+
+// --------------------------- the R1 and R2 final-review regressions
+
+#[test]
+fn the_r1_substituted_valid_root_refuses_with_both_identities() {
+    // R1 cases 2, 3, and 6: a dishonest or defective source returns
+    // a DIFFERENT, completely valid composite root's bytes under
+    // the requested identity. The substituted root's own closure
+    // would verify — but the recalculated SHA-256 of the returned
+    // bytes is the WRONG root's identity: the admission refuses
+    // with BOTH identities preserved, under an empty reservation
+    // AND under a reservation that would otherwise permit it.
+    let root_a = synthetic_composite(0, None);
+    let root_b = synthetic_composite(60, None);
+    assert_ne!(root_a.root.hash(), root_b.root.hash());
+    let mut source = MapSource::new();
+    // The store serves root B's ENTIRE valid closure — but under
+    // root A's identity at the root slot.
+    source.insert(root_a.root.hash(), root_b.root.bytes().to_vec());
+    for (identity, bytes) in &root_b.chunk_objects {
+        source.insert(*identity, bytes.clone());
+    }
+
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    assert_eq!(
+        admit_stored(&mut source, &root_a.root.hash(), &empty),
+        AdmissionVerdict::RootIdentityMismatch {
+            requested: root_a.root.hash(),
+            observed: root_b.root.hash(),
+        },
+        "the wrong-identity root refuses even with valid, unreserved dependencies"
+    );
+
+    // A reservation that would otherwise permit root A's true
+    // closure (reserving an identity in NEITHER closure): the
+    // mismatch still refuses — never an admission on a wrong root.
+    let permissive: BTreeSet<Hash> = [Hash::from_bytes(&[99u8; 32]).unwrap()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        admit_stored(&mut source, &root_a.root.hash(), &permissive),
+        AdmissionVerdict::RootIdentityMismatch {
+            requested: root_a.root.hash(),
+            observed: root_b.root.hash(),
+        },
+        "the mismatch refuses under a permissive reservation too"
+    );
+
+    // The control: the HONEST store (root B under root B's
+    // identity) reaches the full verified stage.
+    source.insert(root_b.root.hash(), root_b.root.bytes().to_vec());
+    let verdict = admit_stored(&mut source, &root_b.root.hash(), &empty);
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
+}
+
+#[test]
+fn the_r1_missing_or_malformed_root_blocks_conservatively() {
+    // R1 cases 4 and 5: the requested root absent from the store,
+    // or garbage bytes under its identity — both fail closed
+    // BEFORE any identity or closure claim.
+    let composite = synthetic_composite(0, None);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+
+    // Missing: the source proves absence.
+    let mut source = MapSource::new();
+    let verdict = admit_stored(&mut source, &composite.root.hash(), &empty);
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail } if detail.contains("could not be read")),
+        "the missing root blocks: {verdict:?}"
+    );
+
+    // Malformed: bytes under the identity that do not frame as a
+    // domain-tagged object at all.
+    let mut source = MapSource::new();
+    let garbage = vec![0xffu8; 24];
+    source.insert(composite.root.hash(), garbage);
+    let verdict = admit_stored(&mut source, &composite.root.hash(), &empty);
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail } if detail.contains("could not be framed")),
+        "the malformed root blocks: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r2_reused_missing_or_corrupt_blocks_the_verified_stage() {
+    // R2 cases 3 and 4: a mixed new/reused closure whose reused
+    // dependency is MISSING or CORRUPTED in the store never reaches
+    // the full verified stage — the fence-clear declared set is
+    // not publication readiness, and the verification failure
+    // blocks conservatively.
+    let (shared, shared_bytes) = shared_chunk();
+    let composite = synthetic_composite(0, Some((shared, shared_bytes.clone())));
+    let record = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "k2b-admission",
+        0,
+    )
+    .with_content_refs(vec![composite.root.hash()]);
+    let new_chunks: Vec<StoredObject> = composite
+        .chunk_objects
+        .iter()
+        .map(|(_, bytes)| StoredObject::new(bytes.clone()).unwrap())
+        .collect();
+    let closure = CompositeClosure {
+        root: composite.root.clone(),
+        new_chunks,
+        reused_chunks: vec![shared],
+    };
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+
+    // (a) The reused dependency MISSING from the store.
+    let mut source = MapSource::new();
+    let verdict = admit_supplied(&record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail } if detail.contains("could not be read")),
+        "the missing reused dependency blocks: {verdict:?}"
+    );
+
+    // (b) The reused dependency CORRUPTED: a well-formed envelope
+    // under the identity whose bytes hash elsewhere.
+    let mut source = MapSource::new();
+    let mut corrupted_payload = vec![77u8; 4 * 31];
+    corrupted_payload[0] ^= 0xff;
+    source.insert(
+        shared,
+        composite_manifest::encode_chunk_envelope(
+            composite_manifest::TAG_LEDGER_RECORDS,
+            &corrupted_payload,
+        )
+        .into_bytes(),
+    );
+    let verdict = admit_supplied(&record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail } if detail.contains("do not hash")),
+        "the corrupt reused dependency blocks: {verdict:?}"
+    );
+
+    // The control: the intact reused dependency reaches the full
+    // verified stage (R2 case 2).
+    let mut source = MapSource::new();
+    source.insert(shared, shared_bytes);
+    let verdict = admit_supplied(&record, &closure, &empty, Some(&mut source));
+    assert!(matches!(
+        verdict,
+        AdmissionVerdict::VerifiedUnreserved { .. }
+    ));
+}
+
+#[test]
+fn the_r2_source_unavailability_blocks_never_clears() {
+    // R2 case 5: the source FAILS for the reused dependency without
+    // proving absence — the admission blocks; the source failure is
+    // never interpreted as proof of reservation absence (the fence
+    // check ran on the declared identities, and the verdict carries
+    // the failure).
+    let (shared, shared_bytes) = shared_chunk();
+    let composite = synthetic_composite(0, Some((shared, shared_bytes.clone())));
+    let record = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "k2b-admission",
+        0,
+    )
+    .with_content_refs(vec![composite.root.hash()]);
+    let new_chunks: Vec<StoredObject> = composite
+        .chunk_objects
+        .iter()
+        .map(|(_, bytes)| StoredObject::new(bytes.clone()).unwrap())
+        .collect();
+    let closure = CompositeClosure {
+        root: composite.root.clone(),
+        new_chunks,
+        reused_chunks: vec![shared],
+    };
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+
+    let mut source = MapSource::new();
+    source.insert(shared, shared_bytes);
+    source.mark_unavailable(&shared);
+    let verdict = admit_supplied(&record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail } if detail.contains("could not be read")),
+        "the unavailable reused dependency blocks conservatively: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r2_fully_verified_closure_with_a_reserved_chunk_rejects() {
+    // R2 case 9: every dependency verifies (the source present, the
+    // bytes intact) but ONE chunk is reserved — the fence on the
+    // declared set fires regardless of verifiability.
+    let (shared, shared_bytes) = shared_chunk();
+    let composite = synthetic_composite(0, Some((shared, shared_bytes.clone())));
+    let record = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "k2b-admission",
+        0,
+    )
+    .with_content_refs(vec![composite.root.hash()]);
+    let new_chunks: Vec<StoredObject> = composite
+        .chunk_objects
+        .iter()
+        .map(|(_, bytes)| StoredObject::new(bytes.clone()).unwrap())
+        .collect();
+    let closure = CompositeClosure {
+        root: composite.root.clone(),
+        new_chunks,
+        reused_chunks: vec![shared],
+    };
+    let reservation: BTreeSet<Hash> = [shared].into_iter().collect();
+    let mut source = MapSource::new();
+    source.insert(shared, shared_bytes);
+    assert_eq!(
+        admit_supplied(&record, &closure, &reservation, Some(&mut source)),
+        AdmissionVerdict::Rejected {
+            reserved: vec![shared]
+        },
+        "the fully verified closure still fences on the reserved chunk"
+    );
+    // And without the source (the reused identity unverified): the
+    // SAME rejection — a known intersection is rejectable on the
+    // declared identities alone (R2 case 7).
+    assert_eq!(
+        admit_supplied(&record, &closure, &reservation, None),
+        AdmissionVerdict::Rejected {
+            reserved: vec![shared]
+        },
+        "the unverified reused identity fences on its declared identity"
+    );
 }
