@@ -301,13 +301,21 @@ fn admit_stored(
     }
 }
 
-/// Verifies ONE reused dependency through the source (the R2
-/// verification for the reused identities): the bytes are read,
-/// hash-verified against the declared identity, framed, and their
-/// envelope's section tag checked against the manifest's entry. A
-/// missing, corrupt, malformed, or unavailable dependency refuses
-/// — an unverified reused identity is never silently promoted to a
-/// verified one.
+/// Verifies ONE reused dependency through the source: the COMPLETE
+/// chunk-envelope verification, matching the K2-B reader's fresh
+/// path semantics (the R4 correction — hash equality proves the
+/// bytes match the declared identity, NEVER that the bytes satisfy
+/// the envelope grammar). The bytes are read, framed, hash-verified
+/// against the declared identity, and then FULLY decoded: the
+/// chunk domain, the section tag vs the manifest entry, the
+/// length-prefixed payload under `MAX_CHUNK_BYTES`, the decoded
+/// payload length vs the manifest entry's declared
+/// `payload_length`, and the complete consumption with no trailing
+/// data. A missing, corrupt, malformed, truncated, oversized, or
+/// unavailable dependency refuses — an unverified reused identity
+/// is never silently promoted to a verified one, and a
+/// hash-authentic but structurally invalid chunk never reaches the
+/// full-verification verdict.
 fn verify_reused_dependency(
     source: &mut MapSource,
     identity: &Hash,
@@ -361,6 +369,26 @@ fn verify_reused_dependency(
             entry.tag
         ));
     }
+    // THE R4 completion — the rest of the envelope, exactly the
+    // reader's fresh-path semantics: the length-prefixed payload
+    // decoded under the schema's per-chunk bound (no excessive
+    // allocation: the decoder bounds the declared length before
+    // trusting it), the decoded length checked against the
+    // manifest entry's declaration, and the COMPLETE consumption
+    // with no trailing data.
+    let payload = decoder
+        .read_bytes(composite_manifest::MAX_CHUNK_BYTES, "k2b-admission-reused")
+        .map_err(|error| format!("the reused dependency {identity} envelope: {error:?}"))?;
+    if payload.len() as u64 != entry.payload_length {
+        return Err(format!(
+            "the reused dependency {identity} carries a {}-byte payload, the manifest declares {}",
+            payload.len(),
+            entry.payload_length
+        ));
+    }
+    decoder
+        .finish()
+        .map_err(|error| format!("the reused dependency {identity} envelope: {error:?}"))?;
     Ok(())
 }
 
@@ -986,5 +1014,318 @@ fn the_r2_fully_verified_closure_with_a_reserved_chunk_rejects() {
             reserved: vec![shared]
         },
         "the unverified reused identity fences on its declared identity"
+    );
+}
+
+// ---------------------- the R4 envelope-verification regressions
+
+/// One admission fixture over the synthetic composite with the
+/// WORLD singleton's manifest entry REPLACED by an adversarial
+/// dependency: the entry carries the adversarial bytes' ACTUAL
+/// content identity (the bytes are hash-valid for that identity —
+/// the R4 distinction: hash equality, never envelope validity) and
+/// the given declared payload length, with the manifest's composed
+/// coherence adjusted so the MANIFEST itself stays grammatically
+/// valid. The unpatched chunks are the new supply; the adversarial
+/// identity rides as reused (or as new, for the equivalence test).
+struct AdversarialFixture {
+    record: RevisionRecord,
+    root: StoredObject,
+    /// The unpatched chunk objects (every manifest entry except the
+    /// patched world singleton).
+    new_chunks: Vec<StoredObject>,
+    /// The patched world entry's declared identity — the adversarial
+    /// bytes' ACTUAL content identity.
+    adversarial_identity: Hash,
+}
+
+fn adversarial_world_fixture(
+    variant: u8,
+    adversarial_bytes: &[u8],
+    declared_payload_length: u64,
+) -> AdversarialFixture {
+    let composite = synthetic_composite(variant, None);
+    let mut manifest = composite_manifest::decode(composite.root.bytes()).unwrap();
+    let world_index = manifest.entries.len() - 2;
+    let original_world_identity = manifest.entries[world_index].identity;
+    let original_length = manifest.entries[world_index].payload_length;
+    let adversarial_identity = engine_persist::hash::hash_object(adversarial_bytes);
+    manifest.entries[world_index].identity = adversarial_identity;
+    manifest.entries[world_index].payload_length = declared_payload_length;
+    // The composed coherence follows the DECLARED lengths (the
+    // subtraction first: the composed total always covers the
+    // original entry's length, so no underflow exists).
+    manifest.composed_length = manifest.composed_length - original_length + declared_payload_length;
+    let root = StoredObject::new(composite_manifest::encode(&manifest)).unwrap();
+    let record = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "k2b-admission-r4",
+        0,
+    )
+    .with_content_refs(vec![root.hash()]);
+    let new_chunks: Vec<StoredObject> = composite
+        .chunk_objects
+        .iter()
+        .filter(|(identity, _)| *identity != original_world_identity)
+        .map(|(_, bytes)| StoredObject::new(bytes.clone()).unwrap())
+        .collect();
+    AdversarialFixture {
+        record,
+        root,
+        new_chunks,
+        adversarial_identity,
+    }
+}
+
+/// Assembles the reused-form closure over an adversarial fixture.
+fn reused_closure(fixture: &AdversarialFixture) -> CompositeClosure {
+    CompositeClosure {
+        root: fixture.root.clone(),
+        new_chunks: fixture.new_chunks.clone(),
+        reused_chunks: vec![fixture.adversarial_identity],
+    }
+}
+
+/// The store carrying ONLY the adversarial bytes (the reused
+/// dependency's source).
+fn adversarial_source(fixture: &AdversarialFixture, bytes: &[u8]) -> MapSource {
+    let mut source = MapSource::new();
+    source.insert(fixture.adversarial_identity, bytes.to_vec());
+    source
+}
+
+#[test]
+fn the_r4_valid_reused_dependency_reaches_full_verification() {
+    // Test A — the positive control: a canonical chunk envelope
+    // whose ACTUAL hash and payload length the manifest carries,
+    // supplied as a reused dependency with no reservation
+    // intersection — the complete envelope verification passes and
+    // the admission reaches VerifiedUnreserved.
+    let valid_world =
+        composite_manifest::encode_chunk_envelope(composite_manifest::TAG_WORLD, &[5u8; 62]);
+    let fixture = adversarial_world_fixture(0, valid_world.bytes(), 62);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, valid_world.bytes());
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    match &verdict {
+        AdmissionVerdict::VerifiedUnreserved { closure } => {
+            assert!(closure.contains(&fixture.adversarial_identity));
+        }
+        other => panic!("the valid reused dependency fully verifies: {other:?}"),
+    }
+}
+
+#[test]
+fn the_r4_truncated_payload_framing_blocks_full_verification() {
+    // Test B — a reused object whose leading chunk domain and
+    // section tag are valid but whose length-prefixed payload is
+    // TRUNCATED (the length prefix declares more bytes than the
+    // object carries). The object's ACTUAL SHA-256 is in the
+    // manifest (hash-valid bytes, structurally invalid envelope) —
+    // the payload decode refuses, never VerifiedUnreserved.
+    let mut encoder = engine_core::Encoder::new();
+    encoder.write_str(composite_manifest::SESSION_CHUNK_DOMAIN);
+    encoder.write_str(composite_manifest::TAG_WORLD);
+    encoder.write_u64(50);
+    let mut bytes = encoder.into_bytes();
+    bytes.extend_from_slice(&[0u8; 10]);
+    let fixture = adversarial_world_fixture(0, &bytes, 19);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, &bytes);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("envelope")),
+        "the truncated payload framing blocks: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r4_manifest_payload_length_decoherence_blocks_full_verification() {
+    // Test C — a structurally VALID chunk envelope (complete
+    // framing, payload 93 bytes) whose decoded payload length
+    // DISAGREES with the manifest entry's declared payload length
+    // (62 — the manifest itself stays valid: the positional
+    // grammar holds and the composed coherence is adjusted to the
+    // declared lengths). The object's correct SHA-256 is in the
+    // manifest. The failure is the payload-length incoherence —
+    // not a hash mismatch and not an invalid root manifest.
+    let valid_chunk =
+        composite_manifest::encode_chunk_envelope(composite_manifest::TAG_WORLD, &[7u8; 93]);
+    let fixture = adversarial_world_fixture(0, valid_chunk.bytes(), 62);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, valid_chunk.bytes());
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("93-byte payload") && detail.contains("declares 62")),
+        "the payload-length decoherence blocks: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r4_trailing_bytes_block_full_verification() {
+    // Test D — an otherwise valid chunk envelope with EXTRA
+    // trailing bytes appended; the manifest carries the EXTENDED
+    // bytes' correct SHA-256 and the true payload length, so the
+    // domain, tag, and payload checks all pass — the decoder's
+    // finish check catches the trailing data.
+    let valid_chunk =
+        composite_manifest::encode_chunk_envelope(composite_manifest::TAG_WORLD, &[3u8; 62]);
+    let mut bytes = valid_chunk.bytes().to_vec();
+    bytes.extend_from_slice(&[0xeeu8; 5]);
+    let fixture = adversarial_world_fixture(0, &bytes, 62);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, &bytes);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("envelope")),
+        "the trailing bytes block through the finish check: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r4_oversized_payload_declaration_blocks_without_excess_allocation() {
+    // Test E — the maximum-payload bound: a compact adversarial
+    // framing whose length prefix declares MORE than
+    // MAX_CHUNK_BYTES with only a few actual bytes (no excessive
+    // buffer). The bounded decoder refuses the declared length
+    // before trusting it — no panic, no oversized allocation.
+    let mut encoder = engine_core::Encoder::new();
+    encoder.write_str(composite_manifest::SESSION_CHUNK_DOMAIN);
+    encoder.write_str(composite_manifest::TAG_WORLD);
+    encoder.write_u64(composite_manifest::MAX_CHUNK_BYTES + 1);
+    let mut bytes = encoder.into_bytes();
+    bytes.extend_from_slice(&[0u8; 4]);
+    let fixture = adversarial_world_fixture(0, &bytes, 4);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, &bytes);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("envelope")),
+        "the oversized payload declaration blocks: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r4_wrong_domain_and_wrong_tag_remain_blocked() {
+    // Test F — the pre-existing failure classes stay fail-closed
+    // alongside the new envelope checks (the missing, corrupt, and
+    // unavailable classes are re-proven by the R2 tests): a
+    // well-framed object under a FOREIGN domain, and a
+    // chunk-domain object carrying the WRONG section tag — both
+    // with their ACTUAL hashes in the manifest.
+    // (a) The foreign domain.
+    let mut encoder = engine_core::Encoder::new();
+    encoder.write_str("sektor7/save/1");
+    encoder.write_str(composite_manifest::TAG_WORLD);
+    encoder.write_bytes(&[1u8; 62]);
+    let foreign = encoder.into_bytes();
+    let fixture = adversarial_world_fixture(0, &foreign, 62);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, &foreign);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("foreign domain")),
+        "the foreign domain blocks: {verdict:?}"
+    );
+    // (b) The wrong section tag: the grammar pins the manifest
+    // entry's tag to TAG_WORLD; the stored envelope carries
+    // TAG_NEAR with a matching payload length.
+    let mis_tagged =
+        composite_manifest::encode_chunk_envelope(composite_manifest::TAG_NEAR, &[2u8; 62]);
+    let fixture = adversarial_world_fixture(10, mis_tagged.bytes(), 62);
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, mis_tagged.bytes());
+    let verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&verdict, AdmissionVerdict::BlockedUnverified { detail }
+            if detail.contains("is tagged")),
+        "the wrong section tag blocks: {verdict:?}"
+    );
+}
+
+#[test]
+fn the_r4_reservation_fencing_still_precedes_the_envelope_verification() {
+    // Test G — the fence is INDEPENDENT of the closure
+    // verification: a declared reused dependency intersecting the
+    // active reservation produces the reservation REJECTION even
+    // though its bytes are structurally invalid (unverified) — the
+    // envelope-verification improvement did not weaken the fence,
+    // and the fence did not need the bytes.
+    let mut encoder = engine_core::Encoder::new();
+    encoder.write_str(composite_manifest::SESSION_CHUNK_DOMAIN);
+    encoder.write_str(composite_manifest::TAG_WORLD);
+    encoder.write_u64(50);
+    let mut bytes = encoder.into_bytes();
+    bytes.extend_from_slice(&[0u8; 10]);
+    let fixture = adversarial_world_fixture(0, &bytes, 19);
+    let closure = reused_closure(&fixture);
+    let reservation: BTreeSet<Hash> = [fixture.adversarial_identity].into_iter().collect();
+    // Without the source (unverified) and with it (the verification
+    // would refuse): the fence rejection is the verdict either way.
+    assert_eq!(
+        admit_supplied(&fixture.record, &closure, &reservation, None),
+        AdmissionVerdict::Rejected {
+            reserved: vec![fixture.adversarial_identity]
+        }
+    );
+    let mut source = adversarial_source(&fixture, &bytes);
+    assert_eq!(
+        admit_supplied(&fixture.record, &closure, &reservation, Some(&mut source)),
+        AdmissionVerdict::Rejected {
+            reserved: vec![fixture.adversarial_identity]
+        },
+        "the reservation rejection fires before and independent of the envelope verification"
+    );
+}
+
+#[test]
+fn the_r4_new_and_reused_paths_enforce_equivalent_envelope_correctness() {
+    // Test H — the SAME structurally invalid chunk (the truncated
+    // payload framing) must not be accepted merely because it is
+    // categorized as NEW instead of reused: the new-supply path's
+    // K2-A validator and the reused path's completed verifier
+    // enforce the equivalent envelope correctness, and both block.
+    let mut encoder = engine_core::Encoder::new();
+    encoder.write_str(composite_manifest::SESSION_CHUNK_DOMAIN);
+    encoder.write_str(composite_manifest::TAG_WORLD);
+    encoder.write_u64(50);
+    let mut bytes = encoder.into_bytes();
+    bytes.extend_from_slice(&[0u8; 10]);
+    let fixture = adversarial_world_fixture(0, &bytes, 19);
+    let empty: BTreeSet<Hash> = BTreeSet::new();
+
+    // The REUSED form: the completed verifier refuses the framing.
+    let closure = reused_closure(&fixture);
+    let mut source = adversarial_source(&fixture, &bytes);
+    let reused_verdict = admit_supplied(&fixture.record, &closure, &empty, Some(&mut source));
+    assert!(
+        matches!(&reused_verdict, AdmissionVerdict::BlockedUnverified { .. }),
+        "the reused form blocks: {reused_verdict:?}"
+    );
+
+    // The NEW form: the K2-A validator's own envelope check refuses
+    // the same bytes supplied as a new chunk.
+    let mut new_chunks = fixture.new_chunks.clone();
+    new_chunks.push(StoredObject::new(bytes.clone()).unwrap());
+    let closure = CompositeClosure {
+        root: fixture.root.clone(),
+        new_chunks,
+        reused_chunks: Vec::new(),
+    };
+    let new_verdict = admit_supplied(&fixture.record, &closure, &empty, None);
+    assert!(
+        matches!(&new_verdict, AdmissionVerdict::BlockedUnverified { .. }),
+        "the new form blocks on the same structurally invalid chunk: {new_verdict:?}"
     );
 }
