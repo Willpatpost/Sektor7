@@ -720,6 +720,42 @@ pub fn decode_root_manifest(bytes: &[u8]) -> Result<CompositeManifest, SaveError
     composite_manifest::decode(bytes)
 }
 
+/// Reconstructs the EXACT legacy `session-snapshot/1` bytes from a
+/// fully verified composite read (the K2-B dark reader's output).
+/// The manifest's positional grammar fixes the FINAL entry as the
+/// director section; every payload before it concatenates, in the
+/// grammar's fixed order, as the spine payload; the legacy framing
+/// (the domain tag, the spine blob's length prefix, the director
+/// blob's length prefix) wraps them — byte-exact with
+/// [`compose_session`] over the same chunks (the K2-A differential
+/// proved the manifest's entry order IS the composition order).
+/// The legacy framing is engine-slice's (the ratified dependency
+/// direction: engine-persist never knows the session format), which
+/// is why this lives here and not in the storage-layer reader.
+pub fn reconstruct_legacy_bytes(
+    verified: &engine_persist::composite_reader::VerifiedComposite,
+) -> Result<Vec<u8>, SaveError> {
+    let Some((director, spine_sections)) = verified.chunks.split_last() else {
+        return Err(SaveError::Integrity(
+            "k2b-reconstruction/empty-verified-closure",
+        ));
+    };
+    if director.tag != TAG_DIRECTOR {
+        // Unrepresentable through the ratified decode (the grammar
+        // pins the director last) — refused typed, never guessed.
+        return Err(SaveError::Integrity("k2b-reconstruction/director-section"));
+    }
+    let mut spine = Vec::new();
+    for section in spine_sections {
+        spine.extend_from_slice(&section.payload);
+    }
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_SNAPSHOT_DOMAIN);
+    enc.write_bytes(&spine);
+    enc.write_bytes(&director.payload);
+    Ok(enc.into_bytes())
+}
+
 /// The local chunk verification: the payload re-hashes to the
 /// chunk's envelope identity (the prospective CAS read check — the
 /// content-addressing's own verification, distinct from the global

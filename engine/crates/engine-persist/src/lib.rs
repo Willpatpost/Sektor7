@@ -39,7 +39,9 @@
 
 pub mod checkpoint;
 pub mod composite_manifest;
+pub mod composite_reader;
 pub mod consequence;
+pub mod dark_reachability;
 pub mod encounter;
 pub mod envelope;
 pub mod fault;
@@ -68,9 +70,14 @@ pub use checkpoint::{
     checkpoint_mk_idempotency_key, compute_digest_seed, compute_range_digest,
     publish_checkpoint_mk,
 };
+pub use composite_reader::{
+    CompositeReadError, ObjectSource, ObjectSourceError, ReadLimits, VerificationMemo,
+    VerifiedChunk, VerifiedComposite, read_composite_closure, read_composite_closure_with_memo,
+};
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
 };
+pub use dark_reachability::{LiveSet, ReachError, ReachabilityLimits, live_set};
 pub use encounter::{EncounterError, EncounterJournal};
 pub use envelope::{
     ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, DurabilityClass,
