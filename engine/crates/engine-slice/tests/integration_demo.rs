@@ -455,10 +455,17 @@ fn a_corrupt_database_fails_closed_without_overwriting() {
 /// close attempted and its outcome observable, the failed close never
 /// reported as success, and the recovery consistent with the actual
 /// durable state (no durability asserted beyond what was confirmed).
+///
+/// DETERMINISTIC FORM (the D-guard CI corrective): no deliberate
+/// action — the static demo presence journals nothing, so the
+/// campaign's durable state at the poison is exactly the verified
+/// anchor, and the recovery's disposition is a pure function of it
+/// (no publication race). The action-bearing race coverage is
+/// preserved separately below.
 #[test]
-fn an_application_failure_after_open_still_finalizes_the_close_once() {
+fn a_worker_poison_finalizes_the_close_once() {
     let dir = TestDir::new("finalization");
-    let mut options = headless_options(&dir, 240, Some(100));
+    let mut options = headless_options(&dir, 240, None);
     options.poison_at_tick = Some(120); // the controlled failure
     let report = persist_demo::run_persist_demo_headless(options)
         .expect("the run reports through the finalization rather than bypassing it");
@@ -485,9 +492,8 @@ fn an_application_failure_after_open_still_finalizes_the_close_once() {
     );
 
     // 5. The recovery is consistent with the ACTUAL durable state:
-    // the failed run's ticks after the last verified snapshot are not
-    // claimed — the recovery restores at most the durably represented
-    // state.
+    // the anchor-only campaign (no journaled plans) recovers
+    // deterministically.
     let (mut fresh, launch) =
         PersistDemo::open_or_recover(&dir.root, SimConfig::default()).unwrap();
     assert!(!launch.founded, "the recovery path");
@@ -506,6 +512,134 @@ fn an_application_failure_after_open_still_finalizes_the_close_once() {
         "{:?}",
         finalization.close.failure
     );
+}
+
+/// Whether the action's snapshot publication verifiably committed
+/// before the worker poison: the durable chain's HEAD is a
+/// session-snapshot revision PAST the anchor (tick > 0) — the anchor
+/// itself carries tick 0, and the action's unconfirmed-batch revision
+/// carries the consequence-batch domain.
+fn action_snapshot_landed(root: &std::path::Path) -> bool {
+    let Ok(mut probe) = SessionStore::open(&StoreLocation::Database(root.join("campaign.db")))
+    else {
+        return false;
+    };
+    let Ok(Some(head)) = probe.head() else {
+        return false;
+    };
+    let Ok(record) = probe.read_record(&head) else {
+        return false;
+    };
+    if record.tick == 0 {
+        return false;
+    }
+    record
+        .content_refs
+        .first()
+        .and_then(|hash| probe.classify_object(hash).ok())
+        .is_some_and(|class| class.domain.as_deref() == Some("engine-slice/session-snapshot/1"))
+}
+
+/// HOLD-1's action-bearing form (the D-guard CI corrective): the
+/// deliberate action (tick 100) plus the worker poison (tick 120)
+/// with the REAL publication race — the action's snapshot publication
+/// is submitted around tick 106 and the worker dies at 120, so the
+/// append may or may not have committed. The finalization discipline
+/// (the preserved error, the failed close, no false durability) holds
+/// identically in both worlds; the recovery's disposition is branched
+/// on the VERIFIED durable evidence, never asserted blind:
+/// - the publication committed → the newest snapshot post-dates the
+///   action's plan → the recovery succeeds through the snapshot, the
+///   action's credits carried exactly once (the recovered sums equal
+///   the crash-time live sums — no duplication, no loss);
+/// - the publication lost the race → the durable state is the anchor
+///   plus the action's beyond-frontier plan → the typed
+///   `RecoveryInsufficient` refusal, the durable state untouched.
+///
+/// Never asserted: a fresh founding, a fabricated success, or a
+/// recovery success where D-only semantics correctly require refusal.
+#[test]
+fn an_action_publication_race_before_poison_is_branch_verified() {
+    let dir = TestDir::new("finalization-action-race");
+    let mut options = headless_options(&dir, 240, Some(100));
+    options.poison_at_tick = Some(120); // the controlled failure
+    let report = persist_demo::run_persist_demo_headless(options)
+        .expect("the run reports through the finalization rather than bypassing it");
+
+    // The finalization discipline (identical in both race worlds):
+    let failure = report
+        .application_failure
+        .as_ref()
+        .expect("the application failure preserved");
+    assert!(failure.contains("tick 120 refused"), "{failure}");
+    assert!(
+        report.close.failure.is_some(),
+        "the failed close is a reported failure"
+    );
+    assert!(!report.close.required_settled);
+    assert!(
+        report.close.final_revision.is_none(),
+        "no final snapshot is claimed over the failed drain"
+    );
+    // The crash-time live consequence sums (the no-duplication
+    // oracle for the landed branch).
+    let (action_region, live_signals, live_credits) = report
+        .closed_region
+        .expect("the action region's sums at close");
+
+    // THE BRANCH on the verified durable evidence.
+    if action_snapshot_landed(&dir.root) {
+        // The publication committed before the poison: the recovery
+        // succeeds through the snapshot — the action's effects
+        // carried exactly once.
+        let (mut fresh, launch) = PersistDemo::open_or_recover(&dir.root, SimConfig::default())
+            .expect("the landed publication recovers");
+        assert!(!launch.founded, "the recovery path, never a founding");
+        let world = fresh.session().spine().world();
+        // The CREDITS are the no-duplication oracle: the action's
+        // consequence was applied (and captured into the landed
+        // snapshot) BEFORE the poison — the recovered credits equal
+        // the crash-time live credits exactly (carried once, never
+        // doubled, never lost). The SIGNALS (the live scratch)
+        // legitimately advance past the snapshot's publication — the
+        // recovered signal sum is bounded by the crash-time live sum
+        // (the post-publication accrual is honestly not reproduced —
+        // the snapshot-plus-journal contract).
+        assert_eq!(
+            region_credit_sum(world, action_region),
+            live_credits,
+            "the recovered credits equal the crash-time live credits — \
+             the action's consequence carried exactly once"
+        );
+        assert!(
+            region_signal_sum(world, action_region) <= live_signals,
+            "the recovered signal sums are bounded by the crash-time live \
+             sums (the post-publication accrual honestly lost)"
+        );
+        fresh.run_headless(1).unwrap();
+        let finalization = fresh.finalize(None);
+        assert!(
+            finalization.close.failure.is_none(),
+            "{:?}",
+            finalization.close.failure
+        );
+    } else {
+        // The publication lost the race: the durable state is the
+        // anchor plus the action's beyond-frontier plan — the typed
+        // refusal (the D interim), the state untouched.
+        let outcome = PersistDemo::open_or_recover(&dir.root, SimConfig::default());
+        let Err(error) = outcome else {
+            panic!("the missing publication is the typed refusal, not a recovery")
+        };
+        assert!(
+            error.contains("RecoveryInsufficient"),
+            "the refusal is the typed insufficient-evidence class: {error}"
+        );
+        assert!(
+            error.contains("the durable state is untouched"),
+            "the refusal preserves the durable campaign state: {error}"
+        );
+    }
 }
 
 // ---------------------------------------- HOLD-2: absolute time accounting

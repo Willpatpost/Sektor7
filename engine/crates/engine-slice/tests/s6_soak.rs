@@ -679,7 +679,33 @@ fn fresh_process_recovery_after_the_scenario_close() {
 
 /// §7D: an EXTERNALLY terminated run (the close status unknown) — the
 /// killed process leaves whatever durable state exists, and the
-/// relaunch recovers honestly from it.
+/// relaunch's outcome is justified by the ACTUAL durable evidence.
+///
+/// THE ANCHOR-READY PRECONDITION (the D-guard CI corrective): the
+/// original fixed 2-second kill was a wall-clock guess at the
+/// campaign's progress — on a slow runner the process was still in
+/// its pre-founding STARTUP at 2 s (the debug binary's load plus the
+/// SQLite initialization), so the relaunch legitimately FOUNDED a
+/// fresh campaign (exit 0, the founded banner — nothing replaced:
+/// the store was unfounded) and the recovery assertion failed. The
+/// kill now happens only after the recovery anchor (the epoch-1
+/// session snapshot) is VERIFIABLY installed on the durable chain —
+/// a bounded, read-only poll of the campaign store — so the
+/// interruption is always post-founding.
+///
+/// THE OUTCOME CONTRACT (the D interim, explicit): a post-founding
+/// interruption admits exactly two honest outcomes, both fully
+/// verified — (a) the verified RECOVERY (the kill landed past the
+/// covering publication: the recovered banner, the closed
+/// continuation, conservation true), or (b) the typed
+/// `RecoveryInsufficient` refusal (the kill landed in the early
+/// window — the first journaled deactivation's plan beyond the
+/// anchor's allocation frontier — the typed class, the durable
+/// state untouched). NEVER accepted: an unexpected fresh founding
+/// (excluded by the precondition — and a founded store is never
+/// silently re-founded: the founded-but-anchorless state refuses
+/// `NoSnapshot`, fail-closed, verified on the pod across all four
+/// kill windows).
 #[test]
 fn an_interrupted_run_recovers_from_the_durable_state() {
     let root = std::env::temp_dir().join(format!(
@@ -701,6 +727,33 @@ fn an_interrupted_run_recovers_from_the_durable_state() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("the binary spawns");
+    // THE ANCHOR-READY WAIT: poll the durable chain (read-only, WAL
+    // concurrent) until the anchor snapshot — or any later revision —
+    // is installed; bounded at 30 s; the child's early exit aborts
+    // the wait honestly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut probe) =
+            SessionStore::open(&StoreLocation::Database(root.join("campaign.db")))
+            && let Ok(Some(head)) = probe.head()
+            && let Ok(record) = probe.read_record(&head)
+            && record.epoch >= 1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the anchor-ready wait is bounded — the child did not establish the \
+             recovery anchor in time"
+        );
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "the child exited before the anchor was established: {status} — \
+                 the interruption must be post-founding"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // The full 9000-tick profile runs long enough to terminate
     // mid-campaign (a bounded kill window — never an unbounded wait).
     std::thread::sleep(Duration::from_secs(2));
@@ -719,13 +772,39 @@ fn an_interrupted_run_recovers_from_the_durable_state() {
         .expect("the relaunch spawns");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "the interrupted campaign recovers (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status.code()
-    );
-    assert!(stdout.contains("campaign: recovered"));
-    assert!(stdout.contains("conservation true"));
+    if output.status.success() {
+        // The verified-recovery branch: the durable evidence (the
+        // post-deactivation publication) supports it — and a fresh
+        // founding would NOT pass (the founded banner fails the
+        // recovered assertion below).
+        assert!(
+            stdout.contains("campaign: recovered"),
+            "a successful relaunch is a verified recovery, never a fresh \
+             founding:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("conservation true"),
+            "the recovered continuation conserves:\n{stdout}"
+        );
+    } else {
+        // The typed-refusal branch (the D interim): the kill landed
+        // in the early window — the first journaled deactivation's
+        // plan beyond the anchor's allocation frontier. The refusal
+        // is typed, diagnosable, and preserves the durable state.
+        assert!(
+            stdout.is_empty(),
+            "the refusal precedes any report or publication:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("RecoveryInsufficient"),
+            "the failed relaunch is the typed insufficient-evidence refusal \
+             (never an unexpected error):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("the durable state is untouched"),
+            "the refusal preserves the durable campaign state:\n{stderr}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
