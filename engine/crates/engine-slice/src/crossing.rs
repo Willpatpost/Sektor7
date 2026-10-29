@@ -845,13 +845,40 @@ impl<S: MediumSource> SessionCrossing<S> {
 
     /// Seeds the C1 covering track from an ACCEPTED session-snapshot
     /// publication of the exact state `content_hash` (crate-trusted —
-    /// the orchestrated session's publication completions call this,
-    /// the counterpart of [`Self::publish_snapshot`]'s own seeding):
-    /// the durable snapshot covers any nonempty plan prepared from
-    /// that same state, and the equivalence check consults the track
+    /// the orchestrated session's publication completions and the
+    /// snapshot publications' own accepted appends call this): the
+    /// durable snapshot covers any nonempty plan prepared from that
+    /// same state, and the equivalence check consults the track
     /// instead of colliding on the chain-unique content-hash
-    /// idempotency key.
+    /// idempotency key. **MONOTONIC:** a candidate qualifies only
+    /// when it is chain-NEWER than the current entry — the accepted
+    /// records' EPOCHS, the trustworthy chain-sequencing evidence,
+    /// never a content-hash comparison — so a delayed older
+    /// completion never regresses a newer accepted covering, while a
+    /// genuinely newer accepted snapshot updates the entry. The first
+    /// entry seeds unconditionally; unreadable ordering evidence
+    /// conservatively retains the current entry (never a guessed
+    /// promotion); the same record is idempotent.
     pub(crate) fn seed_covering(&mut self, content_hash: Hash, revision: Hash) {
+        if let Some(current) = &self.covering {
+            if current.revision == revision {
+                return;
+            }
+            let Ok(mut medium) = self.source.open_medium() else {
+                return;
+            };
+            let (Ok(current_epoch), Ok(candidate_epoch)) = (
+                medium
+                    .read_record(&current.revision)
+                    .map(|record| record.epoch),
+                medium.read_record(&revision).map(|record| record.epoch),
+            ) else {
+                return;
+            };
+            if candidate_epoch < current_epoch {
+                return;
+            }
+        }
         self.covering = Some(CoveringSnapshot {
             content_hash,
             revision,
@@ -1339,7 +1366,15 @@ impl<S: MediumSource> SessionCrossing<S> {
             let record = medium
                 .read_record(&id)
                 .map_err(|error| refusal(format!("covering/duplicate-resolution: {error:?}")))?;
+            // The EXACT admissible shape: the required covering
+            // publication is a canonical SINGLE-snapshot-object record
+            // — precisely one content reference, and it IS the
+            // expected snapshot. A key-matched record carrying extra
+            // references (a legitimate multi-object publication) is a
+            // different record shape and never covering evidence,
+            // however valid its objects.
             let matches = record.idempotency_key.as_deref() == Some(content_hash.as_bytes())
+                && record.content_refs.len() == 1
                 && record.content_refs.first() == Some(&content_hash);
             if matches {
                 // The strict session roundtrip over the referenced
@@ -1401,11 +1436,10 @@ impl<S: MediumSource> SessionCrossing<S> {
                 // The publication seeds the C1 covering track: an
                 // accepted snapshot of THIS exact state covers any
                 // nonempty plan prepared from it (the equivalence
-                // check consults the track).
-                self.covering = Some(CoveringSnapshot {
-                    content_hash: snapshot_hash,
-                    revision: id,
-                });
+                // check consults the track) — through the MONOTONIC
+                // seed (the accepted record is the chain's new head,
+                // so the ordering check passes by construction).
+                self.seed_covering(snapshot_hash, id);
                 Ok(id)
             }
             _ => Err(PipelineError::UnfoundedMedium.into()),

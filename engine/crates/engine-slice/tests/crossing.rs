@@ -2334,6 +2334,69 @@ fn a_key_matched_record_never_qualifies_without_verified_content() {
     }
 }
 
+/// Corrective A of the C1 closeout (the exact covering-record shape):
+/// the required covering publication is a canonical
+/// SINGLE-snapshot-object record. A legitimate, chain-accepted record
+/// whose idempotency key and FIRST content reference match the
+/// expected snapshot but whose references carry a SECOND valid object
+/// is a different record shape and never qualifies as covering
+/// evidence — the crossing refuses before the T1 with the attempted
+/// candidate preserved and the region unchanged.
+#[test]
+fn an_extra_reference_key_match_never_qualifies_as_the_covering() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-extra-ref");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "covering-extra-ref").unwrap();
+    let bytes = save_session(&spine, &director).unwrap();
+    let object = StoredObject::new(bytes).unwrap();
+    let content_hash = object.hash();
+    // The second, genuinely valid object — the crafted record carries
+    // BOTH: the snapshot's own content plus an extra reference, a
+    // legitimate multi-object publication the chain accepts.
+    let extra = StoredObject::new({
+        let mut enc = Encoder::new();
+        enc.write_str("test/publication");
+        enc.write_bytes(b"covering-extra-ref-second-object");
+        enc.into_bytes()
+    })
+    .unwrap();
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, spine.clock().as_u64())
+            .with_idempotency_key(content_hash.as_bytes().to_vec())
+            .with_content_refs(vec![content_hash, extra.hash()]);
+        match medium
+            .append(&record, &[object.clone(), extra], Some(head))
+            .unwrap()
+        {
+            AppendOutcome::Accepted { .. } => {}
+            other => panic!("the crafted multi-reference record lands: {other:?}"),
+        }
+    }
+    // THE CROSSING: the covering for the same exact state hits the
+    // duplicate key — the resolution must REFUSE: the key-matched
+    // record's shape is not the single-object covering publication,
+    // however valid both its objects are.
+    let now = spine.clock();
+    let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+    match refusal {
+        Err(TransitionError::CoveringRefused { detail, candidate }) => {
+            assert_eq!(detail, "covering/duplicate-unresolved");
+            assert!(candidate.is_some(), "the attempted candidate preserved");
+        }
+        Err(other) => panic!("the extra-reference key match refuses, got {other:?}"),
+        Ok(_) => panic!("a multi-reference record never covers the prerequisite"),
+    }
+    assert_eq!(director.levels()[4], LodLevel::Full, "the region unchanged");
+    assert_eq!(spine.held_count(), 625, "nothing suspended");
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert!(scan.committed.is_empty(), "no T1 precedes the covering");
+}
+
 /// §5 of the C1 final corrective (the unresolved reconciliation
 /// errors) — the unverifiable disposition: the uncertain covering
 /// append's reconciliation returns Unverifiable (the uncertainty

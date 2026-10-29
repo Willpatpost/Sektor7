@@ -993,6 +993,15 @@ impl OrchestratedSession {
         self.director.levels()[region]
     }
 
+    /// The C1 covering track's accepted revision (read-only,
+    /// `#[doc(hidden)]` — the delayed-completion regression's
+    /// introspection surface, mirroring the crossing's own
+    /// diagnostic; never a publication or mutation API).
+    #[doc(hidden)]
+    pub fn covering_revision(&self) -> Option<engine_persist::Hash> {
+        self.crossing.covering_revision()
+    }
+
     /// Read-only spine access — the Slice 0 integration
     /// demonstration's narrow read-only seam: the session remains the
     /// ONLY owner and mutator of the authoritative state; derived

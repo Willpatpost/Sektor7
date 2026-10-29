@@ -1578,3 +1578,131 @@ fn an_unpolled_accepted_publication_covers_the_same_state_prerequisite() {
     ));
     assert_eq!(session.pending_publications(), 0);
 }
+
+/// Corrective B of the C1 closeout (the monotonic accepted-publication
+/// ordering): a DELAYED older completion can never regress a newer
+/// accepted covering. The sequence: S1 accepted with its completion
+/// unconsumed; the campaign advances and a capture-bearing boundary
+/// establishes the newer covering S2 (a distinct chain record); the
+/// delayed S1 completion is then consumed — Accepted, genuinely — but
+/// the covering track still names S2 (the ordering rule: the accepted
+/// records' chain epochs, never a content-hash comparison). A
+/// genuinely newer accepted publication still updates the entry, and
+/// the same-state reuse through the track requires NO redundant
+/// append. The completion-ledger accounting is preserved throughout.
+#[test]
+fn a_delayed_older_completion_never_regresses_the_covering_track() {
+    let dir = TestDir::new("delayed-completion");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    // 1. The optional snapshot S1 — submitted, accepted by the worker,
+    //    its completion deliberately unconsumed.
+    let s1 = session
+        .submit_publication(session.capture_snapshot().unwrap())
+        .unwrap();
+    assert_eq!(session.pending_publications(), 1);
+    let founding = oracle_head_at(&location);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while oracle_head_at(&location) == founding {
+        assert!(
+            Instant::now() < deadline,
+            "the worker accepts the S1 publication"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let s1_record = oracle_head_at(&location);
+    // 2-3. Advance to a distinct authoritative state and establish the
+    // newer covering S2: the far tick's region-4 boundary (region 3's
+    // empty-capture reclassification at loop position 3 moves the state
+    // first, so the covering's content is distinct from S1's) publishes
+    // a NEW chain record — the track's entry.
+    session.tick(&far_presence()).unwrap();
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    let s2_covering = oracle_head_at(&location);
+    assert_ne!(s2_covering, s1_record, "the covering is a distinct record");
+    assert_eq!(
+        session.covering_revision(),
+        Some(s2_covering),
+        "the track names the boundary's covering"
+    );
+    // 4. Consume the DELAYED S1 completion — Accepted (it genuinely
+    //    landed long ago), but it must NOT regress the newer entry.
+    assert!(matches!(
+        session.wait_publication(s1).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    assert_eq!(
+        session.pending_publications(),
+        0,
+        "the ledger accounting drained"
+    );
+    // 5. The covering track still names the S2 covering.
+    assert_eq!(
+        session.covering_revision(),
+        Some(s2_covering),
+        "the delayed older completion never regresses the covering entry"
+    );
+    // 6. A GENUINELY newer accepted publication updates the entry, and
+    //    the same-state reuse requires no redundant append: the
+    //    reactivation and accrual advance the campaign, the capture of
+    //    the new state S2' is accepted AND consumed (the newest —
+    //    allowed), and the subsequent boundary prepared from the
+    //    UNCHANGED S2' hits the track — the chain gains nothing.
+    session.tick(&near_presence()).unwrap();
+    assert_ne!(session.region_level(4), LodLevel::Dormant);
+    for _ in 0..5 {
+        session.tick(&near_presence()).unwrap();
+    }
+    let s2b = session.capture_snapshot().unwrap();
+    let s2b_handle = session.submit_publication(s2b).unwrap();
+    let before_s2b = oracle_head_at(&location);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while oracle_head_at(&location) == before_s2b {
+        assert!(
+            Instant::now() < deadline,
+            "the worker accepts the S2' publication"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        session.wait_publication(s2b_handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    let s2b_record = oracle_head_at(&location);
+    assert_eq!(
+        session.covering_revision(),
+        Some(s2b_record),
+        "the genuinely newer accepted snapshot updates the entry"
+    );
+    // The boundary from the UNCHANGED S2': the far-north-west presence
+    // deactivates region 4 as the tick's FIRST transition (the §3
+    // fixture's geometry) — the track hit, no redundant append.
+    let north_far = [PresenceSample {
+        position: (-150.0, 160.0),
+        velocity: (0.0, 0.0),
+    }];
+    let records_before = oracle_records_at(&location);
+    session.tick(&north_far).unwrap();
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    {
+        // The boundary was genuinely capture-bearing (the T1
+        // journaled) — the reuse is not vacuous.
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert!(
+            scan.committed
+                .iter()
+                .any(|transaction| { transaction.frontier.iter().any(|entry| entry.region == 4) }),
+            "the region-4 boundary journaled its captures"
+        );
+    }
+    assert_eq!(
+        oracle_records_at(&location),
+        records_before,
+        "the same-state reuse — no redundant append"
+    );
+    assert_eq!(
+        session.covering_revision(),
+        Some(s2b_record),
+        "the track still names the reused entry"
+    );
+}
