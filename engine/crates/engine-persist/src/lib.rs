@@ -77,7 +77,10 @@ pub use composite_reader::{
 pub use consequence::{
     AwardCheckpoint, AwardState, ConsequenceId, Coverage, OccurrenceSpan, PackedKeyError, SpanError,
 };
-pub use dark_reachability::{LiveSet, ReachError, ReachabilityLimits, live_set};
+pub use dark_reachability::{
+    LiveSet, ReachError, ReachabilityLimits, RetentionReason, RetirementCandidate,
+    RetirementEligibility, live_set,
+};
 pub use encounter::{EncounterError, EncounterJournal};
 pub use envelope::{
     ClassifiedSpan, ConsequenceEnvelope, CounterDelta, CounterValues, DurabilityClass,

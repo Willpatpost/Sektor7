@@ -14,7 +14,10 @@ use engine_persist::composite_manifest::{
     TAG_FAR, TAG_HEADER, TAG_HELD, TAG_LEDGER_META, TAG_LEDGER_RECORDS, TAG_NEAR, TAG_WORLD,
 };
 use engine_persist::composite_reader::{ObjectSource, ObjectSourceError, VerificationMemo};
-use engine_persist::dark_reachability::{self, LiveSet, ReachError, ReachabilityLimits};
+use engine_persist::dark_reachability::{
+    self, LiveSet, ReachError, ReachabilityLimits, RetentionReason, RetirementCandidate,
+    RetirementEligibility,
+};
 use engine_persist::record::{AuthorityMode, RevisionRecord};
 use engine_persist::{Hash, StoredObject};
 
@@ -232,11 +235,30 @@ fn the_mixed_legacy_and_composite_chain_walks_and_verifies() {
     }
     // The memo verified exactly the union (each chunk once).
     assert_eq!(memo.len(), expected_union.len());
-    // The legacy root B is not eligible for retirement while
-    // retained; nothing in the known universe is.
-    assert!(
-        live.eligible_for_retirement(&[root_a.root.hash(), root_b.root.hash()])
-            .is_empty()
+    // Neither reachable root is retirement-eligible while retained.
+    for root in [&root_a, &root_b] {
+        assert_eq!(
+            live.retirement_eligibility(RetirementCandidate(root.root.hash())),
+            RetirementEligibility::Retained(RetentionReason::ReachableCompositeRoot)
+        );
+    }
+    // The reachable legacy /1 object is NEVER retirement-eligible
+    // (Corrective B's core: a live legacy root cannot be
+    // misclassified by a composite-only membership check).
+    assert_eq!(
+        live.retirement_eligibility(RetirementCandidate(legacy)),
+        RetirementEligibility::Retained(RetentionReason::DirectObject),
+        "a reachable legacy /1 snapshot is never retirement-eligible"
+    );
+    // The walked records and the chunk dependencies are protected
+    // categories too.
+    assert_eq!(
+        live.retirement_eligibility(RetirementCandidate(head)),
+        RetirementEligibility::Retained(RetentionReason::RevisionRecord)
+    );
+    assert_eq!(
+        live.retirement_eligibility(RetirementCandidate(root_b.manifest.entries[0].identity)),
+        RetirementEligibility::Retained(RetentionReason::ChunkDependency)
     );
 }
 
@@ -289,10 +311,27 @@ fn the_shared_chunk_survives_one_roots_retirement() {
         "the shared chunk X is STILL REQUIRED by the retained root B"
     );
     assert_eq!(surviving.chunk_reference_counts[&shared], 1);
+    // The retired chain's root is retirement-eligible — ONLY under
+    // the documented candidate-universe assumption (the caller
+    // asserts composite roots); the retained one is refused with
+    // its protecting category.
     assert_eq!(
-        surviving.eligible_for_retirement(&[root_a.root.hash(), root_b.root.hash()]),
-        vec![root_a.root.hash()],
-        "the retired chain's root is retirement-eligible; the retained one is not"
+        surviving.retirement_eligibility(RetirementCandidate(root_a.root.hash())),
+        RetirementEligibility::Eligible,
+        "the retired chain's root is retirement-eligible under the documented assumption"
+    );
+    assert_eq!(
+        surviving.retirement_eligibility(RetirementCandidate(root_b.root.hash())),
+        RetirementEligibility::Retained(RetentionReason::ReachableCompositeRoot),
+        "the retained root is not retirement-eligible"
+    );
+    // The shared chunk itself, passed as a candidate, is protected
+    // by the retained root's dependency (a chunk is never a root,
+    // and the typed contract refuses it by category).
+    assert_eq!(
+        surviving.retirement_eligibility(RetirementCandidate(shared)),
+        RetirementEligibility::Retained(RetentionReason::ChunkDependency),
+        "the shared chunk still required by a retained root is never eligible"
     );
     assert!(
         !surviving.visited_revisions.contains(&head_a),
@@ -466,4 +505,218 @@ fn the_diamond_references_expand_once_and_dedup() {
         assert_eq!(*count, 1, "the diamond expands the root once");
     }
     assert_eq!(memo.len(), root.manifest.entries.len());
+}
+
+// ---------------------------------- the K2-B review correctives A and B
+
+/// One domain-framed opaque object under an arbitrary domain — the
+/// fixture for the family-classification matrix.
+fn domain_object(domain: &str, seed: u8) -> (Hash, Vec<u8>) {
+    let mut enc = engine_core::Encoder::new();
+    enc.write_str(domain);
+    enc.write_bytes(&[seed; 12]);
+    let object = StoredObject::new(enc.into_bytes()).unwrap();
+    (object.hash(), object.into_bytes())
+}
+
+#[test]
+fn the_snapshot_family_classification_fails_closed_on_unsupported_versions() {
+    // Corrective A: the walk recognizes the session-snapshot FAMILY
+    // — the supported /2 expands, the supported legacy /1 snapshot
+    // is a direct object, every OTHER family member (a future /3,
+    // /9, or unversioned member) refuses the walk TYPED with the
+    // offending root's identity, and unrelated domains stay direct
+    // objects. The failed walk produces NO live set — never a
+    // partial result that silently omits the unknown format's
+    // dependencies.
+    let root = synthetic_composite(0, None);
+    for (domain, label) in [
+        ("engine-slice/session-snapshot/3", "the future /3"),
+        ("engine-slice/session-snapshot/9", "another family member"),
+        ("engine-slice/session-snapshot/x", "an unversioned member"),
+    ] {
+        let (future, future_bytes) = domain_object(domain, 5);
+        let mut source = MapSource::new();
+        install(&mut source, &root);
+        source.insert(future, future_bytes);
+        let (head, head_bytes) = record(vec![root.root.hash(), future], None, 0);
+        source.insert(head, head_bytes);
+        let mut memo = VerificationMemo::new();
+        let error = dark_reachability::live_set(
+            &mut source,
+            &[head],
+            &ReachabilityLimits::default(),
+            &mut memo,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ReachError::UnsupportedSnapshot {
+                identity: future,
+                domain: domain.to_owned(),
+            },
+            "{label}: the recognized-but-unsupported family member refuses with its identity"
+        );
+    }
+}
+
+#[test]
+fn the_unsupported_family_member_in_a_historical_revision_fails_the_walk() {
+    // Corrective A's historical case: the unsupported family member
+    // rides an ANCESTOR revision (not the retained head) — the
+    // parent walk reaches it and the whole walk refuses; the
+    // head-only classification would have missed it entirely.
+    let (future, future_bytes) = domain_object("engine-slice/session-snapshot/3", 5);
+    let mut source = MapSource::new();
+    source.insert(future, future_bytes);
+    let (founding, founding_bytes) = record(vec![future], None, 0);
+    let (head, head_bytes) = record(vec![], Some(founding), 1);
+    source.insert(founding, founding_bytes);
+    source.insert(head, head_bytes);
+    let mut memo = VerificationMemo::new();
+    let error = dark_reachability::live_set(
+        &mut source,
+        &[head],
+        &ReachabilityLimits::default(),
+        &mut memo,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        ReachError::UnsupportedSnapshot {
+            identity: future,
+            domain: "engine-slice/session-snapshot/3".to_owned(),
+        },
+        "the historical family member refuses with its identity"
+    );
+}
+
+#[test]
+fn the_supported_legacy_snapshot_and_unrelated_domains_stay_direct() {
+    // The family's SUPPORTED legacy /1 snapshot (the whole-object
+    // form) classifies conservatively as a direct object — and is
+    // NEVER retirement-eligible as a candidate; unrelated domains
+    // keep the direct-object behavior; a malformed (domain-less)
+    // object fails closed.
+    let (legacy_snapshot, legacy_bytes) = domain_object("engine-slice/session-snapshot/1", 7);
+    let (blob, blob_bytes) = domain_object("sektor7/save/1", 9);
+    let root = synthetic_composite(0, None);
+    let mut source = MapSource::new();
+    install(&mut source, &root);
+    source.insert(legacy_snapshot, legacy_bytes);
+    source.insert(blob, blob_bytes);
+    let (head, head_bytes) = record(vec![legacy_snapshot, blob], None, 0);
+    source.insert(head, head_bytes);
+    let mut memo = VerificationMemo::new();
+    let live = dark_reachability::live_set(
+        &mut source,
+        &[head],
+        &ReachabilityLimits::default(),
+        &mut memo,
+    )
+    .unwrap();
+    assert_eq!(
+        live.direct_objects,
+        [legacy_snapshot, blob].into_iter().collect(),
+        "the supported legacy /1 snapshot and the unrelated blob are direct objects"
+    );
+    // Corrective B: the live legacy snapshot is never eligible.
+    assert_eq!(
+        live.retirement_eligibility(RetirementCandidate(legacy_snapshot)),
+        RetirementEligibility::Retained(RetentionReason::DirectObject),
+        "a live legacy /1 snapshot is never retirement-eligible"
+    );
+    assert_eq!(
+        live.retirement_eligibility(RetirementCandidate(blob)),
+        RetirementEligibility::Retained(RetentionReason::DirectObject),
+        "a live direct object referenced by a retained record stays protected"
+    );
+
+    // The malformed object: no decidable domain at all.
+    let mut malformed = Vec::new();
+    malformed.extend_from_slice(&[0xffu8; 24]);
+    let malformed_identity = engine_persist::hash::hash_object(&malformed);
+    let mut source = MapSource::new();
+    source.insert(malformed_identity, malformed);
+    let (head, head_bytes) = record(vec![malformed_identity], None, 0);
+    source.insert(head, head_bytes);
+    let mut memo = VerificationMemo::new();
+    let error = dark_reachability::live_set(
+        &mut source,
+        &[head],
+        &ReachabilityLimits::default(),
+        &mut memo,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ReachError::MalformedObject { identity } if identity == malformed_identity
+    ));
+}
+
+#[test]
+fn the_retirement_eligibility_is_invariant_to_ordering_and_duplicates() {
+    // Corrective B: the per-candidate verdict is a pure function of
+    // the completed live set — the same candidates in any order,
+    // duplicated, yield identical verdicts.
+    let (shared, shared_bytes) = shared_chunk();
+    let root_a = synthetic_composite(0, Some(shared));
+    let root_b = synthetic_composite(60, Some(shared));
+    let mut source = MapSource::new();
+    install(&mut source, &root_a);
+    install(&mut source, &root_b);
+    source.insert(shared, shared_bytes);
+    let (head_a, head_a_bytes) = record(vec![root_a.root.hash()], None, 0);
+    let (head_b, head_b_bytes) = record(vec![root_b.root.hash()], None, 0);
+    source.insert(head_a, head_a_bytes);
+    source.insert(head_b, head_b_bytes);
+    let mut memo = VerificationMemo::new();
+    let live = dark_reachability::live_set(
+        &mut source,
+        &[head_a, head_b],
+        &ReachabilityLimits::default(),
+        &mut memo,
+    )
+    .unwrap();
+    let candidates = [
+        RetirementCandidate(root_a.root.hash()),
+        RetirementCandidate(root_b.root.hash()),
+        RetirementCandidate(shared),
+        RetirementCandidate(head_a),
+    ];
+    let first: Vec<_> = candidates
+        .iter()
+        .map(|c| live.retirement_eligibility(*c))
+        .collect();
+    let mut reordered = candidates.to_vec();
+    reordered.reverse();
+    let second: Vec<_> = reordered
+        .iter()
+        .map(|c| live.retirement_eligibility(*c))
+        .collect();
+    // Pair each verdict with its candidate so the reordering
+    // comparison is per-candidate, not positional.
+    let by_candidate = |verdicts: &[(RetirementCandidate, RetirementEligibility)]| {
+        let mut v = verdicts.to_vec();
+        v.sort_by_key(|(candidate, _)| candidate.0);
+        v
+    };
+    let paired_first: Vec<_> = candidates
+        .iter()
+        .zip(&first)
+        .map(|(c, v)| (*c, *v))
+        .collect();
+    let paired_second: Vec<_> = reordered
+        .iter()
+        .zip(&second)
+        .map(|(c, v)| (*c, *v))
+        .collect();
+    assert_eq!(by_candidate(&paired_first), by_candidate(&paired_second));
+    // Duplicates: the same candidate asked twice answers identically.
+    for candidate in &candidates {
+        assert_eq!(
+            live.retirement_eligibility(*candidate),
+            live.retirement_eligibility(*candidate)
+        );
+    }
 }

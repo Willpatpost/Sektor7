@@ -15,16 +15,31 @@
 //! **The model.** Given the RETAINED revision heads (the roots the
 //! operator keeps), the visitor walks the revision chain
 //! (parent links, founding-terminated, deduplicated, bounded) and
-//! classifies every walked record's content references:
+//! classifies every walked record's content references with the
+//! session-snapshot FAMILY recognition (the K2-A decoder's own
+//! fail-closed discipline — never guessing across versions):
 //!
-//! - a **composite-root reference** — an object whose leading
-//!   domain is the ratified `engine-slice/session-snapshot/2` — is
-//!   expanded through the K2-B dark reader: the root's ENTIRE
+//! - a **supported `/2` composite-root reference** — an object whose
+//!   leading domain is the ratified `engine-slice/session-snapshot/2`
+//!   — is expanded through the K2-B dark reader: the root's ENTIRE
 //!   declared chunk closure is loaded, hash-verified, and joined
 //!   to the live set (the verified read — a missing or corrupt
 //!   chunk fails the walk closed);
-//! - a **direct object reference** (a legacy `/1` session object,
-//!   a blob, anything else) joins the live set as itself;
+//! - a **supported legacy `/1` snapshot** — the whole-object form —
+//!   is classified conservatively as a direct object (a live
+//!   legacy snapshot is never retirement-eligible through
+//!   [`LiveSet::retirement_eligibility`]);
+//! - a **recognized but unsupported family member** (a future
+//!   `engine-slice/session-snapshot/3`, say) REFUSES the walk typed
+//!   with the offending root's identity: a future composite format
+//!   may carry dependencies unknown to this implementation, and
+//!   treating it as an ordinary leaf would silently omit live
+//!   chunks from the retention set — the exact failure a
+//!   reclamation-informing model must never commit;
+//! - an **unrelated valid direct content object** (a blob, any
+//!   other domain) joins the live set as itself;
+//! - an object whose leading bytes decode as NO domain at all is
+//!   malformed and fails closed;
 //! - every walked revision record's own identity joins the live
 //!   set (the chain must remain walkable).
 //!
@@ -33,11 +48,14 @@
 //! by several retained roots appears ONCE), the per-chunk reference
 //! counts across DISTINCT reachable roots (the sharing structure),
 //! the composite roots and direct objects, and — via
-//! [`LiveSet::eligible_for_retirement`] — the roots NOT reachable
-//! from the retained heads (a dropped head's chain): retiring a
-//! root removes only ITS contribution; a chunk still required by
-//! another retained root SURVIVES (the shared-chunk reclamation
-//! invariant the K2-A fence design depends on).
+//! [`LiveSet::retirement_eligibility`] — the typed, conservative
+//! retirement-eligibility contract over caller-asserted composite-
+//! root candidates: retiring a root removes only ITS contribution;
+//! a chunk still required by another retained root SURVIVES (the
+//! shared-chunk reclamation invariant the K2-A fence design depends
+//! on). The live set is EVIDENCE for a future sweep, never
+//! reclamation authority: an identity absent from one walk's live
+//! set is not thereby authorized to be deleted.
 //!
 //! The memo ([`VerificationMemo`]) is threaded through the whole
 //! walk: chunks shared across the visited roots are read and
@@ -57,6 +75,19 @@ use crate::composite_reader::{
 };
 use crate::hash::{Hash, hash_object};
 use crate::record::RevisionRecord;
+
+/// The session-snapshot family prefix — every versioned composite
+/// snapshot domain begins with it. This mirrors the K2-A schema's
+/// own family-recognition discipline (one prefix, locally defined
+/// so the accepted schema module stays untouched; the test matrix
+/// pins it to the exported `/2` domain so the two can never drift).
+const SNAPSHOT_FAMILY: &str = "engine-slice/session-snapshot/";
+
+/// The supported LEGACY session-snapshot domain (the `/1`
+/// whole-object form) — classified conservatively as a direct
+/// object: its dependencies (none — it IS the whole snapshot) are
+/// carried by the object itself.
+const LEGACY_SNAPSHOT_V1_DOMAIN: &str = "engine-slice/session-snapshot/1";
 
 /// The walk's resource limits — the revision-chain and
 /// composite-root bounds. A walk that exceeds either fails typed;
@@ -102,17 +133,80 @@ pub struct LiveSet {
     pub chunk_reference_counts: BTreeMap<Hash, u64>,
 }
 
+/// One retirement-eligibility candidate: an identity the CALLER
+/// asserts is a composite snapshot root in its own known-root
+/// universe. **The assertion is the caller's** — the model never
+/// derives eligibility for an identity it cannot classify, and an
+/// identity absent from this walk's live set is NOT thereby
+/// authorized to be deleted: this dark model supplies EVIDENCE for
+/// a future sweep; it is not reclamation authority. The newtype
+/// exists to make that assumption impossible to state by accident
+/// — a caller must explicitly wrap the identity, and the legacy
+/// `/1` snapshots, revision records, and chunk dependencies a walk
+/// finds live are refused eligibility by category, never silently
+/// misclassified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetirementCandidate(pub Hash);
+
+/// Why a candidate is NOT retirement-eligible — the live-set
+/// category that protects it. Exhaustive so a future storage
+/// implementation must handle every refusal reason explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionReason {
+    /// A composite root reachable from the retained heads.
+    ReachableCompositeRoot,
+    /// A reachable direct object — INCLUDING every supported legacy
+    /// `/1` snapshot: a live legacy root is never retirement-
+    /// eligible through this interface.
+    DirectObject,
+    /// A walked revision record (the chain must stay walkable).
+    RevisionRecord,
+    /// A chunk inside some retained root's verified closure.
+    ChunkDependency,
+}
+
+/// The conservative retirement-eligibility verdict for one
+/// candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetirementEligibility {
+    /// The candidate is unreachable from THIS walk's retained heads
+    /// — eligible ONLY under the documented candidate-universe
+    /// assumption (the caller asserted a composite root from a
+    /// verified universe, and the walk itself completed: a walk
+    /// that fails produces NO live set, hence no eligibility at
+    /// all — an unclassifiable or unverifiable candidate is never
+    /// eligible, because unknown is never safely reclaimable).
+    /// Still evidence, not authority: a future sweep must
+    /// independently confirm before any deletion.
+    Eligible,
+    /// The candidate is live in this walk — the reason names the
+    /// protecting category.
+    Retained(RetentionReason),
+}
+
 impl LiveSet {
-    /// The roots (from the caller's known universe) NOT reachable
-    /// from the retained heads — eligible for retirement. A retired
-    /// root's exclusively-owned chunks leave the live set with it;
-    /// a chunk another RETAINED root still requires does NOT.
-    pub fn eligible_for_retirement(&self, known_roots: &[Hash]) -> Vec<Hash> {
-        known_roots
-            .iter()
-            .filter(|root| !self.composite_roots.contains(root))
-            .copied()
-            .collect()
+    /// The typed, conservative retirement-eligibility contract.
+    /// Every live-set category is checked — a reachable composite
+    /// root, a reachable legacy `/1` snapshot or other direct
+    /// object, a walked revision record, and any retained root's
+    /// chunk dependency all REFUSE eligibility — so a live legacy
+    /// root can never be misclassified as retirement-eligible the
+    /// way a composite-only membership check would. The verdict is
+    /// a pure function of the walk's completed live set: invariant
+    /// to candidate ordering and duplicates.
+    pub fn retirement_eligibility(&self, candidate: RetirementCandidate) -> RetirementEligibility {
+        let identity = candidate.0;
+        if self.composite_roots.contains(&identity) {
+            RetirementEligibility::Retained(RetentionReason::ReachableCompositeRoot)
+        } else if self.direct_objects.contains(&identity) {
+            RetirementEligibility::Retained(RetentionReason::DirectObject)
+        } else if self.visited_revisions.contains(&identity) {
+            RetirementEligibility::Retained(RetentionReason::RevisionRecord)
+        } else if self.chunk_identities.contains(&identity) {
+            RetirementEligibility::Retained(RetentionReason::ChunkDependency)
+        } else {
+            RetirementEligibility::Eligible
+        }
     }
 }
 
@@ -134,6 +228,14 @@ pub enum ReachError {
     /// The source failed for a walked identity without proving
     /// absence — the walk fails closed, concluding nothing.
     Unavailable { identity: Hash, detail: String },
+    /// A RECOGNIZED but unsupported session-snapshot family member
+    /// (a future composite-root version): the walk refuses typed
+    /// with the offending root's identity — a future composite
+    /// format may carry dependencies unknown to this
+    /// implementation, and treating it as an ordinary direct leaf
+    /// would silently omit live chunks from the retention set. The
+    /// walk never produces a partial live set past this refusal.
+    UnsupportedSnapshot { identity: Hash, domain: String },
     /// A composite root's closure failed the verified read.
     Composite {
         root: Hash,
@@ -174,6 +276,13 @@ impl std::fmt::Display for ReachError {
                 write!(
                     f,
                     "the source failed for {} without proving absence: {detail}",
+                    identity.hex()
+                )
+            }
+            ReachError::UnsupportedSnapshot { identity, domain } => {
+                write!(
+                    f,
+                    "the snapshot {} carries the recognized but unsupported family domain {domain}",
                     identity.hex()
                 )
             }
@@ -226,11 +335,14 @@ pub fn live_set(
         visited_revisions.insert(record_id);
         for reference in &record.content_refs {
             let bytes = read_verified(source, reference)?;
-            // The classification: the leading domain tag decides —
-            // the ratified composite root expands; anything else is
-            // a direct object. An object whose leading bytes do not
-            // decode as a domain tag at all is malformed (the
-            // store's objects are domain-framed by construction).
+            // The classification — the session-snapshot FAMILY
+            // recognition (fail-closed on recognized but
+            // unsupported versions, never guessing):
+            //   the ratified /2 composite root expands;
+            //   the supported legacy /1 snapshot is a direct object;
+            //   any OTHER family member refuses the walk typed;
+            //   an unrelated valid domain is a direct object;
+            //   no decidable domain at all is malformed.
             let observed_domain = Decoder::new(&bytes)
                 .read_str(MAX_TAG_LEN, "k2b-reachability")
                 .map_err(|_| ReachError::MalformedObject {
@@ -261,6 +373,21 @@ pub fn live_set(
                     *chunk_reference_counts.entry(identity).or_insert(0) += 1;
                     chunk_identities.insert(identity);
                 }
+            } else if observed_domain == LEGACY_SNAPSHOT_V1_DOMAIN {
+                // The supported legacy /1 whole-object snapshot —
+                // conservatively a direct object (its content IS
+                // the snapshot; no expansion, no eligibility).
+                direct_objects.insert(*reference);
+            } else if observed_domain.starts_with(SNAPSHOT_FAMILY) {
+                // A recognized but unsupported family member: a
+                // future composite-root version whose dependency
+                // closure this implementation cannot know. The
+                // walk refuses typed with the root's identity —
+                // NEVER an ordinary leaf, never a partial live set.
+                return Err(ReachError::UnsupportedSnapshot {
+                    identity: *reference,
+                    domain: observed_domain.to_owned(),
+                });
             } else {
                 direct_objects.insert(*reference);
             }
