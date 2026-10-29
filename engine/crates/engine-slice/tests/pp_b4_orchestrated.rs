@@ -1486,6 +1486,49 @@ fn a_coherent_activation_refusal_refuses_the_tick_before_the_clock() {
     );
 }
 
+/// The race-free publication observation (the C1 closeout's test-only
+/// corrective): a bounded read-only probe that a submitted
+/// publication is ACCEPTED and chain-reachable — the first
+/// chain-reachable record whose idempotency key IS the expected
+/// content identity and whose EXACT single content reference IS that
+/// content (the canonical single-snapshot-object shape). Never a
+/// HEAD-inequality wait (the worker's append may pre-empt the first
+/// read, leaving the "before" head already at the expected record);
+/// never an assumption that the record remains HEAD (a later valid
+/// revision may advance the chain); never the session's own
+/// completion consumption (the deliberately delayed completions stay
+/// unconsumed). A timeout fails visibly with the expected content
+/// identity and the observed chain HEAD; a missing publication never
+/// counts as success; the polling is bounded.
+fn wait_publication_accepted(location: &StoreLocation, content: engine_persist::Hash) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut oracle = SessionStore::open(location).expect("the oracle opens");
+        let head = oracle
+            .head()
+            .expect("the oracle head")
+            .expect("the store is founded");
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            let record = oracle.read_record(&id).expect("the oracle record");
+            if record.idempotency_key.as_deref() == Some(content.as_bytes().as_slice())
+                && record.content_refs.len() == 1
+                && record.content_refs.first() == Some(&content)
+            {
+                return;
+            }
+            cursor = record.parent;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "the expected publication never became chain-reachable: \
+                 content {content} · observed head {head}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// §3 of the C1 final corrective (the unpolled accepted optional
 /// publication): the optional snapshot of state S is submitted and
 /// the worker ACCEPTS it, but its completion is deliberately never
@@ -1503,22 +1546,16 @@ fn an_unpolled_accepted_publication_covers_the_same_state_prerequisite() {
     let dir = TestDir::new("unpolled-covering");
     let location = found_location(&dir, false);
     let mut session = orchestrated(&dir);
-    let founding = oracle_head_at(&location);
     // The optional snapshot of state S — submitted, never consumed.
     let capture = session.capture_snapshot().unwrap();
+    let content = capture.content_identity();
     let handle = session.submit_publication(capture).unwrap();
     assert_eq!(session.pending_publications(), 1);
-    // The worker accepts it (the chain advances past the founding) —
-    // the bounded read-only wait on the ORACLE chain, never the
+    // The worker accepts it — the bounded read-only probe for the
+    // EXPECTED RECORD (keyed by its content identity, chain-reachable
+    // wherever it landed), never a HEAD-inequality wait, never the
     // session's own completion consumption.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while oracle_head_at(&location) == founding {
-        assert!(
-            Instant::now() < deadline,
-            "the worker accepts the optional publication"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_publication_accepted(&location, content);
     assert_eq!(
         session.pending_publications(),
         1,
@@ -1596,20 +1633,18 @@ fn a_delayed_older_completion_never_regresses_the_covering_track() {
     let location = found_location(&dir, false);
     let mut session = orchestrated(&dir);
     // 1. The optional snapshot S1 — submitted, accepted by the worker,
-    //    its completion deliberately unconsumed.
-    let s1 = session
-        .submit_publication(session.capture_snapshot().unwrap())
-        .unwrap();
+    //    its completion deliberately unconsumed (the read-only probe
+    //    never consumes; the pending count below proves it).
+    let s1_capture = session.capture_snapshot().unwrap();
+    let s1_content = s1_capture.content_identity();
+    let s1 = session.submit_publication(s1_capture).unwrap();
     assert_eq!(session.pending_publications(), 1);
-    let founding = oracle_head_at(&location);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while oracle_head_at(&location) == founding {
-        assert!(
-            Instant::now() < deadline,
-            "the worker accepts the S1 publication"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_publication_accepted(&location, s1_content);
+    assert_eq!(
+        session.pending_publications(),
+        1,
+        "the S1 completion stays unconsumed"
+    );
     let s1_record = oracle_head_at(&location);
     // 2-3. Advance to a distinct authoritative state and establish the
     // newer covering S2: the far tick's region-4 boundary (region 3's
@@ -1653,17 +1688,13 @@ fn a_delayed_older_completion_never_regresses_the_covering_track() {
     for _ in 0..5 {
         session.tick(&near_presence()).unwrap();
     }
-    let s2b = session.capture_snapshot().unwrap();
-    let s2b_handle = session.submit_publication(s2b).unwrap();
-    let before_s2b = oracle_head_at(&location);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while oracle_head_at(&location) == before_s2b {
-        assert!(
-            Instant::now() < deadline,
-            "the worker accepts the S2' publication"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let s2b_capture = session.capture_snapshot().unwrap();
+    let s2b_content = s2b_capture.content_identity();
+    let s2b_handle = session.submit_publication(s2b_capture).unwrap();
+    // The race-free probe for the EXPECTED S2' record — never a
+    // HEAD-inequality wait (the worker's append may pre-empt any
+    // "before" read; the Windows race this corrective closes).
+    wait_publication_accepted(&location, s2b_content);
     assert!(matches!(
         session.wait_publication(s2b_handle).unwrap(),
         PublicationOutcome::Accepted { .. }
