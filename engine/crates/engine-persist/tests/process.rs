@@ -422,10 +422,22 @@ fn flip_byte(path: &Path) {
 
 /// Bounded wait for a harness file (ready markers, phase results) —
 /// every parental wait carries a deadline, no hang is accepted.
+/// The wait requires the file's CONTENT, never its bare existence:
+/// `fs::write`'s create-then-write window can briefly expose an
+/// EMPTY file, and under runner load the poll can observe it (the
+/// observed macOS CI failure: an empty `result-0` read as the
+/// holder's failure). Every awaited harness file is a single
+/// non-empty `fs::write`, so content arrival is the completion
+/// signal.
 fn wait_for_file(path: impl AsRef<Path>) {
     let path = path.as_ref();
     let deadline = Instant::now() + WAIT;
-    while !path.exists() {
+    loop {
+        if let Ok(content) = fs::read_to_string(path)
+            && !content.is_empty()
+        {
+            return;
+        }
         assert!(
             Instant::now() < deadline,
             "the file {} never appeared within the bound",
