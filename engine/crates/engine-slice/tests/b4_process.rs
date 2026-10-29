@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::{LodLevel, PresenceSample, Spine};
 use engine_persist::{CommitOutcome, ConsequenceId, T1Journal};
-use engine_slice::crossing::{ARM_MID_INSTALL_EXIT, SessionCrossing};
+use engine_slice::crossing::{ARM_AFTER_COVERING_EXIT, ARM_MID_INSTALL_EXIT, SessionCrossing};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 
@@ -87,16 +87,26 @@ fn child_role(store: PathBuf, journal_path: PathBuf, role: &str) -> ! {
             ARM_MID_INSTALL_EXIT.store(true, Ordering::Relaxed);
             let _ = crossing.deactivate(&mut spine, &mut director, 4, now);
         }
+        // The C1 after-covering kill (the §6 crash-window matrix's
+        // covering/T1 gap): the process dies AFTER the covering
+        // snapshot's acceptance and BEFORE the T1 capture (exit 10,
+        // distinct from the install windows' 6 and 7) — the covering
+        // is durable on the chain, the transaction never journaled,
+        // the install never started.
+        "after-covering-kill" => {
+            ARM_AFTER_COVERING_EXIT.store(true, Ordering::Relaxed);
+            let _ = crossing.deactivate(&mut spine, &mut director, 4, now);
+        }
         other => panic!("unknown B4 child role: {other}"),
     }
     unreachable!("the child exits inside its role");
 }
 
-/// The parent's shared harness: spawn the child re-exec (this binary,
-/// the one test, the role environment), bounded-wait for the hard
-/// exit (a runaway is killed at the deadline), then reconstruct the
-/// session from disk alone and prove the recovery.
-fn spawn_child_and_recover(role: &str, expected_code: i32, test_name: &str) {
+/// The parent's spawn harness: the child re-exec dispatch (this
+/// binary, the one test, the role environment), the bounded wait for
+/// the hard exit (a runaway is killed at the deadline), and the
+/// killed campaign's durable paths — the caller proves the recovery.
+fn spawn_child(role: &str, expected_code: i32, test_name: &str) -> (PathBuf, PathBuf) {
     if let (Ok(env_role), Ok(store), Ok(journal)) = (
         std::env::var(ROLE_ENV),
         std::env::var(STORE_ENV),
@@ -143,6 +153,13 @@ fn spawn_child_and_recover(role: &str, expected_code: i32, test_name: &str) {
         Some(expected_code),
         "the child hard-exited at its window"
     );
+    (store, journal_path)
+}
+
+/// The parent's shared recovery proof: the reconstruct-from-disk
+/// assertions common to the install-window kills.
+fn spawn_child_and_recover(role: &str, expected_code: i32, test_name: &str) {
+    let (store, journal_path) = spawn_child(role, expected_code, test_name);
     // THE RECOVERY: the parent — an independent process —
     // reconstructs the session from disk alone.
     let (recovered_spine, recovered_director, mut recovered_crossing) =
@@ -177,7 +194,7 @@ fn spawn_child_and_recover(role: &str, expected_code: i32, test_name: &str) {
         panic!("the re-drive confirms the recovered captures");
     };
     assert!(receipt.keys.contains(&ConsequenceId::new(4, 1, 4)));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(store.parent().unwrap());
 }
 
 #[test]
@@ -205,4 +222,63 @@ fn child_death_mid_install_recovers_from_disk() {
         7,
         "child_death_mid_install_recovers_from_disk",
     );
+}
+
+#[test]
+fn child_death_after_the_covering_recovers_the_pre_deactivation_state() {
+    // The C1 covering/T1 gap (the §6 crash-window matrix): the child
+    // dies AFTER the covering snapshot's acceptance and BEFORE the
+    // T1 capture (exit 10, distinct from the install windows' 6 and
+    // 7). The covering is the durable newest snapshot — the recovery
+    // carries the PRE-deactivation state exactly: the region live,
+    // nothing journaled, nothing pending — and the continuation
+    // deactivates properly from there (the crash left nothing
+    // half-done).
+    let (store, journal_path) = spawn_child(
+        "after-covering-kill",
+        10,
+        "child_death_after_the_covering_recovers_the_pre_deactivation_state",
+    );
+    // THE RECOVERY: the pre-deactivation state from the covering.
+    let (mut recovered_spine, mut recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&store, &journal_path, "process-campaign")
+            .expect("the covering-anchored recovery reconstructs from disk");
+    assert_eq!(
+        recovered_director.levels()[4],
+        LodLevel::Full,
+        "the covering carries the PRE-deactivation state — the install never ran"
+    );
+    {
+        let scan = T1Journal::scan_file(&journal_path).unwrap();
+        assert!(
+            scan.committed.is_empty(),
+            "the T1 never journaled — the kill preceded it"
+        );
+    }
+    assert_eq!(
+        recovered_director.ledger().pending_count(),
+        0,
+        "no captures landed — nothing was journaled"
+    );
+    assert!(
+        recovered_spine.world().milestones().iter().any(|m| *m > 0),
+        "the covering's session state restored"
+    );
+    assert!(matches!(
+        recovered_crossing.commit_canonical().unwrap(),
+        CommitOutcome::NothingPending
+    ));
+    // THE CONTINUATION: the recovered campaign deactivates region 4
+    // properly through its own full boundary.
+    let now = recovered_spine.clock();
+    recovered_crossing
+        .deactivate(&mut recovered_spine, &mut recovered_director, 4, now)
+        .expect("the continuation boundary commits")
+        .expect("the recovered accrual captured consequences");
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
+        panic!("the continuation's captures confirm");
+    };
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 1, 4)));
+    let _ = std::fs::remove_dir_all(store.parent().unwrap());
 }

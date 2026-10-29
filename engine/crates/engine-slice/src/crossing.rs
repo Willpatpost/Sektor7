@@ -435,6 +435,23 @@ pub enum TransitionError {
     /// publication; never normalized, repaired, or published. The
     /// detail carries the decoder's own diagnostic.
     RecoveryInvalid { detail: String },
+    /// The C1 covering prerequisite's refusal (the recovery-coverage
+    /// checkpoint): a nonempty consequential deactivation's T1
+    /// capture was refused because its covering snapshot could not
+    /// be established — the publication failed, went unknown (and
+    /// the reconciliation could not verify the installation), went
+    /// stale past the single retry, or the serialized state failed
+    /// the strict roundtrip validation. Refused BEFORE the T1
+    /// capture and the destructive install: nothing journaled, the
+    /// region state unchanged, the crossing coherently retryable.
+    /// The uncertain append candidate's revision identity (when one
+    /// exists) is carried for the existing reconciliation contract —
+    /// never a guessed acceptance, never an unverified append
+    /// treated as covered.
+    CoveringRefused {
+        detail: String,
+        candidate: Option<Hash>,
+    },
 }
 
 /// The explicit session compaction's report (PP-B2 — the GO's §2/§3
@@ -600,6 +617,25 @@ pub struct SessionCrossing<S: MediumSource = StoreLocation> {
     /// pointer). Private mutation; the read-only accessor is
     /// [`Self::journal_flip_count`].
     journal_flips: u64,
+    /// THE C1 COVERING TRACK (the recovery-coverage checkpoint): the
+    /// last covering snapshot THIS crossing established — the exact
+    /// content identity of the authoritative state it captured, and
+    /// the accepted revision that carries it. The equivalence check
+    /// (a previously accepted snapshot satisfies a later plan's
+    /// prerequisite ONLY when the current state serializes to the
+    /// SAME content identity) consults this track; every
+    /// authority-side mutation produces different bytes and requires
+    /// a fresh covering. Private to the prerequisite machinery.
+    covering: Option<CoveringSnapshot>,
+}
+
+/// The C1 covering track's entry: the exact-state binding (the
+/// content identity of the captured authoritative state) and the
+/// accepted revision that published it (the diagnostic identity —
+/// which revision carries the covering, retained for introspection).
+struct CoveringSnapshot {
+    content_hash: Hash,
+    revision: Hash,
 }
 
 /// The crossing's journal-authority state (the review correctives
@@ -728,6 +764,7 @@ impl<S: MediumSource> SessionCrossing<S> {
             journal_root,
             journal_authority: JournalAuthority::Healthy,
             journal_flips: 0,
+            covering: None,
         })
     }
 
@@ -787,6 +824,16 @@ impl<S: MediumSource> SessionCrossing<S> {
         self.journal_flips
     }
 
+    /// The C1 covering track's accepted revision — the diagnostic
+    /// identity of the revision carrying the current covering (None
+    /// before any covering is established). Read-only, the mutation
+    /// authority is the covering prerequisite's own (private); the
+    /// test and introspection surface.
+    #[doc(hidden)]
+    pub fn covering_revision(&self) -> Option<Hash> {
+        self.covering.as_ref().map(|covering| covering.revision)
+    }
+
     /// Sets the campaign journal ROOT (crate-trusted — the
     /// orchestrated session's recovery path re-derives the crossing
     /// over the pointer-resolved ACTIVE journal, then restores the
@@ -794,6 +841,31 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// authoritative location).
     pub(crate) fn set_journal_root(&mut self, root: PathBuf) {
         self.journal_root = root;
+    }
+
+    /// Seeds the C1 covering track from an ACCEPTED session-snapshot
+    /// publication of the exact state `content_hash` (crate-trusted —
+    /// the orchestrated session's publication completions call this,
+    /// the counterpart of [`Self::publish_snapshot`]'s own seeding):
+    /// the durable snapshot covers any nonempty plan prepared from
+    /// that same state, and the equivalence check consults the track
+    /// instead of colliding on the chain-unique content-hash
+    /// idempotency key.
+    pub(crate) fn seed_covering(&mut self, content_hash: Hash, revision: Hash) {
+        self.covering = Some(CoveringSnapshot {
+            content_hash,
+            revision,
+        });
+    }
+
+    /// The C1 covering track's current binding, if any (crate-trusted
+    /// — the orchestrated recovery transfers the restored snapshot's
+    /// covering identity onto its fresh worker-backed crossing, the
+    /// same track the plain recovery's own crossing carries).
+    pub(crate) fn covering_snapshot(&self) -> Option<(Hash, Hash)> {
+        self.covering
+            .as_ref()
+            .map(|covering| (covering.content_hash, covering.revision))
     }
 
     /// The composed authority gate, exposed for the orchestrated
@@ -999,6 +1071,24 @@ impl<S: MediumSource> SessionCrossing<S> {
         let episode = director.states()[region].episode + 1;
         let collected = spine.collect_matching(|view| view.class == class);
         let plan = DeactivationPlan::prepare(region, from, episode, now, spine.world(), &collected);
+        // Phase 2.5 — THE C1 COVERING PREREQUISITE (the
+        // recovery-coverage checkpoint): a NONEMPTY consequential
+        // plan may not journal its T1 transaction until an ACCEPTED,
+        // validated session snapshot of the EXACT authoritative state
+        // that plan was prepared from is durable on the chain (the
+        // empty-scratch deactivation journals nothing non-re-derivable
+        // and needs no covering). The plan's preparation (phase 2)
+        // and the snapshot's serialization read the SAME state with
+        // no authority-side mutation between — the phases are
+        // single-threaded and the prerequisite is I/O-only — so the
+        // binding is exact, never a frontier or tick heuristic. See
+        // [`Self::establish_covering`] for the full contract.
+        if !plan.captures.is_empty() {
+            self.establish_covering(spine, director)?;
+        }
+        // The C1 crash-window seam (test-only): the hard exit AFTER
+        // the covering's acceptance and BEFORE the T1 capture.
+        after_covering_seam();
         // Phases 3–4 — persist + verify: ONE journal transaction —
         // the capture envelopes plus the plan blob — SKIPPED when
         // nothing was captured: an empty-scratch deactivation has no
@@ -1044,6 +1134,144 @@ impl<S: MediumSource> SessionCrossing<S> {
         Ok(receipt)
     }
 
+    /// THE C1 COVERING PREREQUISITE (the recovery-coverage
+    /// checkpoint's conservative rule): before a nonempty
+    /// consequential deactivation plan journals its T1 transaction,
+    /// an ACCEPTED, validated session snapshot of the EXACT
+    /// authoritative state that plan was prepared from must be
+    /// durable on the chain. The procedure:
+    ///
+    /// 1. **Serialize** the current authoritative state (the same
+    ///    `save_session` machinery every publication uses).
+    /// 2. **The exact-state equivalence check**: a previously
+    ///    accepted covering snapshot satisfies this prerequisite only
+    ///    when the current state serializes to the SAME content
+    ///    identity — byte-exact, never a frontier or tick heuristic
+    ///    (any mutation since — an install, a compaction, a
+    ///    reclassification — produces different bytes and requires a
+    ///    fresh covering).
+    /// 3. **The strict roundtrip validation**: the serialized bytes
+    ///    must pass `restore_session` — the same integrity contract
+    ///    the recovery's final validation enforces — BEFORE
+    ///    publication.
+    /// 4. **Publish** through the existing canonical source (the
+    ///    single I/O worker in the orchestrated instantiation; a
+    ///    fresh provider handle per operation in the legacy form) —
+    ///    the same CAS append every snapshot publication uses, with
+    ///    the same content-hash idempotency key.
+    /// 5. **Settle**: the `Accepted` outcome (the append executed,
+    ///    the CAS won, the chain rules passed, the provider's actual
+    ///    durability tier carried) establishes the covering; a
+    ///    stale parent retries ONCE against the observed head (the
+    ///    same validated bytes — the equivalence binding is the
+    ///    CONTENT, not the parent); an `Unknown` outcome reconciles
+    ///    under the lock — `Installed` establishes the covering,
+    ///    anything else REFUSES the crossing BEFORE the T1 capture
+    ///    and the destructive install, the uncertain candidate's
+    ///    identity preserved in the typed refusal for the existing
+    ///    reconciliation contract (the recovery's
+    ///    `reconcile_unknown`, the maintenance harvest). No
+    ///    unverified append is ever treated as accepted.
+    ///
+    /// **The state-freeze guarantee:** between the plan's
+    /// preparation (phase 2) and the T1 capture (phase 3) the
+    /// crossing performs only this I/O-only prerequisite — no
+    /// simulation tick, no scheduling, no rotation, no maintenance
+    /// can interleave (the authority thread is inside the crossing;
+    /// the journal-authority guard already refuses the closed
+    /// states) — so the prepared plan's preconditions remain
+    /// exactly the snapshot's state. Complete event identities,
+    /// allocation statistics, execution history, dependencies,
+    /// region state, and consequence-ledger evidence are all inside
+    /// the captured state; nothing is renumbered, fabricated, or
+    /// relaxed.
+    fn establish_covering(
+        &mut self,
+        spine: &Spine<NpcWorld>,
+        director: &RegionDirector,
+    ) -> Result<(), TransitionError> {
+        let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
+        let object = StoredObject::new(bytes)?;
+        let content_hash = object.hash();
+        if let Some(covering) = &self.covering
+            && covering.content_hash == content_hash
+        {
+            // The exact-state equivalence: the previously accepted
+            // covering snapshot captured THIS state — the plan is
+            // covered (the refused-crossing retry and the
+            // shared-state cases).
+            return Ok(());
+        }
+        // The strict roundtrip validation, BEFORE publication.
+        restore_session(object.bytes()).map_err(|error| TransitionError::CoveringRefused {
+            detail: format!("covering/roundtrip-validation: {error:?}"),
+            candidate: None,
+        })?;
+        let mut medium = self.source.open_medium()?;
+        let parent = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
+        let (mut candidate, mut outcome) =
+            covering_append(&mut medium, &object, content_hash, parent, spine.clock())?;
+        if let AppendOutcome::RejectedStaleParent {
+            observed: Some(observed),
+        } = outcome
+        {
+            // ONE retry against the observed head — the same
+            // validated bytes (the equivalence binding is the
+            // content, not the parent). The retried attempt's own
+            // candidate identity replaces the first's: the uncertain
+            // window's reconciliation must name exactly the record
+            // the retry built (the observed parent, not the stale
+            // one).
+            let (retry_candidate, retry_outcome) =
+                covering_append(&mut medium, &object, content_hash, observed, spine.clock())?;
+            candidate = retry_candidate;
+            outcome = retry_outcome;
+        }
+        let revision = match outcome {
+            AppendOutcome::Accepted { id, .. } => id,
+            AppendOutcome::RejectedStaleParent { .. } => {
+                return Err(TransitionError::CoveringRefused {
+                    detail: "covering/stale-parent".into(),
+                    candidate: None,
+                });
+            }
+            AppendOutcome::Unknown { .. } => {
+                // The uncertain append: reconcile under the lock —
+                // Installed establishes the covering (the candidate
+                // accepted); anything else refuses the crossing with
+                // the candidate's identity preserved for the existing
+                // reconciliation contract. The candidate is exactly
+                // the identity the append built — the same bytes, the
+                // same parent — so an installed covering is never
+                // misclassified as absent.
+                return match medium.reconcile_unknown(&candidate)? {
+                    Reconciliation::Installed { .. } => {
+                        self.covering = Some(CoveringSnapshot {
+                            content_hash,
+                            revision: candidate,
+                        });
+                        Ok(())
+                    }
+                    Reconciliation::NotInstalled { .. } => Err(TransitionError::CoveringRefused {
+                        detail: "covering/unknown-not-installed".into(),
+                        candidate: Some(candidate),
+                    }),
+                    Reconciliation::Unverifiable { reason } => {
+                        Err(TransitionError::CoveringRefused {
+                            detail: format!("covering/unknown-unverifiable: {reason}"),
+                            candidate: Some(candidate),
+                        })
+                    }
+                };
+            }
+        };
+        self.covering = Some(CoveringSnapshot {
+            content_hash,
+            revision,
+        });
+        Ok(())
+    }
+
     /// Publishes the session snapshot as ONE verified content object
     /// on the campaign chain (the B2 nine-step append — atomic,
     /// chain-reachable, content-verified): a regular revision whose
@@ -1069,7 +1297,17 @@ impl<S: MediumSource> SessionCrossing<S> {
             .with_idempotency_key(snapshot_hash.as_bytes().to_vec())
             .with_content_refs(vec![snapshot_hash]);
         match medium.append(&record, std::slice::from_ref(&object), Some(head))? {
-            AppendOutcome::Accepted { id, .. } => Ok(id),
+            AppendOutcome::Accepted { id, .. } => {
+                // The publication seeds the C1 covering track: an
+                // accepted snapshot of THIS exact state covers any
+                // nonempty plan prepared from it (the equivalence
+                // check consults the track).
+                self.covering = Some(CoveringSnapshot {
+                    content_hash: snapshot_hash,
+                    revision: id,
+                });
+                Ok(id)
+            }
             _ => Err(PipelineError::UnfoundedMedium.into()),
         }
     }
@@ -1395,7 +1633,9 @@ impl<S: MediumSource> SessionCrossing<S> {
         // THE CHAIN-VERIFIED ANCHOR: the newest session snapshot's
         // director state (a compaction the operator has not published
         // is not subsumption evidence — the anchor on the chain is).
-        let Some((_anchor_spine, anchor_director)) = latest_snapshot_at(&self.source)? else {
+        let Some((_anchor_spine, anchor_director, _content, _revision)) =
+            latest_snapshot_at(&self.source)?
+        else {
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "journal-rotation/no-anchor",
@@ -1821,7 +2061,21 @@ impl<S: MediumSource> SessionCrossing<S> {
                 indexed.sort_unstable_by_key(|entry| entry.epoch);
                 let mut range_bytes = Vec::with_capacity(indexed.len());
                 let mut units: Vec<ReclaimUnit> = Vec::with_capacity(indexed.len());
-                for entry in &indexed {
+                // C1's deletion order: the manifest's units run
+                // NEWEST-FIRST (descending epoch), while the digest
+                // covers the range publications oldest-first. The
+                // walk authorizes a gap only under a RETAINED
+                // revision's skip entry (never an indexed member) —
+                // so deleting from the range's TOP keeps every
+                // interrupted-Phase-B prefix walk-validatable: the
+                // gap's upper boundary is the MK's self-skip, then a
+                // retained record's entry once the range's top falls.
+                // Deleting oldest-first would strand a present
+                // indexed member above a deleted one — the exact
+                // hand-corruption shape the walk must fail closed
+                // on — making the mid-unit crash window (the F4
+                // convergence contract) unrecoverable.
+                for entry in indexed.iter().rev() {
                     let record = medium
                         .read_record(&entry.hash)
                         .map_err(PipelineError::Medium)?;
@@ -1833,6 +2087,10 @@ impl<S: MediumSource> SessionCrossing<S> {
                         objects: record.content_refs.clone(),
                     });
                 }
+                // The digest's own order: oldest-first over the
+                // collected publication bytes (the units above ran
+                // newest-first).
+                range_bytes.reverse();
                 let recomputed = chain_range_digest(&metadata.seed, &range_bytes);
                 if recomputed != metadata.range_digest {
                     return Err(TransitionError::InstallIncompatible {
@@ -2034,7 +2292,9 @@ impl<S: MediumSource> SessionCrossing<S> {
         // 1. The snapshot — fail closed on a recognizable-but-invalid
         //    newest session object (corruption of the newest
         //    authoritative state is never walked past).
-        let Some((mut spine, mut director)) = latest_snapshot_at(source)? else {
+        let Some((mut spine, mut director, snapshot_content, snapshot_revision)) =
+            latest_snapshot_at(source)?
+        else {
             return Err(TransitionError::NoSnapshot);
         };
         // The snapshot-origin materialization evidence, captured
@@ -2100,6 +2360,17 @@ impl<S: MediumSource> SessionCrossing<S> {
         // journal the pipeline holds. Repeated rotations and the
         // recovery both resolve from this one root.
         crossing.journal_root = journal_path.to_path_buf();
+        // THE C1 COVERING TRACK'S RECOVERY SEED: the restored
+        // snapshot is an ACCEPTED, validated snapshot of the exact
+        // state the recovery begins from — any nonempty plan prepared
+        // from the UNMUTATED recovered state (no replay installs) is
+        // covered by it. The replay's installs mutate the state, so
+        // post-replay preparations serialize differently and publish
+        // fresh coverings — the equivalence check decides.
+        crossing.covering = Some(CoveringSnapshot {
+            content_hash: snapshot_content,
+            revision: snapshot_revision,
+        });
         let mut restored = vec![false; NPC_COUNT];
         // THE RECOVERED SNAPSHOT'S ALLOCATION FRONTIER (the S6-C4
         // stage 1-A frontier guard's input): the restored spine
@@ -2324,6 +2595,56 @@ fn mid_install_seam() {
     if ARM_MID_INSTALL_EXIT.load(Ordering::Relaxed) {
         std::process::exit(7);
     }
+}
+
+/// Test-only (the C1 covering-committed/T1-uncommitted crash seam,
+/// the recovery-coverage checkpoint's mandatory window): when armed,
+/// the crossing hard-exits AFTER the covering snapshot's acceptance
+/// and BEFORE the T1 capture — the exact "after covering acceptance,
+/// before T1 commit" window (exit 10, distinct from the mid-install
+/// 7, the after-SK 8, and the abort seam's 9). A process death here
+/// leaves the covering snapshot standing with NO journaled plan —
+/// the recovery carries the pre-deactivation state through the
+/// snapshot, the deactivation never happened durably. Engine code
+/// never arms this; the static is process-local, so only the child
+/// that armed it dies.
+#[doc(hidden)]
+pub static ARM_AFTER_COVERING_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The after-covering seam's exit point (see
+/// [`ARM_AFTER_COVERING_EXIT`]).
+fn after_covering_seam() {
+    if ARM_AFTER_COVERING_EXIT.load(Ordering::Relaxed) {
+        std::process::exit(10);
+    }
+}
+
+/// The C1 covering's single CAS append (see
+/// [`SessionCrossing::establish_covering`]): the validated snapshot
+/// object against the named parent — the same record construction
+/// every snapshot publication uses (the content hash as the
+/// idempotency key, the single content reference, the campaign
+/// clock). Returns the attempted record's identity alongside the
+/// outcome: the uncertain (`Unknown`) window's reconciliation is
+/// BY IDENTITY, so the caller must reconcile exactly the record
+/// this call built — never a reconstruction (an epoch or parent
+/// mismatch would misclassify an installed covering as absent).
+fn covering_append(
+    medium: &mut dyn CanonicalMedium,
+    object: &StoredObject,
+    content_hash: Hash,
+    parent: Hash,
+    clock: Tick,
+) -> Result<(Hash, AppendOutcome), PipelineError> {
+    let parent_epoch = medium.read_record(&parent)?.epoch;
+    let record = RevisionRecord::regular(parent, parent_epoch, clock.as_u64())
+        .with_idempotency_key(content_hash.as_bytes().to_vec())
+        .with_content_refs(vec![content_hash]);
+    let candidate = record.id();
+    Ok((
+        candidate,
+        medium.append(&record, std::slice::from_ref(object), Some(parent))?,
+    ))
 }
 
 /// Test-only (the genuine SK-committed/MK-uncommitted crash seam,
@@ -2607,6 +2928,12 @@ pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector)
     Ok((spine, director))
 }
 
+/// The located restoration of the latest chain session snapshot (the
+/// recovery's input): the spine, the director, and the snapshot's
+/// content and revision identities (the C1 covering track's recovery
+/// seed).
+type LatestSnapshot = (Spine<NpcWorld>, RegionDirector, Hash, Hash);
+
 /// The latest session snapshot on the chain: walk from HEAD through
 /// the parents, reading each revision's first content object. The
 /// FIRST object recognizable as a session snapshot (the
@@ -2618,7 +2945,7 @@ pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector)
 /// content; the walk is bounded by the chain length.
 fn latest_snapshot_at<S: MediumSource>(
     source: &S,
-) -> Result<Option<(Spine<NpcWorld>, RegionDirector)>, TransitionError> {
+) -> Result<Option<LatestSnapshot>, TransitionError> {
     let mut medium = source.open_medium()?;
     let mut cursor = medium.head()?;
     while let Some(id) = cursor {
@@ -2629,8 +2956,11 @@ fn latest_snapshot_at<S: MediumSource>(
         };
         let bytes = medium.read_object(hash)?;
         if is_session_object(&bytes) {
+            // The snapshot's content identity (for the C1 covering
+            // track's recovery seed) and its carrying revision.
+            let content_hash = StoredObject::new(bytes.clone())?.hash();
             return restore_session(&bytes)
-                .map(Some)
+                .map(|pair| Some((pair.0, pair.1, content_hash, id)))
                 .map_err(|_| TransitionError::CorruptSnapshot("newest-snapshot-restore-failed"));
         }
         cursor = record.parent;

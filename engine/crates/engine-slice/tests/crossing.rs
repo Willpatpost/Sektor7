@@ -7,21 +7,24 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use engine_core::{Encoder, EventClass, LodLevel, PresenceSample, Spine};
 use engine_persist::{
-    AwardCheckpoint, AwardState, CancellationReason, CanonicalMedium, ClassifiedSpan,
-    CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage,
-    DurabilityClass, EncounterJournal, FaultAction, FrontierEntry, JournalFaultControl,
-    JournalFaultPoint, KeyPhase, LocalFileMedium, OccurrenceSpan, RecoveryError, RevisionRecord,
-    SignalLane, SourceBaseline, SourcePosition, StoredObject, T1Journal, TransactionInput,
+    AppendOutcome, AwardCheckpoint, AwardState, CancellationReason, CanonicalMedium,
+    ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
+    CounterValues, Coverage, DurabilityClass, EncounterJournal, FaultAction, FrontierEntry, Hash,
+    JournalFaultControl, JournalFaultPoint, KeyPhase, LocalFileMedium, MediumError, OccurrenceSpan,
+    Reconciliation, RecoveryError, RevisionRecord, SignalLane, SourceBaseline, SourcePosition,
+    StoredObject, SyncTier, T1Journal, TransactionInput, UnknownReason,
 };
-use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError};
+use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError, restore_session};
 use engine_slice::npc::{
     NpcConfig, NpcWorld, POSITION_DISCARDED, REGION_COUNT, install_initial_schedules,
 };
 use engine_slice::region::{CaptureStatus, RegionConfig, RegionDirector, stage4_state_fingerprint};
 use engine_slice::sim::{SimConfig, SimDriver};
+use engine_slice::store::MediumSource;
 
 /// A Lod-mode spine with real executed work (no director — the plan
 /// object's unit surface; the director-driven equivalence is the
@@ -648,8 +651,12 @@ fn recovery_reinstalls_the_deactivation_after_a_crash() {
     }
     assert_eq!(
         recovered_director.levels()[3],
-        LodLevel::EventDriven,
-        "the empty-scratch deactivation is presence-re-derivable, never recovered"
+        LodLevel::Dormant,
+        "the empty-scratch deactivation is captured by region 4's covering \
+         snapshot (the C1 discipline: the covering is the state at the \
+         consequential crossing — region 3's live install is inside it; \
+         the pre-C1 shape left it presence-re-derivable because the only \
+         snapshot predated every install)"
     );
     // The pending T1 re-drive: the canonical confirmation.
     let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
@@ -990,27 +997,20 @@ fn recovery_does_not_reapply_presnapshot_episode_crossings() {
     assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
 }
 
-/// The multi-episode interleave — NOW THE FRONTIER GUARD'S REFUSAL
-/// CASE (the S6-C4 stage 1-A interim): ONE snapshot before BOTH
-/// episodes means BOTH plans' obligations (the accrual follow-ups
-/// allocated after that snapshot) lie beyond its allocation
-/// frontier — the incoherent class the recovery must refuse (the
-/// pre-guard behavior — a "successful" interleaved recovery whose
-/// state the next reopen's strict decoder refuses — is exactly the
-/// repeated-recovery integrity failure the guard eliminates). The
-/// interleave arithmetic itself (the per-transaction envelope-base
-/// restore: episode 1's delta minus the snapshot's scratch, its
-/// install zeroing the scratch, episode 2's full delta) is genuine
-/// engine behavior whose MULTI-post-snapshot-episode coverage is
-/// INHERENTLY beyond-frontier — no within-frontier fixture can carry
-/// two post-snapshot episodes (a covering publication before the
-/// second boundary makes the first episode pre-snapshot). That
-/// coverage is EXPLICITLY DEFERRED to the covering-publication
-/// protocol's acceptance (the C design's §7 matrix); the guard's
-/// refusal here is the honest interim, never a claim that the
-/// interleave is wrong.
+/// The multi-episode recovery UNDER THE C1 COVERING DISCIPLINE (the
+/// recovery-coverage checkpoint's restoration): ONE snapshot before
+/// BOTH episodes, but each consequential episode's crossing now
+/// publishes its own covering snapshot of its exact preparation
+/// state BEFORE journaling — so the recovery finds the newest
+/// covering (episode 2's), carries episode 1's installed state
+/// through it (the episode filter skips episode 1's pre-snapshot
+/// plan), and replays episode 2's plan coherently (within-frontier,
+/// the exact-state covered). THE PREVIOUSLY LOST COVERAGE RESTORED:
+/// the two-episode campaign now recovers durably — and reopens
+/// repeatedly — where the pre-C1 (D-guard-only) form correctly
+/// refused it as the incoherent class.
 #[test]
-fn recovery_restores_both_episodes_from_an_older_snapshot_is_refused() {
+fn recovery_restores_both_episodes_under_the_covering_discipline() {
     let near = near_region_4();
     let far = far_from_region_4();
     let (mut spine, mut director) = scenario_pair(150, &near);
@@ -1018,10 +1018,12 @@ fn recovery_restores_both_episodes_from_an_older_snapshot_is_refused() {
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing =
         SessionCrossing::open(&dir.store(), journal, "two-episodes-campaign").unwrap();
-    // THE older snapshot: before both episodes.
+    // THE older snapshot: before both episodes (the fixture's own
+    // publication — the crossings publish their coverings themselves).
     crossing.publish_snapshot(&spine, &director).unwrap();
     // Episode 1: accrual beyond the snapshot, the durable far
-    // boundary, and the durable reactivation.
+    // boundary (the C1 covering publishes automatically), and the
+    // durable reactivation.
     for _ in 0..80 {
         director.apply(&mut spine, std::slice::from_ref(&near));
         spine.run_tick();
@@ -1035,21 +1037,51 @@ fn recovery_restores_both_episodes_from_an_older_snapshot_is_refused() {
         spine.run_tick();
     }
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
-    // THE CRASH + the recovery: the beyond-frontier interleaved
-    // plans are REFUSED with the typed insufficient-evidence class —
-    // before any inferred mutation or install, the durable state
-    // untouched.
+    // THE CRASH + the recovery: the newest covering (episode 2's)
+    // carries episode 1's installed state; episode 2's plan replays.
     drop(crossing);
-    let result = SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign");
-    assert!(
-        matches!(
-            result,
-            Err(TransitionError::RecoveryInsufficient { region: 4, .. })
-        ),
-        "the two-post-snapshot-episode interleave is the incoherent \
-         class the guard refuses (the C protocol's acceptance will \
-         restore the durable form of this coverage)"
+    let (recovered_spine, recovered_director, mut recovered_crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign")
+            .expect("the covered two-episode campaign recovers");
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+    assert_eq!(
+        recovered_director.states()[4].checkpoint,
+        director.states()[4].checkpoint,
+        "episode 2's checkpoint matches the lost state's exactly"
     );
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones(),
+        "the milestones match the lost state's exactly across both episodes"
+    );
+    assert_eq!(
+        recovered_director.ledger().pending_total(),
+        director.ledger().pending_total(),
+        "episode 2's captures are pending — matching the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_director.ledger().applied_count(),
+        director.ledger().applied_count(),
+        "episode 1's applied identities match the lost state's exactly"
+    );
+    assert_eq!(
+        recovered_spine.world().credits(),
+        spine.world().credits(),
+        "the credits match the lost state's exactly — the derived reactivation applied them"
+    );
+    // The re-drive confirms episode 2's recovered captures (episode
+    // 1's are applied-and-carried by the covering snapshot).
+    let CommitOutcome::Confirmed(receipt) = recovered_crossing.commit_canonical().unwrap() else {
+        panic!("the re-drive confirms the recovered captures");
+    };
+    assert!(receipt.keys.contains(&ConsequenceId::new(4, 2, 4)));
+    // THE REPEATED RECOVERY: the recovered state reopens coherently
+    // (the A/B/C/D discipline's library-level form).
+    drop(recovered_crossing);
+    drop(recovered_spine);
+    drop(recovered_director);
+    let second = SessionCrossing::recover(&dir.store(), &dir.journal(), "two-episodes-campaign");
+    assert!(second.is_ok(), "the repeated recovery is coherent");
 }
 
 /// The cancellation integration (the review's second corrective): a
@@ -1597,4 +1629,545 @@ fn recovery_fails_closed_on_planless_confirmed_effects() {
             ..
         }
     ));
+}
+
+// ---------------------------------------- the C1 §6 crash-window matrix
+
+/// The §6 injection seam: a medium source whose appends can be
+/// scripted at the COVERING boundary — the stale-parent race, the
+/// worker-death unknown (installed and not), and the healthy
+/// delegation. The crossing is generic over `MediumSource` (PP-B4's
+/// ownership seam), so the matrix drives the REAL crossing over the
+/// REAL file medium with only the one append's outcome scripted;
+/// every other operation delegates untouched. The script is one-shot
+/// — the next append (the retry, the confirmation, a later
+/// publication) observes the healthy medium again.
+#[derive(Clone)]
+struct CoveringRaceSource {
+    root: PathBuf,
+    script: Arc<Mutex<RaceScript>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceScript {
+    /// The plain delegation (the healthy medium).
+    Healthy,
+    /// The worker died BEFORE the append ran: nothing installed, the
+    /// reply lost — the uncertain class; the reconcile must find
+    /// NotInstalled and the crossing must refuse with the candidate
+    /// preserved.
+    UnknownNotInstalled,
+    /// The worker died AFTER the append ran: the record IS installed,
+    /// the reply lost — the reconcile must find Installed and the
+    /// covering track must follow the installed identity.
+    UnknownInstalled,
+    /// A concurrent publication wins the CAS between the covering's
+    /// head read and its append: the stale parent observed once, the
+    /// single retry lands above the winner.
+    StaleOnce,
+}
+
+impl MediumSource for CoveringRaceSource {
+    type Medium = CoveringRaceMedium;
+
+    fn open_medium(&self) -> Result<CoveringRaceMedium, MediumError> {
+        Ok(CoveringRaceMedium {
+            inner: LocalFileMedium::open(self.root.clone())?,
+            script: self.script.clone(),
+        })
+    }
+}
+
+struct CoveringRaceMedium {
+    inner: LocalFileMedium,
+    script: Arc<Mutex<RaceScript>>,
+}
+
+impl CanonicalMedium for CoveringRaceMedium {
+    fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+        self.inner.head()
+    }
+
+    fn append(
+        &mut self,
+        record: &RevisionRecord,
+        objects: &[StoredObject],
+        expected_parent: Option<Hash>,
+    ) -> Result<AppendOutcome, MediumError> {
+        let scripted = {
+            let mut guard = self.script.lock().unwrap();
+            let scripted = *guard;
+            *guard = RaceScript::Healthy;
+            scripted
+        };
+        match scripted {
+            RaceScript::Healthy => self.inner.append(record, objects, expected_parent),
+            RaceScript::UnknownNotInstalled => Ok(AppendOutcome::Unknown {
+                reason: UnknownReason::WorkerReplyLost,
+            }),
+            RaceScript::UnknownInstalled => {
+                let _ = self.inner.append(record, objects, expected_parent)?;
+                Ok(AppendOutcome::Unknown {
+                    reason: UnknownReason::WorkerReplyLost,
+                })
+            }
+            RaceScript::StaleOnce => {
+                // The concurrent winner: a foreign regular record at
+                // the CURRENT head, moving it before the covering's
+                // own append runs against its now-stale expected
+                // parent.
+                let head = self.inner.head()?.expect("the store is founded");
+                let head_epoch = self.inner.read_record(&head)?.epoch;
+                let object = StoredObject::new({
+                    let mut enc = Encoder::new();
+                    enc.write_str("test/publication");
+                    enc.write_bytes(b"covering-race-foreign");
+                    enc.into_bytes()
+                })
+                .expect("the foreign object encodes");
+                let foreign = RevisionRecord::regular(head, head_epoch, record.tick)
+                    .with_idempotency_key(b"covering/race-foreign".to_vec())
+                    .with_content_refs(vec![object.hash()]);
+                let AppendOutcome::Accepted { id: foreign_id, .. } =
+                    self.inner
+                        .append(&foreign, std::slice::from_ref(&object), Some(head))?
+                else {
+                    panic!("the foreign winner lands at the current head");
+                };
+                let observed = self.inner.append(record, objects, expected_parent);
+                match observed {
+                    Ok(AppendOutcome::RejectedStaleParent {
+                        observed: Some(observed),
+                    }) if observed == foreign_id => Ok(AppendOutcome::RejectedStaleParent {
+                        observed: Some(observed),
+                    }),
+                    other => panic!("the stale observation names the foreign winner: {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+        self.inner.read_record(id)
+    }
+
+    fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+        self.inner.read_object(hash)
+    }
+
+    fn validate(&mut self) -> Result<engine_persist::ChainSummary, MediumError> {
+        self.inner.validate()
+    }
+
+    fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
+        self.inner.reconcile_unknown(candidate)
+    }
+
+    fn durability_tier(&self) -> SyncTier {
+        self.inner.durability_tier()
+    }
+
+    fn reclaim(&mut self, units: &[engine_persist::ReclaimUnit]) -> Result<u64, MediumError> {
+        self.inner.reclaim(units)
+    }
+
+    fn reclaim_pending(
+        &mut self,
+        units: &[engine_persist::ReclaimUnit],
+    ) -> Result<bool, MediumError> {
+        self.inner.reclaim_pending(units)
+    }
+
+    fn checkpoint(&mut self) -> Result<(), MediumError> {
+        self.inner.checkpoint()
+    }
+}
+
+/// §6 case 1 + the uncertain refusal: the covering's append lost its
+/// worker BEFORE anything installed — the reconcile finds
+/// NotInstalled and the crossing REFUSES with the uncertain
+/// candidate's identity preserved, BEFORE the T1 (nothing journaled,
+/// nothing suspended, the region and the chain untouched) — and the
+/// same deactivate through the healthy medium succeeds (the refusal
+/// preserves exact retryability).
+#[test]
+fn covering_unknown_refusal_preserves_the_pre_t1_state_and_retries() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-unknown-refused");
+    let script = Arc::new(Mutex::new(RaceScript::Healthy));
+    let source = CoveringRaceSource {
+        root: dir.store(),
+        script: script.clone(),
+    };
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&source, journal, "covering-unknown-refused").unwrap();
+    // The scenario's own baseline holds (five far regions dormant
+    // since tick 0) — the refusal must leave exactly these, no more.
+    let held_before = spine.held_count();
+    // The arm: the NEXT append (the covering's — the deactivate's
+    // first medium operation) reports the lost worker with nothing
+    // installed.
+    *script.lock().unwrap() = RaceScript::UnknownNotInstalled;
+    let now = spine.clock();
+    let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+    let (detail, candidate) = match refusal {
+        Err(TransitionError::CoveringRefused { detail, candidate }) => (detail, candidate),
+        Err(other) => panic!("the uncertain covering refuses the crossing, got {other:?}"),
+        Ok(_) => panic!("an unresolved covering uncertainty never proceeds to the T1"),
+    };
+    assert_eq!(detail, "covering/unknown-not-installed");
+    let candidate = candidate.expect("the uncertain candidate's identity is preserved");
+    // NOTHING journaled, nothing suspended, the region and the chain
+    // exactly as they stood.
+    {
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert!(scan.committed.is_empty(), "no T1 precedes the covering");
+        assert!(scan.cancellations.is_empty());
+    }
+    assert_eq!(
+        spine.held_count(),
+        held_before,
+        "nothing was suspended by the refused attempt"
+    );
+    assert_eq!(
+        director.levels()[4],
+        LodLevel::Full,
+        "the region stands exactly at its pre-transition level"
+    );
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.records, 1, "only the founding stands");
+        assert!(
+            medium.read_record(&candidate).is_err(),
+            "the uncertain candidate was never installed by the refused attempt"
+        );
+    }
+    // THE RETRY: the same deactivate through the healthy medium —
+    // the refusal never moved the state, so the identical plan
+    // prepares again and succeeds.
+    assert_eq!(*script.lock().unwrap(), RaceScript::Healthy);
+    let receipt = crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .expect("the retried deactivation commits")
+        .expect("the scenario captured consequences");
+    assert_eq!(director.levels()[4], LodLevel::Dormant);
+    {
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert_eq!(scan.committed.len(), 1, "the retried boundary journaled");
+        assert_eq!(scan.committed[0].id, receipt.journal.id);
+    }
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.records, 2, "the founding plus the covering");
+    }
+    let _ = receipt;
+}
+
+/// §6 case 6 (the worker death with the record installed): the
+/// covering's append DID install before the worker died — the
+/// reconcile finds Installed, the covering track follows the
+/// installed identity, and the deactivation proceeds through its T1
+/// and install exactly as the healthy path does.
+#[test]
+fn covering_unknown_reconciles_installed_and_carries_the_track() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-unknown-installed");
+    let script = Arc::new(Mutex::new(RaceScript::Healthy));
+    let source = CoveringRaceSource {
+        root: dir.store(),
+        script: script.clone(),
+    };
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&source, journal, "covering-unknown-installed").unwrap();
+    *script.lock().unwrap() = RaceScript::UnknownInstalled;
+    let now = spine.clock();
+    let pre_deactivation_fingerprint = spine.engine_fingerprint();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .expect("the reconciled covering proceeds to the deactivation")
+        .expect("the scenario captured consequences");
+    assert_eq!(director.levels()[4], LodLevel::Dormant);
+    let covering = crossing
+        .covering_revision()
+        .expect("the track follows the installed covering");
+    {
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert_eq!(scan.committed.len(), 1, "the T1 followed the covering");
+    }
+    {
+        // The installed covering IS on the chain — the identity the
+        // reconcile returned, reachable from the head.
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(summary.records, 2, "the founding plus the covering");
+        let record = medium.read_record(&covering).unwrap();
+        let content = record.content_refs[0];
+        let bytes = medium.read_object(&content).unwrap();
+        let (restored_spine, restored_director) = restore_session(&bytes).unwrap();
+        assert_eq!(
+            restored_director.levels()[4],
+            LodLevel::Full,
+            "the covering captured the PRE-deactivation state"
+        );
+        assert_eq!(
+            restored_spine.engine_fingerprint(),
+            pre_deactivation_fingerprint,
+            "the covering's spine is the exact pre-plan state"
+        );
+    }
+}
+
+/// §6 case 7 (the stale parent and the single retry): a concurrent
+/// publication wins the CAS between the covering's head read and its
+/// append — the crossing observes the winner, retries ONCE against
+/// it, and the covering lands above the winner; the chain carries
+/// both and validates.
+#[test]
+fn covering_stale_parent_retries_once_against_the_observed_head() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-stale-retry");
+    let script = Arc::new(Mutex::new(RaceScript::Healthy));
+    let source = CoveringRaceSource {
+        root: dir.store(),
+        script: script.clone(),
+    };
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(&source, journal, "covering-stale-retry").unwrap();
+    *script.lock().unwrap() = RaceScript::StaleOnce;
+    let now = spine.clock();
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .expect("the stale-retried covering proceeds to the deactivation")
+        .expect("the scenario captured consequences");
+    assert_eq!(director.levels()[4], LodLevel::Dormant);
+    let covering = crossing
+        .covering_revision()
+        .expect("the retry established the covering");
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.records, 3,
+            "the founding, the concurrent winner, and the covering above it"
+        );
+        // The retry landed AGAINST THE OBSERVED WINNER: the covering's
+        // parent is the foreign record, never the stale head it first
+        // read.
+        let record = medium.read_record(&covering).unwrap();
+        let parent = record.parent.expect("the covering has a parent");
+        let parent_record = medium.read_record(&parent).unwrap();
+        assert_eq!(
+            parent_record.idempotency_key.as_deref(),
+            Some(b"covering/race-foreign".as_slice()),
+            "the covering's parent is the concurrent winner"
+        );
+    }
+    {
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert_eq!(scan.committed.len(), 1, "the T1 followed the covering");
+    }
+}
+
+/// §6 case 8 (multiple deactivations at one campaign tick): the
+/// boundary deactivates every live region at the SAME tick — each
+/// capture-bearing plan binds its OWN exact state (a later covering
+/// captures the earlier deactivation's install; an empty-scratch
+/// plan publishes nothing and journals nothing), and the chain plus
+/// the recovery stay coherent over the whole set.
+#[test]
+fn one_tick_deactivations_each_bind_their_own_exact_state() {
+    // A presence inside region 4's full band (22.4 units of its
+    // center) while inside region 3's simplified band (57 units —
+    // region 4 accrues its standard full-rate capture scratch, region
+    // 3 whatever the reduced rate accrues, plus the event-driven ring
+    // around them); the far presence deactivates them all at one
+    // campaign tick.
+    let between = PresenceSample {
+        position: (-90.0, 20.0),
+        velocity: (0.0, 0.0),
+    };
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &between);
+    let dir = TestDir::new("one-tick-coverings");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "one-tick-coverings").unwrap();
+    let boundary_tick = spine.clock();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    // The boundary completed: every region the far presence deactivates
+    // is dormant.
+    for region in 0..REGION_COUNT {
+        let target = director.target_level(region, std::slice::from_ref(&far));
+        assert_eq!(
+            director.levels()[region],
+            target,
+            "region {region} reached its far-presence target"
+        );
+    }
+    // The coverings on the chain: every session-snapshot record at the
+    // boundary tick (this campaign publishes nothing else — no app
+    // snapshot, no checkpoint), collected newest-first.
+    let coverings = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let mut collected = Vec::new();
+        let mut cursor = medium.head().unwrap();
+        while let Some(hash) = cursor {
+            let record = medium.read_record(&hash).unwrap();
+            if record.tick == boundary_tick.as_u64() && !record.content_refs.is_empty() {
+                let bytes = medium.read_object(&record.content_refs[0]).unwrap();
+                if restore_session(&bytes).is_ok() {
+                    collected.push(hash);
+                }
+            }
+            cursor = record.parent;
+        }
+        collected
+    };
+    assert!(
+        !coverings.is_empty(),
+        "at least one capture-bearing deactivation published its covering"
+    );
+    // THE EXACT-STATE BINDING: consecutive coverings (newest first)
+    // each captured the state AFTER the previous deactivation's
+    // install — a later covering's restored director shows the
+    // earlier deactivated region already dormant while its own
+    // region still stands live.
+    for pair in coverings.windows(2) {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let newer_content = medium.read_record(&pair[0]).unwrap().content_refs[0];
+        let newer_bytes = medium.read_object(&newer_content).unwrap();
+        let older_content = medium.read_record(&pair[1]).unwrap().content_refs[0];
+        let older_bytes = medium.read_object(&older_content).unwrap();
+        let (_newer_spine, newer_director) = restore_session(&newer_bytes).unwrap();
+        let (_older_spine, older_director) = restore_session(&older_bytes).unwrap();
+        let transitioned: Vec<usize> = (0..REGION_COUNT)
+            .filter(|&region| {
+                older_director.levels()[region] != LodLevel::Dormant
+                    && newer_director.levels()[region] == LodLevel::Dormant
+            })
+            .collect();
+        assert!(
+            !transitioned.is_empty(),
+            "the later covering captured the earlier deactivation's install"
+        );
+    }
+    // Every covering sits at the SAME campaign tick (one boundary, one
+    // tick — the records' informational tick).
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        for covering in &coverings {
+            let record = medium.read_record(covering).unwrap();
+            assert_eq!(record.tick, boundary_tick.as_u64());
+        }
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.records as usize,
+            coverings.len() + 1,
+            "the founding plus exactly the coverings"
+        );
+    }
+    // The journal: one committed transaction per capture-bearing
+    // deactivation — never one for an empty-scratch plan.
+    {
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert_eq!(
+            scan.committed.len(),
+            coverings.len(),
+            "one T1 per covering — the empty-scratch plans journaled nothing"
+        );
+    }
+    // The ordinary post-boundary publication (the fixture discipline):
+    // the app's snapshot carries the boundary's FINAL state — the
+    // trailing activations (after the last covering) and every
+    // install — making the whole one-tick set durable for the
+    // recovery.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // THE RECOVERY: the whole one-tick set reconstructs coherently.
+    drop(crossing);
+    let (recovered_spine, recovered_director, _crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "one-tick-coverings")
+            .expect("the one-tick boundary set recovers");
+    assert_eq!(
+        stage4_state_fingerprint(&recovered_spine, &recovered_director),
+        stage4_state_fingerprint(&spine, &director),
+        "the recovery reconstructs the boundary's final state exactly"
+    );
+}
+
+/// §6 case 11 (the compacted history): the covering's prerequisite
+/// and its roundtrip validation hold over the EXPLICIT compacted
+/// session form (the spine-history/2 cut) exactly as over the
+/// un-compacted form — the deactivation publishes its covering over
+/// the compacted state, and the recovery restores through it.
+#[test]
+fn the_covering_binds_the_compacted_history_form() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-compacted");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "covering-compacted").unwrap();
+    // The explicit compaction (PP-B2): the lane summarization plus the
+    // spine-history cut, BEFORE the boundary.
+    crossing
+        .compact_session(&mut spine, &mut director, 20)
+        .expect("the compaction applies");
+    let now = spine.clock();
+    let pre_deactivation = (
+        spine.clock(),
+        spine.stats(),
+        spine.held_count(),
+        spine.held_fingerprint(),
+        spine.world().milestones().to_vec(),
+        director.levels(),
+    );
+    crossing
+        .deactivate(&mut spine, &mut director, 4, now)
+        .expect("the compacted-state covering publishes")
+        .expect("the scenario captured consequences");
+    assert_eq!(director.levels()[4], LodLevel::Dormant);
+    let covering = crossing.covering_revision().expect("the covering stands");
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let record = medium.read_record(&covering).unwrap();
+        let bytes = medium.read_object(&record.content_refs[0]).unwrap();
+        let (restored_spine, restored_director) =
+            restore_session(&bytes).expect("the compacted covering round-trips");
+        assert_eq!(
+            restored_director.levels()[4],
+            LodLevel::Full,
+            "the covering captured the PRE-deactivation compacted state"
+        );
+        // The compact-safe comparison domain (the compaction suite's
+        // discipline — the full-history fingerprints are unavailable
+        // by contract on a compacted spine).
+        assert_eq!(restored_spine.clock(), pre_deactivation.0);
+        assert_eq!(restored_spine.stats(), pre_deactivation.1);
+        assert_eq!(restored_spine.held_count(), pre_deactivation.2);
+        assert_eq!(restored_spine.held_fingerprint(), pre_deactivation.3);
+        assert_eq!(restored_spine.world().milestones(), pre_deactivation.4);
+        assert_eq!(restored_director.levels(), pre_deactivation.5);
+    }
+    // THE RECOVERY through the compacted covering — the same
+    // compact-safe comparison domain against the post-boundary live
+    // state.
+    drop(crossing);
+    let (recovered_spine, recovered_director, _crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "covering-compacted")
+            .expect("the compacted-history recovery works");
+    assert_eq!(recovered_spine.clock(), spine.clock());
+    assert_eq!(recovered_spine.stats(), spine.stats());
+    assert_eq!(recovered_spine.held_count(), spine.held_count());
+    assert_eq!(recovered_spine.held_fingerprint(), spine.held_fingerprint());
+    assert_eq!(
+        recovered_spine.world().milestones(),
+        spine.world().milestones()
+    );
+    assert_eq!(recovered_director.levels(), director.levels());
+    assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
 }

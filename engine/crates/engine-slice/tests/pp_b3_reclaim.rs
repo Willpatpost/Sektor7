@@ -213,11 +213,15 @@ fn two_checkpoint_campaign_at(
     };
     durable_boundary(&mut crossing, &mut spine, &mut director, &near);
     run_ticks_near(&mut spine, &mut director, &near, 100);
-    // Checkpoint 1: SK1 (parent C1) + MK1, the range [S1].
+    // Checkpoint 1: SK1 (parent C1) + MK1, the range [S1]. C1: the
+    // range lists the members newest-first — the boundary's covering
+    // above the pre-checkpoint publication — so the campaign's `s1`
+    // (the pre-checkpoint publication, the original semantic) is the
+    // range's LAST member.
     let report1 = crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("the first checkpoint publishes");
-    let s1 = report1.range[0];
+    let s1 = report1.range[report1.range.len() - 1];
     // S3 (parent MK1) + the second window + checkpoint 2: SK2 (parent
     // S3) + MK2, the range [S3]. The tick run comes FIRST: the
     // session state at SK1 and S3 must differ — an identical state
@@ -266,13 +270,15 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the two-phase reclamation completes");
     assert_eq!(reclamation.mk, mk1, "the OLDEST checkpoint is the target");
+    // C1: the covering snapshot published at the T1 boundary joins
+    // S1 and SK1 in the reclaimable range.
     assert_eq!(
-        reclamation.eligible_records, 2,
-        "S1 plus SK1's own retirement"
+        reclamation.eligible_records, 3,
+        "S1, SK1's own retirement, and the boundary's covering"
     );
     assert_eq!(
-        reclamation.removed_objects, 4,
-        "two record objects plus two content objects"
+        reclamation.removed_objects, 6,
+        "three record objects plus three content objects (the covering included)"
     );
     assert!(
         reclamation.journal_files.is_empty(),
@@ -284,10 +290,11 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
-        assert_eq!(summary.reclaimed_keys, 2);
+        assert_eq!(summary.reclaimed_records, 3);
+        assert_eq!(summary.reclaimed_keys, 3);
         // The records: the audit revision, MK2, SK2, S3, MK1, C1, and
-        // the founding (S1 and SK1 gone).
+        // the founding (S1, the boundary's covering, and SK1 gone) —
+        // one more reclaimed, one more appended (the audit).
         assert_eq!(summary.records, 7);
         // S1's revision is genuinely absent.
         assert!(medium.read_record(&s1).is_err());
@@ -336,7 +343,7 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2, "nothing further was deleted");
+        assert_eq!(summary.reclaimed_records, 3, "nothing further was deleted");
     }
 }
 
@@ -424,13 +431,17 @@ fn the_full_stack_rotates_then_reclaims_the_range_and_the_old_journal() {
     // THE ROTATION: T3 survives; the subsumed T1 retires.
     let rotation = crossing.rotate_journal().expect("the rotation completes");
     assert_eq!(rotation.retained.len(), 1, "the outstanding T3 survives");
-    // THE RECLAMATION: MK1's range plus the old journal file.
+    // THE RECLAMATION: MK1's range plus the old journal file. C1:
+    // the first far boundary's covering joins S1 in the range.
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the reclamation completes");
     assert_eq!(reclamation.mk, mk1);
-    assert_eq!(reclamation.eligible_records, 2);
-    assert_eq!(reclamation.removed_objects, 4);
+    assert_eq!(
+        reclamation.eligible_records, 3,
+        "S1, the boundary's covering, and SK1's own retirement"
+    );
+    assert_eq!(reclamation.removed_objects, 6);
     assert_eq!(
         reclamation.journal_files,
         vec![dir.journal()],
@@ -442,7 +453,7 @@ fn the_full_stack_rotates_then_reclaims_the_range_and_the_old_journal() {
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
         assert!(medium.read_record(&s1).is_err());
     }
     drop(crossing);
@@ -498,15 +509,17 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
     crossing.publish_snapshot(&spine, &director).unwrap();
     // C2 — the second cycle.
     confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
-    // SK1 + MK1 — checkpoint 1, the range [S2′, S2, S1] in descent
-    // order.
+    // SK1 + MK1 — checkpoint 1, the range [COV2, S2′, S2, COV1, S1]
+    // in descent order. C1: each confirmation cycle's far boundary
+    // publishes a covering snapshot — the cycle's own covering joins
+    // the range below SK1 (COV1 over S1, COV2 over S2′).
     let report1 = crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("the first checkpoint publishes");
     assert_eq!(
         report1.range.len(),
-        3,
-        "the range carries S1, S2, and S2′ (descent order)"
+        5,
+        "the range carries S1, COV1, S2, S2′, and COV2 (descent order)"
     );
     // S3 — its parent IS MK1 (the example's S3.parent = MK1).
     run_ticks_near(&mut spine, &mut director, &near, 20);
@@ -524,18 +537,25 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
     run_ticks_near(&mut spine, &mut director, &near, 20);
     crossing.publish_snapshot(&spine, &director).unwrap();
     confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
-    // SK2 + MK2 — checkpoint 2, the range [S4, S3].
+    // SK2 + MK2 — checkpoint 2, the range [COV4, S4, COV3, S3].
     let report2 = crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("the second checkpoint publishes");
-    assert_eq!(report2.range.len(), 2, "the range carries S3 and S4");
+    assert_eq!(
+        report2.range.len(),
+        4,
+        "the range carries S3, COV3, S4, and COV4"
+    );
     // The probes' inputs, captured BEFORE the reclamation: S2's
     // idempotency key (the reuse probe) and S2′'s identity (the
     // dependency probe).
     let (s2_key, s2_prime) = {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
-        let s2_prime = report1.range[0];
-        let s2 = report1.range[1];
+        // C1: the descent order is [COV2, S2′, S2, COV1, S1] — the
+        // publications' own relative order is unchanged, the
+        // coverings interleaved above their cycle's publications.
+        let s2_prime = report1.range[1];
+        let s2 = report1.range[2];
         let key = medium.read_record(&s2).unwrap().idempotency_key.unwrap();
         (key, s2_prime)
     };
@@ -548,10 +568,10 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
     assert_eq!(reclamation.mk, report1.mk);
     assert_eq!(reclamation.sk, report1.sk);
     assert_eq!(
-        reclamation.eligible_records, 4,
-        "S1, S2, S2′, and SK1's own retirement entry"
+        reclamation.eligible_records, 6,
+        "S1, COV1, S2, S2′, COV2, and SK1's own retirement entry"
     );
-    assert_eq!(reclamation.removed_objects, 8, "the whole-revision units");
+    assert_eq!(reclamation.removed_objects, 12, "the whole-revision units");
 
     // SK1 RETIRED WHOLE; MK1/MK2 PERMANENT with their metadata
     // objects; the walk validating through the self-skip past SK1
@@ -572,11 +592,11 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
             .unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(summary.checkpoints, vec![report2.mk, report1.mk]);
-        assert_eq!(summary.reclaimed_records, 4);
-        assert_eq!(summary.reclaimed_keys, 4);
+        assert_eq!(summary.reclaimed_records, 6);
+        assert_eq!(summary.reclaimed_keys, 6);
         assert_eq!(
-            summary.records, 11,
-            "F, C1, C2, MK1, S3, C3, S4, C4, SK2, MK2, and the audit"
+            summary.records, 13,
+            "F, C1, C2, MK1, S3, COV3, C3, S4, COV4, C4, SK2, MK2, and the audit"
         );
     }
     // THE RANGE-1 KEY REUSE REJECTED — S2's key, preserved by MK1's
@@ -696,8 +716,8 @@ fn unsafe_retention_windows_are_refused_before_any_audit_or_deletion() {
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 0);
         assert_eq!(
-            summary.records, 8,
-            "F, S1, C1, SK1, MK1, S3, SK2, MK2 — no audit was appended"
+            summary.records, 9,
+            "F, S1, the boundary's covering, C1, SK1, MK1, S3, SK2, MK2 — no audit was appended"
         );
         assert!(
             medium.read_record(&s1).is_ok(),
@@ -775,20 +795,24 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
             })
             .collect()
     };
-    let s3 = report2.range[0];
+    let s3 = report2.range[report2.range.len() - 1];
     drop(spine);
     drop(director);
 
     // GENERATION 1 — the two-generation window (MK4 and MK3
-    // protected): the oldest eligible unreclaimed range is MK1's,
-    // [S1, S2, and SK1's own retirement entry].
+    // protected): the oldest eligible unreclaimed range is MK1's —
+    // C1: the two confirmation cycles' coverings (COV1 over S1,
+    // COV2 over S2) join the publications.
     let size_before = dir_size(&dir.store());
     let r1 = crossing
         .reclaim_checkpoint(&dir.journal(), 2)
         .expect("the first generation reclaims");
     assert_eq!(r1.mk, report1.mk, "the oldest eligible range is MK1's");
-    assert_eq!(r1.eligible_records, 3, "S1, S2, and SK1's own entry");
-    assert_eq!(r1.removed_objects, 6, "three records plus three objects");
+    assert_eq!(
+        r1.eligible_records, 5,
+        "S1, COV1, S2, COV2, and SK1's own entry"
+    );
+    assert_eq!(r1.removed_objects, 10, "five records plus five objects");
     let size_after_r1 = dir_size(&dir.store());
     assert!(
         size_after_r1 < size_before,
@@ -805,16 +829,22 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
         r2.mk, report2.mk,
         "the reclamation progresses past the completed MK1"
     );
-    assert_eq!(r2.eligible_records, 2, "S3 and SK2's own entry");
-    assert_eq!(r2.removed_objects, 4);
+    assert_eq!(
+        r2.eligible_records, 3,
+        "S3, the C3-cycle's covering, and SK2's own entry"
+    );
+    assert_eq!(r2.removed_objects, 6);
 
     // GENERATION 3 — MK3's range.
     let r3 = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the third generation reclaims");
     assert_eq!(r3.mk, report3.mk);
-    assert_eq!(r3.eligible_records, 2, "S4 and SK3's own entry");
-    assert_eq!(r3.removed_objects, 4);
+    assert_eq!(
+        r3.eligible_records, 3,
+        "S4, the C4-cycle's covering, and SK3's own entry"
+    );
+    assert_eq!(r3.removed_objects, 6);
     let size_after_r3 = dir_size(&dir.store());
     assert!(
         size_after_r3 < size_after_r1,
@@ -851,9 +881,9 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
             summary.reclaimed_records,
             r1.eligible_records + r2.eligible_records + r3.eligible_records
         );
-        // The walk: the three audits, MK4, SK4, C5, S5, MK3, C4,
-        // MK2, C3, MK1, C2, C1, and the founding.
-        assert_eq!(summary.records, 15);
+        // The walk: the three audits, MK4, SK4, C5, COV5, S5, MK3,
+        // C4, MK2, C3, MK1, C2, C1, and the founding.
+        assert_eq!(summary.records, 16);
     }
     // THE HISTORICAL UNIVERSE across generations: a key from MK1's
     // range (reclaimed at generation 1) still rejected after
@@ -958,8 +988,8 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 0);
         assert_eq!(
-            summary.records, 9,
-            "F, S1, C1, SK1, MK1, S3, SK2, MK2, and the audit"
+            summary.records, 10,
+            "F, S1, the boundary's covering, C1, SK1, MK1, S3, SK2, MK2, and the audit"
         );
     }
 
@@ -971,15 +1001,15 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the re-run resumes from the installed audit");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert_eq!(
-        reclamation.removed_objects, 4,
-        "the whole-revision units: two records plus two content objects"
+        reclamation.removed_objects, 6,
+        "the whole-revision units: three records plus three content objects"
     );
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(
             summary.records, 7,
             "F, C1, MK1, S3, SK2, MK2, and the audit — no second audit"
@@ -1055,21 +1085,25 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
     let twin_reclaim = twin_crossing
         .reclaim_checkpoint(&twin.journal(), 1)
         .expect("the twin's reclamation completes");
-    assert_eq!(twin_reclaim.eligible_records, 2);
+    assert_eq!(twin_reclaim.eligible_records, 3);
     drop(twin_crossing);
 
     // THE DURABLE POST-DEATH STATE: the audit installed, the first
-    // unit's record gone, its content objects orphaned — and the
-    // authoritative state still validating (the walk skips exactly
-    // what the audit covers; the still-present SK1 is walked, only
-    // S1 is a gap).
+    // manifest unit's record gone (C1 deletes newest-first — SK1,
+    // the range's top), its content objects orphaned — and the
+    // authoritative state still validating (the walk self-skips
+    // past MK1 to C1 and walks the covering and S1; the gap sits
+    // exactly under the self-skip's coverage).
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 1, "S1 alone is reclaimed so far");
         assert_eq!(
-            summary.records, 8,
-            "the walk: F, C1, SK1, MK1, S3, SK2, MK2, and the audit"
+            summary.reclaimed_records, 1,
+            "SK1 alone is reclaimed so far"
+        );
+        assert_eq!(
+            summary.records, 9,
+            "the walk: F, S1, the covering, C1, MK1, S3, SK2, MK2, and the audit"
         );
     }
 
@@ -1083,10 +1117,10 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the re-run resumes from the audited manifest");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert!(
         reclamation.removed_objects >= 3,
-        "the resumed deletes complete the interrupted unit: SK1's record, SK1's object, and S1's orphaned object"
+        "the resumed deletes complete the interrupted unit and the covering's: SK1's orphaned object, the covering's record and object, and S1's record and object"
     );
 
     // THE CONVERGENCE: the object set and the audit head identical
@@ -1111,7 +1145,7 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
             "the audit revision is byte-identical to the twin's"
         );
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(summary.records, 7);
     }
     let remaining = std::fs::read_dir(dir.store().join("quarantine"))
@@ -1169,15 +1203,15 @@ fn the_sqlite_provider_reclaims_with_transactional_atomicity() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the sqlite reclamation completes");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert_eq!(
-        reclamation.removed_objects, 4,
-        "two record rows plus two object rows in one transaction"
+        reclamation.removed_objects, 6,
+        "three record rows plus three object rows in one transaction"
     );
     {
         let mut medium = SqliteMedium::open(dir.db()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(summary.records, 7);
     }
     drop(crossing);
@@ -1308,20 +1342,21 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
     let twin_reclaim = twin_crossing
         .reclaim_checkpoint(&twin.journal(), 1)
         .expect("the twin's reclamation completes");
-    assert_eq!(twin_reclaim.eligible_records, 2);
+    assert_eq!(twin_reclaim.eligible_records, 3);
     drop(twin_crossing);
 
     // THE DURABLE POST-DEATH STATE: the audit installed, EVERY
-    // indexed record gone (the walk skips both S1 and SK1 — the
-    // misclassification's exact precondition), the last unit's
-    // objects still present (orphaned — the next open's sweep
-    // quarantines them), the authoritative state still validating.
+    // indexed record gone (the walk skips S1, the boundary's
+    // covering, and SK1 — the misclassification's exact
+    // precondition), the last unit's objects still present
+    // (orphaned — the next open's sweep quarantines them), the
+    // authoritative state still validating.
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(
-            summary.reclaimed_records, 2,
-            "both index members are gaps — record presence alone says complete"
+            summary.reclaimed_records, 3,
+            "every index member is a gap — record presence alone says complete"
         );
         assert_eq!(summary.records, 7);
     }
@@ -1340,7 +1375,7 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the re-run resumes from the whole-manifest completion check");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert!(
         reclamation.removed_objects >= 1,
         "the resumed deletes complete the last unit's orphaned objects"
@@ -1353,7 +1388,7 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
             "no second audit — the resumed re-run appends nothing"
         );
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(summary.records, 7);
     }
 
@@ -1482,7 +1517,7 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
     let twin_reclaim = twin_crossing
         .reclaim_checkpoint(&twin.journal(), 1)
         .expect("the twin's reclamation completes");
-    assert_eq!(twin_reclaim.eligible_records, 2);
+    assert_eq!(twin_reclaim.eligible_records, 3);
     assert!(
         !twin.journal().is_file(),
         "the twin's stale root journal is retired"
@@ -1490,15 +1525,15 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
     drop(twin_crossing);
 
     // THE DURABLE POST-DEATH STATE: every manifest-authorized medium
-    // byte gone (the walk skips both index members), the chain
+    // byte gone (the walk skips every index member), the chain
     // validating — and the audited stale journal generation STILL
     // PRESENT with its sidecar lock: the incomplete retirement,
     // visible on disk.
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
-        assert_eq!(summary.records, 7);
+        assert_eq!(summary.reclaimed_records, 3);
+        assert_eq!(summary.records, 8);
     }
     let root_lock = {
         let name = dir
@@ -1525,7 +1560,7 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the re-run resumes from the whole-manifest completion check");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert_eq!(
         reclamation.removed_objects, 0,
         "the medium side was already complete — only the journal retirement remained"
@@ -1590,7 +1625,9 @@ fn checkpoints_continue_across_reclamations_and_recover() {
     let (mut spine, mut director) = scenario_pair(150, &near);
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing = SessionCrossing::open(&dir.store(), journal, "lifecycle").unwrap();
-    // (1) Checkpoint 1 — the range [S1].
+    // (1) Checkpoint 1 — the range [the cycle's covering, S1]. C1:
+    // the confirmation cycle's far boundary publishes a covering
+    // that joins S1 in the range.
     crossing.publish_snapshot(&spine, &director).unwrap();
     confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
     let report1 = crossing
@@ -1599,7 +1636,7 @@ fn checkpoints_continue_across_reclamations_and_recover() {
     let s1_key = {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         medium
-            .read_record(&report1.range[0])
+            .read_record(&report1.range[report1.range.len() - 1])
             .unwrap()
             .idempotency_key
             .unwrap()
@@ -1636,11 +1673,13 @@ fn checkpoints_continue_across_reclamations_and_recover() {
     }
     confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
     // (5) CHECKPOINT 3 — the range walk crosses the audit: the R2
-    // classification (previously the unclassifiable refusal).
+    // classification (previously the unclassifiable refusal). C1:
+    // the continuation cycle's covering joins S4 in the range.
     let report3 = crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("checkpoint 3 publishes over the reclamation audit");
-    assert_eq!(report3.range, vec![s4]);
+    assert_eq!(report3.range.len(), 2);
+    assert!(report3.range.contains(&s4));
     // (6) RECOVER and validate.
     drop(crossing);
     drop(spine);
@@ -1656,11 +1695,11 @@ fn checkpoints_continue_across_reclamations_and_recover() {
             vec![report3.mk, report2.mk, report1.mk]
         );
         assert_eq!(summary.reclaimed_records, r1.eligible_records);
-        // The walk: MK3, SK3, C4, S4, A1, MK2, SK2, S3, MK1, C1,
-        // and the founding — the audit retained in the ancestry,
-        // MK1's reclaimed range skipped under its tables (MK2's
-        // range still stands at this point).
-        assert_eq!(summary.records, 11);
+        // The walk: MK3, SK3, C4, the continuation cycle's covering,
+        // S4, A1, MK2, SK2, S3, MK1, C1, and the founding — the audit
+        // retained in the ancestry, MK1's reclaimed range skipped
+        // under its tables (MK2's range still stands at this point).
+        assert_eq!(summary.records, 12);
         let audit = medium.read_record(&audit1).unwrap();
         medium
             .read_object(audit.content_refs.first().unwrap())
@@ -1693,7 +1732,8 @@ fn checkpoints_continue_across_reclamations_and_recover() {
     let report4 = crossing
         .publish_checkpoint(&mut spine, &mut director, 10)
         .expect("checkpoint 4 publishes over the second audit");
-    assert_eq!(report4.range, vec![s5]);
+    assert_eq!(report4.range.len(), 2);
+    assert!(report4.range.contains(&s5));
     // (9) REOPEN and recover: the exactly-once recovery, the
     // historical membership, the permanent metadata, the audits, and
     // the skip-table ancestry.
@@ -1716,10 +1756,12 @@ fn checkpoints_continue_across_reclamations_and_recover() {
             summary.reclaimed_records,
             r1.eligible_records + r2.eligible_records
         );
-        // The walk: MK4, SK4, C5, S5, A2, MK3, SK3, C4, S4, A1, MK2,
-        // MK1, C1, and the founding — both audits retained in the
-        // ancestry, both reclaimed ranges skipped under the tables.
-        assert_eq!(summary.records, 14);
+        // The walk: MK4, SK4, C5, the second continuation cycle's
+        // covering, S5, A2, MK3, SK3, C4, the first continuation
+        // cycle's covering, S4, A1, MK2, MK1, C1, and the founding —
+        // both audits retained in the ancestry, both reclaimed
+        // ranges skipped under the tables.
+        assert_eq!(summary.records, 16);
         for report in [&report1, &report2, &report3, &report4] {
             let mk = medium.read_record(&report.mk).unwrap();
             medium
@@ -1855,7 +1897,10 @@ fn the_sqlite_lifecycle_continues_across_reclamations() {
             summary.reclaimed_records,
             r1.eligible_records + r2.eligible_records
         );
-        assert_eq!(summary.records, 14);
+        // C1: the two continuation cycles' coverings (over S4 and
+        // S5) are retained range members of the protected
+        // checkpoints — the walk carries them with the audits.
+        assert_eq!(summary.records, 16);
     }
 }
 
@@ -1992,7 +2037,7 @@ fn shared_directory_campaigns_never_cross_journal_ownership() {
     let reclamation = crossing_a
         .reclaim_checkpoint(&a_root, 1)
         .expect("A's reclamation completes within its own lineage");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert!(reclamation.journal_files.contains(&a_root));
     assert!(reclamation.journal_files.contains(&a_gen1));
     assert!(!a_root.is_file(), "A's stale root retired");
@@ -2199,7 +2244,7 @@ fn the_old_journals_retire_only_after_the_durability_is_recovered() {
     let reclamation = crossing
         .reclaim_checkpoint(&dir.journal(), 1)
         .expect("the reclamation completes after the verified recovery");
-    assert_eq!(reclamation.eligible_records, 2);
+    assert_eq!(reclamation.eligible_records, 3);
     assert!(
         reclamation.journal_files.contains(&dir.journal()),
         "the old root journal retires once the durability is established"
@@ -2209,7 +2254,7 @@ fn the_old_journals_retire_only_after_the_durability_is_recovered() {
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
-        assert_eq!(summary.reclaimed_records, 2);
+        assert_eq!(summary.reclaimed_records, 3);
     }
     // THE NOTHING-ELIGIBLE RE-RUN.
     let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {

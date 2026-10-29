@@ -171,8 +171,13 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing =
         SessionCrossing::open(&dir.store(), journal, "publication-campaign").unwrap();
-    // The journaled far boundary — the confirmation's evidence.
+    // The journaled far boundary — the confirmation's evidence (the
+    // C1 discipline publishes its covering snapshot before the T1;
+    // its revision joins the reclaimable range below).
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let covering = crossing
+        .covering_revision()
+        .expect("the boundary's covering published");
     run_ticks_near(&mut spine, &mut director, &far, 20);
     let s1 = crossing.publish_snapshot(&spine, &director).unwrap();
     run_ticks_near(&mut spine, &mut director, &far, 20);
@@ -228,16 +233,18 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
         metadata.sk_parent, c1,
         "the self-retirement target is SK's parent"
     );
-    // THE range: the two publications, descent order — the
+    // THE range: the two publications plus the boundary's covering
+    // snapshot (the C1 discipline's — a non-confirming session
+    // snapshot publication, reclaimable), descent order — the
     // confirmation excluded (an anchor, never reclaimable).
     assert_eq!(
         report.range,
-        vec![s2, s1],
+        vec![s2, s1, covering],
         "the reclaimable range, newest first"
     );
     assert_eq!(
-        metadata.range_records, 3,
-        "the retired-set count (the two publications + SK's own retirement entry)"
+        metadata.range_records, 4,
+        "the retired-set count (the covering + the two publications + SK's own retirement entry)"
     );
     // THE skip table: the non-circular self-retirement entry (the
     // reserved zero identity naming the referencing MK itself) and
@@ -255,7 +262,7 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
     // every range revision — plus SK's own retirement entry (the
     // mandatory condition 2: the retired SK's key stays in the
     // universe) — sorted by hash.
-    let mut expected_index = [s1, s2]
+    let mut expected_index = [s1, s2, covering]
         .iter()
         .map(|revision| {
             let record = medium.read_record(revision).unwrap();
@@ -273,12 +280,14 @@ fn the_checkpoint_publication_composes_sk_then_mk_over_the_real_machinery() {
         "the compact membership index"
     );
     // THE digest commitment: recomputed over the range's record
-    // canonical bytes OLDEST first, seeded from the founding.
+    // canonical bytes OLDEST first, seeded from the founding (the
+    // covering's record included — the range's oldest member).
     let seed = compute_digest_seed(&summary.founding);
     assert_eq!(metadata.seed, seed, "the founding-derived seed");
+    let covering_bytes = medium.read_record(&covering).unwrap().canonical_bytes();
     let s1_bytes = medium.read_record(&s1).unwrap().canonical_bytes();
     let s2_bytes = medium.read_record(&s2).unwrap().canonical_bytes();
-    let expected_digest = chain_range_digest(&seed, &[s1_bytes, s2_bytes]);
+    let expected_digest = chain_range_digest(&seed, &[covering_bytes, s1_bytes, s2_bytes]);
     assert_eq!(metadata.range_digest, expected_digest, "the range digest");
     assert_eq!(
         report.range_digest, expected_digest,
@@ -309,6 +318,9 @@ fn an_immediate_second_checkpoint_refuses_the_empty_range() {
     let mut crossing =
         SessionCrossing::open(&dir.store(), journal, "empty-range-campaign").unwrap();
     durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let covering = crossing
+        .covering_revision()
+        .expect("the boundary's covering published");
     run_ticks_near(&mut spine, &mut director, &far, 20);
     let s1 = crossing.publish_snapshot(&spine, &director).unwrap();
     let first = crossing
@@ -316,8 +328,8 @@ fn an_immediate_second_checkpoint_refuses_the_empty_range() {
         .expect("the first checkpoint publishes");
     assert_eq!(
         first.range,
-        vec![s1],
-        "the first range carries the publication"
+        vec![s1, covering],
+        "the first range carries the publication plus the boundary's covering"
     );
 
     // New work so the second attempt's COMPACTION succeeds — the

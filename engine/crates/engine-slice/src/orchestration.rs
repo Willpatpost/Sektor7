@@ -557,6 +557,12 @@ struct PendingPublication {
     /// The candidate's identity and the captured frontier — retained
     /// until (and through) the completion.
     revision: Hash,
+    /// The capture's CONTENT hash (the session snapshot's identity —
+    /// C1: an accepted publication of this exact state seeds the
+    /// crossing's covering track, so a covering prepared from the
+    /// same state reuses it instead of colliding on the chain-unique
+    /// idempotency key).
+    content: Hash,
     coverage: CoverageFrontier,
     journal_frontier: BTreeSet<TransactionId>,
     slot: Receiver<Result<WorkerReply, MediumError>>,
@@ -609,6 +615,13 @@ impl OrchestratedSession {
     ) -> Result<Self, TransitionError> {
         let (spine, director, legacy) =
             SessionCrossing::recover_at(location, journal_path, campaign)?;
+        // C1: the restored snapshot's covering identity transfers onto
+        // the fresh worker-backed crossing below — the recovered
+        // newest snapshot already covers any nonempty plan prepared
+        // from that exact state, and losing the binding would collide
+        // the re-established covering on the chain-unique content-hash
+        // idempotency key.
+        let restored_covering = legacy.covering_snapshot();
         drop(legacy);
         let active = active_journal_path(journal_path).map_err(PipelineError::Journal)?;
         let journal = T1Journal::open(&active).map_err(PipelineError::Journal)?;
@@ -616,6 +629,9 @@ impl OrchestratedSession {
         let source = worker.source().map_err(PipelineError::Medium)?;
         let mut crossing = SessionCrossing::open_at(&source, journal, campaign)?;
         crossing.set_journal_root(journal_path.to_path_buf());
+        if let Some((content_hash, revision)) = restored_covering {
+            crossing.seed_covering(content_hash, revision);
+        }
         Ok(Self {
             spine,
             director,
@@ -841,6 +857,7 @@ impl OrchestratedSession {
         self.pending.push(PendingPublication {
             id,
             revision,
+            content: capture.content,
             coverage: capture.coverage,
             journal_frontier: capture.journal_frontier,
             slot,
@@ -2053,6 +2070,16 @@ impl OrchestratedSession {
     ) -> PublicationOutcome {
         let entry = self.pending.remove(index);
         let outcome = publication_outcome(entry.revision, reply);
+        // C1: an ACCEPTED session-snapshot publication IS a durable
+        // covering of the exact state it captured — seed the
+        // crossing's covering track, so a nonempty plan prepared from
+        // that same state recognizes the equivalence instead of
+        // colliding on the chain-unique content-hash idempotency key
+        // (the orchestrated counterpart of the crossing's own
+        // publish_snapshot seeding).
+        if matches!(outcome, PublicationOutcome::Accepted { .. }) {
+            self.crossing.seed_covering(entry.content, entry.revision);
+        }
         let disposition = CompletionDisposition::of(&outcome);
         self.retire_entry(entry, disposition);
         outcome

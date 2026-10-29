@@ -820,25 +820,26 @@ fn an_interrupted_run_recovers_from_the_durable_state() {
 // interruption a pure function of the LOGICAL tick: the identical
 // campaign state on every platform.
 
-/// §7D (deterministic, the D-guard interim semantics): the
-/// controlled hard exit (reserved code 9) at the completed
-/// tick-1025 boundary — after region 0's first journaled
-/// deactivation and before the next publication. The plan's
-/// obligation identities (seqs 21380..21786) lie far beyond the
-/// anchor snapshot's allocation frontier (1000): the lost session's
-/// allocation and execution history for that range was never
-/// durably saved, so NO coherent identity-preserving reconstruction
-/// exists. **THE TEMPORARY D-ONLY LIMITATION, UNMISTAKABLE:** this
-/// early-window campaign is NOT recovered by the fail-closed guard
-/// — the recovery REFUSES with the typed insufficient-evidence
-/// error, honestly, BEFORE any mutation or publication (never the
-/// pre-guard behavior: a misleading successful close followed by a
-/// corrupt reopen). Durable recovery of this campaign shape awaits
-/// the covering-publication protocol (the C design, held); the
-/// guard is the interim safety contract, never a claim of
-/// successful recovery.
+/// §7 (deterministic, the C1 covering semantics): the controlled
+/// hard exit (reserved code 9) at the completed tick-1025 boundary
+/// — after region 0's first journaled deactivation and before the
+/// next publication. The C1 covering discipline publishes the
+/// validated session snapshot of the EXACT authoritative state each
+/// nonempty deactivation plan was prepared from — so this
+/// early-window campaign, REFUSED by the D-era interim guard (the
+/// frontier insufficiency: the plan's obligation identities beyond
+/// the anchor's allocation frontier), now RECOVERS: the covering
+/// carries the pre-deactivation allocation state, the recovery
+/// replays the journaled plan against it, and the A→B→C→D cycle
+/// repeats the recovery — B recovers at the covering's tick 1020
+/// and closes, C and D each recover from the prior close and close
+/// again, with no RecoveryInsufficient/RecoveryInvalid, strict
+/// conservation, and the required credits settled at every close.
+/// The D guard itself remains the legacy defense (the separate
+/// negatives below prove it still rejects fabricated or frontier-
+/// short evidence).
 #[test]
-fn deterministic_early_window_hard_exit_refused_with_typed_insufficient_evidence() {
+fn deterministic_early_window_hard_exit_recovers_through_the_covering() {
     let root = std::env::temp_dir().join(format!(
         "s7-s6c4-early-window-{}",
         std::time::SystemTime::now()
@@ -867,6 +868,11 @@ fn deterministic_early_window_hard_exit_refused_with_typed_insufficient_evidence
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr)
     );
+    // B — THE FIRST RECOVERY: the covering snapshot (published at the
+    // deactivation's preparation state, tick 1020) carries the
+    // pre-deactivation allocation state; the journaled plan replays
+    // against it and the campaign closes — never the D-era typed
+    // refusal.
     let relaunch = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
         .args([
             "--demo-persist",
@@ -880,43 +886,98 @@ fn deterministic_early_window_hard_exit_refused_with_typed_insufficient_evidence
     let stdout = String::from_utf8_lossy(&relaunch.stdout);
     let stderr = String::from_utf8_lossy(&relaunch.stderr);
     assert!(
-        !relaunch.status.success(),
-        "the early-window campaign is REFUSED (the D-only interim — \
-         never a misleading successful close):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        relaunch.status.success(),
+        "the early-window campaign RECOVERS through the covering \
+         (stdout:\n{stdout}\nstderr:\n{stderr})"
     );
     assert!(
-        stdout.is_empty(),
-        "the refusal precedes any report or publication: {stdout}"
-    );
-    // The typed, distinguishable insufficient-evidence class with
-    // the exact measured numbers (the deterministic scenario's
-    // allocation at tick 1020 vs the anchor's founding frontier).
-    assert!(
-        stderr.contains("RecoveryInsufficient { region: 0, identity: 21380, frontier: 1000 }"),
-        "the typed refusal with the fixture's measured values:\n{stderr}"
+        !stdout.is_empty(),
+        "the recovery reports its carried state before the close: {stdout}"
     );
     assert!(
-        stderr.contains("the durable state is untouched"),
-        "the refusal preserves the durable campaign state:\n{stderr}"
+        stdout.contains("campaign: recovered"),
+        "the relaunch reports the recovered campaign:\n{stdout}"
     );
-    // NO new snapshot was written: a second relaunch observes the
-    // IDENTICAL refusal — the campaign state did not move.
-    let relaunch2 = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+    assert!(
+        stdout.contains("recovered at tick 1020"),
+        "the recovery anchors at the covering's exact state:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("closed at tick 1050"),
+        "the recovered campaign closes at 1050 (1020 + 30):\n{stdout}"
+    );
+    assert!(
+        stdout.contains("conservation true"),
+        "the closed campaign conserves strictly:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("required settled true"),
+        "the required credits settle at the close:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("RecoveryInsufficient") && !stderr.contains("RecoveryInvalid"),
+        "no typed recovery refusal anywhere in the covering-carried \
+         recovery:\n{stderr}"
+    );
+    // C — THE SECOND RECOVERY: the campaign reopens from B's close and
+    // closes again.
+    let relaunch_c = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
         .args([
             "--demo-persist",
             root.to_str().unwrap(),
             "--headless",
             "--ticks",
-            "30",
+            "10",
         ])
         .output()
         .expect("the second relaunch spawns");
-    let stderr2 = String::from_utf8_lossy(&relaunch2.stderr);
+    let stdout_c = String::from_utf8_lossy(&relaunch_c.stdout);
+    let stderr_c = String::from_utf8_lossy(&relaunch_c.stderr);
     assert!(
-        !relaunch2.status.success()
-            && stderr2.replace(root.to_str().unwrap(), "<dir>")
-                == stderr.replace(root.to_str().unwrap(), "<dir>"),
-        "the refusal is idempotent — no snapshot, no state change:\n{stderr2}"
+        relaunch_c.status.success(),
+        "the second recovery closes (stdout:\n{stdout_c}\nstderr:\n{stderr_c})"
+    );
+    assert!(
+        stdout_c.contains("recovered at tick 1050") && stdout_c.contains("closed at tick 1060"),
+        "the second recovery carries B's close and advances:\n{stdout_c}"
+    );
+    assert!(
+        stdout_c.contains("conservation true"),
+        "the second close conserves strictly:\n{stdout_c}"
+    );
+    assert!(
+        !stderr_c.contains("RecoveryInsufficient") && !stderr_c.contains("RecoveryInvalid"),
+        "no typed recovery refusal in the second cycle:\n{stderr_c}"
+    );
+    // D — THE THIRD RECOVERY: the repeated-recovery cycle stays
+    // coherent.
+    let relaunch_d = Command::new(env!("CARGO_BIN_EXE_engine-slice"))
+        .args([
+            "--demo-persist",
+            root.to_str().unwrap(),
+            "--headless",
+            "--ticks",
+            "5",
+        ])
+        .output()
+        .expect("the third relaunch spawns");
+    let stdout_d = String::from_utf8_lossy(&relaunch_d.stdout);
+    let stderr_d = String::from_utf8_lossy(&relaunch_d.stderr);
+    assert!(
+        relaunch_d.status.success(),
+        "the third recovery closes (stdout:\n{stdout_d}\nstderr:\n{stderr_d})"
+    );
+    assert!(
+        stdout_d.contains("recovered at tick 1060") && stdout_d.contains("closed at tick 1065"),
+        "the third recovery carries C's close and advances:\n{stdout_d}"
+    );
+    assert!(
+        stdout_d.contains("conservation true"),
+        "the third close conserves strictly:\n{stdout_d}"
+    );
+    assert!(
+        !stderr_d.contains("RecoveryInsufficient") && !stderr_d.contains("RecoveryInvalid"),
+        "no typed recovery refusal in the third cycle:\n{stderr_d}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

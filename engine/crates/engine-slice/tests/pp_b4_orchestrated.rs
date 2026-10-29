@@ -371,9 +371,16 @@ fn schedule_event_preserves_the_scheduling_semantics() {
 }
 
 /// 6 — a pending optional snapshot does not stall authorized gameplay
-/// ticks: with the worker parked on the publication job, the far
-/// boundary's tick completes (the tick's durability is journal-side,
-/// never worker-side); the release completes the publication.
+/// ticks: with the worker parked on the publication job, a tick with
+/// NO capture-bearing deactivation completes — its durability is
+/// journal-side, never worker-side. C1 sharpens the boundary
+/// honestly: the covering prerequisite is the ONE worker-side
+/// dependency a tick can carry (a capture-bearing deactivation
+/// submits its covering snapshot through the worker BEFORE the T1,
+/// so that tick shape waits for the worker by design — the §6
+/// matrix proves the ordering separately); every other tick —
+/// including this near-presence one — never touches the worker, and
+/// the parked release completes the publication.
 #[test]
 fn a_pending_optional_snapshot_does_not_stall_ticks() {
     let dir = TestDir::new("pending-no-stall");
@@ -382,10 +389,14 @@ fn a_pending_optional_snapshot_does_not_stall_ticks() {
     session.fault_control().set(WorkerFault::ParkNext);
     let handle = session.submit_publication(capture).unwrap();
     assert_eq!(session.pending_publications(), 1);
-    // The tick runs while the publication is parked in the queue.
-    let report = session.tick(&far_presence()).unwrap();
-    assert!(report.regions_transitioned.contains(&4));
-    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    // The tick runs while the publication is parked in the queue: the
+    // near presence keeps every region at its current level — no
+    // deactivation, no covering submission, no worker dependency.
+    let report = session.tick(&near_presence()).unwrap();
+    assert!(
+        report.regions_transitioned.is_empty(),
+        "the near tick transitions nothing — it needs no crossing at all"
+    );
     // The release completes the publication.
     session.fault_control().release_park();
     assert!(matches!(
@@ -424,13 +435,16 @@ fn capture_a_stale_after_confirmation_never_rebased() {
         }
         other => panic!("the stale capture must reject: {other:?}"),
     }
-    // The chain holds no A-content revision: the head is still the
-    // confirmation's, and only the founding + the batch exist.
+    // The chain holds no A-candidate revision: the head is still the
+    // confirmation's, and the chain is the founding, the boundary's
+    // C1 covering (the same exact state the capture took, published
+    // by the boundary's own prerequisite), and the batch.
     assert_eq!(oracle_head_at(&location), advanced);
-    assert_eq!(oracle_records_at(&location), 2);
+    assert_eq!(oracle_records_at(&location), 3);
 }
 
-/// 8 — a fresh capture at H1 publishes successfully.
+/// 8 — a fresh capture at the confirmation's head publishes
+/// successfully.
 #[test]
 fn a_fresh_capture_publishes_successfully() {
     let dir = TestDir::new("fresh-capture");
@@ -456,33 +470,65 @@ fn a_fresh_capture_publishes_successfully() {
         }
         other => panic!("the fresh capture must publish: {other:?}"),
     }
-    assert_eq!(oracle_records_at(&location), 3);
+    // The founding, the boundary's C1 covering, the confirmation
+    // batch, and the fresh capture.
+    assert_eq!(oracle_records_at(&location), 4);
 }
 
-/// 9 — T1 advancing while the canonical HEAD is unchanged: the
-/// earlier capture still publishes (the CAS passes — the head did not
-/// move), and the newer T1 progress is honestly pending (absent from
-/// the capture's journal frontier, confirmed only by the subsequent
-/// commit).
+/// 9 — T1 advancing with the canonical HEAD carried by the C1
+/// covering: the far boundary journals its T1 (journal-side) AND
+/// publishes its covering snapshot (the canonical side — the head
+/// advances BY THE COVERING, never by the T1 itself; the covering
+/// binds the state the boundary's plan was prepared from, the
+/// prepare-then-capture order); the earlier capture — taken before
+/// the boundary, parented at the founding — submits STALE against
+/// the covering (honest: the head advanced past its parent), and
+/// the commit confirms the T1's captures.
 #[test]
-fn t1_advances_head_unchanged_the_earlier_capture_stays_coherent() {
+fn t1_advances_the_head_by_the_covering_and_the_earlier_capture_stays_honest() {
     let dir = TestDir::new("t1-advances");
     let location = found_location(&dir, false);
     let mut session = orchestrated(&dir);
     let capture = session.capture_snapshot().unwrap();
     assert!(capture.journal_frontier().is_empty());
     let captured_parent = capture.captured_parent();
-    // The far boundary journals T1 — the canonical HEAD is unchanged.
+    // The far boundary journals T1 — and its covering snapshot is the
+    // canonical advance.
     session.tick(&far_presence()).unwrap();
-    assert_eq!(oracle_head_at(&location), captured_parent);
+    let head = oracle_head_at(&location);
+    assert_ne!(
+        head, captured_parent,
+        "the boundary's covering advanced the canonical head"
+    );
+    {
+        // The head's record IS the boundary's covering: a
+        // content-keyed session snapshot (the idempotency key equals
+        // the single content reference — the snapshot publication
+        // discipline). The covering binds the PREPARED plan's state,
+        // not the earlier capture's pre-plan state.
+        let mut oracle = SessionStore::open(&location).unwrap();
+        let record = oracle.read_record(&head).unwrap();
+        assert_eq!(
+            record.idempotency_key.as_deref(),
+            Some(record.content_refs[0].as_bytes().as_slice()),
+            "the head is the boundary's covering — a content-keyed snapshot"
+        );
+    }
     let scan = T1Journal::scan_file(dir.journal()).unwrap();
-    assert_eq!(scan.committed.len(), 1);
-    // The earlier capture publishes (the CAS passes).
+    assert_eq!(scan.committed.len(), 1, "the T1 itself is journal-side");
+    // The earlier capture submits STALE against the covering — the
+    // head advanced past its captured parent.
     let handle = session.submit_publication(capture).unwrap();
-    assert!(matches!(
-        session.wait_publication(handle).unwrap(),
-        PublicationOutcome::Accepted { .. }
-    ));
+    match session.wait_publication(handle).unwrap() {
+        PublicationOutcome::Stale { observed, .. } => {
+            assert_eq!(
+                observed,
+                Some(head),
+                "the stale observation is the covering"
+            );
+        }
+        other => panic!("the earlier capture is honestly stale against the covering: {other:?}"),
+    }
     // The newer T1 progress was honestly pending: the capture's
     // frontier predates it, and the commit confirms it NOW.
     assert!(matches!(
