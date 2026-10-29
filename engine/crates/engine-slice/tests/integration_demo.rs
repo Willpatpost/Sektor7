@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use engine_core::PresenceSample;
+use engine_core::{LodLevel, PresenceSample};
 use engine_persist::CanonicalMedium;
 use engine_slice::npc::{NPC_COUNT, REGION_COUNT};
 use engine_slice::persist_demo::{
@@ -514,50 +514,33 @@ fn a_worker_poison_finalizes_the_close_once() {
     );
 }
 
-/// Whether the action's snapshot publication verifiably committed
-/// before the worker poison: the durable chain's HEAD is a
-/// session-snapshot revision PAST the anchor (tick > 0) — the anchor
-/// itself carries tick 0, and the action's unconfirmed-batch revision
-/// carries the consequence-batch domain.
-fn action_snapshot_landed(root: &std::path::Path) -> bool {
-    let Ok(mut probe) = SessionStore::open(&StoreLocation::Database(root.join("campaign.db")))
-    else {
-        return false;
-    };
-    let Ok(Some(head)) = probe.head() else {
-        return false;
-    };
-    let Ok(record) = probe.read_record(&head) else {
-        return false;
-    };
-    if record.tick == 0 {
-        return false;
-    }
-    record
-        .content_refs
-        .first()
-        .and_then(|hash| probe.classify_object(hash).ok())
-        .is_some_and(|class| class.domain.as_deref() == Some("engine-slice/session-snapshot/1"))
-}
-
-/// HOLD-1's action-bearing form (the D-guard CI corrective): the
+/// HOLD-1's action-bearing form (the C1 final corrective): the
 /// deliberate action (tick 100) plus the worker poison (tick 120)
 /// with the REAL publication race — the action's snapshot publication
 /// is submitted around tick 106 and the worker dies at 120, so the
 /// append may or may not have committed. The finalization discipline
 /// (the preserved error, the failed close, no false durability) holds
-/// identically in both worlds; the recovery's disposition is branched
-/// on the VERIFIED durable evidence, never asserted blind:
-/// - the publication committed → the newest snapshot post-dates the
-///   action's plan → the recovery succeeds through the snapshot, the
-///   action's credits carried exactly once (the recovered sums equal
-///   the crash-time live sums — no duplication, no loss);
-/// - the publication lost the race → the durable state is the anchor
-///   plus the action's beyond-frontier plan → the typed
+/// identically in every world; the recovery's disposition is branched
+/// on the VERIFIED recovery outcome and the actual recovered state —
+/// never asserted blind, never on the HEAD's content type alone. The
+/// C1 three-world truth:
+/// - the action's optional post-application snapshot accepted → the
+///   recovery through it: the credits carried IN the snapshot (the
+///   recovered sums equal the crash-time live sums directly);
+/// - only the action boundary's pre-deactivation COVERING accepted →
+///   the recovery through the covering plus the journaled plan's
+///   replay: the newest durable snapshot predates the application —
+///   the region dormant, the captured credits pending — and the
+///   HOME-presence continuation's reactivation applies them exactly
+///   once (the correct oracle for a recovery whose newest snapshot
+///   predates activation);
+/// - neither (the anchor-only world) → the typed
 ///   `RecoveryInsufficient` refusal, the durable state untouched.
 ///
 /// Never asserted: a fresh founding, a fabricated success, or a
-/// recovery success where D-only semantics correctly require refusal.
+/// recovery success the durable evidence does not support. The
+/// deterministic covering-world companion below pins the middle
+/// world without the race.
 #[test]
 fn an_action_publication_race_before_poison_is_branch_verified() {
     let dir = TestDir::new("finalization-action-race");
@@ -566,7 +549,7 @@ fn an_action_publication_race_before_poison_is_branch_verified() {
     let report = persist_demo::run_persist_demo_headless(options)
         .expect("the run reports through the finalization rather than bypassing it");
 
-    // The finalization discipline (identical in both race worlds):
+    // The finalization discipline (identical in every race world):
     let failure = report
         .application_failure
         .as_ref()
@@ -582,64 +565,162 @@ fn an_action_publication_race_before_poison_is_branch_verified() {
         "no final snapshot is claimed over the failed drain"
     );
     // The crash-time live consequence sums (the no-duplication
-    // oracle for the landed branch).
+    // oracle's target).
     let (action_region, live_signals, live_credits) = report
         .closed_region
         .expect("the action region's sums at close");
 
-    // THE BRANCH on the verified durable evidence.
-    if action_snapshot_landed(&dir.root) {
-        // The publication committed before the poison: the recovery
-        // succeeds through the snapshot — the action's effects
-        // carried exactly once.
-        let (mut fresh, launch) = PersistDemo::open_or_recover(&dir.root, SimConfig::default())
-            .expect("the landed publication recovers");
-        assert!(!launch.founded, "the recovery path, never a founding");
-        let world = fresh.session().spine().world();
-        // The CREDITS are the no-duplication oracle: the action's
-        // consequence was applied (and captured into the landed
-        // snapshot) BEFORE the poison — the recovered credits equal
-        // the crash-time live credits exactly (carried once, never
-        // doubled, never lost). The SIGNALS (the live scratch)
-        // legitimately advance past the snapshot's publication — the
-        // recovered signal sum is bounded by the crash-time live sum
-        // (the post-publication accrual is honestly not reproduced —
-        // the snapshot-plus-journal contract).
-        assert_eq!(
-            region_credit_sum(world, action_region),
-            live_credits,
-            "the recovered credits equal the crash-time live credits — \
-             the action's consequence carried exactly once"
-        );
-        assert!(
-            region_signal_sum(world, action_region) <= live_signals,
-            "the recovered signal sums are bounded by the crash-time live \
-             sums (the post-publication accrual honestly lost)"
-        );
-        fresh.run_headless(1).unwrap();
-        let finalization = fresh.finalize(None);
-        assert!(
-            finalization.close.failure.is_none(),
-            "{:?}",
-            finalization.close.failure
-        );
-    } else {
-        // The publication lost the race: the durable state is the
-        // anchor plus the action's beyond-frontier plan — the typed
-        // refusal (the D interim), the state untouched.
-        let outcome = PersistDemo::open_or_recover(&dir.root, SimConfig::default());
-        let Err(error) = outcome else {
-            panic!("the missing publication is the typed refusal, not a recovery")
-        };
-        assert!(
-            error.contains("RecoveryInsufficient"),
-            "the refusal is the typed insufficient-evidence class: {error}"
-        );
-        assert!(
-            error.contains("the durable state is untouched"),
-            "the refusal preserves the durable campaign state: {error}"
-        );
+    // THE BRANCH on the verified recovery outcome and the actual
+    // recovered state.
+    match PersistDemo::open_or_recover(&dir.root, SimConfig::default()) {
+        Ok((mut fresh, launch)) => {
+            assert!(!launch.founded, "the recovery path, never a founding");
+            let world = fresh.session().spine().world();
+            if region_credit_sum(world, action_region) == live_credits {
+                // The action's optional snapshot committed before the
+                // poison: the recovery carries the post-application
+                // state — the credits applied and carried IN the
+                // snapshot, exactly once.
+                assert!(
+                    region_signal_sum(world, action_region) <= live_signals,
+                    "the recovered signal sums are bounded by the crash-time live \
+                     sums (the post-publication accrual honestly lost)"
+                );
+            } else {
+                // Only the action boundary's COVERING committed: the
+                // newest durable snapshot predates the application —
+                // the plan's replay carried the captured credits into
+                // the dormant region's checkpoint (pending, not yet
+                // applied) — the application itself requires the
+                // reactivation the continuation performs.
+                assert_eq!(
+                    fresh.session().director().levels()[action_region],
+                    LodLevel::Dormant,
+                    "the covering carried the PRE-application state"
+                );
+                assert_eq!(
+                    region_credit_sum(world, action_region),
+                    0,
+                    "the credits pending the reactivation, not yet applied"
+                );
+            }
+            // The coherent continuation — in the covering world the
+            // HOME presence reactivates the region and applies the
+            // captured credits exactly once (through the plan's
+            // replay); in the snapshot world they simply stay applied.
+            fresh.run_headless(1).unwrap();
+            let after = fresh.session().spine().world();
+            assert_eq!(
+                region_credit_sum(after, action_region),
+                live_credits,
+                "the action's consequence carried exactly once — through the \
+                 snapshot or the covering-plus-replay-plus-reactivation"
+            );
+            let finalization = fresh.finalize(None);
+            assert!(
+                finalization.close.failure.is_none(),
+                "{:?}",
+                finalization.close.failure
+            );
+        }
+        Err(error) => {
+            // The anchor-only world: neither the snapshot nor the
+            // covering — the typed refusal, the state untouched.
+            assert!(
+                error.contains("RecoveryInsufficient"),
+                "the refusal is the typed insufficient-evidence class: {error}"
+            );
+            assert!(
+                error.contains("the durable state is untouched"),
+                "the refusal preserves the durable campaign state: {error}"
+            );
+        }
     }
+}
+
+/// The deterministic covering-world companion (the C1 final
+/// corrective, no race): the worker poisoned at tick 101 — AFTER the
+/// action boundary's covering and T1 landed (tick 100, the
+/// excursion's first antipode tick) and BEFORE the excursion's
+/// return, the reactivation, and the application — the durable state
+/// is exactly the covering plus the journaled plan. The recovery
+/// carries the PRE-application state (the region dormant, the
+/// captured credits pending in its checkpoint), and the home-presence
+/// continuation's reactivation applies the captured delta exactly
+/// once. The finalization discipline is identical to the race form.
+#[test]
+fn the_action_boundary_covering_world_recovers_and_reactivates_deterministically() {
+    let dir = TestDir::new("finalization-covering-world");
+    let mut options = headless_options(&dir, 240, Some(100));
+    options.poison_at_tick = Some(101); // after the boundary, before the application
+    let report = persist_demo::run_persist_demo_headless(options)
+        .expect("the run reports through the finalization rather than bypassing it");
+
+    // The finalization discipline.
+    let failure = report
+        .application_failure
+        .as_ref()
+        .expect("the application failure preserved");
+    assert!(failure.contains("tick 101 refused"), "{failure}");
+    assert!(
+        report.close.failure.is_some(),
+        "the failed close is a reported failure"
+    );
+    assert!(!report.close.required_settled);
+    assert!(
+        report.close.final_revision.is_none(),
+        "no final snapshot is claimed over the failed drain"
+    );
+    let action = report
+        .action
+        .as_ref()
+        .expect("the action record at the crash");
+    let captured_delta = action.captured_delta;
+    assert!(
+        captured_delta > 0,
+        "the excursion's boundary captured real consequences"
+    );
+    let (action_region, _live_signals, live_credits) = report
+        .closed_region
+        .expect("the action region's sums at close");
+    assert_eq!(
+        live_credits, 0,
+        "the crash preceded the application — the live credits are the \
+         pre-application sums"
+    );
+
+    // THE RECOVERY: the covering world — the pre-application state
+    // through the covering plus the plan's replay (the C1 semantics:
+    // the prerequisite's snapshot covers the boundary's plan).
+    let (mut fresh, launch) = PersistDemo::open_or_recover(&dir.root, SimConfig::default())
+        .expect("the covering-plus-plan recovery succeeds");
+    assert!(!launch.founded, "the recovery path, never a founding");
+    assert_eq!(
+        fresh.session().director().levels()[action_region],
+        LodLevel::Dormant,
+        "the plan replayed — the region dormant"
+    );
+    assert_eq!(
+        region_credit_sum(fresh.session().spine().world(), action_region),
+        0,
+        "the captured credits pending the reactivation, not yet applied"
+    );
+
+    // THE CONTINUATION: the home presence reactivates the region and
+    // applies the captured delta exactly once (the correct oracle for
+    // a recovery whose newest snapshot predates activation).
+    fresh.run_headless(1).unwrap();
+    assert_eq!(
+        region_credit_sum(fresh.session().spine().world(), action_region),
+        captured_delta,
+        "the reactivation applies the captured credits exactly once"
+    );
+    let finalization = fresh.finalize(None);
+    assert!(
+        finalization.close.failure.is_none(),
+        "{:?}",
+        finalization.close.failure
+    );
 }
 
 // ---------------------------------------- HOLD-2: absolute time accounting

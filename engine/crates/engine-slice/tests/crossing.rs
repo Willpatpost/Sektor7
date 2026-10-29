@@ -15,10 +15,12 @@ use engine_persist::{
     ClassifiedSpan, CommitOutcome, CommitPipeline, ConsequenceEnvelope, ConsequenceId,
     CounterValues, Coverage, DurabilityClass, EncounterJournal, FaultAction, FrontierEntry, Hash,
     JournalFaultControl, JournalFaultPoint, KeyPhase, LocalFileMedium, MediumError, OccurrenceSpan,
-    Reconciliation, RecoveryError, RevisionRecord, SignalLane, SourceBaseline, SourcePosition,
-    StoredObject, SyncTier, T1Journal, TransactionInput, UnknownReason,
+    PipelineError, Reconciliation, RecoveryError, RevisionRecord, SignalLane, SourceBaseline,
+    SourcePosition, StoredObject, SyncTier, T1Journal, TransactionInput, UnknownReason,
 };
-use engine_slice::crossing::{DeactivationPlan, SessionCrossing, TransitionError, restore_session};
+use engine_slice::crossing::{
+    DeactivationPlan, SessionCrossing, TransitionError, restore_session, save_session,
+};
 use engine_slice::npc::{
     NpcConfig, NpcWorld, POSITION_DISCARDED, REGION_COUNT, install_initial_schedules,
 };
@@ -1646,6 +1648,11 @@ fn recovery_fails_closed_on_planless_confirmed_effects() {
 struct CoveringRaceSource {
     root: PathBuf,
     script: Arc<Mutex<RaceScript>>,
+    /// The reconcile_unknown injection (§5: the unresolved
+    /// reconciliation errors) — an independent one-shot from the
+    /// append script, so a covering append that reports Unknown can
+    /// exercise the reconciliation's OWN failure modes.
+    reconcile: Arc<Mutex<Option<ReconcileScript>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1667,6 +1674,17 @@ enum RaceScript {
     StaleOnce,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileScript {
+    /// The reconciliation returns the unverifiable disposition — the
+    /// uncertainty retained, never converted into a confirmation.
+    Unverifiable,
+    /// The reconciliation itself fails (the transport, the lock) —
+    /// never a raw escape, never a success: the typed refusal with
+    /// the attempted candidate preserved.
+    TransportFailure,
+}
+
 impl MediumSource for CoveringRaceSource {
     type Medium = CoveringRaceMedium;
 
@@ -1674,6 +1692,7 @@ impl MediumSource for CoveringRaceSource {
         Ok(CoveringRaceMedium {
             inner: LocalFileMedium::open(self.root.clone())?,
             script: self.script.clone(),
+            reconcile: self.reconcile.clone(),
         })
     }
 }
@@ -1681,6 +1700,7 @@ impl MediumSource for CoveringRaceSource {
 struct CoveringRaceMedium {
     inner: LocalFileMedium,
     script: Arc<Mutex<RaceScript>>,
+    reconcile: Arc<Mutex<Option<ReconcileScript>>>,
 }
 
 impl CanonicalMedium for CoveringRaceMedium {
@@ -1760,7 +1780,18 @@ impl CanonicalMedium for CoveringRaceMedium {
     }
 
     fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
-        self.inner.reconcile_unknown(candidate)
+        let scripted = self.reconcile.lock().unwrap().take();
+        match scripted {
+            Some(ReconcileScript::Unverifiable) => Ok(Reconciliation::Unverifiable {
+                reason: "scripted-unverifiable".into(),
+            }),
+            Some(ReconcileScript::TransportFailure) => Err(MediumError::Io {
+                op: "fault-injected",
+                path: "reconcile".to_owned(),
+                source: std::io::Error::other("fault-injected"),
+            }),
+            None => self.inner.reconcile_unknown(candidate),
+        }
     }
 
     fn durability_tier(&self) -> SyncTier {
@@ -1799,6 +1830,7 @@ fn covering_unknown_refusal_preserves_the_pre_t1_state_and_retries() {
     let source = CoveringRaceSource {
         root: dir.store(),
         script: script.clone(),
+        reconcile: Arc::new(Mutex::new(None)),
     };
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing =
@@ -1881,6 +1913,7 @@ fn covering_unknown_reconciles_installed_and_carries_the_track() {
     let source = CoveringRaceSource {
         root: dir.store(),
         script: script.clone(),
+        reconcile: Arc::new(Mutex::new(None)),
     };
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing =
@@ -1937,6 +1970,7 @@ fn covering_stale_parent_retries_once_against_the_observed_head() {
     let source = CoveringRaceSource {
         root: dir.store(),
         script: script.clone(),
+        reconcile: Arc::new(Mutex::new(None)),
     };
     let journal = T1Journal::open(dir.journal()).unwrap();
     let mut crossing = SessionCrossing::open_at(&source, journal, "covering-stale-retry").unwrap();
@@ -2170,4 +2204,215 @@ fn the_covering_binds_the_compacted_history_form() {
     );
     assert_eq!(recovered_director.levels(), director.levels());
     assert_eq!(recovered_director.levels()[4], LodLevel::Dormant);
+}
+
+/// §4 of the C1 final corrective (the validation provenance): a
+/// chain record keyed by the exact content hash — the shape the
+/// duplicate resolution consults — never qualifies as a covering
+/// through identity alone. Two crafted forms: a key-matched record
+/// referencing a FOREIGN object (the single-content-reference
+/// check), and a key-matched record whose referenced object was
+/// replaced BY HAND with non-session bytes after acceptance (the
+/// CAS content verification and the strict session roundtrip).
+/// Each refuses the crossing BEFORE the T1 with the attempted
+/// candidate preserved — never a success, never the raw duplicate
+/// rejection as acceptance.
+#[test]
+fn a_key_matched_record_never_qualifies_without_verified_content() {
+    let near = near_region_4();
+    // FORM 1 — the foreign content reference.
+    {
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = TestDir::new("covering-foreign-ref");
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.store(), journal, "covering-foreign-ref").unwrap();
+        let bytes = save_session(&spine, &director).unwrap();
+        let content_hash = StoredObject::new(bytes.clone()).unwrap().hash();
+        // The crafted record: keyed by the content hash, referencing
+        // a foreign object — a legitimate append the chain accepts.
+        let foreign = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("test/publication");
+            enc.write_bytes(b"covering-foreign-ref-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        {
+            let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, spine.clock().as_u64())
+                .with_idempotency_key(content_hash.as_bytes().to_vec())
+                .with_content_refs(vec![foreign.hash()]);
+            match medium
+                .append(&record, std::slice::from_ref(&foreign), Some(head))
+                .unwrap()
+            {
+                AppendOutcome::Accepted { .. } => {}
+                other => panic!("the crafted key-matched record lands: {other:?}"),
+            }
+        }
+        // THE CROSSING: the covering for the same exact state hits the
+        // duplicate key — the resolution must REFUSE (the record's
+        // reference is foreign), before the T1.
+        let now = spine.clock();
+        let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+        let detail = match refusal {
+            Err(TransitionError::CoveringRefused { detail, candidate }) => {
+                assert!(candidate.is_some(), "the attempted candidate preserved");
+                detail
+            }
+            Err(other) => panic!("the foreign-referenced key match refuses, got {other:?}"),
+            Ok(_) => panic!("an unverified key match never covers the prerequisite"),
+        };
+        assert_eq!(detail, "covering/duplicate-unresolved");
+        assert_eq!(director.levels()[4], LodLevel::Full, "the region unchanged");
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert!(scan.committed.is_empty(), "no T1 precedes the covering");
+    }
+    // FORM 2 — the accepted snapshot's object replaced by hand with
+    // non-session bytes.
+    {
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let dir = TestDir::new("covering-corrupted-bytes");
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.store(), journal, "covering-corrupted-bytes").unwrap();
+        let bytes = save_session(&spine, &director).unwrap();
+        let object = StoredObject::new(bytes).unwrap();
+        let content_hash = object.hash();
+        // The crafted record: keyed by the content hash, referencing
+        // the REAL session object — a legitimate accepted publication
+        // of the exact state.
+        {
+            let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, spine.clock().as_u64())
+                .with_idempotency_key(content_hash.as_bytes().to_vec())
+                .with_content_refs(vec![content_hash]);
+            match medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap()
+            {
+                AppendOutcome::Accepted { .. } => {}
+                other => panic!("the crafted publication lands: {other:?}"),
+            }
+        }
+        // The hand corruption: the referenced object's bytes replaced
+        // with foreign content (the previously accepted snapshot is
+        // no longer what its identity claims).
+        std::fs::write(
+            dir.store().join("objects").join(content_hash.hex()),
+            b"covering-corrupted-bytes-payload",
+        )
+        .unwrap();
+        // THE CROSSING: the corruption is caught BEFORE any covering
+        // logic — the medium's own open-time chain walk verifies
+        // every referenced object's CAS identity (the previously
+        // accepted snapshot is no longer what its identity claims),
+        // and the crossing refuses with the typed corruption class —
+        // never a success over unverified identity, never the T1.
+        let now = spine.clock();
+        let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+        match refusal {
+            Err(TransitionError::JournalFailed(PipelineError::Medium(
+                MediumError::ReferencedObjectCorrupt { hash },
+            ))) => {
+                assert_eq!(
+                    hash, content_hash,
+                    "the corrupted snapshot's identity named exactly"
+                );
+            }
+            Err(other) => panic!("the corrupted-bytes key match refuses, got {other:?}"),
+            Ok(_) => panic!("a corrupted snapshot never covers the prerequisite"),
+        }
+        assert_eq!(director.levels()[4], LodLevel::Full, "the region unchanged");
+        let scan = T1Journal::scan_file(dir.journal()).unwrap();
+        assert!(scan.committed.is_empty(), "no T1 precedes the covering");
+    }
+}
+
+/// §5 of the C1 final corrective (the unresolved reconciliation
+/// errors) — the unverifiable disposition: the uncertain covering
+/// append's reconciliation returns Unverifiable (the uncertainty
+/// retained, never converted into a confirmation): the crossing
+/// refuses BEFORE the T1 with the attempted candidate preserved.
+#[test]
+fn covering_unknown_reconciliation_unverifiable_refuses_with_the_candidate() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-reconcile-unverifiable");
+    let script = Arc::new(Mutex::new(RaceScript::Healthy));
+    let reconcile = Arc::new(Mutex::new(Some(ReconcileScript::Unverifiable)));
+    let source = CoveringRaceSource {
+        root: dir.store(),
+        script: script.clone(),
+        reconcile: reconcile.clone(),
+    };
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&source, journal, "covering-reconcile-unverifiable").unwrap();
+    let held_before = spine.held_count();
+    *script.lock().unwrap() = RaceScript::UnknownNotInstalled;
+    let now = spine.clock();
+    let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+    match refusal {
+        Err(TransitionError::CoveringRefused { detail, candidate }) => {
+            assert_eq!(
+                detail,
+                "covering/unknown-unverifiable: scripted-unverifiable"
+            );
+            assert!(candidate.is_some(), "the attempted candidate preserved");
+        }
+        Err(other) => panic!("the unverifiable reconciliation refuses, got {other:?}"),
+        Ok(_) => panic!("an unverifiable reconciliation never covers the prerequisite"),
+    }
+    assert_eq!(director.levels()[4], LodLevel::Full, "the region unchanged");
+    assert_eq!(spine.held_count(), held_before, "nothing suspended");
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert!(scan.committed.is_empty(), "no T1 precedes the covering");
+}
+
+/// §5 of the C1 final corrective (the unresolved reconciliation
+/// errors) — the transport failure: the uncertain covering append's
+/// reconciliation ITSELF fails (the I/O, the lock): the crossing
+/// refuses BEFORE the T1 with the attempted candidate preserved —
+/// never a raw error escape, never a success over an unverified
+/// candidate.
+#[test]
+fn covering_unknown_reconciliation_failure_refuses_with_the_candidate() {
+    let near = near_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("covering-reconcile-failure");
+    let script = Arc::new(Mutex::new(RaceScript::Healthy));
+    let reconcile = Arc::new(Mutex::new(Some(ReconcileScript::TransportFailure)));
+    let source = CoveringRaceSource {
+        root: dir.store(),
+        script: script.clone(),
+        reconcile: reconcile.clone(),
+    };
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing =
+        SessionCrossing::open_at(&source, journal, "covering-reconcile-failure").unwrap();
+    let held_before = spine.held_count();
+    *script.lock().unwrap() = RaceScript::UnknownNotInstalled;
+    let now = spine.clock();
+    let refusal = crossing.deactivate(&mut spine, &mut director, 4, now);
+    match refusal {
+        Err(TransitionError::CoveringRefused { detail, candidate }) => {
+            assert!(
+                detail.starts_with("covering/reconcile-unavailable:"),
+                "the reconciliation failure's typed refusal: {detail}"
+            );
+            assert!(candidate.is_some(), "the attempted candidate preserved");
+        }
+        Err(other) => panic!("the failed reconciliation refuses, got {other:?}"),
+        Ok(_) => panic!("a failed reconciliation never covers the prerequisite"),
+    }
+    assert_eq!(director.levels()[4], LodLevel::Full, "the region unchanged");
+    assert_eq!(spine.held_count(), held_before, "nothing suspended");
+    let scan = T1Journal::scan_file(dir.journal()).unwrap();
+    assert!(scan.committed.is_empty(), "no T1 precedes the covering");
 }

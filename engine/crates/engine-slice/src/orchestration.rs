@@ -780,6 +780,20 @@ impl OrchestratedSession {
     pub fn capture_snapshot(&self) -> Result<SnapshotCapture, TransitionError> {
         let bytes = save_session(&self.spine, &self.director).map_err(PipelineError::Format)?;
         let object = StoredObject::new(bytes).map_err(PipelineError::Medium)?;
+        // The C1 validation provenance: an ACCEPTED publication of
+        // this capture seeds the crossing's covering track (the exact
+        // state covers any nonempty plan prepared from it), so the
+        // bytes must pass the strict session roundtrip the covering
+        // prerequisite demands — BEFORE the capture is even
+        // submittable (an invalid serialization never becomes
+        // covering evidence, through this path or the chain-verified
+        // duplicate resolution).
+        crate::crossing::restore_session(object.bytes()).map_err(|error| {
+            TransitionError::CoveringRefused {
+                detail: format!("covering/capture-validation: {error:?}"),
+                candidate: None,
+            }
+        })?;
         let coverage = self.coverage_frontier();
         // C3-F2: the frontier derives from the AUTHORITATIVE ACTIVE
         // journal generation — the pointer-resolved path, never the

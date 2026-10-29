@@ -1209,8 +1209,20 @@ impl<S: MediumSource> SessionCrossing<S> {
         })?;
         let mut medium = self.source.open_medium()?;
         let parent = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
-        let (mut candidate, mut outcome) =
+        let mut attempt =
             covering_append(&mut medium, &object, content_hash, parent, spine.clock())?;
+        let mut candidate = attempt.candidate;
+        let mut outcome = match attempt.outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return self.resolve_covering_append_error(
+                    &mut medium,
+                    error,
+                    candidate,
+                    content_hash,
+                );
+            }
+        };
         if let AppendOutcome::RejectedStaleParent {
             observed: Some(observed),
         } = outcome
@@ -1222,10 +1234,19 @@ impl<S: MediumSource> SessionCrossing<S> {
             // window's reconciliation must name exactly the record
             // the retry built (the observed parent, not the stale
             // one).
-            let (retry_candidate, retry_outcome) =
-                covering_append(&mut medium, &object, content_hash, observed, spine.clock())?;
-            candidate = retry_candidate;
-            outcome = retry_outcome;
+            attempt = covering_append(&mut medium, &object, content_hash, observed, spine.clock())?;
+            candidate = attempt.candidate;
+            outcome = match attempt.outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return self.resolve_covering_append_error(
+                        &mut medium,
+                        error,
+                        candidate,
+                        content_hash,
+                    );
+                }
+            };
         }
         let revision = match outcome {
             AppendOutcome::Accepted { id, .. } => id,
@@ -1243,8 +1264,17 @@ impl<S: MediumSource> SessionCrossing<S> {
                 // reconciliation contract. The candidate is exactly
                 // the identity the append built — the same bytes, the
                 // same parent — so an installed covering is never
-                // misclassified as absent.
-                return match medium.reconcile_unknown(&candidate)? {
+                // misclassified as absent. A reconciliation that
+                // ITSELF fails (the transport, the lock) is never
+                // converted into a success or a raw escape: the
+                // crossing refuses with the candidate preserved.
+                let reconciliation = medium.reconcile_unknown(&candidate).map_err(|error| {
+                    TransitionError::CoveringRefused {
+                        detail: format!("covering/reconcile-unavailable: {error:?}"),
+                        candidate: Some(candidate),
+                    }
+                })?;
+                return match reconciliation {
                     Reconciliation::Installed { .. } => {
                         self.covering = Some(CoveringSnapshot {
                             content_hash,
@@ -1272,6 +1302,66 @@ impl<S: MediumSource> SessionCrossing<S> {
         Ok(())
     }
 
+    /// Resolves a covering-append ERROR (never an outcome): the
+    /// duplicate-idempotency-key rejection means a record keyed by
+    /// THIS content may already be durable — an accepted publication
+    /// of the exact state whose completion was never consumed (the
+    /// unpolled optional submission). The rejection alone is never
+    /// acceptance: the record is resolved against the chain — its
+    /// idempotency key, its single content reference, and the strict
+    /// session roundtrip over the referenced bytes — and only a
+    /// fully verified record satisfies the prerequisite (the track
+    /// binds to it; no second append of the same content). Any other
+    /// append error propagates typed, exactly as before.
+    fn resolve_covering_append_error(
+        &mut self,
+        medium: &mut dyn CanonicalMedium,
+        error: MediumError,
+        candidate: Hash,
+        content_hash: Hash,
+    ) -> Result<(), TransitionError> {
+        if !matches!(
+            &error,
+            MediumError::Chain {
+                rule: "duplicate-idempotency-key"
+            }
+        ) {
+            return Err(error.into());
+        }
+        let refusal = |detail: String| TransitionError::CoveringRefused {
+            detail,
+            candidate: Some(candidate),
+        };
+        let mut cursor = medium
+            .head()
+            .map_err(|error| refusal(format!("covering/duplicate-resolution: {error:?}")))?;
+        while let Some(id) = cursor {
+            let record = medium
+                .read_record(&id)
+                .map_err(|error| refusal(format!("covering/duplicate-resolution: {error:?}")))?;
+            let matches = record.idempotency_key.as_deref() == Some(content_hash.as_bytes())
+                && record.content_refs.first() == Some(&content_hash);
+            if matches {
+                // The strict session roundtrip over the referenced
+                // bytes: an invalid or unreadable snapshot never
+                // qualifies as a covering through identity alone.
+                let bytes = medium.read_object(&content_hash).map_err(|error| {
+                    refusal(format!("covering/duplicate-content-unverified: {error:?}"))
+                })?;
+                restore_session(&bytes).map_err(|error| {
+                    refusal(format!("covering/duplicate-invalid-session: {error:?}"))
+                })?;
+                self.covering = Some(CoveringSnapshot {
+                    content_hash,
+                    revision: id,
+                });
+                return Ok(());
+            }
+            cursor = record.parent;
+        }
+        Err(refusal("covering/duplicate-unresolved".into()))
+    }
+
     /// Publishes the session snapshot as ONE verified content object
     /// on the campaign chain (the B2 nine-step append — atomic,
     /// chain-reachable, content-verified): a regular revision whose
@@ -1287,6 +1377,16 @@ impl<S: MediumSource> SessionCrossing<S> {
         let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
         let object = StoredObject::new(bytes)?;
         let snapshot_hash = object.hash();
+        // The C1 validation provenance: this publication seeds the
+        // covering track — an accepted snapshot of the exact state
+        // covers any nonempty plan prepared from it — so the bytes
+        // must pass the SAME strict session roundtrip the covering
+        // prerequisite demands, BEFORE publication (an invalid
+        // serialization never becomes covering evidence).
+        restore_session(object.bytes()).map_err(|error| TransitionError::CoveringRefused {
+            detail: format!("covering/publication-validation: {error:?}"),
+            candidate: None,
+        })?;
         // A fresh medium handle (each provider's coordination is
         // per-operation; the pipeline's own handle is idle between its
         // operations).
@@ -2619,6 +2719,18 @@ fn after_covering_seam() {
     }
 }
 
+/// One covering-append attempt: the attempted record's identity (the
+/// uncertain window's reconciliation anchor — preserved across the
+/// append's own outcome OR error) and the append's result. The error
+/// form carries the typed medium failure (the duplicate-idempotency
+/// key rejection the prerequisite resolves against the chain — see
+/// [`SessionCrossing::resolve_covering_append_error`]); the identity
+/// must survive it, never be reconstructed.
+struct CoveringAttempt {
+    candidate: Hash,
+    outcome: Result<AppendOutcome, MediumError>,
+}
+
 /// The C1 covering's single CAS append (see
 /// [`SessionCrossing::establish_covering`]): the validated snapshot
 /// object against the named parent — the same record construction
@@ -2635,16 +2747,16 @@ fn covering_append(
     content_hash: Hash,
     parent: Hash,
     clock: Tick,
-) -> Result<(Hash, AppendOutcome), PipelineError> {
+) -> Result<CoveringAttempt, PipelineError> {
     let parent_epoch = medium.read_record(&parent)?.epoch;
     let record = RevisionRecord::regular(parent, parent_epoch, clock.as_u64())
         .with_idempotency_key(content_hash.as_bytes().to_vec())
         .with_content_refs(vec![content_hash]);
     let candidate = record.id();
-    Ok((
+    Ok(CoveringAttempt {
         candidate,
-        medium.append(&record, std::slice::from_ref(object), Some(parent))?,
-    ))
+        outcome: medium.append(&record, std::slice::from_ref(object), Some(parent)),
+    })
 }
 
 /// Test-only (the genuine SK-committed/MK-uncommitted crash seam,

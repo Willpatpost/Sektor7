@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use engine_core::{
     EventClass, EventId, EventSpec, LodLevel, PresenceSample, Schedule, Spine, Tick,
@@ -1483,4 +1484,97 @@ fn a_coherent_activation_refusal_refuses_the_tick_before_the_clock() {
         twin_capture.content_identity(),
         "the full serialized state matches the clean twin (no double application)"
     );
+}
+
+/// §3 of the C1 final corrective (the unpolled accepted optional
+/// publication): the optional snapshot of state S is submitted and
+/// the worker ACCEPTS it, but its completion is deliberately never
+/// consumed — the completion path's covering-track seeding never
+/// runs. A nonempty consequential deactivation prepared from the
+/// UNCHANGED state S must satisfy the C1 prerequisite through the
+/// already-durable accepted snapshot — resolved against the chain
+/// (the record's idempotency key, its single content reference, and
+/// the strict session roundtrip), never the duplicate rejection
+/// alone — and never by appending the same content twice. The
+/// pending completion stays consumable and the publication
+/// accounting is preserved exactly.
+#[test]
+fn an_unpolled_accepted_publication_covers_the_same_state_prerequisite() {
+    let dir = TestDir::new("unpolled-covering");
+    let location = found_location(&dir, false);
+    let mut session = orchestrated(&dir);
+    let founding = oracle_head_at(&location);
+    // The optional snapshot of state S — submitted, never consumed.
+    let capture = session.capture_snapshot().unwrap();
+    let handle = session.submit_publication(capture).unwrap();
+    assert_eq!(session.pending_publications(), 1);
+    // The worker accepts it (the chain advances past the founding) —
+    // the bounded read-only wait on the ORACLE chain, never the
+    // session's own completion consumption.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while oracle_head_at(&location) == founding {
+        assert!(
+            Instant::now() < deadline,
+            "the worker accepts the optional publication"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        session.pending_publications(),
+        1,
+        "the completion stays unconsumed"
+    );
+    // THE CROSSING from the UNCHANGED state S: the far-north-west
+    // presence deactivates region 4 as the tick's FIRST transition —
+    // every earlier region holds its level (regions 0-2 dormant-stay
+    // beyond the event band, region 3 EventDriven-stay inside its
+    // hysteresis), and the only other transition — region 5's
+    // deactivation — comes later in the region order — so the
+    // covering prerequisite serializes exactly the state S the
+    // accepted publication carries.
+    let north_far = [PresenceSample {
+        position: (-150.0, 160.0),
+        velocity: (0.0, 0.0),
+    }];
+    session.tick(&north_far).unwrap();
+    assert_eq!(session.region_level(4), LodLevel::Dormant);
+    assert_eq!(session.region_level(3), LodLevel::EventDriven);
+    // No second append of the same content: the chain holds the
+    // founding plus the accepted publication — the covering REUSED it
+    // through the chain-verified resolution (the T1 is journal-side).
+    let publication_head = oracle_head_at(&location);
+    assert_eq!(
+        oracle_records_at(&location),
+        2,
+        "the accepted publication IS the covering — no duplicate append"
+    );
+    assert_eq!(
+        oracle_head_at(&location),
+        publication_head,
+        "the tick appended nothing to the chain — the prerequisite reused the accepted record"
+    );
+    {
+        // The reused record is the accepted publication's: a
+        // content-keyed session snapshot of exactly state S (the
+        // pre-boundary state — region 4 still Full).
+        let mut oracle = SessionStore::open(&location).unwrap();
+        let record = oracle.read_record(&publication_head).unwrap();
+        assert_eq!(record.tick, 150);
+        let bytes = oracle.read_object(&record.content_refs[0]).unwrap();
+        let (_spine, restored_director) = engine_slice::crossing::restore_session(&bytes)
+            .expect("the reused covering round-trips");
+        assert_eq!(
+            restored_director.levels()[4],
+            LodLevel::Full,
+            "the reused snapshot is the PRE-boundary state S"
+        );
+    }
+    // The pending completion stays consumable — the accounting
+    // preserved (the accepted publication reports through its own
+    // completion, exactly once).
+    assert!(matches!(
+        session.wait_publication(handle).unwrap(),
+        PublicationOutcome::Accepted { .. }
+    ));
+    assert_eq!(session.pending_publications(), 0);
 }
