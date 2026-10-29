@@ -16,6 +16,7 @@ pub mod region_render;
 pub mod render_demo;
 pub mod save_demo;
 pub mod session;
+pub mod session_chunks;
 pub mod sim;
 pub mod sim_demo;
 pub mod soak_evidence;

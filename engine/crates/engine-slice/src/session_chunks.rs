@@ -1,0 +1,566 @@
+//! The S6-C4 Phase 2 K1 DARK STRUCTURAL SNAPSHOT CODEC — an
+//! internal, deterministic, section-split representation of the
+//! authoritative session, **never published to canonical storage**
+//! (the authorization is the differential-verification foundation
+//! only; every production publication path — the covering append,
+//! the snapshot publication, the recovery selection, the sweep, the
+//! reclamation — is untouched and remains the accepted C1 behavior).
+//!
+//! **The representation.** The accepted legacy session snapshot
+//! (`engine-slice/session-snapshot/1`) is one content object: the
+//! domain tag, the spine's complete save bytes (`sektor7/save/1` or
+//! `/2`), and the director's complete save bytes. The chunk codec
+//! walks those exact legacy bytes and splits them at the WIRE'S OWN
+//! section boundaries into independently identified
+//! [`SectionChunk`]s — the scheduler header and counters, the near
+//! and far lanes, the blocked and held obligations, the
+//! compacted-history metadata (when the `/2` form), the execution
+//! ledger's count prefix and its records in bounded immutable
+//! chunks, the world section, and the director section. Each chunk
+//! carries its own content identity (the SHA-256 of its
+//! domain-tagged envelope — the prospective canonical CAS object);
+//! a root manifest lists the chunk identities (the prospective
+//! `session-snapshot/2` publication root).
+//!
+//! **The ledger chunk policy.** The execution ledger is append-only
+//! in the full-history form: its record stream is split at a fixed
+//! record boundary ([`DEFAULT_LEDGER_CHUNK_RECORDS`], the ratified
+//! default; the policy is a parameter for the boundary study). Every
+//! chunk below the last is SEALED (its bytes immutable for the life
+//! of the history); the final chunk is the PARTIAL TAIL (re-emitted
+//! per save; it becomes sealed when the next boundary fills). Sealed
+//! prefix identities are therefore stable across saves — the
+//! content-addressed reuse the staged architecture builds on. An
+//! explicit history compaction (the `/2` transition) rewrites the
+//! record stream (the summarized prefix + the retained tail): the
+//! chunk identities are NOT carried across the transition — the
+//! compaction is the documented invalidation point, and the walker
+//! re-derives the new form's chunks from the new bytes.
+//!
+//! **The equivalence contract (the differential discipline).**
+//! [`compose_session`] reassembles the EXACT legacy
+//! `session-snapshot/1` bytes from the chunks — the concatenation,
+//! in the manifest's fixed order, of the unmodified legacy slices —
+//! so the existing strict restoration contract (`restore_session`
+//! and every §5.2 gate) validates the composed state UNCHANGED.
+//! The K1 verification layering: the WALK's local checks (the
+//! domain tags, the bounded counts, the wire advance) and the
+//! COMPOSE's global validation (the existing decoder's full gate
+//! set) — no optimistic cache substitutes for global validity.
+//!
+//! **What K1 does NOT do:** no canonical appends, no
+//! `CanonicalMedium` changes, no covering-publication changes, no
+//! recovery-selection changes, no sweep/reclamation changes, no
+//! journal/allocation changes, no transition-state-machine changes,
+//! no delta snapshots, no background threads. No production path
+//! depends on this module; it exists for the differential corpus,
+//! the chunk-boundary study, and the microbenchmarks.
+
+use engine_core::wire::{SAVE_DOMAIN, SAVE_DOMAIN_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN};
+use engine_core::{Decoder, Encoder, SaveError, Spine, Tick};
+use engine_persist::{Hash, StoredObject};
+
+use crate::crossing::SESSION_SNAPSHOT_DOMAIN;
+use crate::npc::NpcWorld;
+use crate::region::RegionDirector;
+
+/// The prospective `session-snapshot/2` root's domain (INTERNAL to
+/// K1 — never written to canonical storage in this checkpoint).
+pub const SESSION_SNAPSHOT_V2_DOMAIN: &str = "engine-slice/session-snapshot/2";
+const V2_VERSION: u32 = 2;
+
+/// The chunk object envelope's domain: every prospective canonical
+/// chunk object is `{domain} + {section tag} + {payload}` — the
+/// content identity is the SHA-256 of exactly those bytes.
+pub const SESSION_CHUNK_DOMAIN: &str = "engine-slice/session-chunk/1";
+
+/// The ratified default ledger chunk boundary: the record count per
+/// sealed chunk. The boundary study compares candidate values; the
+/// default matches the measured workload's scale (a 9,000-tick
+/// scenario carries ~288k records ≈ 71 chunks).
+pub const DEFAULT_LEDGER_CHUNK_RECORDS: u64 = 4096;
+
+/// The ledger record's fixed wire width (the save codec's own
+/// layout: seq u64 + class u32 + field u8 + intended-due tick +
+/// executed tick + schedule-kind u8 + late u8).
+const LEDGER_RECORD_BYTES: usize = 8 + 4 + 1 + 8 + 8 + 1 + 1;
+
+// -------------------------------------------------------- the chunk model
+
+/// One independently identified session section — an unmodified
+/// slice of the EXACT legacy serialization, wrapped in the
+/// prospective canonical chunk envelope for content addressing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionChunk {
+    /// The section's structural tag (the manifest's ordering key).
+    pub tag: &'static str,
+    /// The exact legacy bytes of the section's span.
+    pub payload: Vec<u8>,
+    /// The content identity: the SHA-256 of the chunk envelope
+    /// (`SESSION_CHUNK_DOMAIN` + tag + payload) — the prospective
+    /// CAS object identity.
+    pub identity: Hash,
+}
+
+/// The ledger chunk policy: the sealed-boundary record count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPolicy {
+    pub ledger_records: u64,
+}
+
+impl Default for ChunkPolicy {
+    fn default() -> Self {
+        ChunkPolicy {
+            ledger_records: DEFAULT_LEDGER_CHUNK_RECORDS,
+        }
+    }
+}
+
+/// The history form the walked spine save carried (the manifest
+/// field; the `/2` transition is the chunk-identity invalidation
+/// point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryForm {
+    Full,
+    Compacted,
+}
+
+/// The dark structural snapshot: the ordered section chunks of one
+/// complete legacy session serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedSession {
+    /// The history form the walked bytes carried.
+    pub form: HistoryForm,
+    /// The framing + scheduler header and counters (the save
+    /// domain, version, spine section domain, clock, next_seq,
+    /// budget, near-reserve, and the seven counters).
+    pub header: SectionChunk,
+    /// The near lane (count + event entries).
+    pub near: SectionChunk,
+    /// The far lane (count + event entries).
+    pub far: SectionChunk,
+    /// The blocked obligations (count + event entries).
+    pub blocked: SectionChunk,
+    /// The held obligations (count + event entries).
+    pub held: SectionChunk,
+    /// The compacted-history metadata (the `/2` form only: the
+    /// carried max, the authenticated prefix summary, and the
+    /// summarized count).
+    pub compacted_meta: Option<SectionChunk>,
+    /// The execution ledger's count prefix (the full-history count,
+    /// or the `/2` retained-tail count).
+    pub ledger_header: SectionChunk,
+    /// The ledger record stream in bounded chunks: every chunk below
+    /// the last is sealed (immutable for the history's lifetime);
+    /// the last is the partial tail.
+    pub ledger_chunks: Vec<SectionChunk>,
+    /// The world section (the world domain tag + the nested blob).
+    pub world: SectionChunk,
+    /// The director section (the whole director save).
+    pub director: SectionChunk,
+}
+
+impl ChunkedSession {
+    /// The ordered section list (the manifest's and the
+    /// composition's fixed order).
+    pub fn section_list(&self) -> Vec<&SectionChunk> {
+        let mut sections = vec![
+            &self.header,
+            &self.near,
+            &self.far,
+            &self.blocked,
+            &self.held,
+        ];
+        if let Some(meta) = &self.compacted_meta {
+            sections.push(meta);
+        }
+        sections.push(&self.ledger_header);
+        sections.extend(self.ledger_chunks.iter());
+        sections.push(&self.world);
+        sections.push(&self.director);
+        sections
+    }
+
+    /// The ledger's sealed-prefix chunk identities — the
+    /// content-addressed reuse surface (stable across saves while
+    /// the history form and the append-only prefix hold).
+    pub fn sealed_prefix_identities(&self) -> Vec<Hash> {
+        let sealed = self.ledger_chunks.len().saturating_sub(1);
+        self.ledger_chunks[..sealed]
+            .iter()
+            .map(|chunk| chunk.identity)
+            .collect()
+    }
+
+    /// The clock the walked header carried (the differential's
+    /// structural-state check input).
+    pub fn walked_clock(&self) -> Result<Tick, SaveError> {
+        let mut dec = Decoder::new(&self.header.payload);
+        let _ = dec.read_str(u32::MAX as u64, "domain-tag")?;
+        let _ = dec.read_u32()?;
+        let _ = dec.read_str(u32::MAX as u64, "domain-tag")?;
+        dec.read_tick()
+    }
+}
+
+// ------------------------------------------------------------- the walker
+
+fn consumed(dec: &Decoder<'_>, total: usize) -> usize {
+    total - dec.remaining()
+}
+
+fn walk_event(dec: &mut Decoder<'_>) -> Result<(), SaveError> {
+    dec.read_u64()?; // seq
+    dec.read_u32()?; // class
+    dec.read_u8()?; // field
+    match dec.read_u8()? {
+        0 => {
+            dec.read_u64()?; // at-logical-time due
+        }
+        1 => {
+            dec.read_u64()?; // execution-relative origin
+            dec.read_u64()?; // delay
+        }
+        other => {
+            return Err(SaveError::Enum {
+                section: "k1-chunk/walk",
+                discriminant: u64::from(other),
+            });
+        }
+    }
+    dec.read_u64()?; // payload
+    let deps = dec.read_count(u64::MAX, "k1-chunk/walk", "dependency-count")?;
+    for _ in 0..deps {
+        dec.read_u64()?;
+    }
+    Ok(())
+}
+
+fn walk_lane(dec: &mut Decoder<'_>) -> Result<(), SaveError> {
+    let count = dec.read_count(u64::MAX, "k1-chunk/walk", "lane-count")?;
+    for _ in 0..count {
+        walk_event(dec)?;
+    }
+    Ok(())
+}
+
+// The section tags (the manifest's ordering keys — also the
+// prospective chunk envelopes' section domains).
+const TAG_HEADER: &str = "engine-slice/session-chunk/header/1";
+const TAG_NEAR: &str = "engine-slice/session-chunk/near/1";
+const TAG_FAR: &str = "engine-slice/session-chunk/far/1";
+const TAG_BLOCKED: &str = "engine-slice/session-chunk/blocked/1";
+const TAG_HELD: &str = "engine-slice/session-chunk/held/1";
+const TAG_COMPACTED_META: &str = "engine-slice/session-chunk/compacted-meta/1";
+const TAG_LEDGER_HEADER: &str = "engine-slice/session-chunk/ledger-meta/1";
+const TAG_LEDGER_RECORDS: &str = "engine-slice/session-chunk/ledger-records/1";
+const TAG_WORLD: &str = "engine-slice/session-chunk/world/1";
+const TAG_DIRECTOR: &str = "engine-slice/session-chunk/director/1";
+
+fn make_chunk(tag: &'static str, payload: &[u8]) -> SectionChunk {
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_CHUNK_DOMAIN);
+    enc.write_str(tag);
+    enc.write_bytes(payload);
+    let envelope = enc.into_bytes();
+    let identity = StoredObject::new(envelope)
+        .expect("the chunk envelope is a valid content object")
+        .hash();
+    SectionChunk {
+        tag,
+        payload: payload.to_vec(),
+        identity,
+    }
+}
+
+/// Walks one complete legacy `session-snapshot/1` byte stream and
+/// splits it at the wire's own section boundaries. The local checks
+/// are the walk's own (the domain tags, the bounded counts, the wire
+/// advance); the global validation is the existing strict
+/// restoration over the composed bytes — unchanged.
+pub fn chunk_session(bytes: &[u8], policy: &ChunkPolicy) -> Result<ChunkedSession, SaveError> {
+    let total = bytes.len();
+    let mut dec = Decoder::new(bytes);
+    dec.read_domain(SESSION_SNAPSHOT_DOMAIN)?;
+    // The spine blob's framing.
+    let spine_start = consumed(&dec, total);
+    let spine_len = dec.read_count(u64::MAX, "k1-chunk/walk", "spine-length")? as usize;
+    let spine_payload_start = spine_start + 8;
+    let spine_end = spine_payload_start
+        .checked_add(spine_len)
+        .ok_or(SaveError::Truncated)?;
+    if spine_end > total {
+        return Err(SaveError::Truncated);
+    }
+    let spine = &bytes[spine_payload_start..spine_end];
+    // The director blob's framing.
+    let mut dec = Decoder::new(&bytes[spine_end..]);
+    let director_len = dec.read_count(u64::MAX, "k1-chunk/walk", "director-length")? as usize;
+    let director_start = spine_end + 8;
+    let director_end = director_start
+        .checked_add(director_len)
+        .ok_or(SaveError::Truncated)?;
+    if director_end > total {
+        return Err(SaveError::Truncated);
+    }
+    let director = &bytes[director_start..director_end];
+    if director_end != total {
+        return Err(SaveError::Trailing {
+            leftover: (total - director_end) as u64,
+        });
+    }
+
+    // ---- the spine payload walk ----
+    let spine_total = spine.len();
+    let mut dec = Decoder::new(spine);
+    let form = {
+        let observed = dec.read_str(u32::MAX as u64, "domain-tag")?;
+        match observed {
+            SAVE_DOMAIN => HistoryForm::Full,
+            SAVE_DOMAIN_V2 => HistoryForm::Compacted,
+            other => {
+                return Err(SaveError::Domain {
+                    expected: SAVE_DOMAIN,
+                    observed: other.to_owned(),
+                });
+            }
+        }
+    };
+    dec.read_u32()?; // the save-format version
+    let spine_tag = match form {
+        HistoryForm::Full => SPINE_DOMAIN,
+        HistoryForm::Compacted => SPINE_HISTORY_DOMAIN,
+    };
+    dec.read_domain(spine_tag)?;
+    dec.read_tick()?;
+    dec.read_u64()?; // next_seq
+    dec.read_u32()?; // budget
+    dec.read_u32()?; // near_reserve
+    for _ in 0..7 {
+        dec.read_u64()?;
+    }
+    let header_end = consumed(&dec, spine_total);
+    let header = make_chunk(TAG_HEADER, &spine[..header_end]);
+
+    // The lanes and obligation sections.
+    let mut section_start = header_end;
+    walk_lane(&mut dec)?;
+    let near = make_chunk(TAG_NEAR, &spine[section_start..consumed(&dec, spine_total)]);
+    section_start = consumed(&dec, spine_total);
+    walk_lane(&mut dec)?;
+    let far = make_chunk(TAG_FAR, &spine[section_start..consumed(&dec, spine_total)]);
+    section_start = consumed(&dec, spine_total);
+    let count = dec.read_count(u64::MAX, "k1-chunk/walk", "blocked-count")?;
+    for _ in 0..count {
+        walk_event(&mut dec)?;
+    }
+    let blocked = make_chunk(
+        TAG_BLOCKED,
+        &spine[section_start..consumed(&dec, spine_total)],
+    );
+    section_start = consumed(&dec, spine_total);
+    let count = dec.read_count(u64::MAX, "k1-chunk/walk", "held-count")?;
+    for _ in 0..count {
+        walk_event(&mut dec)?;
+    }
+    let held = make_chunk(TAG_HELD, &spine[section_start..consumed(&dec, spine_total)]);
+    section_start = consumed(&dec, spine_total);
+
+    // The compacted-history metadata (the /2 form only).
+    let compacted_meta = if form == HistoryForm::Compacted {
+        let has_max = dec.read_u8()?;
+        if has_max != 0 {
+            dec.read_tick()?;
+        }
+        let summary_len = dec.read_count(u64::MAX, "k1-chunk/walk", "summary-length")? as usize;
+        if dec.remaining() < summary_len {
+            return Err(SaveError::Truncated);
+        }
+        for _ in 0..summary_len {
+            dec.read_u8()?;
+        }
+        dec.read_u64()?; // summarized records
+        let meta = make_chunk(
+            TAG_COMPACTED_META,
+            &spine[section_start..consumed(&dec, spine_total)],
+        );
+        section_start = consumed(&dec, spine_total);
+        Some(meta)
+    } else {
+        None
+    };
+
+    // The ledger: the count prefix, then the fixed-width record
+    // stream (advanced arithmetically — the count is bounded by the
+    // remaining bytes, so the offsets are overflow-safe checked
+    // adds over a slice that exists).
+    let ledger_count = dec.read_count(u64::MAX, "k1-chunk/walk", "ledger-count")?;
+    let ledger_header = make_chunk(
+        TAG_LEDGER_HEADER,
+        &spine[section_start..consumed(&dec, spine_total)],
+    );
+    let records_start = consumed(&dec, spine_total);
+    let record_bytes = (ledger_count as usize)
+        .checked_mul(LEDGER_RECORD_BYTES)
+        .ok_or(SaveError::Limit {
+            section: "k1-chunk/walk",
+            kind: "ledger-bytes",
+            value: ledger_count * LEDGER_RECORD_BYTES as u64,
+            max: u64::MAX,
+        })?;
+    let records_end = records_start
+        .checked_add(record_bytes)
+        .ok_or(SaveError::Truncated)?;
+    if records_end > spine_total {
+        return Err(SaveError::Truncated);
+    }
+    let records = &spine[records_start..records_end];
+
+    // The bounded chunk split.
+    let boundary = (policy.ledger_records.max(1)) as usize;
+    let mut ledger_chunks = Vec::new();
+    let mut offset = 0usize;
+    while offset < record_bytes {
+        let remaining_records = (record_bytes - offset) / LEDGER_RECORD_BYTES;
+        let take = remaining_records.min(boundary) * LEDGER_RECORD_BYTES;
+        let end = offset + take;
+        ledger_chunks.push(make_chunk(TAG_LEDGER_RECORDS, &records[offset..end]));
+        offset = end;
+    }
+    if ledger_chunks.is_empty() {
+        // The empty ledger: one empty tail chunk keeps the manifest
+        // structure uniform (the boundary study's zero case).
+        ledger_chunks.push(make_chunk(TAG_LEDGER_RECORDS, &[]));
+    }
+
+    // The world section (the world domain tag + the nested blob) —
+    // the stream must end exactly at the spine payload's end.
+    let mut dec = Decoder::new(&spine[records_end..]);
+    let _ = dec.read_str(u32::MAX as u64, "domain-tag")?;
+    let world_len = dec.read_count(u64::MAX, "k1-chunk/walk", "world-length")? as usize;
+    if dec.remaining() < world_len {
+        return Err(SaveError::Truncated);
+    }
+    for _ in 0..world_len {
+        dec.read_u8()?;
+    }
+    if dec.remaining() != 0 {
+        return Err(SaveError::Trailing {
+            leftover: dec.remaining() as u64,
+        });
+    }
+    let world = make_chunk(TAG_WORLD, &spine[records_end..]);
+
+    let director_chunk = make_chunk(TAG_DIRECTOR, director);
+
+    Ok(ChunkedSession {
+        form,
+        header,
+        near,
+        far,
+        blocked,
+        held,
+        compacted_meta,
+        ledger_header,
+        ledger_chunks,
+        world,
+        director: director_chunk,
+    })
+}
+
+// ------------------------------------------------------ compose and root
+
+/// Reassembles the EXACT legacy `session-snapshot/1` bytes from the
+/// chunks — the unmodified legacy slices concatenated in the fixed
+/// section order under the original framing. The composed stream is
+/// byte-for-byte the walked input (the differential's foundation);
+/// the existing strict restoration validates it unchanged.
+pub fn compose_session(chunks: &ChunkedSession) -> Vec<u8> {
+    let mut spine = Vec::with_capacity(
+        chunks.header.payload.len()
+            + chunks.near.payload.len()
+            + chunks.far.payload.len()
+            + chunks.blocked.payload.len()
+            + chunks.held.payload.len()
+            + chunks
+                .compacted_meta
+                .as_ref()
+                .map_or(0, |meta| meta.payload.len())
+            + chunks.ledger_header.payload.len()
+            + chunks
+                .ledger_chunks
+                .iter()
+                .map(|chunk| chunk.payload.len())
+                .sum::<usize>()
+            + chunks.world.payload.len(),
+    );
+    spine.extend_from_slice(&chunks.header.payload);
+    spine.extend_from_slice(&chunks.near.payload);
+    spine.extend_from_slice(&chunks.far.payload);
+    spine.extend_from_slice(&chunks.blocked.payload);
+    spine.extend_from_slice(&chunks.held.payload);
+    if let Some(meta) = &chunks.compacted_meta {
+        spine.extend_from_slice(&meta.payload);
+    }
+    spine.extend_from_slice(&chunks.ledger_header.payload);
+    for chunk in &chunks.ledger_chunks {
+        spine.extend_from_slice(&chunk.payload);
+    }
+    spine.extend_from_slice(&chunks.world.payload);
+
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_SNAPSHOT_DOMAIN);
+    enc.write_bytes(&spine);
+    enc.write_bytes(&chunks.director.payload);
+    enc.into_bytes()
+}
+
+/// The internal root manifest (the prospective
+/// `session-snapshot/2` publication root — NEVER written to
+/// canonical storage in K1): the history form, the chunk count, and
+/// each chunk's section tag, content identity, and payload length.
+pub fn root_manifest(chunks: &ChunkedSession) -> Vec<u8> {
+    let sections: Vec<&SectionChunk> = chunks.section_list();
+    let mut enc = Encoder::new();
+    enc.write_str(SESSION_SNAPSHOT_V2_DOMAIN);
+    enc.write_u32(V2_VERSION);
+    enc.write_u8(match chunks.form {
+        HistoryForm::Full => 0,
+        HistoryForm::Compacted => 1,
+    });
+    enc.write_count(sections.len());
+    for section in sections {
+        enc.write_str(section.tag);
+        enc.write_bytes(section.identity.as_bytes());
+        enc.write_u64(section.payload.len() as u64);
+    }
+    enc.into_bytes()
+}
+
+/// The root's content identity — the prospective snapshot identity
+/// (the exact-state equivalence key's future form; the C1 covering's
+/// idempotency semantics carry over unchanged: the root identity IS
+/// the state identity).
+pub fn root_identity(chunks: &ChunkedSession) -> Hash {
+    StoredObject::new(root_manifest(chunks))
+        .expect("the root manifest is a valid content object")
+        .hash()
+}
+
+/// The local chunk verification: the payload re-hashes to the
+/// chunk's envelope identity (the prospective CAS read check — the
+/// content-addressing's own verification, distinct from the global
+/// composed validation).
+pub fn verify_chunk(chunk: &SectionChunk) -> bool {
+    make_chunk(chunk.tag, &chunk.payload).identity == chunk.identity
+}
+
+/// The global composed validation through the existing strict
+/// restoration contract — the K1 discipline's unchanged global gate
+/// (no optimistic cache substitutes for it).
+pub fn validate_composed(
+    chunks: &ChunkedSession,
+) -> Result<(Spine<NpcWorld>, RegionDirector), SaveError> {
+    let bytes = compose_session(chunks);
+    crate::crossing::restore_session(&bytes)
+}
