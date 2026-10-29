@@ -379,7 +379,8 @@ fn the_ratified_manifest_and_closure_validate_over_the_corpus() {
 
         // The produced root strictly decodes (the self-check) and
         // its entry order is the composition order.
-        let root_bytes = session_chunks::root_manifest(&chunks);
+        let root_bytes = session_chunks::try_root_manifest(&chunks)
+            .expect("the default-policy corpus root is in-schema");
         let manifest = session_chunks::decode_root_manifest(&root_bytes)
             .expect("the produced root decodes through the ratified schema");
         let section_tags: Vec<_> = chunks.section_list().iter().map(|s| s.tag).collect();
@@ -401,7 +402,11 @@ fn the_ratified_manifest_and_closure_validate_over_the_corpus() {
         // The root identity is deterministic and the closure
         // validates with every chunk supplied as new.
         let root = StoredObject::new(root_bytes.clone()).unwrap();
-        assert_eq!(root.hash(), session_chunks::root_identity(&chunks));
+        assert_eq!(
+            root.hash(),
+            session_chunks::try_root_identity(&chunks)
+                .expect("the default-policy corpus root identity is in-schema")
+        );
         let record = RevisionRecord::regular(Hash::from_bytes(&[9u8; 32]).unwrap(), 4, 77)
             .with_idempotency_key(root.hash().as_bytes().to_vec())
             .with_content_refs(vec![root.hash()]);
@@ -470,6 +475,165 @@ fn the_ratified_manifest_and_closure_validate_over_the_corpus() {
     }
 }
 
+// ------------------------------------------ the K2-A producer bounds
+
+#[test]
+fn the_out_of_schema_policies_walk_but_refuse_the_ratified_root() {
+    // The producer/decoder seam: the K1 WALK tolerates the boundary
+    // study's full policy range (the split is a host parameter — a
+    // gigantic boundary simply yields one chunk over a small
+    // ledger), but the RATIFIED /2 manifest producer refuses, TYPED,
+    // any session it cannot represent — no panic in debug or
+    // release, and the refusal names the bounded count.
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let legacy = save_session(&spine, &director).unwrap();
+
+    // (1) The extreme out-of-schema policy: u64::MAX records per
+    // chunk passes the walk's host-index conversion on 64-bit hosts
+    // (the whole ledger is one chunk) — the root refuses typed.
+    let policy = ChunkPolicy {
+        ledger_records: u64::MAX,
+    };
+    let chunks = session_chunks::chunk_session(&legacy, &policy)
+        .unwrap_or_else(|error| panic!("the walk tolerates the extreme boundary: {error:?}"));
+    assert_eq!(
+        chunks.ledger_chunks.len(),
+        1,
+        "the extreme boundary yields one chunk over the fixture's ledger"
+    );
+    let error = session_chunks::try_build_manifest(&chunks)
+        .expect_err("the extreme boundary exceeds the ratified schema maximum");
+    assert!(
+        matches!(
+            &error,
+            engine_core::SaveError::Limit {
+                kind: "ledger-boundary",
+                value,
+                max,
+                ..
+            } if *value == u64::MAX
+                && *max == composite_manifest::MAX_LEDGER_BOUNDARY
+        ),
+        "the typed refusal names the boundary count: {error:?}"
+    );
+    // The root forms refuse identically — an out-of-schema policy
+    // yields NO root bytes, never a panic and never an undecodable
+    // root.
+    assert!(session_chunks::try_root_manifest(&chunks).is_err());
+    assert!(session_chunks::try_root_identity(&chunks).is_err());
+
+    // (2) A boundary just above the ratified maximum (fitting host
+    // arithmetic everywhere — the refusal is the schema bound, not
+    // an overflow): the walk still succeeds, the root still refuses.
+    let policy = ChunkPolicy {
+        ledger_records: composite_manifest::MAX_LEDGER_BOUNDARY + 1,
+    };
+    let chunks = session_chunks::chunk_session(&legacy, &policy)
+        .unwrap_or_else(|error| panic!("the walk tolerates the just-over boundary: {error:?}"));
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+    let error = session_chunks::try_build_manifest(&chunks)
+        .expect_err("the just-above-maximum boundary refuses");
+    assert!(
+        matches!(
+            &error,
+            engine_core::SaveError::Limit {
+                kind: "ledger-boundary",
+                value,
+                ..
+            } if *value == composite_manifest::MAX_LEDGER_BOUNDARY + 1
+        ),
+        "the typed refusal names the boundary count: {error:?}"
+    );
+
+    // The K1 standalone behavior is preserved at both out-of-schema
+    // policies: the walk exists, the composition stays byte-exact —
+    // only the RATIFIED ROOT refuses.
+    let recomposed = session_chunks::compose_session(&chunks);
+    assert_eq!(
+        recomposed, legacy,
+        "the out-of-schema policy still composes byte-exactly (the walk is standalone)"
+    );
+}
+
+#[test]
+fn the_exact_maximum_boundary_is_representable_and_round_trips() {
+    // (3) The schema's exact maximum boundary is a VALID policy (a
+    // sealed chunk at it is exactly MAX_CHUNK_BYTES wide): the root
+    // it produces strictly decodes — the producer never emits a
+    // manifest the decoder refuses.
+    let (spine, director) = scenario_pair(150, &near_region_4());
+    let legacy = save_session(&spine, &director).unwrap();
+    let policy = ChunkPolicy {
+        ledger_records: composite_manifest::MAX_LEDGER_BOUNDARY,
+    };
+    let chunks = session_chunks::chunk_session(&legacy, &policy)
+        .unwrap_or_else(|error| panic!("the exact-maximum boundary walks: {error:?}"));
+    // The fixture's ledger is far below the boundary: one partial
+    // tail chunk.
+    assert_eq!(chunks.ledger_chunks.len(), 1);
+    let manifest = session_chunks::try_build_manifest(&chunks)
+        .unwrap_or_else(|error| panic!("the exact-maximum boundary is in-schema: {error:?}"));
+    assert_eq!(
+        manifest.ledger_boundary,
+        composite_manifest::MAX_LEDGER_BOUNDARY
+    );
+    let root_bytes = session_chunks::try_root_manifest(&chunks)
+        .expect("the exact-maximum boundary produces root bytes");
+    let decoded = session_chunks::decode_root_manifest(&root_bytes)
+        .expect("the produced root strictly decodes through the ratified schema");
+    assert_eq!(decoded, manifest);
+    let identity = session_chunks::try_root_identity(&chunks)
+        .expect("the exact-maximum boundary produces a root identity");
+    assert_eq!(
+        identity,
+        StoredObject::new(root_bytes.clone()).unwrap().hash()
+    );
+    // The differential still holds at the exact-maximum boundary.
+    differential(spine, director, &policy);
+}
+
+#[test]
+fn the_excessive_chunk_count_refuses_the_ratified_root() {
+    // (4) A deliberately small chunk policy over the large corpus
+    // produces more ledger chunks than the schema's entry maximum:
+    // the WALK still succeeds (the boundary study's domain — the
+    // representation exists without a huge input buffer), but the
+    // RATIFIED ROOT refuses typed, naming the entry count.
+    let (spine, director) = scenario_pair(600, &near_region_4());
+    let legacy = save_session(&spine, &director).unwrap();
+    let policy = ChunkPolicy { ledger_records: 1 };
+    let chunks = session_chunks::chunk_session(&legacy, &policy)
+        .unwrap_or_else(|error| panic!("the per-record boundary walks: {error:?}"));
+    let entry_count = chunks.section_list().len() as u64;
+    assert!(
+        entry_count > composite_manifest::MAX_MANIFEST_CHUNKS,
+        "the per-record policy exceeds the manifest entry maximum ({entry_count} entries)"
+    );
+    let error = session_chunks::try_build_manifest(&chunks)
+        .expect_err("the excessive chunk count refuses the ratified root");
+    assert!(
+        matches!(
+            &error,
+            engine_core::SaveError::Limit {
+                kind: "chunk-count",
+                value,
+                max,
+                ..
+            } if *value == entry_count
+                && *max == composite_manifest::MAX_MANIFEST_CHUNKS
+        ),
+        "the typed refusal names the entry count: {error:?}"
+    );
+    assert!(session_chunks::try_root_manifest(&chunks).is_err());
+    // The K1 standalone behavior: the walked representation composes
+    // byte-exactly at the out-of-schema policy.
+    assert_eq!(
+        session_chunks::compose_session(&chunks),
+        legacy,
+        "the per-record policy still composes byte-exactly (the walk is standalone)"
+    );
+}
+
 // ------------------------------------------------------ the chunk invariants
 
 #[test]
@@ -482,8 +646,10 @@ fn the_chunk_identities_are_deterministic_and_prefix_stable() {
     let first = session_chunks::chunk_session(&legacy, &ChunkPolicy::default()).unwrap();
     let second = session_chunks::chunk_session(&legacy, &ChunkPolicy::default()).unwrap();
     assert_eq!(
-        session_chunks::root_identity(&first),
-        session_chunks::root_identity(&second),
+        session_chunks::try_root_identity(&first)
+            .expect("the default-policy root identity is in-schema"),
+        session_chunks::try_root_identity(&second)
+            .expect("the default-policy root identity is in-schema"),
         "the root identity is deterministic"
     );
     assert_eq!(first, second, "the whole chunk set is deterministic");

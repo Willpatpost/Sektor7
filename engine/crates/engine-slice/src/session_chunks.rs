@@ -59,7 +59,8 @@
 use engine_core::wire::{SAVE_DOMAIN, SAVE_DOMAIN_V2, SPINE_DOMAIN, SPINE_HISTORY_DOMAIN};
 use engine_core::{Decoder, Encoder, SaveError, Spine, Tick};
 use engine_persist::composite_manifest::{
-    self, CompositeManifest, HistoryKind, ManifestEntry, SectionKind, TAG_BLOCKED,
+    self, CompositeManifest, HistoryKind, MAX_CHUNK_BYTES, MAX_COMPOSED_LENGTH,
+    MAX_LEDGER_BOUNDARY, MAX_MANIFEST_CHUNKS, ManifestEntry, SectionKind, TAG_BLOCKED,
     TAG_COMPACTED_META, TAG_DIRECTOR, TAG_FAR, TAG_HEADER, TAG_HELD, TAG_LEDGER_META,
     TAG_LEDGER_RECORDS, TAG_NEAR, TAG_WORLD,
 };
@@ -584,63 +585,132 @@ pub fn compose_session(chunks: &ChunkedSession) -> Vec<u8> {
 /// and the entries in the grammar's fixed order with their section
 /// kinds (the singletons; the ledger run's sealed and partial-tail
 /// classification).
-pub fn build_manifest(chunks: &ChunkedSession) -> CompositeManifest {
-    let sealed_width = (chunks.ledger_boundary as usize)
-        .checked_mul(LEDGER_RECORD_BYTES)
-        .expect("the walked boundary is bounded below the manifest maximum");
-    let entries: Vec<ManifestEntry> = chunks
-        .section_list()
-        .iter()
-        .map(|section| ManifestEntry {
+///
+/// **The producer/decoder seam (the K2-A corrective):** the manifest
+/// is a SCHEMA-BOUNDED object, not a mechanical transcription of the
+/// walk. The strict decoder enforces its bounds over untrusted
+/// bytes; this producer refuses, TYPED, any walked session it
+/// cannot represent — the ledger boundary within the schema's
+/// maximum, the entry count within the schema's chunk maximum, every
+/// payload within the schema's per-chunk maximum, and the composed
+/// total within the schema's overall maximum. An out-of-schema
+/// [`ChunkPolicy`] therefore NEVER panics (in debug or release) and
+/// never yields root bytes the decoder would reject: every
+/// successful construction is decodable by construction. The K1
+/// WALK keeps its standalone boundary-study behavior — a policy
+/// outside the manifest schema still splits and composes (the
+/// representation exists); only the RATIFIED ROOT refuses it.
+pub fn try_build_manifest(chunks: &ChunkedSession) -> Result<CompositeManifest, SaveError> {
+    const SECTION: &str = "k1-chunk/manifest";
+    // (1) The ledger boundary: a policy the schema cannot carry (an
+    // extreme per-chunk record count, or a hand-built session)
+    // refuses naming the COUNT — never a derived byte product, so
+    // the error construction itself cannot overflow.
+    let boundary = chunks.ledger_boundary;
+    if boundary == 0 || boundary > MAX_LEDGER_BOUNDARY {
+        return Err(SaveError::Limit {
+            section: SECTION,
+            kind: "ledger-boundary",
+            value: boundary,
+            max: MAX_LEDGER_BOUNDARY,
+        });
+    }
+    // (2) The entry count: the manifest lists every section chunk —
+    // a deliberately small boundary over a large ledger exceeds the
+    // schema's entry maximum and refuses naming the count.
+    let sections = chunks.section_list();
+    if sections.len() > MAX_MANIFEST_CHUNKS as usize {
+        return Err(SaveError::Limit {
+            section: SECTION,
+            kind: "chunk-count",
+            value: sections.len() as u64,
+            max: MAX_MANIFEST_CHUNKS,
+        });
+    }
+    // The sealed width on the schema's own u64 plane: the boundary
+    // check above bounds it below MAX_CHUNK_BYTES, so the checked
+    // multiply cannot fail — it is kept checked so the invariant is
+    // structural, not incidental.
+    let sealed_width = boundary
+        .checked_mul(composite_manifest::LEDGER_RECORD_BYTES)
+        .ok_or(SaveError::Limit {
+            section: SECTION,
+            kind: "ledger-boundary",
+            value: boundary,
+            max: MAX_LEDGER_BOUNDARY,
+        })?;
+    let mut entries = Vec::with_capacity(sections.len());
+    let mut composed_length = 0u64;
+    for section in &sections {
+        // (3) The per-chunk payload bound.
+        let payload_length = section.payload.len() as u64;
+        if payload_length > MAX_CHUNK_BYTES {
+            return Err(SaveError::Limit {
+                section: SECTION,
+                kind: "chunk-length",
+                value: payload_length,
+                max: MAX_CHUNK_BYTES,
+            });
+        }
+        // (4) The composed total: `composed_length <=
+        // MAX_COMPOSED_LENGTH` holds before every increment (the
+        // check below maintains it), so the subtraction cannot
+        // underflow, and the refusal names the true exceeded total
+        // (bounded by MAX_COMPOSED_LENGTH + MAX_CHUNK_BYTES — the
+        // error construction itself cannot overflow).
+        if payload_length > MAX_COMPOSED_LENGTH - composed_length {
+            return Err(SaveError::Limit {
+                section: SECTION,
+                kind: "composed-length",
+                value: composed_length + payload_length,
+                max: MAX_COMPOSED_LENGTH,
+            });
+        }
+        composed_length += payload_length;
+        let kind = if section.tag == TAG_LEDGER_RECORDS {
+            if payload_length == sealed_width {
+                SectionKind::LedgerSealed
+            } else {
+                SectionKind::LedgerTail
+            }
+        } else {
+            SectionKind::Singleton
+        };
+        entries.push(ManifestEntry {
             tag: section.tag,
             identity: section.identity,
-            payload_length: section.payload.len() as u64,
-            kind: if section.tag == TAG_LEDGER_RECORDS {
-                if section.payload.len() == sealed_width {
-                    SectionKind::LedgerSealed
-                } else {
-                    SectionKind::LedgerTail
-                }
-            } else {
-                SectionKind::Singleton
-            },
-        })
-        .collect();
-    let composed_length =
-        entries
-            .iter()
-            .map(|entry| entry.payload_length)
-            .fold(0u64, |sum, len| {
-                sum.checked_add(len)
-                    .expect("the walked payload sum is bounded below the manifest maximum")
-            });
-    CompositeManifest {
+            payload_length,
+            kind,
+        });
+    }
+    Ok(CompositeManifest {
         history_kind: match chunks.form {
             HistoryForm::Full => HistoryKind::Full,
             HistoryForm::Compacted => HistoryKind::Compacted,
         },
-        ledger_boundary: chunks.ledger_boundary,
+        ledger_boundary: boundary,
         composed_length,
         entries,
-    }
+    })
 }
 
 /// The root manifest's canonical bytes (the prospective
 /// `session-snapshot/2` publication root — NEVER written to
 /// canonical storage; the K2-A ratified schema, superseding the K1
-/// prototype root).
-pub fn root_manifest(chunks: &ChunkedSession) -> Vec<u8> {
-    composite_manifest::encode(&build_manifest(chunks))
+/// prototype root). Fallible with the producer's typed refusals: an
+/// out-of-schema chunk policy yields NO root bytes, not a panic.
+pub fn try_root_manifest(chunks: &ChunkedSession) -> Result<Vec<u8>, SaveError> {
+    Ok(composite_manifest::encode(&try_build_manifest(chunks)?))
 }
 
 /// The root's content identity — the prospective snapshot identity
 /// (the exact-state equivalence key's future form; the C1 covering's
 /// idempotency semantics carry over unchanged: the root identity IS
-/// the state identity).
-pub fn root_identity(chunks: &ChunkedSession) -> Hash {
-    StoredObject::new(root_manifest(chunks))
-        .expect("the root manifest is a valid content object")
-        .hash()
+/// the state identity). Fallible with the producer's typed refusals.
+pub fn try_root_identity(chunks: &ChunkedSession) -> Result<Hash, SaveError> {
+    let root = StoredObject::new(try_root_manifest(chunks)?)
+        .map_err(|_| SaveError::Integrity("k1-chunk/manifest/root-object"))?;
+    Ok(root.hash())
 }
 
 /// Strictly decodes this module's own root through the ratified
