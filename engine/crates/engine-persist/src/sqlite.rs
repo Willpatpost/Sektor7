@@ -822,8 +822,22 @@ impl CanonicalMedium for SqliteMedium {
         }
 
         // The trusted cursor advances over the accepted revision —
-        // O(1) work.
-        advance_cursor(&mut self.cursor, &record, &record_id);
+        // O(1) work; the R12 corrective carries the VERIFIED
+        // composite closure (the manifest's identities — the
+        // admission already verified every chunk; the manifest
+        // re-decode here is the same bounded object).
+        if composite {
+            let manifest =
+                composite_manifest::decode(objects[0].bytes()).map_err(MediumError::Format)?;
+            advance_cursor(
+                &mut self.cursor,
+                &record,
+                &record_id,
+                Some(&manifest.closure_identities()),
+            );
+        } else {
+            advance_cursor(&mut self.cursor, &record, &record_id, None);
+        }
         Ok(AppendOutcome::Accepted {
             id: record_id,
             tier: SyncTier::TransactionalWalFull,
@@ -1606,7 +1620,18 @@ fn validate_observed(
             ) {
                 Ok(suffix) => {
                     walks.last_append_walked = suffix.len() as u64;
-                    absorb_suffix(cursor, suffix, id);
+                    // R12: the per-record verified composite closures
+                    // (the walk already verified every chunk; the
+                    // re-extraction here reads the same objects).
+                    let mut closures = Vec::with_capacity(suffix.len());
+                    for (_, record) in &suffix {
+                        let closure = record.content_refs.first().and_then(|root| {
+                            let bytes = load_referenced_object(conn, root).ok()?;
+                            verified_composite_closure(conn, &bytes).ok()?
+                        });
+                        closures.push(closure);
+                    }
+                    absorb_suffix(cursor, suffix, closures, id);
                     Ok(())
                 }
                 Err(MediumError::Chain { rule: "divergence" }) => {
@@ -1648,6 +1673,32 @@ fn validate_observed(
 /// by the next cold walk; the single-writer discipline makes a
 /// mid-handle foreign MK one this process published through another,
 /// already-closed handle).
+/// The VERIFIED composite closure over the SQLite connection (the
+/// R12 corrective): for a /2 root, strictly decode the manifest and
+/// verify every declared chunk (the hash-verified load + the full
+/// envelope check) — returning the closure identities for the
+/// trusted reachability set. Every failure propagates typed.
+fn verified_composite_closure(
+    conn: &Connection,
+    root_bytes: &[u8],
+) -> Result<Option<Vec<Hash>>, MediumError> {
+    let domain = peek_object_domain(root_bytes).map_err(MediumError::Format)?;
+    if domain != composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+        return Ok(None);
+    }
+    let manifest = composite_manifest::decode(root_bytes).map_err(MediumError::Format)?;
+    let mut identities = Vec::with_capacity(manifest.entries.len());
+    for entry in &manifest.entries {
+        let chunk_bytes = load_referenced_object(conn, &entry.identity)?;
+        crate::composite_append::verify_chunk_dependency(&chunk_bytes, &entry.identity, &manifest)
+            .map_err(|_error| MediumError::Chain {
+                rule: "composite-closure-verification",
+            })?;
+        identities.push(entry.identity);
+    }
+    Ok(Some(identities))
+}
+
 fn walk_suffix(
     conn: &Connection,
     target: Hash,
@@ -1713,7 +1764,10 @@ fn walk_suffix(
             });
         }
         for reference in &record.content_refs {
-            load_referenced_object(conn, reference)?;
+            let bytes = load_referenced_object(conn, reference)?;
+            // R12: the /2 root's verified closure joins the suffix
+            // validation (the same discipline as the cold walk).
+            verified_composite_closure(conn, &bytes)?;
         }
         newer_epoch = Some(record.epoch);
         match record.parent {
@@ -1732,12 +1786,13 @@ fn walk_suffix(
 fn absorb_suffix(
     cursor: &mut Option<SqliteCursor>,
     suffix: Vec<(Hash, RevisionRecord)>,
+    closures: Vec<Option<Vec<Hash>>>,
     new_head: Hash,
 ) {
     let Some(cursor) = cursor.as_mut() else {
         return;
     };
-    for (id, record) in suffix.into_iter().rev() {
+    for ((id, record), closure) in suffix.into_iter().rev().zip(closures.into_iter().rev()) {
         if let Some(key) = &record.idempotency_key {
             cursor.seen_keys.insert(key.clone());
         }
@@ -1748,13 +1803,30 @@ fn absorb_suffix(
                 cursor.content_objects += 1;
             }
         }
+        // R12: the verified composite closure joins the trusted
+        // reachability set (the walk already verified every chunk).
+        if let Some(closure) = closure {
+            for identity in closure {
+                if cursor.reachable.insert(identity) {
+                    cursor.content_objects += 1;
+                }
+            }
+        }
         cursor.epoch = record.epoch;
     }
     cursor.head = new_head;
 }
 
-/// Advances the cursor over an accepted append — O(1) work.
-fn advance_cursor(cursor: &mut Option<SqliteCursor>, record: &RevisionRecord, id: &Hash) {
+/// Advances the cursor over an accepted append — O(1) work (plus
+/// the verified composite closure when the record is a /2 root —
+/// the R12 corrective keeps the hot cursor on the same definition
+/// of reachability as the cold walk).
+fn advance_cursor(
+    cursor: &mut Option<SqliteCursor>,
+    record: &RevisionRecord,
+    id: &Hash,
+    composite_closure: Option<&[Hash]>,
+) {
     let refs = &record.content_refs;
     match cursor.as_mut() {
         None => {
@@ -1777,6 +1849,13 @@ fn advance_cursor(cursor: &mut Option<SqliteCursor>, record: &RevisionRecord, id
             for reference in refs {
                 if reachable.insert(*reference) {
                     content_objects += 1;
+                }
+            }
+            if let Some(closure) = composite_closure {
+                for identity in closure {
+                    if reachable.insert(*identity) {
+                        content_objects += 1;
+                    }
                 }
             }
             *cursor = Some(SqliteCursor {
@@ -1803,6 +1882,13 @@ fn advance_cursor(cursor: &mut Option<SqliteCursor>, record: &RevisionRecord, id
             for reference in refs {
                 if cursor.reachable.insert(*reference) {
                     cursor.content_objects += 1;
+                }
+            }
+            if let Some(closure) = composite_closure {
+                for identity in closure {
+                    if cursor.reachable.insert(*identity) {
+                        cursor.content_objects += 1;
+                    }
                 }
             }
         }

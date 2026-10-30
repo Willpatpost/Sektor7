@@ -862,9 +862,18 @@ impl LocalFileMedium {
             let mut closure = None;
             if let Some(root) = record.content_refs.first() {
                 let bytes = self.load_referenced(root)?;
-                if let Ok(domain) = peek_object_domain(&bytes)
-                    && domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
-                {
+                // R13: the domain peek PROPAGATES its failure — a
+                // malformed leading prefix is a typed fail-closed
+                // refusal, never silently treated as an unrelated
+                // object. The recognized-but-unsupported future
+                // family member (e.g. /3) follows the forward-
+                // compatibility semantics: it passes the peek (a
+                // valid domain string), does not match /2, and is
+                // carried as a non-composite reference — the
+                // recovery-level fail-closed (R11's regression)
+                // handles it.
+                let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+                if domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
                     let manifest =
                         composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
                     let mut identities = Vec::with_capacity(manifest.entries.len());
