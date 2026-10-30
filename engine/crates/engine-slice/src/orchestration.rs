@@ -660,6 +660,7 @@ impl OrchestratedSession {
         self.crossing.assert_authoritative()?;
         let now = self.spine.clock();
         let mut regions_transitioned = Vec::new();
+        let mut profile_crossing_ms_sum = 0.0;
         for region in 0..REGION_COUNT {
             let current = self.director.levels()[region];
             let next = self.director.target_level(region, presence);
@@ -679,6 +680,7 @@ impl OrchestratedSession {
                 self.crossing
                     .deactivate(&mut self.spine, &mut self.director, region, now)?;
                 let crossing_ms = crossing_start.elapsed().as_secs_f64() * 1000.0;
+                profile_crossing_ms_sum += crossing_ms;
                 self.director.push_transition_entry(TransitionEntry {
                     tick: now,
                     region,
@@ -699,6 +701,7 @@ impl OrchestratedSession {
                 self.crossing
                     .activate(&mut self.spine, &mut self.director, region, next, now)?;
                 let crossing_ms = crossing_start.elapsed().as_secs_f64() * 1000.0;
+                profile_crossing_ms_sum += crossing_ms;
                 self.director.push_transition_entry(TransitionEntry {
                     tick: now,
                     region,
@@ -732,6 +735,15 @@ impl OrchestratedSession {
                 regions_transitioned.push(region);
             }
         }
+        // The S6-C4 profiling aggregate (opt-in, observational):
+        // the per-tick transition count and the summed crossing wall
+        // time — the multi-transition accounting the frame-stall
+        // analysis requires.
+        crate::crossing_profile::record_tick(
+            now.as_u64(),
+            regions_transitioned.len(),
+            profile_crossing_ms_sum,
+        );
         let tick = self.spine.run_tick();
         Ok(TickReport {
             tick,

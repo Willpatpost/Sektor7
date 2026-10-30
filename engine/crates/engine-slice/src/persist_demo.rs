@@ -707,6 +707,9 @@ impl HeadlessReport {
         if let Some((region, signals, credits)) = &self.closed_region {
             println!("  closed action region r{region}: signals {signals} · credits {credits}");
         }
+        if crate::crossing_profile::enabled() {
+            print!("{}", crate::crossing_profile::summary());
+        }
         println!(
             "  complete boundary time (tick + confirmation + action lifecycle): p50 {:.3} ms · p95 {:.3} ms · max {:.3} ms ({} samples)",
             self.boundary_p50, self.boundary_p95, self.boundary_max, self.boundary_samples
@@ -1328,6 +1331,12 @@ impl PersistDemo {
                 let commit_start = Instant::now();
                 let outcome = self.session.commit_canonical()?;
                 let confirmation_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
+                crate::crossing_profile::io_wait(
+                    "9-canonical-confirmation",
+                    usize::MAX,
+                    self.session.clock().as_u64(),
+                    commit_start,
+                );
                 let label = commit_label(&outcome);
                 let revision = if let CommitOutcome::Confirmed(receipt) = &outcome {
                     self.confirmed_revision = Some(receipt.revision);
@@ -3026,6 +3035,9 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         println!("  {failure}");
     }
     println!("--- run summary ---");
+    if crate::crossing_profile::enabled() {
+        print!("{}", crate::crossing_profile::summary());
+    }
     println!(
         "presented {} frames over {:.1}s ({:.1} fps avg)",
         presented,

@@ -734,6 +734,27 @@ impl SessionCrossing<StoreLocation> {
     }
 }
 
+/// The S6-C4 profiling drop-guard for the covering's medium phase:
+/// records the append-settle wall boundary on EVERY exit path of the
+/// covering's medium section (observational, opt-in,
+/// fingerprint-excluded — see crossing_profile).
+struct CoveringAppendMark {
+    region: usize,
+    tick: u64,
+    start: std::time::Instant,
+}
+
+impl Drop for CoveringAppendMark {
+    fn drop(&mut self) {
+        crate::crossing_profile::io_wait(
+            "6-covering-append-settle",
+            self.region,
+            self.tick,
+            self.start,
+        );
+    }
+}
+
 impl<S: MediumSource> SessionCrossing<S> {
     /// The provider-aware constructor (PP-B1's integration seam,
     /// source-generalized at PP-B4 checkpoint 1): the same
@@ -1096,8 +1117,10 @@ impl<S: MediumSource> SessionCrossing<S> {
         // Phase 2 — determine (read-only).
         let class = EventClass::new(region as u16);
         let episode = director.states()[region].episode + 1;
+        let step_start = std::time::Instant::now();
         let collected = spine.collect_matching(|view| view.class == class);
         let plan = DeactivationPlan::prepare(region, from, episode, now, spine.world(), &collected);
+        crate::crossing_profile::compute("1-plan-preparation", region, now.as_u64(), step_start);
         // Phase 2.5 — THE C1 COVERING PREREQUISITE (the
         // recovery-coverage checkpoint): a NONEMPTY consequential
         // plan may not journal its T1 transaction until an ACCEPTED,
@@ -1111,7 +1134,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // binding is exact, never a frontier or tick heuristic. See
         // [`Self::establish_covering`] for the full contract.
         if !plan.captures.is_empty() {
-            self.establish_covering(spine, director)?;
+            self.establish_covering(spine, director, region, now)?;
         }
         // The C1 crash-window seam (test-only): the hard exit AFTER
         // the covering's acceptance and BEFORE the T1 capture.
@@ -1129,6 +1152,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // capture records land in input order and the commit's
         // identity list is written sorted, validated equal at every
         // scan).
+        let t1_start = std::time::Instant::now();
         let receipt = if plan.captures.is_empty() {
             None
         } else {
@@ -1155,9 +1179,12 @@ impl<S: MediumSource> SessionCrossing<S> {
             )?)
         };
         // Phase 4 — verify: the receipt is post-fsync by contract.
+        crate::crossing_profile::io_wait("7-t1-journal", region, now.as_u64(), t1_start);
         gap(spine, director);
         // Phase 5 — install (the staged bundle).
+        let step_start = std::time::Instant::now();
         install_deactivation(spine, director, &plan)?;
+        crate::crossing_profile::compute("8-installation", region, now.as_u64(), step_start);
         Ok(receipt)
     }
 
@@ -1216,10 +1243,28 @@ impl<S: MediumSource> SessionCrossing<S> {
         &mut self,
         spine: &Spine<NpcWorld>,
         director: &RegionDirector,
+        profile_region: usize,
+        profile_tick: Tick,
     ) -> Result<(), TransitionError> {
+        let profile_tick_u64 = profile_tick.as_u64();
+        let step_start = std::time::Instant::now();
         let bytes = save_session(spine, director).map_err(PipelineError::Format)?;
+        crate::crossing_profile::compute(
+            "2-session-serialization",
+            profile_region,
+            profile_tick_u64,
+            step_start,
+        );
+        let step_start = std::time::Instant::now();
         let object = StoredObject::new(bytes)?;
         let content_hash = object.hash();
+        crate::crossing_profile::compute(
+            "3-object-hash",
+            profile_region,
+            profile_tick_u64,
+            step_start,
+        );
+        let step_start = std::time::Instant::now();
         if let Some(covering) = &self.covering
             && covering.content_hash == content_hash
         {
@@ -1227,13 +1272,42 @@ impl<S: MediumSource> SessionCrossing<S> {
             // covering snapshot captured THIS state — the plan is
             // covered (the refused-crossing retry and the
             // shared-state cases).
+            crate::crossing_profile::compute(
+                "4-covering-equivalence",
+                profile_region,
+                profile_tick_u64,
+                step_start,
+            );
             return Ok(());
         }
+        crate::crossing_profile::compute(
+            "4-covering-equivalence",
+            profile_region,
+            profile_tick_u64,
+            step_start,
+        );
         // The strict roundtrip validation, BEFORE publication.
+        let step_start = std::time::Instant::now();
         restore_session(object.bytes()).map_err(|error| TransitionError::CoveringRefused {
             detail: format!("covering/roundtrip-validation: {error:?}"),
             candidate: None,
         })?;
+        crate::crossing_profile::compute(
+            "5-restore-validation",
+            profile_region,
+            profile_tick_u64,
+            step_start,
+        );
+        // The medium phase (the open, the head, the append, the
+        // stale-parent retry, and the Unknown reconciliation) — ONE
+        // I/O-wait-class boundary through a drop-guard: the mark
+        // fires on EVERY exit path, the wall time covering queue
+        // waits, provider operations, and fsyncs.
+        let _append_mark = CoveringAppendMark {
+            region: profile_region,
+            tick: profile_tick_u64,
+            start: std::time::Instant::now(),
+        };
         let mut medium = self.source.open_medium()?;
         let parent = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
         let mut attempt =

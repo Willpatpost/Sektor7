@@ -6,6 +6,7 @@
 pub mod backup;
 pub mod benchmark;
 pub mod crossing;
+pub mod crossing_profile;
 pub mod frame_timing;
 pub mod math;
 pub mod npc;

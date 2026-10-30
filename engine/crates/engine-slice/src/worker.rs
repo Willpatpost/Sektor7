@@ -117,6 +117,11 @@ pub enum WorkerReply {
 /// the worker ignores.
 struct Job {
     op: MediumOp,
+    /// The S6-C4 profiling witness: the submit-side instant (set on
+    /// EVERY job — a cheap Instant copy) the worker uses to split
+    /// the queue wait from the provider operation time when the
+    /// opt-in collector is enabled.
+    submitted: std::time::Instant,
     /// The optional-publication cancellation token (PP-B4 checkpoint 3):
     /// checked ONCE before execution — a canceled queued job is skipped
     /// (a definite non-event); a job already executing runs to its
@@ -336,6 +341,23 @@ impl Drop for DeathGuard {
     }
 }
 
+/// The coarse operation label for the profiling split.
+fn op_label(op: &MediumOp) -> &'static str {
+    match op {
+        MediumOp::Head => "head",
+        MediumOp::Append { .. } => "append",
+        MediumOp::ReadRecord { .. } => "read-record",
+        MediumOp::ReadObject { .. } => "read-object",
+        MediumOp::ClassifyObject { .. } => "classify-object",
+        MediumOp::ReconcileUnknown { .. } => "reconcile-unknown",
+        MediumOp::Checkpoint => "checkpoint",
+        MediumOp::Reclaim { .. } => "reclaim",
+        MediumOp::ReclaimPending { .. } => "reclaim-pending",
+        MediumOp::Validate => "validate",
+        MediumOp::Barrier => "barrier",
+    }
+}
+
 fn worker_loop(
     rx: Receiver<Job>,
     mut store: SessionStore,
@@ -464,7 +486,15 @@ fn worker_loop(
             continue;
         }
         let executed_kind = job_kind(&job.op);
+        let op_start = std::time::Instant::now();
+        let queue_ms = op_start.duration_since(job.submitted).as_secs_f64() * 1000.0;
+        let op_label = op_label(&job.op);
         let reply = execute(&mut store, job.op);
+        crate::crossing_profile::record_worker_op(
+            op_label,
+            queue_ms,
+            op_start.elapsed().as_secs_f64() * 1000.0,
+        );
         // An abandoned receiver fails this send; the worker ignores it and
         // never blocks (one reply per one-slot channel).
         let _ = job.reply.send(reply);
@@ -549,6 +579,7 @@ impl WorkerMedium {
                 op,
                 cancel: None,
                 reply,
+                submitted: std::time::Instant::now(),
             })
             .is_err()
         {
@@ -598,6 +629,7 @@ impl CanonicalMedium for WorkerMedium {
                 op,
                 cancel: None,
                 reply,
+                submitted: std::time::Instant::now(),
             })
             .is_err()
         {
@@ -851,6 +883,7 @@ impl IoWorker {
                     op,
                     cancel: None,
                     reply,
+                    submitted: std::time::Instant::now(),
                 })
                 .map(|()| slot)
                 .map_err(|_| MediumError::WorkerUnavailable {
@@ -876,7 +909,12 @@ impl IoWorker {
             return Err(TrySubmitError::Unavailable);
         }
         let (reply, slot) = completion_slot();
-        let job = Job { op, cancel, reply };
+        let job = Job {
+            op,
+            cancel,
+            reply,
+            submitted: std::time::Instant::now(),
+        };
         match &self.tx {
             Some(tx) => match tx.try_send(job) {
                 Ok(()) => Ok(slot),
@@ -911,6 +949,7 @@ impl IoWorker {
             op,
             cancel: None,
             reply,
+            submitted: std::time::Instant::now(),
         };
         match &self.tx {
             Some(tx) => tx

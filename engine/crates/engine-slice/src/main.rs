@@ -232,6 +232,11 @@ fn main() {
         while index < args.len() {
             match args[index].as_str() {
                 "--headless" => options.headless = true,
+                // The S6-C4 crossing-latency profiling flag (the
+                // profiling GO): strictly observational, opt-in,
+                // inactive by default — enables the per-step marks;
+                // the summary prints with the run summary.
+                "--crossing-profile" => engine_slice::crossing_profile::enable(),
                 "--ticks" => {
                     if let Some(value) = args.get(index + 1)
                         && let Ok(ticks) = value.parse::<u64>()
