@@ -209,6 +209,22 @@ pub enum MediumError {
         /// What failed and where.
         detail: String,
     },
+    /// The dedicated composite admission refused the publication
+    /// (K2-C1): a typed, identity-naming failure — the root
+    /// manifest, the dependency set, or a chunk dependency could
+    /// not be established. Nothing was mutated.
+    CompositeAdmission {
+        /// What was proven and refused.
+        detail: String,
+    },
+    /// The generic append's snapshot-family domain gate refused a
+    /// composite (or unrecognized future family) snapshot root
+    /// (K2-C1): such objects may enter ONLY through the dedicated
+    /// `append_composite` admission.
+    CompositeDomainGate {
+        /// The refused object's leading domain.
+        domain: String,
+    },
 }
 
 impl fmt::Display for MediumError {
@@ -254,6 +270,15 @@ impl fmt::Display for MediumError {
             }
             MediumError::WorkerUnavailable { detail } => {
                 write!(f, "the canonical I/O worker is unavailable: {detail}")
+            }
+            MediumError::CompositeAdmission { detail } => {
+                write!(f, "the composite admission refused: {detail}")
+            }
+            MediumError::CompositeDomainGate { domain } => {
+                write!(
+                    f,
+                    "the generic append refuses the snapshot-family domain {domain} — use the composite admission"
+                )
             }
         }
     }
@@ -389,12 +414,57 @@ pub trait CanonicalMedium {
     /// concurrent writer for a given expected parent can be
     /// `Accepted`; losers observe `RejectedStaleParent`; any failure
     /// from the first object write onward is `Unknown`.
+    /// The GENERIC publication. Provided (K2-C1): the snapshot-
+    /// family domain gate runs BEFORE the provider's own append — a
+    /// composite (or unrecognized future family) snapshot root may
+    /// enter ONLY through the dedicated [`Self::append_composite`]
+    /// admission; the legacy `/1` path is unchanged.
     fn append(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],
         expected_parent: Option<Hash>,
+    ) -> Result<AppendOutcome, MediumError> {
+        crate::composite_append::enforce_snapshot_family_gate(objects)?;
+        self.append_raw(record, objects, expected_parent)
+    }
+
+    /// The provider's own append WITHOUT the snapshot-family gate —
+    /// the raw publication the dedicated composite admission
+    /// delegates to after ITS full verification. NEVER a public
+    /// entry point: every composite root must pass
+    /// [`Self::append_composite`]'s admission.
+    fn append_raw(
+        &mut self,
+        record: &RevisionRecord,
+        objects: &[StoredObject],
+        expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError>;
+
+    /// The DEDICATED composite publication (K2-C1): the fail-closed
+    /// admission over the root manifest, the revision's root
+    /// reference, the exact dependency set, and EVERY chunk (the
+    /// newly supplied against their bytes, the reused through the
+    /// medium's hash-verified read) — then the publication through
+    /// the provider's own `append` with the root and the new chunks
+    /// as the supplied objects (the record's content set), so the
+    /// CAS, idempotency, and reconciliation guarantees are exactly
+    /// the existing ones. Every admission failure refuses typed
+    /// BEFORE any mutation; an uncertain outcome is never converted
+    /// into a success. No production caller exists yet (the K2-C1
+    /// activation restriction).
+    fn append_composite(
+        &mut self,
+        request: &crate::composite_append::CompositeAppend,
+        expected_parent: Option<Hash>,
+    ) -> Result<AppendOutcome, MediumError> {
+        crate::composite_append::admit_composite(request, |identity| self.read_object(identity))
+            .map_err(crate::composite_append::CompositeAdmissionError::into_medium_error)?;
+        let mut objects = Vec::with_capacity(request.new_chunks.len() + 1);
+        objects.push(request.root.clone());
+        objects.extend(request.new_chunks.iter().cloned());
+        self.append_raw(request.record, &objects, expected_parent)
+    }
 
     /// Reads, hash-verifies, and decodes a revision record by
     /// identity.

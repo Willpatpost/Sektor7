@@ -139,7 +139,7 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
-    fn append(
+    fn append_raw(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],

@@ -737,11 +737,20 @@ fn the_reader_verifies_objects_published_through_a_real_local_file_medium() {
         .map(|(_identity, bytes)| StoredObject::new(bytes.clone()).unwrap())
         .collect();
     // with_content_refs sorts; the stored objects may arrive in any
-    // order — the medium matches by hash.
-    objects.push(composite.root.clone());
-    match medium.append(&record, &objects, None).unwrap() {
+    // order — the medium matches by hash. K2-C1: the publication now
+    // goes through the DEDICATED composite admission (the generic
+    // append's domain gate refuses /2 roots by design) — the root is
+    // the first object, the chunks the new supply.
+    objects.insert(0, composite.root.clone());
+    let request = engine_persist::composite_append::CompositeAppend {
+        record: &record,
+        root: &composite.root,
+        new_chunks: &objects[1..],
+        reused_chunks: &[],
+    };
+    match medium.append_composite(&request, None).unwrap() {
         AppendOutcome::Accepted { .. } => {}
-        other => panic!("the founding append is accepted: {other:?}"),
+        other => panic!("the founding composite append is accepted: {other:?}"),
     }
 
     // The read-only adapter: the dark reader over the real medium.

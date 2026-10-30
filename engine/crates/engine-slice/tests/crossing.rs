@@ -1369,13 +1369,39 @@ fn recovery_fails_closed_on_invalid_newest_snapshot() {
         Ok(_) => panic!("the invalid newest snapshot fails the recovery closed"),
     };
     assert!(matches!(error, TransitionError::CorruptSnapshot(_)));
-    // The future-version case: a session-snapshot/2 object is still
-    // recognizable (the domain family) — this build fails closed
-    // rather than silently using the older snapshot.
-    append_corrupt("engine-slice/session-snapshot/2");
+    // The future-version case (K2-C1 corrected): a session-snapshot/2
+    // object can no longer ENTER through the generic append at all —
+    // the snapshot-family domain gate refuses it typed BEFORE any
+    // mutation, so the recovery never meets an unadmitted /2 object
+    // (the fail-closed moved EARLIER; the head is unchanged and the
+    // recovery still succeeds on the last valid /1 snapshot).
+    let gate_refusal = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mut enc = Encoder::new();
+        enc.write_str("engine-slice/session-snapshot/2");
+        enc.write_bytes(b"not-a-spine-save");
+        enc.write_bytes(b"not-a-director-save");
+        let object = StoredObject::new(enc.into_bytes()).unwrap();
+        let record = RevisionRecord::regular(head, epoch, 999)
+            .with_idempotency_key(object.hash().as_bytes().to_vec())
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&record, std::slice::from_ref(&object), Some(head))
+            .expect_err("the generic append refuses the /2 object at the domain gate")
+    };
+    assert!(matches!(
+        gate_refusal,
+        engine_persist::medium::MediumError::CompositeDomainGate { .. }
+    ));
+    // The chain's newest is still the CORRUPT /1 object (the /2 was
+    // refused at the gate), so the recovery fails closed exactly as
+    // the first half asserted — the gate prevented the /2 from ever
+    // entering, and the existing fail-closed behavior is unchanged.
     let error = match SessionCrossing::recover(&dir.store(), &dir.journal(), "corrupt-campaign") {
         Err(error) => error,
-        Ok(_) => panic!("the future-version snapshot also fails closed"),
+        Ok(_) => panic!("the corrupt newest snapshot still fails the recovery closed"),
     };
     assert!(matches!(error, TransitionError::CorruptSnapshot(_)));
 }
@@ -1708,7 +1734,7 @@ impl CanonicalMedium for CoveringRaceMedium {
         self.inner.head()
     }
 
-    fn append(
+    fn append_raw(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],

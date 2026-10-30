@@ -1404,7 +1404,7 @@ impl CanonicalMedium for LocalFileMedium {
         outcome
     }
 
-    fn append(
+    fn append_raw(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],

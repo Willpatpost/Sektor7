@@ -56,9 +56,20 @@ use crate::{RevisionRecord, StoredObject};
 /// is not exactly `/2` is RECOGNIZED but unsupported — readers never
 /// guess across versions.
 pub const SESSION_SNAPSHOT_V2_DOMAIN: &str = "engine-slice/session-snapshot/2";
-/// The domain-family prefix (future-version recognition, never
-/// silent interpretation).
-const SESSION_SNAPSHOT_FAMILY: &str = "engine-slice/session-snapshot/";
+
+/// The session-snapshot family prefix (K2-C1: the production domain
+/// gate's recognition discipline — every versioned snapshot domain
+/// begins with it; the GENERIC append admits only the supported
+/// legacy `/1` form and refuses every other family member, so an
+/// unsupported future composite version can never bypass the
+/// dedicated composite admission).
+pub const SESSION_SNAPSHOT_FAMILY: &str = "engine-slice/session-snapshot/";
+
+/// The supported LEGACY whole-object snapshot domain — the existing
+/// production `/1` publication path (behaviorally unchanged by
+/// K2-C1; the generic append continues to admit it).
+pub const SESSION_SNAPSHOT_V1_DOMAIN: &str = "engine-slice/session-snapshot/1";
+
 /// The ratified manifest schema version.
 pub const MANIFEST_VERSION: u32 = 2;
 

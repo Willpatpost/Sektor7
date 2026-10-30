@@ -1864,30 +1864,36 @@ fn a_future_version_snapshot_supersedes_and_recovery_fails_closed() {
     let future_record = RevisionRecord::regular(s_revision, s_epoch, 999)
         .with_idempotency_key(future_hash.as_bytes().to_vec())
         .with_content_refs(vec![future_hash]);
-    let future_revision = future_record.id();
+    // K2-C1 corrected: the future-version snapshot can no longer
+    // ENTER through the generic append — the snapshot-family domain
+    // gate refuses it typed BEFORE any mutation (the fail-closed
+    // moved EARLIER; the close/recovery-level forward-compatibility
+    // rule is unchanged and remains proven by the corrupt-/1
+    // coverage in the crossing suite).
     let mut store = SessionStore::open(&location).unwrap();
-    store
+    let gate_refusal = store
         .append(&future_record, &[future_object], Some(s_revision))
-        .unwrap();
+        .expect_err("the generic append refuses the future-version snapshot at the domain gate");
     drop(store);
-    // THE CLOSE of the unchanged-S session: the future-version
-    // snapshot supersedes — the typed conflict, never a success.
+    assert!(matches!(
+        gate_refusal,
+        engine_persist::medium::MediumError::CompositeDomainGate { .. }
+    ));
+    // The chain stands UNCHANGED at S's revision — nothing entered.
+    assert_eq!(oracle_head_at(&location), s_revision);
+    // THE CLOSE of the unchanged-S session now SUCCEEDS (the future
+    // object never superseded it) — the exact-state idempotency.
     let report = session.close();
-    match &report.failure {
-        Some(CloseFailure::SupersededSnapshot) => {}
-        other => panic!("the future-version snapshot is the typed conflict: {other:?}"),
-    }
-    assert_eq!(report.final_revision, None);
-    // The chain stands: the future-version revision at HEAD — no
-    // rebase, no new append.
-    assert_eq!(oracle_head_at(&location), future_revision);
-    // THE RECOVERY ORACLE: a fresh recovery FAILS CLOSED on the newer
-    // snapshot (the forward-compatibility rule) — never silently
-    // selecting the older S.
+    assert!(
+        report.failure.is_none(),
+        "the close succeeds on the unchanged snapshot: {:?}",
+        report.failure
+    );
+    // THE RECOVERY ORACLE: a fresh recovery succeeds on S — the
+    // future-version object never entered the chain.
     match OrchestratedSession::recover(&location, &dir.journal(), "pp-b4-m") {
-        Err(TransitionError::CorruptSnapshot(_)) => {}
-        Err(other) => panic!("the recovery fails closed on the future version: {other:?}"),
-        Ok(_) => panic!("the recovery must fail closed on the future version, never select S"),
+        Ok(_) => {}
+        Err(other) => panic!("the recovery succeeds on S: {other:?}"),
     }
 }
 

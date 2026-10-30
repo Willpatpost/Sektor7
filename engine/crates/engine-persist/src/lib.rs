@@ -38,6 +38,7 @@
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
 pub mod checkpoint;
+pub mod composite_append;
 pub mod composite_manifest;
 pub mod composite_reader;
 pub mod consequence;
@@ -70,6 +71,7 @@ pub use checkpoint::{
     checkpoint_mk_idempotency_key, compute_digest_seed, compute_range_digest,
     publish_checkpoint_mk,
 };
+pub use composite_append::{CompositeAdmissionError, CompositeAppend};
 pub use composite_reader::{
     CompositeReadError, ObjectSource, ObjectSourceError, ReadLimits, VerificationMemo,
     VerifiedChunk, VerifiedComposite, read_composite_closure, read_composite_closure_with_memo,

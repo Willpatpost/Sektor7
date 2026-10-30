@@ -623,7 +623,7 @@ impl CanonicalMedium for SqliteMedium {
         Ok(observed)
     }
 
-    fn append(
+    fn append_raw(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],

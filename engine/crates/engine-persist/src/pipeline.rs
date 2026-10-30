@@ -3021,7 +3021,7 @@ mod tests {
         fn head(&mut self) -> Result<Option<Hash>, MediumError> {
             self.inner.head()
         }
-        fn append(
+        fn append_raw(
             &mut self,
             record: &RevisionRecord,
             objects: &[StoredObject],

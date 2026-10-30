@@ -571,7 +571,7 @@ impl CanonicalMedium for WorkerMedium {
         }
     }
 
-    fn append(
+    fn append_raw(
         &mut self,
         record: &RevisionRecord,
         objects: &[StoredObject],
