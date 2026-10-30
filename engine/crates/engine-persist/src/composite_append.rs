@@ -61,6 +61,11 @@ pub struct CompositeAppend<'a> {
 /// surface; every failure names what was proven).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositeAdmissionError {
+    /// The K2-C2 activation barrier: composite publication is not
+    /// enabled (the test-only facility has not activated it) — the
+    /// reused-dependency versus reclamation race is unresolved
+    /// until the reservation fence.
+    ActivationBarrier,
     /// The strict root-manifest decode failed (the grammar, the
     /// version, the domain family, the bounds, the coherence).
     Manifest(SaveError),
@@ -81,6 +86,10 @@ impl CompositeAdmissionError {
     /// The medium-error form (the typed production surface).
     pub fn into_medium_error(self) -> MediumError {
         let detail = match self {
+            CompositeAdmissionError::ActivationBarrier => {
+                "composite publication is not activated (the K2-C2 reservation prerequisite stands)"
+                    .to_owned()
+            }
             CompositeAdmissionError::Manifest(error) => {
                 format!("the root manifest failed the strict decode: {error:?}")
             }
@@ -100,6 +109,12 @@ impl CompositeAdmissionError {
 impl std::fmt::Display for CompositeAdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CompositeAdmissionError::ActivationBarrier => {
+                write!(
+                    f,
+                    "composite publication is not activated (the K2-C2 reservation prerequisite stands)"
+                )
+            }
             CompositeAdmissionError::Manifest(error) => {
                 write!(f, "the root manifest failed the strict decode: {error}")
             }
@@ -182,6 +197,48 @@ pub fn verify_chunk_dependency(
     Ok(())
 }
 
+/// The K2-C2 ACTIVATION BARRIER: composite publication is disabled
+/// by default and enabled ONLY by the explicit test-only facility —
+/// never called by any production path. The reused-dependency
+/// versus reclamation race is unresolved until K2-C2's reservation
+/// fence; the default refusal is the enforceable barrier.
+static COMPOSITE_PUBLICATION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The TEST-ONLY composite-publication activation (the K2-C1
+/// verification facility): flips the activation barrier for the
+/// process. Production code never calls this; the isolation tests
+/// call it once in their setup.
+#[doc(hidden)]
+pub fn test_enable_composite_publication() {
+    COMPOSITE_PUBLICATION_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether composite publication is currently activated (the
+/// test-only facility).
+pub fn composite_publication_enabled() -> bool {
+    COMPOSITE_PUBLICATION_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The publication admission (the provided `append_composite`'s
+/// path): the activation barrier, then the full verification, then
+/// the UNFORGEABLE publication receipt. Every failure is typed and
+/// leaves nothing mutated.
+pub fn admit_for_publication(
+    request: &CompositeAppend,
+    mut read_reused: impl FnMut(&Hash) -> Result<Vec<u8>, MediumError>,
+) -> Result<crate::medium::AdmittedAppend, CompositeAdmissionError> {
+    if !composite_publication_enabled() {
+        return Err(CompositeAdmissionError::ActivationBarrier);
+    }
+    admit_composite(request, |identity| read_reused(identity))?;
+    Ok(crate::medium::AdmittedAppend::composite(
+        request.record,
+        request.root,
+        request.new_chunks,
+    ))
+}
+
 /// The full admission (pure over the request; the reused
 /// dependencies are established through the caller-supplied byte
 /// reader — the medium's hash-verified `read_object`). Returns the
@@ -195,9 +252,12 @@ pub fn admit_composite(
     // family recognition, the bounds, the composed coherence).
     let manifest = composite_manifest::decode(request.root.bytes())
         .map_err(CompositeAdmissionError::Manifest)?;
-    // (2) The snapshot binding: the revision references the root.
+    // (2) The ROOT-ONLY snapshot binding (the ratified K2-A record
+    // contract): the revision's content references are EXACTLY the
+    // root identity — the chunks are transitively referenced through
+    // the manifest, never directly.
     let root_identity = request.root.hash();
-    if !request.record.content_refs.contains(&root_identity) {
+    if request.record.content_refs.len() != 1 || request.record.content_refs[0] != root_identity {
         return Err(CompositeAdmissionError::RootNotReferenced {
             root: root_identity,
         });
@@ -205,21 +265,30 @@ pub fn admit_composite(
     // (3) The exact-set rule: the manifest's declared closure equals
     // the supplied new chunks plus the reused identities — no
     // duplicate, omitted, or extraneous dependency.
-    let mut supplied: Vec<Hash> = request.new_chunks.iter().map(StoredObject::hash).collect();
-    supplied.extend(request.reused_chunks.iter().copied());
-    let supplied_sorted = {
-        let mut sorted = supplied.clone();
-        sorted.sort();
-        sorted
-    };
-    if supplied_sorted.len() != supplied.len() {
-        return Err(CompositeAdmissionError::DependencySet {
-            detail: "a duplicate dependency identity in the request".to_owned(),
-        });
+    // The exact-set rule with REAL duplicate detection: the
+    // identity SET built from the new hashes and the reused ids —
+    // the insert-returns-false check catches duplicates WITHIN
+    // either list and shared ACROSS both (a sort preserves length;
+    // a set does not).
+    let mut supplied_set = std::collections::BTreeSet::new();
+    for chunk in request.new_chunks {
+        if !supplied_set.insert(chunk.hash()) {
+            return Err(CompositeAdmissionError::DependencySet {
+                detail: "a duplicate dependency identity in the new chunks".to_owned(),
+            });
+        }
     }
-    let mut declared_sorted = manifest.closure_identities();
-    declared_sorted.sort();
-    if supplied_sorted != declared_sorted {
+    for identity in request.reused_chunks {
+        if !supplied_set.insert(*identity) {
+            return Err(CompositeAdmissionError::DependencySet {
+                detail: "a duplicate dependency identity (within the reused list or shared with the new chunks)"
+                    .to_owned(),
+            });
+        }
+    }
+    let declared_set: std::collections::BTreeSet<Hash> =
+        manifest.closure_identities().into_iter().collect();
+    if supplied_set != declared_set {
         return Err(CompositeAdmissionError::DependencySet {
             detail: "the declared dependency set does not match the supplied new chunks plus the reused identities"
                 .to_owned(),

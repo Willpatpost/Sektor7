@@ -119,18 +119,17 @@ fn build_fixture(variant: u8) -> Fixture {
 /// The founding record referencing the root and every NEWLY supplied
 /// chunk (the production record shape: the supplied set == the
 /// referenced set).
-fn record_for(root: &Hash, new_chunks: &[StoredObject]) -> RevisionRecord {
-    let mut refs = vec![*root];
-    refs.extend(new_chunks.iter().map(StoredObject::hash));
-    RevisionRecord::founding(AuthorityMode::Standalone, "k2c1-matrix", 0).with_content_refs(refs)
+/// The ROOT-ONLY record form (the ratified K2-A contract): the
+/// revision references exactly the root identity.
+fn record_for(root: &Hash) -> RevisionRecord {
+    RevisionRecord::founding(AuthorityMode::Standalone, "k2c1-matrix", 0)
+        .with_content_refs(vec![*root])
 }
 
 /// The regular-record reference set for a full new-supply
 /// composite: the root and every newly supplied chunk.
 fn second_head_refs(fixture: &Fixture) -> Vec<Hash> {
-    let mut refs = vec![fixture.root.hash()];
-    refs.extend(fixture.chunks.iter().map(StoredObject::hash));
-    refs
+    vec![fixture.root.hash()]
 }
 
 fn request<'a>(
@@ -163,11 +162,12 @@ fn model_admit(
 
 #[test]
 fn the_valid_publication_forms_admit_and_append_on_both_providers() {
+    engine_persist::composite_append::test_enable_composite_publication();
     for provider in ["file", "sqlite"] {
         let root_dir = temp_root(&format!("valid-{provider}"));
         let case = build_fixture(0);
         // (1) NEW-ONLY: every chunk supplied.
-        let record = record_for(&case.root.hash(), &case.chunks);
+        let record = record_for(&case.root.hash());
         let (head, outcome) = match provider {
             "file" => {
                 let mut medium =
@@ -260,7 +260,7 @@ fn the_dependency_refusals_leave_the_state_unchanged() {
 
     // (a) MISSING reused: the manifest declares a chunk the store
     // lacks.
-    let record = record_for(&root, &case.chunks[..4]);
+    let record = record_for(&root);
     let missing: Vec<Hash> = case.chunks[4..].iter().map(StoredObject::hash).collect();
     let mut partial = store.clone();
     for identity in &missing {
@@ -298,7 +298,7 @@ fn the_dependency_refusals_leave_the_state_unchanged() {
         .collect();
     let mut malformed_store = store.clone();
     malformed_store.insert(truncated_object.hash(), truncated_object.bytes().to_vec());
-    let record = record_for(&malformed_root.hash(), &new_chunks);
+    let record = record_for(&malformed_root.hash());
     let error = model_admit(
         &request(
             &record,
@@ -317,7 +317,7 @@ fn the_dependency_refusals_leave_the_state_unchanged() {
 
     // (c) The SET mismatches: a duplicate, an omitted, and an
     // extraneous dependency.
-    let record = record_for(&root, &case.chunks);
+    let record = record_for(&root);
     let all: Vec<Hash> = case.chunks.iter().map(StoredObject::hash).collect();
     let mut duplicated = all.clone();
     duplicated.push(all[0]);
@@ -331,7 +331,7 @@ fn the_dependency_refusals_leave_the_state_unchanged() {
         CompositeAdmissionError::DependencySet { .. }
     ));
 
-    let short_record = record_for(&root, &case.chunks[..4]);
+    let short_record = record_for(&root);
     let error = model_admit(
         &request(&short_record, &case.root, &case.chunks[..4], &all[4..5]),
         &store,
@@ -346,7 +346,7 @@ fn the_dependency_refusals_leave_the_state_unchanged() {
     let mut versioned = case.root.bytes().to_vec();
     versioned[8 + 31] = 3;
     let future_root = StoredObject::new(versioned).unwrap();
-    let record = record_for(&future_root.hash(), &case.chunks);
+    let record = record_for(&future_root.hash());
     let error = model_admit(&request(&record, &future_root, &case.chunks, &[]), &store)
         .expect_err("the unsupported version refuses");
     assert!(matches!(
@@ -371,7 +371,7 @@ fn the_generic_append_domain_gate_refuses_composite_roots_on_both_providers() {
         let root_dir = temp_root(&format!("gate-{provider}"));
         let case = build_fixture(0);
         // The /2 root supplied through the GENERIC append: refused.
-        let record = record_for(&case.root.hash(), std::slice::from_ref(&case.root));
+        let record = record_for(&case.root.hash());
         let refusal = match provider {
             "file" => {
                 let mut medium =
@@ -410,7 +410,7 @@ fn the_generic_append_domain_gate_refuses_composite_roots_on_both_providers() {
         // The domain digit: 8 (len prefix) + 30 = the '2' position.
         future[8 + 30] = b'3';
         let future_root = StoredObject::new(future).unwrap();
-        let record = record_for(&future_root.hash(), std::slice::from_ref(&future_root));
+        let record = record_for(&future_root.hash());
         let refusal = match provider {
             "file" => {
                 let mut medium =
@@ -434,7 +434,7 @@ fn the_generic_append_domain_gate_refuses_composite_roots_on_both_providers() {
             encoder.write_bytes(&[1u8; 16]);
             StoredObject::new(encoder.into_bytes()).unwrap()
         };
-        let legacy_record = record_for(&legacy.hash(), std::slice::from_ref(&legacy));
+        let legacy_record = record_for(&legacy.hash());
         let outcome = match provider {
             "file" => {
                 let mut medium =
@@ -463,13 +463,14 @@ fn the_generic_append_domain_gate_refuses_composite_roots_on_both_providers() {
 
 #[test]
 fn the_cas_semantics_are_preserved_through_the_delegation() {
+    engine_persist::composite_append::test_enable_composite_publication();
     // Stale parent, the concurrent single-winner, and the idempotent
     // retry — over the file medium (the SQLite CAS is the same
     // contract, exercised by its own suites).
     let root_dir = temp_root("cas");
     let mut medium = LocalFileMedium::open(root_dir.join("store")).expect("the store opens");
     let case = build_fixture(0);
-    let record = record_for(&case.root.hash(), &case.chunks);
+    let record = record_for(&case.root.hash());
     let _first = medium
         .append_composite(&request(&record, &case.root, &case.chunks, &[]), None)
         .expect("the first publication accepts");

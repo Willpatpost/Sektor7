@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use engine_persist::{
     AppendOutcome, CanonicalMedium, ChainSummary, LocalFileMedium, MediumError, Reconciliation,
-    RevisionRecord, SqliteMedium, StoredObject, SyncTier,
+    RevisionRecord, SqliteMedium, SyncTier,
 };
 
 /// Where a campaign's canonical store lives — the explicit provider
@@ -139,15 +139,17 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
-    fn append_raw(
+    fn append_admitted(
         &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
+        admitted: engine_persist::medium::AdmittedAppend,
         expected_parent: Option<engine_persist::Hash>,
     ) -> Result<AppendOutcome, MediumError> {
+        // The receipt's dispatch through the store: the value is
+        // UNFORGEABLE (constructed only inside engine-persist after
+        // its verification) — the forwarding is pure delegation.
         match self {
-            SessionStore::Local(medium) => medium.append(record, objects, expected_parent),
-            SessionStore::Sqlite(medium) => medium.append(record, objects, expected_parent),
+            SessionStore::Local(medium) => medium.append_admitted(admitted, expected_parent),
+            SessionStore::Sqlite(medium) => medium.append_admitted(admitted, expected_parent),
         }
     }
 

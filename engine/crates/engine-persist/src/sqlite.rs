@@ -623,12 +623,14 @@ impl CanonicalMedium for SqliteMedium {
         Ok(observed)
     }
 
-    fn append_raw(
+    fn append_admitted(
         &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
+        admitted: crate::medium::AdmittedAppend,
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
+        let (record, objects, composite) = admitted.parts();
+        let record = record.clone();
+        let objects: Vec<StoredObject> = objects.to_vec();
         if self.read_only {
             return Err(MediumError::Sqlite {
                 op: "append",
@@ -641,7 +643,7 @@ impl CanonicalMedium for SqliteMedium {
         // supplied object set. Identical to the file medium's checks.
         let record_bytes = record.canonical_bytes();
         let reparsed = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
-        if reparsed != *record {
+        if reparsed != record {
             return Err(MediumError::Chain {
                 rule: "record-noncanonical",
             });
@@ -649,9 +651,14 @@ impl CanonicalMedium for SqliteMedium {
         let record_id = hash_object(&record_bytes);
         let supplied: BTreeSet<Hash> = objects.iter().map(StoredObject::hash).collect();
         let declared: BTreeSet<Hash> = record.content_refs.iter().copied().collect();
-        if supplied != declared {
+        if !composite && supplied != declared {
             return Err(MediumError::Chain {
                 rule: "content-set-mismatch",
+            });
+        }
+        if composite && !supplied.is_superset(&declared) {
+            return Err(MediumError::Chain {
+                rule: "composite-content-missing",
             });
         }
 
@@ -760,8 +767,8 @@ impl CanonicalMedium for SqliteMedium {
         let transactional = append_inserts(
             &tx,
             &self.cursor,
-            record,
-            objects,
+            &record,
+            &objects,
             &record_bytes,
             &record_id,
             &self.fault,
@@ -815,7 +822,7 @@ impl CanonicalMedium for SqliteMedium {
 
         // The trusted cursor advances over the accepted revision —
         // O(1) work.
-        advance_cursor(&mut self.cursor, record, &record_id);
+        advance_cursor(&mut self.cursor, &record, &record_id);
         Ok(AppendOutcome::Accepted {
             id: record_id,
             tier: SyncTier::TransactionalWalFull,

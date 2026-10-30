@@ -67,6 +67,7 @@ use engine_core::{Decoder, Encoder};
 use crate::checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata, ReclaimedIndexEntry, peek_object_domain,
 };
+use crate::composite_manifest;
 use crate::fault::{FaultControl, FaultPoint};
 use crate::hash::{Hash, hash_object};
 use crate::medium::{
@@ -360,6 +361,7 @@ impl LocalFileMedium {
 
     /// Steps 2–4 plus the record-level coherence checks, then steps
     /// 5–7 with every in-window failure classified as `Unknown`.
+    #[allow(clippy::too_many_arguments)]
     fn append_locked(
         &mut self,
         record: &RevisionRecord,
@@ -367,6 +369,7 @@ impl LocalFileMedium {
         expected_parent: Option<Hash>,
         record_bytes: &[u8],
         record_id: &Hash,
+        composite: bool,
     ) -> Result<AppendOutcome, MediumError> {
         self.fault_pre(FaultPoint::AfterLock)?;
 
@@ -480,7 +483,21 @@ impl LocalFileMedium {
         self.timings.object_write_sync_nanos = elapsed_nanos(objects_started);
 
         // The trusted cursor advances to the accepted revision.
-        self.advance_cursor(record, record_id);
+        // The K2-C1 corrective: a composite append advances the
+        // cursor with the VERIFIED closure (the manifest's
+        // identities — the admission already verified every chunk;
+        // the manifest re-decode here is the same bounded object).
+        if composite {
+            let manifest =
+                composite_manifest::decode(objects[0].bytes()).map_err(MediumError::Format)?;
+            self.advance_cursor_with_closure(
+                record,
+                record_id,
+                Some(&manifest.closure_identities()),
+            );
+        } else {
+            self.advance_cursor(record, record_id);
+        }
         Ok(AppendOutcome::Accepted {
             id: *record_id,
             tier: self.platform_tier,
@@ -826,10 +843,27 @@ impl LocalFileMedium {
     /// multi-revision suffix the cursor's head, epoch, reachable set,
     /// seen-key index, and record-id index stay mutually consistent.
     fn absorb_suffix(&mut self, suffix: Vec<(Hash, RevisionRecord)>, new_head: Hash) {
+        // The K2-C1 corrective: precompute each suffix record's
+        // verified composite closure (if its first reference is a
+        // /2 root) BEFORE the cursor borrow — the load is
+        // hash-verified and the decode is the walk's own.
+        let mut closures: Vec<(Hash, RevisionRecord, Option<Vec<Hash>>)> = Vec::new();
+        for (id, record) in suffix.into_iter() {
+            let closure = record.content_refs.first().and_then(|root| {
+                let bytes = self.load_referenced(root).ok()?;
+                let domain = peek_object_domain(&bytes).ok()?;
+                if domain != composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                    return None;
+                }
+                let manifest = composite_manifest::decode(&bytes).ok()?;
+                Some(manifest.closure_identities())
+            });
+            closures.push((id, record, closure));
+        }
         let Some(cursor) = self.cursor.as_mut() else {
             return;
         };
-        for (id, record) in suffix.into_iter().rev() {
+        for (id, record, closure) in closures.into_iter().rev() {
             if let Some(key) = &record.idempotency_key {
                 cursor.seen_keys.insert(key.clone());
             }
@@ -838,6 +872,13 @@ impl LocalFileMedium {
             for reference in &record.content_refs {
                 if cursor.reachable.insert(*reference) {
                     cursor.content_objects += 1;
+                }
+            }
+            if let Some(closure) = closure {
+                for identity in closure {
+                    if cursor.reachable.insert(identity) {
+                        cursor.content_objects += 1;
+                    }
                 }
             }
             cursor.epoch = record.epoch;
@@ -935,6 +976,32 @@ impl LocalFileMedium {
             // everything below it.
             if let Some(bytes) = first_object {
                 let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+                // The K2-C1 corrective's VERIFIED composite-closure
+                // reachability: a /2 root's chunks are transitively
+                // referenced through its manifest — the walk proves
+                // EVERY dependency (the hash-verified read, the full
+                // envelope verification against the manifest entry)
+                // before it joins the reachable set. A missing,
+                // corrupt, or malformed chunk fails the walk closed;
+                // nothing is silently ignored.
+                if domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                    let manifest =
+                        composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                    for entry in &manifest.entries {
+                        let chunk_bytes = self.load_referenced(&entry.identity)?;
+                        crate::composite_append::verify_chunk_dependency(
+                            &chunk_bytes,
+                            &entry.identity,
+                            &manifest,
+                        )
+                        .map_err(|_error| MediumError::Chain {
+                            rule: "composite-closure-verification",
+                        })?;
+                        if reachable.insert(entry.identity) {
+                            content_objects += 1;
+                        }
+                    }
+                }
                 if domain == CHECKPOINT_METADATA_DOMAIN {
                     let metadata =
                         CheckpointMetadata::decode(&bytes).map_err(MediumError::Format)?;
@@ -1080,6 +1147,20 @@ impl LocalFileMedium {
 
     /// Advances the cursor over an accepted append (O(1) work).
     fn advance_cursor(&mut self, record: &RevisionRecord, id: &Hash) {
+        self.advance_cursor_with_closure(record, id, None);
+    }
+
+    /// The cursor advance with the optional VERIFIED composite
+    /// closure (the K2-C1 corrective): a composite append's chunks
+    /// join the reachable set through the admission-verified
+    /// manifest, keeping the hot cursor and the cold walk on the
+    /// SAME definition of reachability.
+    fn advance_cursor_with_closure(
+        &mut self,
+        record: &RevisionRecord,
+        id: &Hash,
+        composite_closure: Option<&[Hash]>,
+    ) {
         let refs = &record.content_refs;
         match self.cursor.as_mut() {
             None => {
@@ -1103,6 +1184,13 @@ impl LocalFileMedium {
                 for reference in refs {
                     if reachable.insert(*reference) {
                         content_objects += 1;
+                    }
+                }
+                if let Some(closure) = composite_closure {
+                    for identity in closure {
+                        if reachable.insert(*identity) {
+                            content_objects += 1;
+                        }
                     }
                 }
                 self.cursor = Some(Cursor {
@@ -1129,6 +1217,13 @@ impl LocalFileMedium {
                 for reference in refs {
                     if cursor.reachable.insert(*reference) {
                         cursor.content_objects += 1;
+                    }
+                }
+                if let Some(closure) = composite_closure {
+                    for identity in closure {
+                        if cursor.reachable.insert(*identity) {
+                            cursor.content_objects += 1;
+                        }
                     }
                 }
             }
@@ -1404,20 +1499,38 @@ impl CanonicalMedium for LocalFileMedium {
         outcome
     }
 
-    fn append_raw(
+    fn append_admitted(
         &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
+        admitted: crate::medium::AdmittedAppend,
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
         let encode_started = Instant::now();
+        let (record, objects, composite) = admitted.parts();
+        // The set rule BY KIND: the generic form keeps the exact
+        // supplied==referenced equality (unchanged); the composite
+        // form carries the ROOT-ONLY record with the
+        // admission-verified extras (the root plus the new chunks —
+        // the record's single reference IS the root, and every
+        // extra was verified against the root manifest by the
+        // in-crate admission that built the receipt).
+        let record = record.clone();
+        let objects: Vec<StoredObject> = objects.to_vec();
+        if composite
+            && (record.content_refs.len() != 1
+                || objects.is_empty()
+                || objects[0].hash() != record.content_refs[0])
+        {
+            return Err(MediumError::Chain {
+                rule: "composite-receipt-shape",
+            });
+        }
         // Structural validation (pre-window; a failure is a clean
         // error — nothing has been written): the record must be
         // canonically representable and reference exactly the supplied
         // object set.
         let record_bytes = record.canonical_bytes();
         let reparsed = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
-        if reparsed != *record {
+        if reparsed != record {
             return Err(MediumError::Chain {
                 rule: "record-noncanonical",
             });
@@ -1425,9 +1538,14 @@ impl CanonicalMedium for LocalFileMedium {
         let record_id = hash_object(&record_bytes);
         let supplied: BTreeSet<Hash> = objects.iter().map(StoredObject::hash).collect();
         let declared: BTreeSet<Hash> = record.content_refs.iter().copied().collect();
-        if supplied != declared {
+        if !composite && supplied != declared {
             return Err(MediumError::Chain {
                 rule: "content-set-mismatch",
+            });
+        }
+        if composite && !supplied.is_superset(&declared) {
+            return Err(MediumError::Chain {
+                rule: "composite-content-missing",
             });
         }
         self.timings.encode_nanos = elapsed_nanos(encode_started);
@@ -1435,8 +1553,14 @@ impl CanonicalMedium for LocalFileMedium {
         // Step 1: acquire the OS-managed coordination.
         self.fault_pre(FaultPoint::BeforeLock)?;
         self.lock()?;
-        let outcome =
-            self.append_locked(record, objects, expected_parent, &record_bytes, &record_id);
+        let outcome = self.append_locked(
+            &record,
+            &objects,
+            expected_parent,
+            &record_bytes,
+            &record_id,
+            composite,
+        );
         // Step 8: release after the defined outcome. An unlock failure
         // does not alter a reached outcome — the OS releases ownership
         // at handle close or process death either way.

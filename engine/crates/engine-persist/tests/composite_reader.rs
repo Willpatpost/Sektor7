@@ -718,19 +718,14 @@ fn the_reader_verifies_objects_published_through_a_real_local_file_medium() {
     ));
     let store_root = dir.join("store");
     let mut medium = LocalFileMedium::open(&store_root).unwrap();
+    engine_persist::composite_append::test_enable_composite_publication();
     let composite = valid_full();
 
-    // The founding revision references the root and every chunk as
-    // its content objects — the production publication path.
-    let mut references: Vec<Hash> = composite
-        .manifest
-        .entries
-        .iter()
-        .map(|entry| entry.identity)
-        .collect();
-    references.push(composite.root.hash());
+    // K2-C1 corrective: the ROOT-ONLY record form (the ratified K2-A
+    // contract) — the revision references exactly the root; the
+    // chunks ride the receipt's verified object set.
     let record = RevisionRecord::founding(AuthorityMode::Standalone, "k2b-dark-reader", 1)
-        .with_content_refs(references);
+        .with_content_refs(vec![composite.root.hash()]);
     let mut objects: Vec<StoredObject> = composite
         .chunks
         .iter()

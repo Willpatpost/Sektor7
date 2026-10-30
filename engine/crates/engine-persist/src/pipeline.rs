@@ -3021,13 +3021,12 @@ mod tests {
         fn head(&mut self) -> Result<Option<Hash>, MediumError> {
             self.inner.head()
         }
-        fn append_raw(
+        fn append_admitted(
             &mut self,
-            record: &RevisionRecord,
-            objects: &[StoredObject],
+            admitted: crate::medium::AdmittedAppend,
             expected_parent: Option<Hash>,
         ) -> Result<AppendOutcome, MediumError> {
-            self.inner.append(record, objects, expected_parent)
+            self.inner.append_admitted(admitted, expected_parent)
         }
         fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
             self.inner.read_record(id)

@@ -57,6 +57,14 @@ pub enum MediumOp {
         objects: Vec<StoredObject>,
         expected_parent: Option<Hash>,
     },
+    /// The K2-C1 corrective's verified composite publication: the
+    /// UNFORGEABLE receipt (constructed only inside engine-persist
+    /// after its admission) riding the queue — the worker neither
+    /// builds nor weakens it.
+    AdmittedAppend {
+        admitted: engine_persist::medium::AdmittedAppend,
+        expected_parent: Option<Hash>,
+    },
     ReadRecord {
         id: Hash,
     },
@@ -392,7 +400,7 @@ fn worker_loop(
             let _ = job.reply.send(Ok(WorkerReply::Canceled));
             continue;
         }
-        if let MediumOp::Append { .. } = job.op {
+        if let MediumOp::Append { .. } | MediumOp::AdmittedAppend { .. } = job.op {
             match fault.current() {
                 WorkerFault::FailAppendPreCommit => {
                     fault.clear();
@@ -486,6 +494,12 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
         } => store
             .append(&record, &objects, expected_parent)
             .map(WorkerReply::Append),
+        MediumOp::AdmittedAppend {
+            admitted,
+            expected_parent,
+        } => store
+            .append_admitted(admitted, expected_parent)
+            .map(WorkerReply::Append),
         MediumOp::ReadRecord { id } => store.read_record(&id).map(WorkerReply::ReadRecord),
         MediumOp::ReadObject { hash } => store.read_object(&hash).map(WorkerReply::ReadObject),
         MediumOp::ClassifyObject { hash } => store
@@ -506,7 +520,7 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
 
 fn job_kind(op: &MediumOp) -> Option<JobKind> {
     match op {
-        MediumOp::Append { .. } => Some(JobKind::Append),
+        MediumOp::Append { .. } | MediumOp::AdmittedAppend { .. } => Some(JobKind::Append),
         MediumOp::ReconcileUnknown { .. } => Some(JobKind::Reconcile),
         MediumOp::ReadObject { .. } => Some(JobKind::ReadObject),
         MediumOp::ClassifyObject { .. } => Some(JobKind::ReadObject),
@@ -571,24 +585,27 @@ impl CanonicalMedium for WorkerMedium {
         }
     }
 
-    fn append_raw(
+    fn append_admitted(
         &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
+        admitted: engine_persist::medium::AdmittedAppend,
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
+        // The K2-C1 corrective's worker transport: the UNFORGEABLE
+        // receipt rides the bounded queue inside the job — the
+        // worker neither builds nor weakens it; the same health,
+        // cancellation, reply-loss, and Unknown semantics as every
+        // append job.
         // The same terminal-poison admission gate (C2-F2): a definite
-        // refusal BEFORE anything is admitted — the job never started, so
-        // this is never the uncertain Unknown class.
+        // refusal BEFORE anything is admitted — the job never started,
+        // so this is never the uncertain Unknown class.
         if !self.health.alive() {
             return Err(MediumError::WorkerUnavailable {
                 detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
                     .to_owned(),
             });
         }
-        let op = MediumOp::Append {
-            record: record.clone(),
-            objects: objects.to_vec(),
+        let op = MediumOp::AdmittedAppend {
+            admitted,
             expected_parent,
         };
         let (reply, slot) = completion_slot();
@@ -601,8 +618,6 @@ impl CanonicalMedium for WorkerMedium {
             })
             .is_err()
         {
-            // Admission failed: the queue's receiver is gone — THIS job
-            // never started (definite for it; the session is dead).
             return Err(MediumError::WorkerUnavailable {
                 detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
             });
@@ -610,12 +625,13 @@ impl CanonicalMedium for WorkerMedium {
         match slot.recv() {
             Ok(result) => match result {
                 Ok(WorkerReply::Append(outcome)) => Ok(outcome),
-                Ok(other) => unreachable!("the append request returned {other:?}"),
+                Ok(other) => unreachable!("the admitted append returned {other:?}"),
                 Err(error) => Err(error),
             },
-            // THE UNCERTAIN CLASS: the job was admitted; the worker died (or
-            // its reply was lost) after the append MAY have executed. Never
-            // a definite failure — the candidate's identity is preserved
+            // THE UNCERTAIN CLASS (the exact legacy append semantics):
+            // the job was admitted; the worker died (or its reply was
+            // lost) after the append MAY have executed. Never a
+            // definite failure — the candidate's identity is preserved
             // upstream by the pipeline's retained pending attempt.
             Err(_) => Ok(AppendOutcome::Unknown {
                 reason: UnknownReason::WorkerReplyLost,

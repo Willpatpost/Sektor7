@@ -403,6 +403,81 @@ impl ObjectClass {
 /// (§4.2's contract, typed). Every operation — including reads —
 /// serializes on the medium's OS-managed coordination, so a concurrent
 /// sweep can never race a read.
+/// The VERIFIED publication receipt (the K2-C1 corrective's
+/// unforgeable admission boundary): the record and the object set a
+/// provider may install, together with the kind of verification
+/// that produced it. **Public type, PRIVATE fields, in-crate-only
+/// constructors** — the generic form is created by the provided
+/// [`CanonicalMedium::append`] after the snapshot-family gate; the
+/// composite form is created by the provided
+/// [`CanonicalMedium::append_composite`] after the full composite
+/// admission. External code (including `engine-slice`'s worker
+/// transport and store dispatch) can hold, pass, and consume the
+/// value BY VALUE but can never construct, mutate, or reinterpret
+/// one — every externally reachable installing method requires
+/// either passing the fresh gate or holding this receipt. The
+/// receipt carries no mutable access to its validated content and
+/// grants no exemption from the provider's CAS and idempotency
+/// checks.
+#[derive(Debug, Clone)]
+pub struct AdmittedAppend {
+    record: RevisionRecord,
+    objects: Vec<StoredObject>,
+    /// Whether the object set exceeds the record's direct
+    /// references because the composite admission verified the
+    /// extras against the root manifest (the root-only record
+    /// contract).
+    composite: bool,
+}
+
+impl AdmittedAppend {
+    /// The verified GENERIC form — in-crate only (the provided
+    /// `append` after the domain gate).
+    pub(crate) fn generic(record: &RevisionRecord, objects: &[StoredObject]) -> Self {
+        AdmittedAppend {
+            record: record.clone(),
+            objects: objects.to_vec(),
+            composite: false,
+        }
+    }
+
+    /// The verified COMPOSITE form — in-crate only (the provided
+    /// `append_composite` after the full admission): the root-only
+    /// record and the root plus new-chunk object set.
+    pub(crate) fn composite(
+        record: &RevisionRecord,
+        root: &StoredObject,
+        new_chunks: &[StoredObject],
+    ) -> Self {
+        let mut objects = Vec::with_capacity(new_chunks.len() + 1);
+        objects.push(root.clone());
+        objects.extend(new_chunks.iter().cloned());
+        AdmittedAppend {
+            record: record.clone(),
+            objects,
+            composite: true,
+        }
+    }
+
+    /// The provider-side view (in-crate only): the record, the
+    /// object set, and the kind. Consumed by the providers'
+    /// `append_admitted` implementations and the receipt's own
+    /// Clone — a replayed receipt still passes the provider's full
+    /// CAS/idempotency checks, so a duplicate can never install a
+    /// duplicate canonical effect.
+    pub(crate) fn parts(&self) -> (&RevisionRecord, &[StoredObject], bool) {
+        (&self.record, &self.objects, self.composite)
+    }
+
+    /// The READ-ONLY test accessor (the race fixtures and the
+    /// verification tests observe the receipt's content — no
+    /// construction, no mutation; the unforgeability is unchanged).
+    #[doc(hidden)]
+    pub fn parts_for_tests(&self) -> (&RevisionRecord, &[StoredObject], bool) {
+        self.parts()
+    }
+}
+
 pub trait CanonicalMedium {
     /// The authoritative HEAD revision, or `None` for an unfounded
     /// campaign.
@@ -414,11 +489,17 @@ pub trait CanonicalMedium {
     /// concurrent writer for a given expected parent can be
     /// `Accepted`; losers observe `RejectedStaleParent`; any failure
     /// from the first object write onward is `Unknown`.
-    /// The GENERIC publication. Provided (K2-C1): the snapshot-
-    /// family domain gate runs BEFORE the provider's own append — a
-    /// composite (or unrecognized future family) snapshot root may
-    /// enter ONLY through the dedicated [`Self::append_composite`]
-    /// admission; the legacy `/1` path is unchanged.
+    /// The GENERIC publication. Provided (K2-C1 corrective): the
+    /// snapshot-family domain gate, then the VERIFIED publication
+    /// receipt (an [`AdmittedAppend`] — constructible only inside
+    /// engine-persist after the gate and the structural checks),
+    /// then the provider dispatch. A composite (or unrecognized
+    /// future family) snapshot root may enter ONLY through the
+    /// dedicated [`Self::append_composite`] admission; the legacy
+    /// `/1` path is unchanged. There is NO raw-publication method
+    /// on this trait — every externally reachable installing method
+    /// requires either passing this gate or holding an unforgeable
+    /// admission receipt.
     fn append(
         &mut self,
         record: &RevisionRecord,
@@ -426,45 +507,61 @@ pub trait CanonicalMedium {
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
         crate::composite_append::enforce_snapshot_family_gate(objects)?;
-        self.append_raw(record, objects, expected_parent)
+        let admitted = AdmittedAppend::generic(record, objects);
+        self.append_admitted(admitted, expected_parent)
     }
 
-    /// The provider's own append WITHOUT the snapshot-family gate —
-    /// the raw publication the dedicated composite admission
-    /// delegates to after ITS full verification. NEVER a public
-    /// entry point: every composite root must pass
-    /// [`Self::append_composite`]'s admission.
-    fn append_raw(
-        &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
-        expected_parent: Option<Hash>,
-    ) -> Result<AppendOutcome, MediumError>;
-
-    /// The DEDICATED composite publication (K2-C1): the fail-closed
-    /// admission over the root manifest, the revision's root
-    /// reference, the exact dependency set, and EVERY chunk (the
-    /// newly supplied against their bytes, the reused through the
-    /// medium's hash-verified read) — then the publication through
-    /// the provider's own `append` with the root and the new chunks
-    /// as the supplied objects (the record's content set), so the
-    /// CAS, idempotency, and reconciliation guarantees are exactly
-    /// the existing ones. Every admission failure refuses typed
-    /// BEFORE any mutation; an uncertain outcome is never converted
-    /// into a success. No production caller exists yet (the K2-C1
-    /// activation restriction).
+    /// The DEDICATED composite publication (K2-C1 corrective): the
+    /// fail-closed admission — the strict root decode, the
+    /// ROOT-ONLY record binding (the ratified K2-A contract:
+    /// `content_refs == [root_identity]`), the exact dependency
+    /// set, and EVERY chunk fully verified (the new against their
+    /// supplied bytes, the reused through the medium's hash-verified
+    /// read) — then the verified publication receipt and the
+    /// provider dispatch, carrying the root plus the new chunks as
+    /// the stored object set while the RECORD references only the
+    /// root (the chunks are transitively referenced through the
+    /// manifest). Every admission failure refuses typed BEFORE any
+    /// mutation; the CAS, idempotency, and Unknown/reconciliation
+    /// guarantees are the provider's existing ones.
+    ///
+    /// **The K2-C2 activation barrier:** composite publication is
+    /// NOT production-available — the reused-dependency versus
+    /// reclamation race is unresolved until K2-C2's reservation
+    /// fence. The admission refuses unless the explicit TEST-ONLY
+    /// activation has been set
+    /// ([`crate::composite_append::test_enable_composite_publication`]
+    /// — never called by any production path); the refusal is the
+    /// enforceable barrier, not a convention.
     fn append_composite(
         &mut self,
         request: &crate::composite_append::CompositeAppend,
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
-        crate::composite_append::admit_composite(request, |identity| self.read_object(identity))
-            .map_err(crate::composite_append::CompositeAdmissionError::into_medium_error)?;
-        let mut objects = Vec::with_capacity(request.new_chunks.len() + 1);
-        objects.push(request.root.clone());
-        objects.extend(request.new_chunks.iter().cloned());
-        self.append_raw(request.record, &objects, expected_parent)
+        let admitted = crate::composite_append::admit_for_publication(request, |identity| {
+            self.read_object(identity)
+        })
+        .map_err(crate::composite_append::CompositeAdmissionError::into_medium_error)?;
+        self.append_admitted(admitted, expected_parent)
     }
+
+    /// The verified publication dispatch every provider implements.
+    /// The [`AdmittedAppend`] argument is UNFORGEABLE: a public type
+    /// with private fields and an in-crate-only constructor —
+    /// `engine-slice` (the worker transport, the store dispatch)
+    /// can hold, pass, and consume it BY VALUE but can never
+    /// construct, mutate, or reinterpret one. The provider runs its
+    /// own structural checks (the canonical record decode; the set
+    /// rule by kind — the generic form's supplied==referenced
+    /// equality, the composite form's root-only record with the
+    /// admission-verified extras) and then its established
+    /// publication sequence with all of its CAS, idempotency,
+    /// Unknown, and reconciliation semantics.
+    fn append_admitted(
+        &mut self,
+        admitted: AdmittedAppend,
+        expected_parent: Option<Hash>,
+    ) -> Result<AppendOutcome, MediumError>;
 
     /// Reads, hash-verifies, and decodes a revision record by
     /// identity.

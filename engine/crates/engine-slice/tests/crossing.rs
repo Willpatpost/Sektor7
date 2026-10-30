@@ -1734,12 +1734,14 @@ impl CanonicalMedium for CoveringRaceMedium {
         self.inner.head()
     }
 
-    fn append_raw(
+    fn append_admitted(
         &mut self,
-        record: &RevisionRecord,
-        objects: &[StoredObject],
+        admitted: engine_persist::medium::AdmittedAppend,
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
+        let (record, objects, _composite) = admitted.parts_for_tests();
+        let record = record.clone();
+        let objects = objects.to_vec();
         let scripted = {
             let mut guard = self.script.lock().unwrap();
             let scripted = *guard;
@@ -1747,12 +1749,12 @@ impl CanonicalMedium for CoveringRaceMedium {
             scripted
         };
         match scripted {
-            RaceScript::Healthy => self.inner.append(record, objects, expected_parent),
+            RaceScript::Healthy => self.inner.append(&record, &objects, expected_parent),
             RaceScript::UnknownNotInstalled => Ok(AppendOutcome::Unknown {
                 reason: UnknownReason::WorkerReplyLost,
             }),
             RaceScript::UnknownInstalled => {
-                let _ = self.inner.append(record, objects, expected_parent)?;
+                let _ = self.inner.append(&record, &objects, expected_parent)?;
                 Ok(AppendOutcome::Unknown {
                     reason: UnknownReason::WorkerReplyLost,
                 })
@@ -1780,7 +1782,7 @@ impl CanonicalMedium for CoveringRaceMedium {
                 else {
                     panic!("the foreign winner lands at the current head");
                 };
-                let observed = self.inner.append(record, objects, expected_parent);
+                let observed = self.inner.append(&record, &objects, expected_parent);
                 match observed {
                     Ok(AppendOutcome::RejectedStaleParent {
                         observed: Some(observed),
