@@ -469,6 +469,21 @@ impl SqliteMedium {
         self.walks
     }
 
+    /// Test-only (the `composite-test-fixture` feature — never
+    /// compiled into a production build): the trusted cursor's
+    /// accounting — `(head, epoch, distinct content objects)`. The
+    /// cold walk establishes these fields and the hot and suffix
+    /// paths maintain them under the same definition, so this is the
+    /// direct hot/cold/suffix equivalence observation (a subsequent
+    /// `validate()` cold-walks by design and cannot prove it).
+    /// `None` before the store is founded.
+    #[cfg(feature = "composite-test-fixture")]
+    pub fn trusted_cursor_accounting(&self) -> Option<(Hash, u64, u64)> {
+        self.cursor
+            .as_ref()
+            .map(|cursor| (cursor.head, cursor.epoch, cursor.content_objects))
+    }
+
     /// The ratified `TRUNCATE` checkpoint — the graceful lifecycle
     /// boundary operation (the session close, the backup capture).
     /// Returns fail-closed typed errors; never a destructive repair.
@@ -1620,18 +1635,13 @@ fn validate_observed(
             ) {
                 Ok(suffix) => {
                     walks.last_append_walked = suffix.len() as u64;
-                    // R12: the per-record verified composite closures
-                    // (the walk already verified every chunk; the
-                    // re-extraction here reads the same objects).
-                    let mut closures = Vec::with_capacity(suffix.len());
-                    for (_, record) in &suffix {
-                        let closure = record.content_refs.first().and_then(|root| {
-                            let bytes = load_referenced_object(conn, root).ok()?;
-                            verified_composite_closure(conn, &bytes).ok()?
-                        });
-                        closures.push(closure);
-                    }
-                    absorb_suffix(cursor, suffix, closures, id);
+                    // R15: the entries already carry their
+                    // walk-verified composite closures — no
+                    // re-extraction (no duplicate hash-verifying
+                    // reads) and no verification failure converted
+                    // into an absent closure: absorption consumes
+                    // only verified entries.
+                    absorb_suffix(cursor, suffix, id);
                     Ok(())
                 }
                 Err(MediumError::Chain { rule: "divergence" }) => {
@@ -1662,22 +1672,14 @@ fn validate_observed(
     }
 }
 
-/// Walks `target` down its parents until `until` (exclusive),
-/// verifying each record and its content references — the same
-/// invariants the cold walk enforces, including the trusted-cursor
-/// boundary epoch and dependency ancestry over the trusted record
-/// set, the strictly-older suffix positions, and the reclaim-indexed
-/// revisions' indexed epochs. A suffix may pass a foreign MK — its
-/// record and metadata object validate like any other, but its index
-/// is not absorbed into this handle's cursor (the universe is rebuilt
-/// by the next cold walk; the single-writer discipline makes a
-/// mid-handle foreign MK one this process published through another,
-/// already-closed handle).
 /// The VERIFIED composite closure over the SQLite connection (the
 /// R12 corrective): for a /2 root, strictly decode the manifest and
 /// verify every declared chunk (the hash-verified load + the full
 /// envelope check) — returning the closure identities for the
-/// trusted reachability set. Every failure propagates typed.
+/// trusted reachability set. Every failure propagates typed;
+/// `Ok(None)` is ONLY the positively established non-composite case
+/// (the peeked domain is not the /2 root) — never a suppressed
+/// verification failure.
 fn verified_composite_closure(
     conn: &Connection,
     root_bytes: &[u8],
@@ -1699,6 +1701,35 @@ fn verified_composite_closure(
     Ok(Some(identities))
 }
 
+/// One suffix revision with its walk-verified composite closure (the
+/// R15 corrective): the closure was verified DURING the suffix walk
+/// by the established closure verifier over the record's FIRST
+/// content reference — exactly the cold walk's discipline — so
+/// `None` is positively established non-composite content (the
+/// peeked domain is not the /2 root), NEVER a suppressed
+/// verification failure: every required failure propagated typed
+/// before this entry could exist. The entries are produced only by
+/// [`walk_suffix`] and consumed only by [`absorb_suffix`] — no other
+/// path extracts a closure.
+struct VerifiedSuffixEntry {
+    id: Hash,
+    record: RevisionRecord,
+    composite_closure: Option<Vec<Hash>>,
+}
+
+/// Walks `target` down its parents until `until` (exclusive),
+/// verifying each record and its content references — the same
+/// invariants the cold walk enforces, including the trusted-cursor
+/// boundary epoch and dependency ancestry over the trusted record
+/// set, the strictly-older suffix positions, and the reclaim-indexed
+/// revisions' indexed epochs. A suffix may pass a foreign MK — its
+/// record and metadata object validate like any other, but its index
+/// is not absorbed into this handle's cursor (the universe is rebuilt
+/// by the next cold walk; the single-writer discipline makes a
+/// mid-handle foreign MK one this process published through another,
+/// already-closed handle). R15: each returned entry carries its
+/// walk-verified composite closure (the established verifier runs
+/// during the walk — see [`VerifiedSuffixEntry`]).
 fn walk_suffix(
     conn: &Connection,
     target: Hash,
@@ -1707,34 +1738,34 @@ fn walk_suffix(
     trusted_keys: BTreeSet<Vec<u8>>,
     trusted_record_ids: BTreeSet<Hash>,
     reclaimed: BTreeMap<Hash, u64>,
-) -> Result<Vec<(Hash, RevisionRecord)>, MediumError> {
-    let mut suffix: Vec<(Hash, RevisionRecord)> = Vec::new();
+) -> Result<Vec<VerifiedSuffixEntry>, MediumError> {
+    let mut suffix: Vec<VerifiedSuffixEntry> = Vec::new();
     let mut current = target;
     let mut newer_epoch: Option<u64> = None;
     let mut visited = BTreeSet::new();
     let mut suffix_keys = BTreeSet::new();
     loop {
         if current == until {
-            if let Some((_, boundary)) = suffix.last()
-                && trusted_epoch.checked_add(1) != Some(boundary.epoch)
+            if let Some(boundary) = suffix.last()
+                && trusted_epoch.checked_add(1) != Some(boundary.record.epoch)
             {
                 return Err(MediumError::Chain {
                     rule: "epoch-regression",
                 });
             }
             let mut positions: BTreeMap<Hash, usize> = BTreeMap::new();
-            for (index, (id, _)) in suffix.iter().enumerate() {
-                positions.insert(*id, index);
+            for (index, entry) in suffix.iter().enumerate() {
+                positions.insert(entry.id, index);
             }
-            for (index, (_, record)) in suffix.iter().enumerate() {
-                for dependency in &record.depends_on {
+            for (index, entry) in suffix.iter().enumerate() {
+                for dependency in &entry.record.depends_on {
                     let resolves = trusted_record_ids.contains(dependency)
                         || positions
                             .get(dependency)
                             .is_some_and(|position| *position > index)
                         || reclaimed
                             .get(dependency)
-                            .is_some_and(|&dep_epoch| dep_epoch < record.epoch);
+                            .is_some_and(|&dep_epoch| dep_epoch < entry.record.epoch);
                     if !resolves {
                         return Err(MediumError::Chain {
                             rule: "depends-on-unresolvable",
@@ -1763,18 +1794,35 @@ fn walk_suffix(
                 rule: "duplicate-idempotency-key",
             });
         }
-        for reference in &record.content_refs {
+        // R15: every content reference loads hash-verified; the
+        // FIRST reference's domain determines the entry's composite
+        // closure — the cold walk's exact discipline — and the
+        // established verifier runs HERE, during the walk: a /2
+        // root's full closure is verified exactly once (no
+        // re-extraction, no duplicate hash-verifying reads), a
+        // malformed root domain refuses (the peek propagates), and a
+        // missing, hash-mismatched, or malformed chunk refuses — a
+        // failure is never converted into an absent closure.
+        let mut first_object: Option<Vec<u8>> = None;
+        for (position, reference) in record.content_refs.iter().enumerate() {
             let bytes = load_referenced_object(conn, reference)?;
-            // R12: the /2 root's verified closure joins the suffix
-            // validation (the same discipline as the cold walk).
-            verified_composite_closure(conn, &bytes)?;
-        }
-        newer_epoch = Some(record.epoch);
-        match record.parent {
-            Some(parent) => {
-                suffix.push((current, record));
-                current = parent;
+            if position == 0 {
+                first_object = Some(bytes);
             }
+        }
+        let composite_closure = match first_object {
+            Some(bytes) => verified_composite_closure(conn, &bytes)?,
+            None => None,
+        };
+        newer_epoch = Some(record.epoch);
+        let parent = record.parent;
+        suffix.push(VerifiedSuffixEntry {
+            id: current,
+            record,
+            composite_closure,
+        });
+        match parent {
+            Some(parent) => current = parent,
             None => return Err(MediumError::Chain { rule: "divergence" }),
         }
     }
@@ -1782,17 +1830,24 @@ fn walk_suffix(
 
 /// Merges a verified suffix (newest-first) into the cursor and points
 /// it at the new head — oldest-first absorption so the final epoch is
-/// the newest verified one.
+/// the newest verified one. R15: the entries carry their
+/// walk-verified composite closures (verified during the walk, never
+/// re-extracted here) — the cursor absorbs only verified entries,
+/// after the whole suffix passed every check.
 fn absorb_suffix(
     cursor: &mut Option<SqliteCursor>,
-    suffix: Vec<(Hash, RevisionRecord)>,
-    closures: Vec<Option<Vec<Hash>>>,
+    suffix: Vec<VerifiedSuffixEntry>,
     new_head: Hash,
 ) {
     let Some(cursor) = cursor.as_mut() else {
         return;
     };
-    for ((id, record), closure) in suffix.into_iter().rev().zip(closures.into_iter().rev()) {
+    for entry in suffix.into_iter().rev() {
+        let VerifiedSuffixEntry {
+            id,
+            record,
+            composite_closure,
+        } = entry;
         if let Some(key) = &record.idempotency_key {
             cursor.seen_keys.insert(key.clone());
         }
@@ -1803,9 +1858,11 @@ fn absorb_suffix(
                 cursor.content_objects += 1;
             }
         }
-        // R12: the verified composite closure joins the trusted
-        // reachability set (the walk already verified every chunk).
-        if let Some(closure) = closure {
+        // The walk-verified composite closure joins the trusted
+        // reachability set — the same identities the cold walk
+        // collects over the same chain (`None` is positively
+        // established non-composite content).
+        if let Some(closure) = composite_closure {
             for identity in closure {
                 if cursor.reachable.insert(identity) {
                     cursor.content_objects += 1;

@@ -16,6 +16,13 @@ sha2 = "0.11"
 # --features flag) has NO activation function at all (the code does
 # not compile into the binary). The CI test command and the
 # engine-slice dev-dependencies enable it for the test harness.
+#
+# NEVER enable this feature in a shipping build (the R16
+# documentation obligation): it exists solely so the test harness
+# can drive the composite publication path against the activation
+# barrier's refusal semantics. The CI carries an explicit build
+# check (the Linux-only activation-isolation step) proving the
+# feature-disabled artifact carries zero activation symbols.
 composite-test-fixture = []
 
 [[test]]

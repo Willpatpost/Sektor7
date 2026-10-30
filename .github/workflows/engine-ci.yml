@@ -34,6 +34,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace
+      # R16 (the K2-C1 final-review activation-isolation check): the
+      # feature-disabled build — the plain `cargo build --workspace`
+      # above, the shipping configuration with NO --features flag —
+      # must not compile the test-only activation helper into
+      # engine-persist at all. A production artifact therefore cannot
+      # call it: the symbol is absent from the rlib the Build step
+      # just produced (this step runs BEFORE the feature-enabled
+      # Tests step refreshes the target directory).
+      - name: Activation isolation (Linux only — the feature-disabled build carries no activation symbol)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          rlib="target/debug/libengine_persist.rlib"
+          [ -f "$rlib" ] || { echo "missing $rlib (the Build step artifact)"; exit 1; }
+          count=$(nm "$rlib" | grep -c test_enable_composite_publication || true)
+          if [ "$count" != "0" ]; then
+            echo "the feature-disabled build carries the activation symbol ($count matches)"
+            exit 1
+          fi
+          echo "activation isolation verified: 0 activation symbols in the feature-disabled rlib"
       - name: Tests
         run: cargo test --workspace --features engine-persist/composite-test-fixture
       - name: Fingerprint self-test double run
