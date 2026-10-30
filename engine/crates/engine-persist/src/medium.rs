@@ -526,10 +526,11 @@ pub trait CanonicalMedium {
     /// guarantees are the provider's existing ones.
     ///
     /// **The K2-C2 activation barrier:** composite publication is
-    /// NOT production-available — the reused-dependency versus
-    /// reclamation race is unresolved until K2-C2's reservation
-    /// fence. The admission refuses unless the explicit TEST-ONLY
-    /// activation has been set
+    /// NOT production-available — the K2-C2A publication fence (the
+    /// provider-side reused-dependency revalidation under the
+    /// coordination boundary) is in force, but the reclamation-side
+    /// survivor protocol (K2-C2B) remains unresolved. The admission
+    /// refuses unless the explicit TEST-ONLY activation has been set
     /// ([`crate::composite_append::test_enable_composite_publication`]
     /// — never called by any production path); the refusal is the
     /// enforceable barrier, not a convention.

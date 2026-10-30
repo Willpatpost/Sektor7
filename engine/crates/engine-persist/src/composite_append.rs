@@ -199,9 +199,11 @@ pub fn verify_chunk_dependency(
 
 /// The K2-C2 ACTIVATION BARRIER: composite publication is disabled
 /// by default and enabled ONLY by the explicit test-only facility —
-/// never called by any production path. The reused-dependency
-/// versus reclamation race is unresolved until K2-C2's reservation
-/// fence; the default refusal is the enforceable barrier.
+/// never called by any production path. The K2-C2A publication
+/// fence (the provider-side reused-dependency revalidation) is in
+/// force; the barrier REMAINS because the reclamation-side survivor
+/// protocol (K2-C2B) is unresolved — the default refusal is the
+/// enforceable barrier.
 #[cfg(feature = "composite-test-fixture")]
 static COMPOSITE_PUBLICATION_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -342,6 +344,39 @@ pub fn enforce_snapshot_family_gate(objects: &[StoredObject]) -> Result<(), Medi
                 domain: domain.to_owned(),
             });
         }
+    }
+    Ok(())
+}
+
+/// The K2-C2A PUBLICATION FENCE (provider-internal): revalidate
+/// every REUSED dependency under the provider's coordination
+/// boundary, immediately before the first mutating write. The
+/// caller-side admission's reads are advisory fast-fail; THIS
+/// revalidation is the authority — a dependency that vanished or
+/// changed between the admission and the publication (a sweep's
+/// quarantine, a committed reclamation delete, on-disk corruption)
+/// REFUSES the append typed, with nothing mutated. The loader is
+/// the provider's OWN lock-held / transaction-scoped hash-verifying
+/// read primitive (the walks' internal discipline — never a public
+/// storage operation, so no nested coordination can arise).
+pub(crate) fn fence_reused_dependencies(
+    root_bytes: &[u8],
+    supplied: &std::collections::BTreeSet<Hash>,
+    mut load: impl FnMut(&Hash) -> Result<Vec<u8>, MediumError>,
+) -> Result<(), MediumError> {
+    let manifest = composite_manifest::decode(root_bytes).map_err(MediumError::Format)?;
+    for entry in &manifest.entries {
+        if supplied.contains(&entry.identity) {
+            // Rewritten by this append's own insert path — the
+            // insert-once / verify-on-retry discipline covers it.
+            continue;
+        }
+        let bytes = load(&entry.identity)?;
+        verify_chunk_dependency(&bytes, &entry.identity, &manifest).map_err(|error| {
+            MediumError::CompositeAdmission {
+                detail: format!("the publication fence refused: {error}"),
+            }
+        })?;
     }
     Ok(())
 }

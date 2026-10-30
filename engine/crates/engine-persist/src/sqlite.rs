@@ -776,6 +776,29 @@ impl CanonicalMedium for SqliteMedium {
             }
         }
 
+        // The K2-C2A PUBLICATION FENCE: revalidate every REUSED
+        // composite dependency inside the write transaction,
+        // immediately before the inserts — the admission's
+        // caller-side reads are advisory; a dependency that vanished
+        // (a concurrent connection's committed delete) or changed
+        // between the admission and this publication REFUSES typed,
+        // with the transaction rolled back and nothing installed.
+        // The loader is the transaction-scoped hash-verifying read
+        // the walks use — no public storage operation, no nested
+        // transaction.
+        if composite {
+            let supplied: BTreeSet<Hash> = objects.iter().map(StoredObject::hash).collect();
+            let fenced = crate::composite_append::fence_reused_dependencies(
+                objects[0].bytes(),
+                &supplied,
+                |identity| load_referenced_object(&tx, identity),
+            );
+            if let Err(error) = fenced {
+                let _ = tx.rollback();
+                return Err(error);
+            }
+        }
+
         // The inserts: every object (insert-once, verify-on-retry),
         // then the record row. An in-window failure takes the rollback
         // path: a clean rollback is the typed error (nothing

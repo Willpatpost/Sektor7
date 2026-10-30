@@ -448,6 +448,24 @@ impl LocalFileMedium {
         }
         self.fault_pre(FaultPoint::AfterComparison)?;
 
+        // The K2-C2A PUBLICATION FENCE: revalidate every REUSED
+        // composite dependency under HEAD.lock, immediately before
+        // the first mutating write — the admission's caller-side
+        // reads are advisory; a dependency that vanished (a sweep's
+        // quarantine move, a committed reclamation delete) or
+        // changed between the admission and this publication
+        // REFUSES typed, with nothing mutated. The loader is the
+        // lock-held internal hash-verifying read the walks use —
+        // no public storage operation, no nested coordination.
+        if composite {
+            let supplied: BTreeSet<Hash> = objects.iter().map(StoredObject::hash).collect();
+            crate::composite_append::fence_reused_dependencies(
+                objects[0].bytes(),
+                &supplied,
+                |identity| self.load_referenced(identity),
+            )?;
+        }
+
         // Step 5: write every object the candidate needs (the
         // uncertain window opens).
         let objects_started = Instant::now();
