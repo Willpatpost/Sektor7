@@ -35,7 +35,7 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --features engine-persist/composite-test-fixture
       - name: Fingerprint self-test double run
         shell: bash
         run: |

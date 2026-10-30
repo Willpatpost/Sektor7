@@ -202,22 +202,35 @@ pub fn verify_chunk_dependency(
 /// never called by any production path. The reused-dependency
 /// versus reclamation race is unresolved until K2-C2's reservation
 /// fence; the default refusal is the enforceable barrier.
+#[cfg(feature = "composite-test-fixture")]
 static COMPOSITE_PUBLICATION_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The TEST-ONLY composite-publication activation (the K2-C1
-/// verification facility): flips the activation barrier for the
-/// process. Production code never calls this; the isolation tests
-/// call it once in their setup.
+/// The TEST-ONLY composite-publication activation — **COMPILE-TIME
+/// ISOLATED (the R8 corrective)**: the function exists ONLY when the
+/// `composite-test-fixture` cargo feature is explicitly enabled
+/// (the CI test command and the engine-slice dev-dependencies). A
+/// normal production build (no --features flag) does not compile
+/// this function into the binary at all — any production code
+/// attempting to call it FAILS TO COMPILE. The barrier is enforced
+/// by construction, not by convention.
+#[cfg(feature = "composite-test-fixture")]
 #[doc(hidden)]
 pub fn test_enable_composite_publication() {
     COMPOSITE_PUBLICATION_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Whether composite publication is currently activated (the
-/// test-only facility).
+/// Whether composite publication is currently activated. Without the
+/// test-fixture feature this is a compile-time constant `false` —
+/// the admission's activation barrier is total in production builds.
+#[cfg(feature = "composite-test-fixture")]
 pub fn composite_publication_enabled() -> bool {
     COMPOSITE_PUBLICATION_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(feature = "composite-test-fixture"))]
+pub fn composite_publication_enabled() -> bool {
+    false
 }
 
 /// The publication admission (the provided `append_composite`'s

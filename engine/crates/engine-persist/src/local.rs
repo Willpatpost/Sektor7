@@ -696,7 +696,7 @@ impl LocalFileMedium {
                 match self.walk_suffix(id, trusted_head, trusted_epoch) {
                     Ok(suffix) => {
                         self.walks.last_append_walked = suffix.len() as u64;
-                        self.absorb_suffix(suffix, id);
+                        self.absorb_suffix(suffix, id)?;
                         Ok(())
                     }
                     Err(MediumError::Chain { rule: "divergence" }) => {
@@ -842,26 +842,51 @@ impl LocalFileMedium {
     /// final epoch written is the newest verified epoch — for a
     /// multi-revision suffix the cursor's head, epoch, reachable set,
     /// seen-key index, and record-id index stay mutually consistent.
-    fn absorb_suffix(&mut self, suffix: Vec<(Hash, RevisionRecord)>, new_head: Hash) {
-        // The K2-C1 corrective: precompute each suffix record's
-        // verified composite closure (if its first reference is a
-        // /2 root) BEFORE the cursor borrow — the load is
-        // hash-verified and the decode is the walk's own.
+    fn absorb_suffix(
+        &mut self,
+        suffix: Vec<(Hash, RevisionRecord)>,
+        new_head: Hash,
+    ) -> Result<(), MediumError> {
+        // The R10 corrective: precompute each suffix record's
+        // VERIFIED composite closure (if its first reference is a
+        // /2 root) BEFORE the cursor borrow — every failure
+        // PROPAGATES (never silently treated as an absent closure):
+        // the hash-verified load, the domain peek, the strict
+        // manifest decode, and EVERY dependency's full envelope
+        // verification (the same verify_chunk_dependency the cold
+        // walk uses). A missing, corrupt, or malformed transitive
+        // chunk refuses the suffix absorption — the trusted cursor
+        // does NOT advance past unverifiable composite state.
         let mut closures: Vec<(Hash, RevisionRecord, Option<Vec<Hash>>)> = Vec::new();
         for (id, record) in suffix.into_iter() {
-            let closure = record.content_refs.first().and_then(|root| {
-                let bytes = self.load_referenced(root).ok()?;
-                let domain = peek_object_domain(&bytes).ok()?;
-                if domain != composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
-                    return None;
+            let mut closure = None;
+            if let Some(root) = record.content_refs.first() {
+                let bytes = self.load_referenced(root)?;
+                if let Ok(domain) = peek_object_domain(&bytes)
+                    && domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
+                {
+                    let manifest =
+                        composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                    let mut identities = Vec::with_capacity(manifest.entries.len());
+                    for entry in &manifest.entries {
+                        let chunk_bytes = self.load_referenced(&entry.identity)?;
+                        crate::composite_append::verify_chunk_dependency(
+                            &chunk_bytes,
+                            &entry.identity,
+                            &manifest,
+                        )
+                        .map_err(|_error| MediumError::Chain {
+                            rule: "composite-suffix-closure-verification",
+                        })?;
+                        identities.push(entry.identity);
+                    }
+                    closure = Some(identities);
                 }
-                let manifest = composite_manifest::decode(&bytes).ok()?;
-                Some(manifest.closure_identities())
-            });
+            }
             closures.push((id, record, closure));
         }
         let Some(cursor) = self.cursor.as_mut() else {
-            return;
+            return Ok(());
         };
         for (id, record, closure) in closures.into_iter().rev() {
             if let Some(key) = &record.idempotency_key {
@@ -884,6 +909,7 @@ impl LocalFileMedium {
             cursor.epoch = record.epoch;
         }
         cursor.head = new_head;
+        Ok(())
     }
 
     /// The cold founding → HEAD walk: every record hash-verified,

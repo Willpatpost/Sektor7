@@ -9,5 +9,22 @@ engine-core = { path = "../engine-core" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11"
 
+[features]
+# The K2-C1 compile-time activation barrier (the R8 corrective):
+# composite publication's test-only facility exists ONLY when this
+# feature is explicitly enabled — a normal production build (no
+# --features flag) has NO activation function at all (the code does
+# not compile into the binary). The CI test command and the
+# engine-slice dev-dependencies enable it for the test harness.
+composite-test-fixture = []
+
+[[test]]
+name = "composite_append"
+required-features = ["composite-test-fixture"]
+
+[[test]]
+name = "composite_reader"
+required-features = ["composite-test-fixture"]
+
 [lints]
 workspace = true

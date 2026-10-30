@@ -16,6 +16,11 @@ engine-shell = { path = "../engine-shell" }
 # classification regressions (the same SQLite library the workspace
 # already builds — never linked into the binary).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The K2-C1 composite-publication test facility (the R8 corrective):
+# the feature exists ONLY in engine-slice's test builds — the
+# production binary never sees it (dev-dependencies do not apply to
+# cargo build / cargo build --release).
+engine-persist = { path = "../engine-persist", features = ["composite-test-fixture"] }
 
 [lints]
 workspace = true

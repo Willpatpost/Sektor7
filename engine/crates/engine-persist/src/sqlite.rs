@@ -74,6 +74,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use crate::checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CheckpointMetadata, ReclaimedIndexEntry, peek_object_domain,
 };
+use crate::composite_manifest;
 use crate::hash::{Hash, hash_object};
 use crate::local::WalkStats;
 use crate::medium::{
@@ -1370,6 +1371,30 @@ fn walk_chain(conn: &Connection, head: Hash) -> Result<WalkedChain, MediumError>
         // below it.
         if let Some(bytes) = first_object {
             let domain = peek_object_domain(&bytes).map_err(MediumError::Format)?;
+            // The R9 corrective: the VERIFIED composite-closure
+            // reachability (the same discipline as the file medium's
+            // cold walk): a /2 root's chunks are transitively
+            // referenced through its manifest — every dependency is
+            // loaded hash-verified and fully envelope-checked before
+            // it joins the reachable set. A missing, corrupt, or
+            // malformed chunk fails the walk closed.
+            if domain == composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN {
+                let manifest = composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                for entry in &manifest.entries {
+                    let chunk_bytes = load_referenced_object(conn, &entry.identity)?;
+                    crate::composite_append::verify_chunk_dependency(
+                        &chunk_bytes,
+                        &entry.identity,
+                        &manifest,
+                    )
+                    .map_err(|_error| MediumError::Chain {
+                        rule: "composite-closure-verification",
+                    })?;
+                    if reachable.insert(entry.identity) {
+                        content_objects += 1;
+                    }
+                }
+            }
             if domain == CHECKPOINT_METADATA_DOMAIN {
                 let metadata = CheckpointMetadata::decode(&bytes).map_err(MediumError::Format)?;
                 staged_indexes.extend(metadata.index.iter().cloned());
