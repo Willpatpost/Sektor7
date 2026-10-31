@@ -960,3 +960,45 @@ fn manifest_v3_contract_fields_portability_and_bounds() {
         Err(BackupError::ManifestCorrupt { .. })
     ));
 }
+
+#[test]
+fn concurrent_verifications_of_one_set_all_succeed() {
+    // The scratch-collision regression (the recurring macOS CI
+    // flake): multiple verifications of the SAME backup set run in
+    // parallel — the exact shape that collided two scratch names
+    // when a coarse clock handed parallel tests the same nanosecond
+    // stamp. Every verification now claims its OWN exclusively
+    // created scratch (the pid + stamp name, the exclusive
+    // create_dir, the bounded AlreadyExists retry) and succeeds;
+    // the cleanup removes only the directory that verification
+    // claimed.
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("concurrent-verify");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "concurrent-verify",
+    )
+    .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    backup_campaign(&dir.db(), &dir.journal(), &dir.output()).unwrap();
+
+    let output = dir.output();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let output = output.clone();
+            std::thread::spawn(move || {
+                verify_backup(&output).expect("the concurrent verification succeeds");
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("the verification thread panicked");
+    }
+}

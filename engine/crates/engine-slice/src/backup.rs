@@ -577,13 +577,62 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
     }
     // The restoration: an isolated scratch environment (never the
     // source, never a live campaign directory) and the real B4
-    // recovery — the same machinery a restart uses.
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| io_err("clock", backup_dir, std::io::Error::other(e)))?
-        .as_nanos();
-    let scratch = std::env::temp_dir().join(format!("s7-pp-b1-backup-verify-{stamp}"));
-    fs::create_dir(&scratch).map_err(|e| io_err("create the scratch", &scratch, e))?;
+    // recovery — the same machinery a restart uses. The scratch
+    // name carries the process id AND a nanosecond stamp, and the
+    // directory is created EXCLUSIVELY (never `create_dir_all` — a
+    // collision must surface, never silently share a scratch): on
+    // an AlreadyExists collision (a coarse clock handing two
+    // parallel verifications the same stamp) a bounded retry
+    // regenerates the name, and the cleanup below removes only the
+    // directory THIS verification successfully claimed.
+    let scratch = {
+        const CLAIM_ATTEMPTS: u32 = 8;
+        let mut claimed: Option<PathBuf> = None;
+        let mut last_candidate = std::env::temp_dir();
+        for attempt in 0..CLAIM_ATTEMPTS {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| io_err("clock", backup_dir, std::io::Error::other(e)))?
+                .as_nanos();
+            let candidate = std::env::temp_dir().join(format!(
+                "s7-pp-b1-backup-verify-{}-{stamp}",
+                std::process::id()
+            ));
+            last_candidate = candidate.clone();
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    claimed = Some(candidate);
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempt + 1 < CLAIM_ATTEMPTS =>
+                {
+                    // Another verification claimed this name —
+                    // regenerate and retry (bounded).
+                    continue;
+                }
+                Err(error) => {
+                    return Err(io_err("create the scratch", &candidate, error));
+                }
+            }
+        }
+        match claimed {
+            Some(scratch) => scratch,
+            None => {
+                // The bounded retry's exhaustion is a typed refusal
+                // — never a partial or shared scratch environment.
+                return Err(io_err(
+                    "create the scratch",
+                    &last_candidate,
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "the scratch-name collision retry is exhausted",
+                    ),
+                ));
+            }
+        }
+    };
     let restoration = (|| -> Result<(), BackupError> {
         let scratch_db = scratch.join(BACKUP_DB);
         let scratch_journal = scratch.join(BACKUP_JOURNAL);
