@@ -112,8 +112,15 @@ pub use pipeline::{
     PipelineError, ReconcileOutcome,
 };
 pub use reclaim::{
-    RECLAMATION_LEDGER_DOMAIN, RECLAMATION_LEDGER_KEY_DOMAIN, RECLAMATION_LEDGER_VERSION,
-    ReclaimUnit, ReclamationLedger, publish_reclamation_ledger, reclamation_ledger_idempotency_key,
+    CompletionKind, PlanBatch, RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_COMPLETE_KEY_DOMAIN,
+    RECLAMATION_COMPLETE_VERSION, RECLAMATION_LEDGER_DOMAIN, RECLAMATION_LEDGER_KEY_DOMAIN,
+    RECLAMATION_LEDGER_V2_DOMAIN, RECLAMATION_LEDGER_V2_KEY_DOMAIN, RECLAMATION_LEDGER_V2_VERSION,
+    RECLAMATION_LEDGER_VERSION, RECLAMATION_PLAN_DOMAIN, RECLAMATION_PLAN_KEY_DOMAIN,
+    RECLAMATION_PLAN_VERSION, ReclaimDirective, ReclaimOutcome, ReclaimPlan, ReclaimUnit,
+    ReclamationComplete, ReclamationLedger, ReclamationLedgerV2, is_reclamation_ledger_family,
+    publish_reclamation_complete, publish_reclamation_ledger, reclamation_complete_idempotency_key,
+    reclamation_ledger_idempotency_key, reclamation_ledger_v2_idempotency_key,
+    reclamation_plan_idempotency_key,
 };
 pub use record::{AuthorityMode, RECORD_DOMAIN, RECORD_VERSION, RecordKind, RevisionRecord};
 pub use recovery::{

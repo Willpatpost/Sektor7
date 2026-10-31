@@ -26,12 +26,12 @@ use engine_persist::{
     CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
     ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
     JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
-    RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry, ReclamationLedger,
-    ReconcileOutcome, Reconciliation, RecordedCancellation, RecoveryAnchor, RecoveryError,
-    RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition, StoredObject, T1Journal,
-    TailState, TransactionId, active_journal_path, chain_range_digest, compute_digest_seed,
-    publish_checkpoint_mk, publish_reclamation_ledger, read_journal_generations, reconcile,
-    retire_journal_generations, rotate_journal,
+    RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry,
+    ReclamationComplete, ReclamationLedger, ReconcileOutcome, Reconciliation, RecordedCancellation,
+    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
+    SourcePosition, StoredObject, T1Journal, TailState, TransactionId, active_journal_path,
+    chain_range_digest, compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
+    read_journal_generations, reconcile, retire_journal_generations, rotate_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -3346,6 +3346,20 @@ fn walk_checkpoint_range(
             // ancestry and the skip tables exactly like a
             // confirming anchor.
             ReclamationLedger::decode(&bytes).map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == RECLAMATION_COMPLETE_DOMAIN {
+            // The K2-C2B completion marker (P2-F4: the reader arm
+            // ships BEFORE any writer — no marker-bearing history
+            // can exist until the P2 execution switch): RETAINED
+            // EVIDENCE — the terminal-completion record,
+            // strict-decoded (an invalid or incoherent marker object
+            // refuses the checkpoint — never merely skipped), its
+            // retained position participating in the ancestry and
+            // the skip tables exactly like the audit arm.
+            ReclamationComplete::decode(&bytes).map_err(PipelineError::Format)?;
             walked.push(WalkedRecord {
                 record,
                 kind: RangeKind::Anchor,

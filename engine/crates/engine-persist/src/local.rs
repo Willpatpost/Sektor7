@@ -954,7 +954,10 @@ impl LocalFileMedium {
     /// gap-aware strictly-earlier epoch linkage. An uncovered absence
     /// is hard corruption — fail closed, never assumed reclamation.
     fn cold_walk_from(&mut self, head: Hash) -> Result<ChainSummary, MediumError> {
-        self.cold_walk_excluding(head, &BTreeSet::new())
+        let (summary, cursor) = self.cold_walk_excluding(head, &BTreeSet::new())?;
+        self.walks.cold_walk_records = summary.records;
+        self.cursor = Some(cursor);
+        Ok(summary)
     }
 
     /// The authenticated virtual-exclusion survivor walk (K2-C2B
@@ -966,14 +969,20 @@ impl LocalFileMedium {
     /// automatically carries the excluded records into the
     /// reclaimed-membership universe (preserving depends_on
     /// resolution and key history exactly as physical reclamation
-    /// does). Nothing else changes: every walked record and object
-    /// remains hash-verified, and an unrelated missing parent still
-    /// fails closed.
+    /// does). **P2-F1: the simulated post-retirement view is
+    /// returned as DATA — the authoritative trusted cursor, the
+    /// walk counters, and every other provider state are untouched
+    /// (the walk is a pure `&self` computation), so an unsuccessful
+    /// walk, an authorization refusal, or a resource limit leaves
+    /// the provider's ordinary state exactly as it was, and no
+    /// append, validation, or sweep ever observes the simulated
+    /// view.** The caller decides whether and when to establish a
+    /// cursor consistent with the post-deletion physical state.
     fn cold_walk_excluding(
-        &mut self,
+        &self,
         head: Hash,
         exclude: &BTreeSet<Hash>,
-    ) -> Result<ChainSummary, MediumError> {
+    ) -> Result<(ChainSummary, Cursor), MediumError> {
         let mut seen_ids = BTreeSet::new();
         let mut seen_keys = BTreeSet::new();
         let mut reachable = BTreeSet::new();
@@ -1195,8 +1204,7 @@ impl LocalFileMedium {
                 }
             }
         }
-        self.walks.cold_walk_records = records;
-        self.cursor = Some(Cursor {
+        let cursor = Cursor {
             head,
             epoch: head_epoch,
             seen_keys,
@@ -1207,19 +1215,22 @@ impl LocalFileMedium {
             authority,
             campaign_id: campaign_id.clone(),
             content_objects,
-        });
-        Ok(ChainSummary {
-            head,
-            height: head_epoch,
-            founding: founding_id,
-            authority,
-            campaign_id,
-            records,
-            content_objects,
-            checkpoints,
-            reclaimed_records,
-            reclaimed_keys,
-        })
+        };
+        Ok((
+            ChainSummary {
+                head,
+                height: head_epoch,
+                founding: founding_id,
+                authority,
+                campaign_id,
+                records,
+                content_objects,
+                checkpoints,
+                reclaimed_records,
+                reclaimed_keys,
+            },
+            cursor,
+        ))
     }
 
     /// Advances the cursor over an accepted append (O(1) work).
@@ -1787,4 +1798,203 @@ fn io_err(op: &'static str, path: &Path, source: io::Error) -> MediumError {
 
 fn elapsed_nanos(from: Instant) -> u64 {
     u64::try_from(from.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    use crate::hash::hash_object;
+    use crate::medium::AppendOutcome;
+    use crate::medium::CanonicalMedium;
+    use crate::reclaim::{CompletionKind, ReclamationComplete, publish_reclamation_complete};
+    use crate::record::{AuthorityMode, RevisionRecord};
+
+    fn temp_store(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2f1-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn snapshot(medium: &mut LocalFileMedium) -> (Option<Hash>, Option<ChainSummary>) {
+        // The observable ordinary state: the trusted head and the
+        // validated summary (the cursor's authoritative view).
+        let head = medium.head().unwrap();
+        let summary = medium.validate().ok();
+        (head, summary)
+    }
+
+    #[test]
+    fn a_refused_exclusion_walk_leaves_the_medium_untouched() {
+        // P2-F1's regression: a nonempty virtual-exclusion walk that
+        // REFUSES (here: the excluded record has no covering MK skip
+        // — the uncovered virtual absence fails closed exactly like
+        // an uncovered physical absence) leaves the provider's
+        // ordinary state exactly as it was — the trusted head, the
+        // validated chain, and a subsequent append all behave as if
+        // the simulated walk never ran. The walk is a pure &self
+        // computation: it STRUCTURALLY cannot touch the cursor, the
+        // counters, or any sweep state.
+        let root = temp_store("refusal");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        // A founded chain: the founding record plus two regular
+        // revisions (no MK — any exclusion is uncovered).
+        let object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2f1", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let second = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&second, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let third = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&third, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+
+        let before = snapshot(&mut medium);
+        let before_stats = medium.walk_stats();
+
+        // The nonempty exclusion over the middle record: with no
+        // covering skip table this fails closed (the uncovered
+        // virtual absence) — the exact pre-deletion refusal shape.
+        let excluded: BTreeSet<Hash> = [second.id()].into_iter().collect();
+        let refused = medium.cold_walk_excluding(head, &excluded);
+        assert!(
+            refused.is_err(),
+            "the uncovered virtual exclusion fails closed"
+        );
+
+        // The ordinary state is byte-for-byte as before: the head,
+        // the validation, the walk counters, and a fresh append all
+        // behave exactly as if the simulated walk never ran.
+        let after = snapshot(&mut medium);
+        assert_eq!(before, after, "the trusted state is untouched");
+        assert_eq!(
+            medium.walk_stats().cold_walk_records,
+            before_stats.cold_walk_records,
+            "the simulated walk never counted as a cold walk"
+        );
+        let head_now = medium.head().unwrap().unwrap();
+        let epoch_now = medium.read_record(&head_now).unwrap().epoch;
+        let fourth =
+            RevisionRecord::regular(head_now, epoch_now, 3).with_content_refs(vec![object.hash()]);
+        let outcome = medium
+            .append(&fourth, std::slice::from_ref(&object), Some(head_now))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+
+        // The reopen behaves identically (the on-disk state was
+        // never touched by the simulated view).
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(&root).unwrap();
+        assert_eq!(reopened.head().unwrap().unwrap(), fourth.id());
+        reopened.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_marker_publication_is_cas_bound_and_kind_keyed() {
+        // P2-F2/F3: the marker's append is CAS-bound to the EXACT
+        // expected parent — a HEAD advancement between the
+        // completion validation and the publication REFUSES
+        // (RejectedStaleParent, never a silently rebased marker;
+        // the caller rederives against the new HEAD before
+        // retrying) — and the kind-aware key derivation keeps the
+        // batch and range-terminal namespaces distinct on the
+        // publication path (no collision between batch 0 and the
+        // range marker of one MK).
+        let root = temp_store("marker-cas");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2f2", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        let verified_head = medium.head().unwrap().unwrap();
+
+        // HEAD ADVANCES between the (simulated) completion
+        // validation and the publication.
+        let epoch = medium.read_record(&verified_head).unwrap().epoch;
+        let interloper =
+            RevisionRecord::regular(verified_head, epoch, 9).with_content_refs(vec![object.hash()]);
+        medium
+            .append(
+                &interloper,
+                std::slice::from_ref(&object),
+                Some(verified_head),
+            )
+            .unwrap();
+
+        let mk = hash_object(b"p2f2-mk");
+        let marker = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: hash_object(b"p2f2-audit"),
+            mandatory_count: 1,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let (_, outcome) =
+            publish_reclamation_complete(&mut medium, &marker, verified_head, 10).unwrap();
+        assert!(
+            matches!(outcome, AppendOutcome::RejectedStaleParent { .. }),
+            "the advanced HEAD refuses the stale-parent marker: {outcome:?}"
+        );
+
+        // Against the CURRENT head the marker installs.
+        let current = medium.head().unwrap().unwrap();
+        let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, current, 11).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+
+        // The RANGE-terminal marker for the same MK installs under
+        // its DISTINCT key (the kind-aware derivation).
+        let range_marker = ReclamationComplete {
+            kind: CompletionKind::Range,
+            mk,
+            batch: 0,
+            source: hash_object(b"p2f2-plan"),
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: vec!["journal.t1.2".to_owned()],
+        };
+        let current = medium.head().unwrap().unwrap();
+        let (_, outcome) =
+            publish_reclamation_complete(&mut medium, &range_marker, current, 12).unwrap();
+        assert!(
+            matches!(outcome, AppendOutcome::Accepted { .. }),
+            "the range key never collides with batch 0: {outcome:?}"
+        );
+        medium.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

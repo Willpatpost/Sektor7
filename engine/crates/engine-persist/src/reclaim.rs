@@ -870,29 +870,43 @@ pub struct ReclaimOutcome {
 
 /// Publishes the completion marker revision: a regular revision
 /// whose single content object is the marker, keyed
-/// deterministically by the MK and the batch index, parented on the
-/// current head. Returns the candidate (for the caller's Unknown
-/// reconciliation) and the outcome — the same shape as the audit's
-/// own publication.
+/// deterministically by the marker's KIND (the batch form by the MK
+/// and batch index — P2-F3: the range-terminal form by the MK and
+/// the `range` tag; the two namespaces never collide), and CAS-bound
+/// to the EXACT expected parent (P2-F2: the HEAD under which the
+/// completion obligations were verified — an advancement between
+/// validation and publication surfaces `RejectedStaleParent`, never
+/// a silently rebased marker; the caller rederives the completion
+/// conditions against the new HEAD before retrying). Returns the
+/// candidate (for the caller's Unknown reconciliation) and the
+/// outcome — the same shape as the audit's own publication. A
+/// duplicate-key result is never alone proof of completion: the
+/// caller must discover and verify the existing marker's contents
+/// and underlying obligations.
 pub fn publish_reclamation_complete(
     medium: &mut dyn CanonicalMedium,
     marker: &ReclamationComplete,
+    expected_parent: Hash,
     tick: u64,
 ) -> Result<(Hash, AppendOutcome), MediumError> {
     let bytes = marker.canonical_bytes();
     let object = StoredObject::new(bytes)?;
-    let head = medium
-        .head()?
-        .ok_or(MediumError::Chain { rule: "unfounded" })?;
-    let parent_epoch = medium.read_record(&head)?.epoch;
-    let record = RevisionRecord::regular(head, parent_epoch, tick)
-        .with_idempotency_key(reclamation_complete_idempotency_key(
-            &marker.mk,
-            Some(marker.batch),
-        ))
+    let parent_epoch = medium.read_record(&expected_parent)?.epoch;
+    let key = match marker.kind {
+        CompletionKind::Batch => {
+            reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch))
+        }
+        CompletionKind::Range => reclamation_complete_idempotency_key(&marker.mk, None),
+    };
+    let record = RevisionRecord::regular(expected_parent, parent_epoch, tick)
+        .with_idempotency_key(key)
         .with_content_refs(vec![object.hash()]);
     let candidate = record.id();
-    let outcome = medium.append(&record, std::slice::from_ref(&object), Some(head))?;
+    let outcome = medium.append(
+        &record,
+        std::slice::from_ref(&object),
+        Some(expected_parent),
+    )?;
     Ok((candidate, outcome))
 }
 
