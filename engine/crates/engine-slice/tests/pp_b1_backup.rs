@@ -1002,3 +1002,48 @@ fn concurrent_verifications_of_one_set_all_succeed() {
         handle.join().expect("the verification thread panicked");
     }
 }
+
+#[test]
+fn the_scratch_claim_retries_a_deterministic_forced_collision() {
+    // The deterministic forced-collision regression: a pre-created
+    // directory at the forced name makes THIS thread's first claim
+    // attempt genuinely collide (AlreadyExists) — the bounded retry
+    // then draws a fresh monotonic-counter name, claims it, and the
+    // verification SUCCEEDS. The pre-created directory survives
+    // untouched (the cleanup removes only the directory the
+    // verification claimed). The arm is thread-local, so no parallel
+    // verification in this process can steal or observe it.
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let dir = TestDir::new("forced-collision");
+    let journal = T1Journal::open(dir.journal()).unwrap();
+    let mut crossing = SessionCrossing::open_at(
+        &StoreLocation::Database(dir.db()),
+        journal,
+        "forced-collision",
+    )
+    .unwrap();
+    run(&mut spine, &mut director, &near, 100);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    backup_campaign(&dir.db(), &dir.journal(), &dir.output()).unwrap();
+
+    // The forced collision: the fixed-name directory exists BEFORE
+    // the verification's first claim attempt.
+    let forced = std::env::temp_dir().join(engine_slice::backup::FORCED_SCRATCH_NAME);
+    std::fs::create_dir(&forced).unwrap();
+    engine_slice::backup::test_force_next_scratch_collision();
+
+    verify_backup(&dir.output())
+        .expect("the forced collision retries and the verification succeeds");
+
+    // The unclaimed directory is never cleaned up, and the retry's
+    // own scratch was fully removed.
+    assert!(
+        forced.is_dir(),
+        "the pre-existing directory the verification did not claim is untouched"
+    );
+    let _ = std::fs::remove_dir_all(&forced);
+}

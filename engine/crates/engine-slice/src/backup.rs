@@ -491,6 +491,35 @@ pub fn backup_campaign(
     })
 }
 
+/// The monotonic scratch-claim counter — the collision-progress
+/// guarantee underpinning [`verify_backup`]'s isolated restoration
+/// scratch: every claim attempt (first or retry) draws a strictly
+/// increasing process-local value, so a repeating system clock can
+/// never regenerate a name.
+static SCRATCH_CLAIM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only (the deterministic forced-collision arm): the calling
+/// thread's NEXT scratch claim uses the fixed name below instead of
+/// its own — a directory the test pre-creates at that name forces a
+/// genuine `AlreadyExists`, proving the bounded retry
+/// deterministically rather than through a timing-dependent natural
+/// collision. Thread-local and one-shot: no parallel verification in
+/// the same process can steal or observe the arm.
+#[doc(hidden)]
+pub fn test_force_next_scratch_collision() {
+    FORCED_SCRATCH_COLLISION.with(|armed| armed.set(true));
+}
+
+/// The fixed name the forced-collision arm uses (test-only).
+#[doc(hidden)]
+pub const FORCED_SCRATCH_NAME: &str = "s7-pp-b1-backup-verify-collision-forced";
+
+thread_local! {
+    static FORCED_SCRATCH_COLLISION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
 /// Verifies a backup set: the manifest present and decodable, the
 /// captured chain validating to the manifest's binding, the journal
 /// hashing AND re-scanning to the manifest's binding (the last
@@ -578,26 +607,38 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
     // The restoration: an isolated scratch environment (never the
     // source, never a live campaign directory) and the real B4
     // recovery — the same machinery a restart uses. The scratch
-    // name carries the process id AND a nanosecond stamp, and the
-    // directory is created EXCLUSIVELY (never `create_dir_all` — a
-    // collision must surface, never silently share a scratch): on
-    // an AlreadyExists collision (a coarse clock handing two
-    // parallel verifications the same stamp) a bounded retry
-    // regenerates the name, and the cleanup below removes only the
-    // directory THIS verification successfully claimed.
+    // name carries the process id and a MONOTONIC process-local
+    // claim counter — a repeating system clock can never regenerate
+    // a name (every attempt, first or retry, draws a strictly
+    // increasing value; the pid separates concurrent processes; the
+    // bounded AlreadyExists retry handles even a stale directory
+    // left by a crashed pid-reused predecessor, since each retry
+    // advances the counter). The directory is created EXCLUSIVELY
+    // (never `create_dir_all` — a collision must surface, never
+    // silently share a scratch), and the cleanup below removes only
+    // the directory THIS verification successfully claimed.
     let scratch = {
         const CLAIM_ATTEMPTS: u32 = 8;
+        // The test-only forced collision is thread-local: only the
+        // calling thread's next claim observes it, so the
+        // deterministic regression cannot be stolen by a parallel
+        // verification in the same process.
+        let forced = FORCED_SCRATCH_COLLISION.with(|armed| armed.replace(false));
         let mut claimed: Option<PathBuf> = None;
         let mut last_candidate = std::env::temp_dir();
         for attempt in 0..CLAIM_ATTEMPTS {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| io_err("clock", backup_dir, std::io::Error::other(e)))?
-                .as_nanos();
-            let candidate = std::env::temp_dir().join(format!(
-                "s7-pp-b1-backup-verify-{}-{stamp}",
-                std::process::id()
-            ));
+            let candidate = if forced && attempt == 0 {
+                // The test-only forced collision: a directory the
+                // test pre-creates at the fixed name.
+                std::env::temp_dir().join(FORCED_SCRATCH_NAME)
+            } else {
+                let claim =
+                    SCRATCH_CLAIM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::env::temp_dir().join(format!(
+                    "s7-pp-b1-backup-verify-{}-{claim}",
+                    std::process::id()
+                ))
+            };
             last_candidate = candidate.clone();
             match fs::create_dir(&candidate) {
                 Ok(()) => {
@@ -608,8 +649,9 @@ pub fn verify_backup(backup_dir: &Path) -> Result<ChainSummary, BackupError> {
                     if error.kind() == std::io::ErrorKind::AlreadyExists
                         && attempt + 1 < CLAIM_ATTEMPTS =>
                 {
-                    // Another verification claimed this name —
-                    // regenerate and retry (bounded).
+                    // Another verification claimed this name — the
+                    // monotonic counter guarantees the retry draws a
+                    // fresh one.
                     continue;
                 }
                 Err(error) => {
