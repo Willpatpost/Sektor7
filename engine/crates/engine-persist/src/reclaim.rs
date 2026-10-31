@@ -298,6 +298,24 @@ pub const RECLAMATION_COMPLETE_KEY_DOMAIN: &str = "engine-persist/reclamation-co
 pub const MAX_RECLAMATION_UNIT_OBJECTS_V2: u64 =
     crate::record::MAX_HASH_LIST_LEN + crate::composite_manifest::MAX_MANIFEST_CHUNKS;
 
+/// The ratified maximum ledger byte ceiling (the admission's L) —
+/// the codec-visible form of the owner-ratified bound.
+pub const MAX_RECLAMATION_LEDGER_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The maximum deferred-identity cardinality a batch marker may
+/// certify — derived from the LEDGER byte ceiling, not the
+/// single-unit object bound (a batch spans many units, so its
+/// combined distinct deferred set may legitimately exceed
+/// `MAX_RECLAMATION_UNIT_OBJECTS_V2`): every deferred identity
+/// appears in its batch's ledger as a unit object costing at least
+/// `Hash::WIDTH` bytes plus per-unit count framing, so a ledger
+/// within the byte ceiling cannot declare more distinct objects
+/// than this. The bound is therefore always sufficient — a batch
+/// can never become unfinishable because its valid completion
+/// evidence exceeded the decoder limit.
+pub const MAX_RECLAMATION_DEFERRED_IDENTITIES: u64 =
+    MAX_RECLAMATION_LEDGER_BYTES / (Hash::WIDTH + 8);
+
 /// The reclamation-ledger family prefix — every versioned audit
 /// domain begins with it. The family gate's classification input:
 /// a domain in the family with no matching exact arm refuses typed
@@ -422,6 +440,9 @@ impl ReclamationLedgerV2 {
             let mut seen_objects = std::collections::BTreeSet::new();
             for _ in 0..object_count {
                 let object = read_hash(&mut dec, SECTION)?;
+                if object == Hash::ZERO {
+                    return Err(SaveError::Integrity("reclamation-ledger-v2/zero-identity"));
+                }
                 if !seen_objects.insert(object) {
                     return Err(SaveError::Integrity(
                         "reclamation-ledger-v2/duplicate-unit-object",
@@ -548,8 +569,14 @@ impl ReclaimPlan {
             return Err(SaveError::Integrity("reclamation-plan/zero-byte-limit"));
         }
         let batch_count = dec.read_count(MAX_RECLAMATION_UNITS, SECTION, "batch-count")?;
+        if batch_count == 0 {
+            // A real retirement has at least one record — a
+            // zero-batch plan is not a legitimate ratified state.
+            return Err(SaveError::Integrity("reclamation-plan/empty-plan"));
+        }
         let mut batches = Vec::with_capacity(batch_count as usize);
         let mut seen_records = std::collections::BTreeSet::new();
+        let mut aggregate_records: u64 = 0;
         for expected_index in 0..batch_count {
             let index = dec.read_u64()?;
             if index != expected_index {
@@ -559,6 +586,22 @@ impl ReclaimPlan {
                 dec.read_count(MAX_RECLAMATION_UNITS, SECTION, "batch-record-count")?;
             if record_count == 0 {
                 return Err(SaveError::Integrity("reclamation-plan/empty-batch"));
+            }
+            // The aggregate membership ceiling (checked
+            // arithmetic): the plan partitions ONE MK retirement
+            // range, whose membership is bounded by the checkpoint
+            // index — the same bound the v1 ledger's unit count
+            // uses.
+            aggregate_records =
+                aggregate_records
+                    .checked_add(record_count)
+                    .ok_or(SaveError::Integrity(
+                        "reclamation-plan/aggregate-membership",
+                    ))?;
+            if aggregate_records > MAX_RECLAMATION_UNITS {
+                return Err(SaveError::Integrity(
+                    "reclamation-plan/aggregate-membership",
+                ));
             }
             let mut records = Vec::with_capacity(record_count as usize);
             for _ in 0..record_count {
@@ -711,12 +754,18 @@ impl ReclamationComplete {
                     return Err(SaveError::Integrity("reclamation-complete/zero-identity"));
                 }
                 let mandatory_count = dec.read_u64()?;
-                let deferred_count =
-                    dec.read_count(MAX_RECLAMATION_UNIT_OBJECTS_V2, SECTION, "deferred-count")?;
+                let deferred_count = dec.read_count(
+                    MAX_RECLAMATION_DEFERRED_IDENTITIES,
+                    SECTION,
+                    "deferred-count",
+                )?;
                 let mut deferred = Vec::with_capacity(deferred_count as usize);
                 let mut seen = std::collections::BTreeSet::new();
                 for _ in 0..deferred_count {
                     let identity = read_hash(&mut dec, SECTION)?;
+                    if identity == Hash::ZERO {
+                        return Err(SaveError::Integrity("reclamation-complete/zero-identity"));
+                    }
                     if !seen.insert(identity) {
                         return Err(SaveError::Integrity(
                             "reclamation-complete/duplicate-deferred",
@@ -1226,6 +1275,130 @@ mod tests {
         ));
         assert!(!is_reclamation_ledger_family(
             "engine-slice/session-snapshot/2"
+        ));
+    }
+
+    // ------------------ the P1-F1/F2/F3 review corrective
+
+    #[test]
+    fn the_marker_deferred_set_exceeding_the_single_unit_bound_decodes() {
+        // P1-F1: a batch's combined distinct deferred set may
+        // legitimately exceed the SINGLE-UNIT object bound
+        // (69,632) while its ledger stays within the ratified byte
+        // ceiling — the marker's decoder bound is derived from the
+        // LEDGER ceiling, so this valid terminal evidence decodes.
+        let deferred: Vec<Hash> = (0..69_700)
+            .map(|index| hash_object(format!("deferred-{index}").as_bytes()))
+            .collect();
+        let marker = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: hash_object(b"mark-mk"),
+            batch: 0,
+            source: hash_object(b"mark-ledger-record"),
+            mandatory_count: 1,
+            deferred,
+            journal_files: Vec::new(),
+        };
+        let bytes = marker.canonical_bytes();
+        let restored = ReclamationComplete::decode(&bytes).unwrap();
+        assert_eq!(restored.deferred.len(), 69_700);
+        assert_eq!(restored.canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn the_marker_deferred_count_bound_refuses_the_derived_ceiling() {
+        // The deferred-count bound itself: a declared count above
+        // the ledger-derived ceiling refuses at the count (the
+        // bounded read), before any identity is consumed.
+        let mk = hash_object(b"mark-mk");
+        let source = hash_object(b"mark-ledger-record");
+        let mut enc = Encoder::new();
+        enc.write_str(RECLAMATION_COMPLETE_DOMAIN);
+        enc.write_u32(RECLAMATION_COMPLETE_VERSION);
+        enc.write_u8(0);
+        enc.write_bytes(mk.as_bytes());
+        enc.write_u64(0);
+        enc.write_bytes(source.as_bytes());
+        enc.write_u64(0);
+        enc.write_count((MAX_RECLAMATION_DEFERRED_IDENTITIES + 1) as usize);
+        assert!(matches!(
+            ReclamationComplete::decode(&enc.into_bytes()),
+            Err(SaveError::Limit { .. })
+        ));
+    }
+
+    #[test]
+    fn the_zero_identity_refusals_cover_objects_and_deferred() {
+        // P1-F2: the v2 deletion-object identities and the marker's
+        // deferred identities refuse the all-zero identity (the v1
+        // decoder is unchanged).
+        let mut ledger = sample_v2_ledger();
+        ledger.units[0].objects[0] = Hash::ZERO;
+        assert!(matches!(
+            ReclamationLedgerV2::decode(&ledger.canonical_bytes()),
+            Err(SaveError::Integrity("reclamation-ledger-v2/zero-identity"))
+        ));
+        let mut marker = sample_batch_marker();
+        marker.deferred[0] = Hash::ZERO;
+        assert!(matches!(
+            ReclamationComplete::decode(&marker.canonical_bytes()),
+            Err(SaveError::Integrity("reclamation-complete/zero-identity"))
+        ));
+    }
+
+    #[test]
+    fn the_plan_aggregate_membership_is_bounded() {
+        // P1-F3: the aggregate record count across ALL batches is
+        // bounded by the checkpoint-index membership ceiling —
+        // 65,538 records across two batches refuses.
+        let over: Vec<Hash> = (0..32_769)
+            .map(|index| hash_object(format!("over-{index}").as_bytes()))
+            .collect();
+        let plan = ReclaimPlan {
+            mk: hash_object(b"plan-mk"),
+            sk: hash_object(b"plan-sk"),
+            range_digest: [1; 32],
+            seed: [2; 32],
+            ledger_byte_limit: 512 * 1024 * 1024,
+            batches: vec![
+                PlanBatch {
+                    index: 0,
+                    records: over.clone(),
+                },
+                PlanBatch {
+                    index: 1,
+                    records: over,
+                },
+            ],
+            journal_files: Vec::new(),
+        };
+        assert!(matches!(
+            ReclaimPlan::decode(&plan.canonical_bytes()),
+            Err(SaveError::Integrity(
+                "reclamation-plan/aggregate-membership"
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_empty_plan_refuses() {
+        // P1-F3: a zero-batch plan is not a legitimate ratified
+        // state — a real retirement has at least one record.
+        let mk = hash_object(b"plan-mk");
+        let sk = hash_object(b"plan-sk");
+        let mut enc = Encoder::new();
+        enc.write_str(RECLAMATION_PLAN_DOMAIN);
+        enc.write_u32(RECLAMATION_PLAN_VERSION);
+        enc.write_bytes(mk.as_bytes());
+        enc.write_bytes(sk.as_bytes());
+        enc.write_bytes(&[0u8; 32]);
+        enc.write_bytes(&[0u8; 32]);
+        enc.write_u64(512 * 1024 * 1024);
+        enc.write_count(0);
+        enc.write_count(0);
+        assert!(matches!(
+            ReclaimPlan::decode(&enc.into_bytes()),
+            Err(SaveError::Integrity("reclamation-plan/empty-plan"))
         ));
     }
 }
