@@ -954,6 +954,26 @@ impl LocalFileMedium {
     /// gap-aware strictly-earlier epoch linkage. An uncovered absence
     /// is hard corruption — fail closed, never assumed reclamation.
     fn cold_walk_from(&mut self, head: Hash) -> Result<ChainSummary, MediumError> {
+        self.cold_walk_excluding(head, &BTreeSet::new())
+    }
+
+    /// The authenticated virtual-exclusion survivor walk (K2-C2B
+    /// P2): the cold walk with the AUDITED retiring-record set
+    /// treated as virtually absent — a physically present record in
+    /// the exclusion routes through the SAME authenticated skip
+    /// jump an absent one takes (the covering MK's table, the
+    /// gap-aware epoch linkage), and the MK-index staging
+    /// automatically carries the excluded records into the
+    /// reclaimed-membership universe (preserving depends_on
+    /// resolution and key history exactly as physical reclamation
+    /// does). Nothing else changes: every walked record and object
+    /// remains hash-verified, and an unrelated missing parent still
+    /// fails closed.
+    fn cold_walk_excluding(
+        &mut self,
+        head: Hash,
+        exclude: &BTreeSet<Hash>,
+    ) -> Result<ChainSummary, MediumError> {
         let mut seen_ids = BTreeSet::new();
         let mut seen_keys = BTreeSet::new();
         let mut reachable = BTreeSet::new();
@@ -1072,8 +1092,12 @@ impl LocalFileMedium {
                     // The compacted walk: an absent parent is a gap —
                     // legitimate only under the covering skip table;
                     // anything else is hard corruption (fail closed,
-                    // never assumed reclamation).
-                    if self.object_path(&parent).is_file() {
+                    // never assumed reclamation). The K2-C2B P2
+                    // exclusion: an AUDITED retiring record routes
+                    // through the same authenticated jump (the
+                    // directive's chain-verified membership is the
+                    // only virtual-absence authority).
+                    if self.object_path(&parent).is_file() && !exclude.contains(&parent) {
                         current = parent;
                     } else {
                         let Some((owner, table)) = skip_table.as_ref() else {

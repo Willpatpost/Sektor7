@@ -1348,6 +1348,24 @@ fn load_object(conn: &Connection, hash: &Hash) -> Result<Vec<u8>, MediumError> {
 /// strictly-earlier epoch linkage. An uncovered absence is hard
 /// corruption — fail closed, never assumed reclamation.
 fn walk_chain(conn: &Connection, head: Hash) -> Result<WalkedChain, MediumError> {
+    walk_chain_excluding(conn, head, &BTreeSet::new())
+}
+
+/// The authenticated virtual-exclusion survivor walk (K2-C2B P2):
+/// the cold walk with the AUDITED retiring-record set treated as
+/// virtually absent — a physically present record in the exclusion
+/// routes through the SAME authenticated skip jump an absent one
+/// takes, and the MK-index staging automatically carries the
+/// excluded records into the reclaimed-membership universe
+/// (preserving depends_on resolution and key history exactly as
+/// physical reclamation does). Every walked record and object
+/// remains hash-verified; an unrelated missing parent still fails
+/// closed.
+fn walk_chain_excluding(
+    conn: &Connection,
+    head: Hash,
+    exclude: &BTreeSet<Hash>,
+) -> Result<WalkedChain, MediumError> {
     let mut seen_ids = BTreeSet::new();
     let mut seen_keys = BTreeSet::new();
     let mut reachable = BTreeSet::new();
@@ -1463,8 +1481,12 @@ fn walk_chain(conn: &Connection, head: Hash) -> Result<WalkedChain, MediumError>
                 // The compacted walk: an absent parent row is a gap —
                 // legitimate only under the covering skip table;
                 // anything else is hard corruption (fail closed,
-                // never assumed reclamation).
-                if record_exists(conn, &parent)? {
+                // never assumed reclamation). The K2-C2B P2
+                // exclusion: an AUDITED retiring record routes
+                // through the same authenticated jump (the
+                // directive's chain-verified membership is the only
+                // virtual-absence authority).
+                if record_exists(conn, &parent)? && !exclude.contains(&parent) {
                     current = parent;
                 } else {
                     let Some((owner, table)) = skip_table.as_ref() else {

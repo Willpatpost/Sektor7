@@ -838,6 +838,64 @@ pub fn reclamation_complete_idempotency_key(mk: &Hash, batch: Option<u64>) -> Ve
     }
 }
 
+/// The authenticated reclamation directive (K2-C2B P2): the audit
+/// revision's identity ON THE AUTHORITATIVE CHAIN plus the caller's
+/// candidate manifest. The provider re-reads and strictly decodes
+/// the ledger UNDER its coordination boundary, cross-checks the
+/// supplied units against the decoded manifest (any mismatch
+/// refuses typed before any deletion), derives the virtual-exclusion
+/// set from the decoded unit RECORDS only, verifies the audit's
+/// chain membership and MK-bound idempotency key, and executes the
+/// two-pass schedule against the survivor partition. A caller-
+/// supplied unit list is never independent authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimDirective {
+    /// The audit revision's identity on the authoritative chain.
+    pub audit_record: Hash,
+    /// The caller's candidate deletion manifest.
+    pub units: Vec<ReclaimUnit>,
+}
+
+/// The partitioned reclamation outcome: the mandatory identities
+/// deleted (the unit records plus the objects no surviving root
+/// requires), the deferred identities authorized to survive
+/// (shared with surviving roots — the visible debt the completion
+/// marker records), and the raw removal count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimOutcome {
+    pub removed: u64,
+    pub mandatory: Vec<Hash>,
+    pub deferred: Vec<Hash>,
+}
+
+/// Publishes the completion marker revision: a regular revision
+/// whose single content object is the marker, keyed
+/// deterministically by the MK and the batch index, parented on the
+/// current head. Returns the candidate (for the caller's Unknown
+/// reconciliation) and the outcome — the same shape as the audit's
+/// own publication.
+pub fn publish_reclamation_complete(
+    medium: &mut dyn CanonicalMedium,
+    marker: &ReclamationComplete,
+    tick: u64,
+) -> Result<(Hash, AppendOutcome), MediumError> {
+    let bytes = marker.canonical_bytes();
+    let object = StoredObject::new(bytes)?;
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let parent_epoch = medium.read_record(&head)?.epoch;
+    let record = RevisionRecord::regular(head, parent_epoch, tick)
+        .with_idempotency_key(reclamation_complete_idempotency_key(
+            &marker.mk,
+            Some(marker.batch),
+        ))
+        .with_content_refs(vec![object.hash()]);
+    let candidate = record.id();
+    let outcome = medium.append(&record, std::slice::from_ref(&object), Some(head))?;
+    Ok((candidate, outcome))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
