@@ -2147,7 +2147,37 @@ impl<S: MediumSource> SessionCrossing<S> {
                         target = Some((*candidate, sk, metadata, Some((record_id, ledger))));
                         break;
                     }
-                    // Completed — the manifest fully satisfied — skip.
+                    // Completed — the manifest fully satisfied. P2-F4:
+                    // the terminal evidence is ensured BEFORE the
+                    // skip — the restart after a completed deletion
+                    // but before the marker's installation converges
+                    // HERE (the same verified-completion admission,
+                    // the state re-verified at publication), and an
+                    // ALREADY-installed marker is verified through
+                    // the trusted consumer (a marker-shaped object
+                    // without completion authority is rejected —
+                    // never silently honored).
+                    match engine_persist::reclaim::find_installed_completion(&mut medium, candidate)
+                        .map_err(PipelineError::Medium)?
+                    {
+                        Some((marker_id, _marker)) => {
+                            engine_persist::reclaim::verify_reclamation_complete(
+                                &mut medium,
+                                &marker_id,
+                                candidate,
+                            )
+                            .map_err(PipelineError::Medium)?;
+                        }
+                        None => {
+                            engine_persist::reclaim::complete_reclamation(
+                                &mut medium,
+                                &record_id,
+                                candidate,
+                            )
+                            .map_err(PipelineError::Medium)?;
+                        }
+                    }
+                    // Completed — skip.
                 }
                 None => {
                     // The fresh-eligibility probe: record presence.
@@ -2402,6 +2432,16 @@ impl<S: MediumSource> SessionCrossing<S> {
                 detail: "reclaim/anchor-lost",
             });
         }
+        // P2-F4: THE TRUSTED COMPLETION RECEIPT — the marker
+        // installed through the verified-completion admission (the
+        // postconditions re-verified against the live medium at
+        // publication; the CAS/reconciliation/duplicate handling
+        // inside). The terminal evidence maintenance discovery
+        // recognizes: a completed v1 retirement never reselects as
+        // unfinished work.
+        let _completion =
+            engine_persist::reclaim::complete_reclamation(&mut medium, &ledger_id, &oldest_mk)
+                .map_err(PipelineError::Medium)?;
         Ok(ReclamationReport {
             ledger: ledger_id,
             mk: oldest_mk,

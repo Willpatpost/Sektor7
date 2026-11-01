@@ -1039,8 +1039,46 @@ pub fn publish_reclamation_complete(
     // audit-shaped record: the source must be an installed v1 audit
     // ON THE AUTHORITATIVE CHAIN whose MK is a real checkpoint,
     // whose bindings agree with the permanent metadata, and whose
-    // units exactly match the checkpoint's retirement index.
-    let (_ledger, _metadata) = verify_canonical_v1_audit(medium, &marker.source, &marker.mk)?;
+    // units exactly match the checkpoint's retirement index —
+    // verified in the RECOVERY-SAFE form (the completed
+    // retirement's records are absent by construction).
+    let (ledger, _metadata) = verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    // P2-F4: the verified-completion RECEIPT — the marker's
+    // certified obligations are checked against the ACTUAL
+    // post-execution state, never the caller's claim: every
+    // retiring record absent, the partition recomputed from the
+    // surviving chain, every mandatory identity absent, every
+    // deferred identity present and hash-verified.
+    let (mandatory_count, deferred) = verify_completion_state(medium, &ledger)?;
+    if marker.mandatory_count != mandatory_count {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mandatory-count-mismatch",
+        });
+    }
+    if marker
+        .deferred
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<Hash>>()
+        != deferred
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/deferred-mismatch",
+        });
+    }
+    // The provider-internal residue (the quarantine forms): the
+    // mandatory-empty postcondition across every authenticated
+    // storage form — the advisory probe's observation, bound into
+    // the admission.
+    let directive = ReclaimDirective {
+        audit_record: marker.source,
+        units: ledger.units.clone(),
+    };
+    if medium.reclaim_pending(&directive)? {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mandatory-residue",
+        });
+    }
     // The CAS-bound publication: the receipt is constructed
     // IN-CRATE (the generic gate does not apply — this admission IS
     // the authority), the append's expected parent binding to the
@@ -1231,6 +1269,584 @@ pub fn verify_canonical_v1_audit(
         }
     }
     Ok((ledger, metadata))
+}
+
+// ------------------------------------------ the trusted completion (P2-F4)
+//
+// The verified completion receipt: the marker installed ONLY
+// through [`publish_reclamation_complete`] — the in-crate admission
+// (the generic append refuses the completion domain; the
+// `AdmittedAppend` receipt is `pub(crate)`) — whose verification
+// establishes the ACTUAL retirement state, never the caller's
+// claim. The trusted consumer re-establishes the structural
+// authority for readers; the admission-time state verification is
+// the gate a marker-shaped object cannot bypass.
+
+/// The founding revision's identity: the gap-aware descent from the
+/// authoritative HEAD to the parentless record (the completion
+/// verification's seed derivation — the founding is permanent, so
+/// this is always computable).
+fn founding_of(medium: &mut dyn CanonicalMedium) -> Result<Hash, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let record = medium.read_record(&current)?;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            return Ok(current);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "reclamation-complete/descent-bound",
+    })
+}
+
+/// The recovery-safe audit authentication: the same descent,
+/// bindings, and units-vs-index membership as
+/// [`verify_canonical_v1_audit`] — but WITHOUT the pre-deletion
+/// requirement that every unit's record is present. The completed
+/// retirement's records are absent BY CONSTRUCTION; the absent set
+/// must hold the (E1) deletion-prefix shape (an absent unit after a
+/// present one is missing storage, never proof of a prior
+/// authorized deletion), and the range digest is recomputed
+/// whenever every digest member is present. A present unit's
+/// manifest is still verified against its actual content
+/// references.
+pub fn verify_installed_v1_audit(
+    medium: &mut dyn CanonicalMedium,
+    audit_record: &Hash,
+    mk: &Hash,
+) -> Result<(ReclamationLedger, crate::checkpoint::CheckpointMetadata), MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut ledger: Option<ReclamationLedger> = None;
+    let mut metadata: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let record = medium.read_record(&current)?;
+        let parent = record.parent;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            let domain = StoredObject::new(bytes.clone())?.domain().to_owned();
+            if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+                let decoded = crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                    .map_err(MediumError::Format)?;
+                skip_table = Some(decoded.clone());
+                if current == *mk {
+                    if decoded.sk != parent.unwrap_or(Hash::ZERO) {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-complete/mk-binding-mismatch",
+                        });
+                    }
+                    metadata = Some(decoded);
+                }
+            } else if domain == RECLAMATION_LEDGER_DOMAIN && current == *audit_record {
+                let decoded = ReclamationLedger::decode(&bytes).map_err(MediumError::Format)?;
+                if decoded.mk != *mk {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/mk-mismatch",
+                    });
+                }
+                let expected = reclamation_ledger_idempotency_key(mk);
+                if record.idempotency_key != Some(expected) {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/audit-key-mismatch",
+                    });
+                }
+                ledger = Some(decoded);
+            }
+        }
+        if ledger.is_some() && metadata.is_some() {
+            break;
+        }
+        let Some(parent) = parent else {
+            break;
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let Some(ledger) = ledger else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/audit-not-canonical",
+        });
+    };
+    let Some(metadata) = metadata else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mk-not-a-checkpoint",
+        });
+    };
+    if ledger.sk != metadata.sk
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/binding-mismatch",
+        });
+    }
+    let index: std::collections::BTreeSet<Hash> =
+        metadata.index.iter().map(|entry| entry.hash).collect();
+    let units: std::collections::BTreeSet<Hash> =
+        ledger.units.iter().map(|unit| unit.record).collect();
+    if index.len() != metadata.index.len() || units.len() != ledger.units.len() {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/index-incoherent",
+        });
+    }
+    if index != units {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/units-index-mismatch",
+        });
+    }
+    // (E2) The newest-first order — the prefix property below
+    // depends on it.
+    verify_newest_first_order(&ledger.units, &metadata)?;
+    // The founding-derived seed: ALWAYS verifiable (the founding is
+    // permanent — the descent crosses the reclaimed gaps under the
+    // authenticated skip tables).
+    verify_founding_seed(&metadata, &founding_of(medium)?)?;
+    // The (E1) recovery boundary + the digest recomputation: the
+    // present units verify their manifests; the absent set must be
+    // a deletion prefix; every digest member present triggers the
+    // recomputation.
+    let mut present_seen = false;
+    let mut all_present = true;
+    for unit in &ledger.units {
+        match medium.read_record(&unit.record) {
+            Ok(record) => {
+                present_seen = true;
+                if unit.objects != record.content_refs {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/units-objects-mismatch",
+                    });
+                }
+            }
+            Err(MediumError::MissingObject { .. }) => {
+                if present_seen {
+                    return Err(MediumError::Chain {
+                        rule: "reclaim/absence-not-deletion-prefix",
+                    });
+                }
+                if unit.record != ledger.sk {
+                    all_present = false;
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if all_present {
+        let mut digest_members: Vec<(u64, Hash)> = ledger
+            .units
+            .iter()
+            .filter(|unit| unit.record != ledger.sk)
+            .filter_map(|unit| {
+                metadata
+                    .index
+                    .iter()
+                    .find(|e| e.hash == unit.record)
+                    .map(|e| (e.epoch, unit.record))
+            })
+            .collect();
+        digest_members.sort_unstable_by_key(|(epoch, _)| *epoch);
+        let mut range_bytes = Vec::with_capacity(digest_members.len());
+        for (_, record) in digest_members {
+            range_bytes.push(medium.read_record(&record)?.canonical_bytes());
+        }
+        let recomputed = crate::checkpoint::chain_range_digest(&metadata.seed, &range_bytes);
+        if recomputed != ledger.range_digest {
+            return Err(MediumError::Chain {
+                rule: "reclaim/range-digest-mismatch",
+            });
+        }
+    }
+    Ok((ledger, metadata))
+}
+
+/// The trait-level survivor object set: the gap-aware cold walk
+/// from the authoritative HEAD to the founding, EXCLUDING the
+/// retiring records — every content object reachable from the
+/// surviving chain (the partition input for the completion
+/// verification; the same discipline as the providers' internal
+/// walks, expressed over the public hash-verified reads).
+pub fn survivor_objects(
+    medium: &mut dyn CanonicalMedium,
+    exclusion: &std::collections::BTreeSet<Hash>,
+) -> Result<std::collections::BTreeSet<Hash>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut reachable = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let record = medium.read_record(&current)?;
+        if !exclusion.contains(&current) {
+            for object in &record.content_refs {
+                reachable.insert(*object);
+            }
+        }
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            return Ok(reachable);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "reclamation-complete/descent-bound",
+    })
+}
+
+/// The completion postconditions over the live medium: every
+/// retiring record absent, the partition recomputed from the
+/// surviving chain, every mandatory identity absent, and every
+/// deferred identity present and hash-verified. Returns the
+/// verified (mandatory count, deferred set) the marker must carry.
+pub fn verify_completion_state(
+    medium: &mut dyn CanonicalMedium,
+    ledger: &ReclamationLedger,
+) -> Result<(u64, std::collections::BTreeSet<Hash>), MediumError> {
+    for unit in &ledger.units {
+        match medium.read_record(&unit.record) {
+            Err(MediumError::MissingObject { .. }) => {}
+            Ok(_) => {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/record-still-present",
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let exclusion: std::collections::BTreeSet<Hash> =
+        ledger.units.iter().map(|unit| unit.record).collect();
+    let survivors = survivor_objects(medium, &exclusion)?;
+    let partition = partition_reclaim(&ledger.units, &survivors)?;
+    for identity in &partition.mandatory {
+        match medium.read_object(identity) {
+            Err(MediumError::MissingObject { .. }) => {}
+            Ok(_) => {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-residue",
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    for identity in &partition.deferred {
+        // A deferred identity is a required surviving object: its
+        // absence is a postcondition violation (the shared evidence
+        // the marker certifies as preserved).
+        medium.read_object(identity)?;
+    }
+    Ok((
+        partition.mandatory.len() as u64,
+        partition.deferred.iter().copied().collect(),
+    ))
+}
+
+/// The trusted completion-receipt path: verifies the recovery-safe
+/// audit authority and the ACTUAL postconditions, constructs the
+/// marker FROM the verified state, and installs it through the
+/// CAS-bound admission with the full reconciliation (the stale
+/// parent revalidated against the fresh HEAD; the Unknown outcome
+/// reconciled; the duplicate deterministic key resolved by
+/// discovering and EXACTLY verifying the installed marker — never
+/// inferring success from the key alone).
+pub fn complete_reclamation(
+    medium: &mut dyn CanonicalMedium,
+    source: &Hash,
+    mk: &Hash,
+) -> Result<(Hash, ReclamationComplete), MediumError> {
+    let (ledger, _metadata) = verify_installed_v1_audit(medium, source, mk)?;
+    let (mandatory_count, deferred) = verify_completion_state(medium, &ledger)?;
+    // The provider-internal residue (the quarantine forms) — the
+    // mandatory-empty postcondition across every authenticated
+    // storage form.
+    let directive = ReclaimDirective {
+        audit_record: *source,
+        units: ledger.units.clone(),
+    };
+    if medium.reclaim_pending(&directive)? {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mandatory-residue",
+        });
+    }
+    let marker = ReclamationComplete {
+        kind: CompletionKind::Batch,
+        mk: *mk,
+        batch: 0,
+        source: *source,
+        mandatory_count,
+        deferred: deferred.into_iter().collect(),
+        journal_files: Vec::new(),
+    };
+    for attempt in 0..2 {
+        let head = medium
+            .head()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let tick = medium.read_record(&head)?.tick.saturating_add(1);
+        let outcome = publish_reclamation_complete(medium, &marker, head, tick);
+        match outcome {
+            Ok((id, crate::medium::AppendOutcome::Accepted { .. })) => return Ok((id, marker)),
+            Ok((_, crate::medium::AppendOutcome::RejectedStaleParent { .. })) => {
+                if attempt == 1 {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/stale-unresolved",
+                    });
+                }
+                // The fresh revalidation: the next iteration re-reads
+                // the authoritative HEAD and the admission re-verifies
+                // the entire postcondition set against it.
+                continue;
+            }
+            Ok((candidate, crate::medium::AppendOutcome::Unknown { .. })) => {
+                match medium.reconcile_unknown(&candidate)? {
+                    crate::medium::Reconciliation::Installed { id } => return Ok((id, marker)),
+                    crate::medium::Reconciliation::NotInstalled { .. } => {
+                        if attempt == 1 {
+                            return Err(MediumError::Chain {
+                                rule: "reclamation-complete/unknown-unresolved",
+                            });
+                        }
+                        continue;
+                    }
+                    crate::medium::Reconciliation::Unverifiable { .. } => {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-complete/unknown-unverifiable",
+                        });
+                    }
+                }
+            }
+            Err(MediumError::Chain {
+                rule: "duplicate-idempotency-key",
+            }) => {
+                // The deterministic key is taken: discover and
+                // verify the installed marker's EXACT content — the
+                // certified obligations must match the verified
+                // state, never the key's mere existence.
+                let Some((id, installed)) = find_installed_completion(medium, mk)? else {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/duplicate-unresolved",
+                    });
+                };
+                if installed != marker {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/duplicate-content-mismatch",
+                    });
+                }
+                return Ok((id, installed));
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    unreachable!("the retry loop returns on every path")
+}
+
+/// The keyed completion-marker discovery: the gap-aware descent
+/// from the authoritative HEAD, returning the first record carrying
+/// THIS mk's deterministic completion key with its strictly decoded
+/// marker (the mk binding checked; everything else verified by
+/// [`verify_reclamation_complete`]).
+pub fn find_installed_completion(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+) -> Result<Option<(Hash, ReclamationComplete)>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let key = reclamation_complete_idempotency_key(mk, Some(0));
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let record = medium.read_record(&current)?;
+        if record.idempotency_key.as_deref() == Some(key.as_slice()) {
+            let Some(object) = record.content_refs.first().copied() else {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/marker-malformed",
+                });
+            };
+            let bytes = medium.read_object(&object)?;
+            let marker = ReclamationComplete::decode(&bytes).map_err(MediumError::Format)?;
+            if marker.mk != *mk {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/marker-mk-mismatch",
+                });
+            }
+            return Ok(Some((current, marker)));
+        }
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(None)
+}
+
+/// The trusted completion consumer: the read-side authority for
+/// maintenance and discovery decisions. Establishes the marker's
+/// STRUCTURAL authority — the record's deterministic key, the
+/// strict decode, the v1 boundary gates (Batch kind, batch zero),
+/// and the source audit authenticated in the recovery-safe form.
+/// The marker's certified STATE was verified at admission (only the
+/// in-crate admission can install this domain); a marker-shaped
+/// object without actual completion authority cannot present this
+/// keyed, MK-bound, canonical-audit-sourced form.
+pub fn verify_reclamation_complete(
+    medium: &mut dyn CanonicalMedium,
+    marker_record: &Hash,
+    mk: &Hash,
+) -> Result<ReclamationComplete, MediumError> {
+    let record = medium.read_record(marker_record)?;
+    let Some(object) = record.content_refs.first().copied() else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/marker-malformed",
+        });
+    };
+    let bytes = medium.read_object(&object)?;
+    let marker = ReclamationComplete::decode(&bytes).map_err(MediumError::Format)?;
+    if marker.mk != *mk {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/marker-mk-mismatch",
+        });
+    }
+    if marker.kind == CompletionKind::Range {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/range-unauthorized",
+        });
+    }
+    if marker.batch != 0 {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/batch-nonzero",
+        });
+    }
+    let expected = reclamation_complete_idempotency_key(mk, Some(marker.batch));
+    if record.idempotency_key != Some(expected) {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/marker-key-mismatch",
+        });
+    }
+    // The source audit's authority in the recovery-safe form: the
+    // completed retirement's records are absent by construction.
+    verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    Ok(marker)
 }
 
 #[cfg(test)]

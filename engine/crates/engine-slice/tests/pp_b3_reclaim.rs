@@ -292,10 +292,11 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(summary.reclaimed_keys, 3);
-        // The records: the audit revision, MK2, SK2, S3, MK1, C1, and
-        // the founding (S1, the boundary's covering, and SK1 gone) —
-        // one more reclaimed, one more appended (the audit).
-        assert_eq!(summary.records, 7);
+        // The records: the completion marker, the audit revision,
+        // MK2, SK2, S3, MK1, C1, and the founding (S1, the
+        // boundary's covering, and SK1 gone) — one more reclaimed,
+        // two more appended (the audit, then the terminal marker).
+        assert_eq!(summary.records, 8);
         // S1's revision is genuinely absent.
         assert!(medium.read_record(&s1).is_err());
     }
@@ -595,8 +596,8 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
         assert_eq!(summary.reclaimed_records, 6);
         assert_eq!(summary.reclaimed_keys, 6);
         assert_eq!(
-            summary.records, 13,
-            "F, C1, C2, MK1, S3, COV3, C3, S4, COV4, C4, SK2, MK2, and the audit"
+            summary.records, 14,
+            "F, C1, C2, MK1, S3, COV3, C3, S4, COV4, C4, SK2, MK2, the audit, and the completion marker"
         );
     }
     // THE RANGE-1 KEY REUSE REJECTED — S2's key, preserved by MK1's
@@ -881,9 +882,10 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
             summary.reclaimed_records,
             r1.eligible_records + r2.eligible_records + r3.eligible_records
         );
-        // The walk: the three audits, MK4, SK4, C5, COV5, S5, MK3,
-        // C4, MK2, C3, MK1, C2, C1, and the founding.
-        assert_eq!(summary.records, 16);
+        // The walk: the three audits and their three completion
+        // markers, MK4, SK4, C5, COV5, S5, MK3, C4, MK2, C3, MK1,
+        // C2, C1, and the founding.
+        assert_eq!(summary.records, 19);
     }
     // THE HISTORICAL UNIVERSE across generations: a key from MK1's
     // range (reclaimed at generation 1) still rejected after
@@ -1011,8 +1013,8 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
         assert_eq!(
-            summary.records, 7,
-            "F, C1, MK1, S3, SK2, MK2, and the audit — no second audit"
+            summary.records, 8,
+            "F, C1, MK1, S3, SK2, MK2, the audit, and the completion marker — no second audit"
         );
     }
 
@@ -1146,7 +1148,7 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
         );
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 7);
+        assert_eq!(summary.records, 8);
     }
     let remaining = std::fs::read_dir(dir.store().join("quarantine"))
         .map(|entries| entries.count())
@@ -1212,7 +1214,7 @@ fn the_sqlite_provider_reclaims_with_transactional_atomicity() {
         let mut medium = SqliteMedium::open(dir.db()).unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 7);
+        assert_eq!(summary.records, 8);
     }
     drop(crossing);
     let (_spine, _director, mut recovered) = SessionCrossing::recover_at(
@@ -1382,14 +1384,17 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
     );
     {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let head_after = medium.head().unwrap().unwrap();
+        let head_record = medium.read_record(&head_after).unwrap();
+        assert_ne!(head_after, head_before);
         assert_eq!(
-            medium.head().unwrap().unwrap(),
-            head_before,
-            "no second audit — the resumed re-run appends nothing"
+            head_record.parent,
+            Some(head_before),
+            "no second audit — the resumed re-run's only append is the terminal completion marker"
         );
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 7);
+        assert_eq!(summary.records, 8);
     }
 
     // THE CONVERGENCE onto the twin: identical object sets, the
@@ -1696,10 +1701,11 @@ fn checkpoints_continue_across_reclamations_and_recover() {
         );
         assert_eq!(summary.reclaimed_records, r1.eligible_records);
         // The walk: MK3, SK3, C4, the continuation cycle's covering,
-        // S4, A1, MK2, SK2, S3, MK1, C1, and the founding — the audit
-        // retained in the ancestry, MK1's reclaimed range skipped
-        // under its tables (MK2's range still stands at this point).
-        assert_eq!(summary.records, 12);
+        // S4, A1, MK2, SK2, S3, MK1, C1, the founding, and MK1's
+        // completion marker — the audit retained in the ancestry,
+        // MK1's reclaimed range skipped under its tables (MK2's
+        // range still stands at this point).
+        assert_eq!(summary.records, 13);
         let audit = medium.read_record(&audit1).unwrap();
         medium
             .read_object(audit.content_refs.first().unwrap())
@@ -1758,10 +1764,10 @@ fn checkpoints_continue_across_reclamations_and_recover() {
         );
         // The walk: MK4, SK4, C5, the second continuation cycle's
         // covering, S5, A2, MK3, SK3, C4, the first continuation
-        // cycle's covering, S4, A1, MK2, MK1, C1, and the founding —
-        // both audits retained in the ancestry, both reclaimed
-        // ranges skipped under the tables.
-        assert_eq!(summary.records, 16);
+        // cycle's covering, S4, A1, MK2, MK1, C1, the founding, and
+        // the two completion markers — both audits retained in the
+        // ancestry, both reclaimed ranges skipped under the tables.
+        assert_eq!(summary.records, 18);
         for report in [&report1, &report2, &report3, &report4] {
             let mk = medium.read_record(&report.mk).unwrap();
             medium
@@ -1899,8 +1905,9 @@ fn the_sqlite_lifecycle_continues_across_reclamations() {
         );
         // C1: the two continuation cycles' coverings (over S4 and
         // S5) are retained range members of the protected
-        // checkpoints — the walk carries them with the audits.
-        assert_eq!(summary.records, 16);
+        // checkpoints — the walk carries them with the audits and
+        // the two completion markers.
+        assert_eq!(summary.records, 18);
     }
 }
 

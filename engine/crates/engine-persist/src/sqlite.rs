@@ -1028,9 +1028,17 @@ fn reclaim_authorized_tx(
     crate::reclaim::verify_newest_first_order(&ledger.units, &metadata)?;
     // The manifest reread with the resume tolerance (the records-
     // table read; an absent retiring record is the protocol-
-    // accounted resume).
+    // accounted resume — but ONLY in the deletion-prefix shape: the
+    // (E1) recovery boundary. This provider's pass 1 deletes
+    // newest-first under one transaction, so a genuine interruption
+    // rolls back to the all-present state; an absent row in a non-
+    // prefix pattern is evidence of missing storage, never proof of
+    // a prior authorized deletion — the fabricated-audit-with-
+    // missing-data shape fails closed).
+    let mut present_seen = false;
     for unit in &ledger.units {
         if record_exists(tx, &unit.record)? {
+            present_seen = true;
             let bytes = load_record_verified(tx, &unit.record)?;
             let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
             if unit.objects != record.content_refs {
@@ -1038,6 +1046,10 @@ fn reclaim_authorized_tx(
                     rule: "reclaim/units-objects-mismatch",
                 });
             }
+        } else if present_seen {
+            return Err(MediumError::Chain {
+                rule: "reclaim/absence-not-deletion-prefix",
+            });
         }
     }
     // The survivor partition under the same transaction — and the
@@ -3287,6 +3299,263 @@ mod exclusion_tests {
         }
         assert_eq!(exists(&medium, "objects", shared.hash()), 1);
         assert!(!medium.reclaim_pending(&directive).unwrap());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_non_prefix_absence_refuses_on_sqlite() {
+        // (E1) The recovery-authorization boundary on the second
+        // provider: a missing retiring record ROW in a non-prefix
+        // pattern (the oldest digest member gone while the SK
+        // remains) is a shape this provider's single-transaction
+        // pass 1 never produces — a genuine interruption rolls back
+        // to the all-present state. The absence is evidence of
+        // missing storage, never proof of a prior authorized
+        // deletion: the provider refuses typed and nothing further
+        // is deleted.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2np-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2np", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject]| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, refs.len() as u64 + 10)
+                .with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared));
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
+        let sk = step(&mut medium, std::slice::from_ref(&shared));
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            range_digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk.id(),
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        // The non-prefix absence: the OLDEST digest member's row is
+        // gone while the SK (the newest unit) remains.
+        medium
+            .conn
+            .execute(
+                "DELETE FROM records WHERE hash = ?1",
+                params![r1.as_bytes()],
+            )
+            .unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclaim/absence-not-deletion-prefix"
+                }
+            ),
+            "the non-prefix absence refuses: {error:?}"
+        );
+        // Nothing further deleted: the SK row and both objects
+        // remain.
+        let exists = |table: &str, id: Hash| -> i64 {
+            medium
+                .conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE hash = ?1)"),
+                    params![id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(exists("records", sk), 1);
+        assert_eq!(exists("objects", private.hash()), 1);
+        assert_eq!(exists("objects", shared.hash()), 1);
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_trusted_completion_receipt_installs_on_sqlite() {
+        // (P2-F4) The trusted completion receipt on the second
+        // provider: the executed retirement under the atomic
+        // transaction, then complete_reclamation over the
+        // recovery-safe authority — the marker installed through
+        // the CAS-bound admission, discovered and verified, the
+        // duplicate key resolved by exact-content verification.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2cmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2cmp", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject]| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, refs.len() as u64 + 10)
+                .with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared));
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
+        let sk = step(&mut medium, std::slice::from_ref(&shared));
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            range_digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk.id(),
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        medium.reclaim(&directive).unwrap();
+        let (marker_id, marker) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
+        assert_eq!(marker.deferred, vec![shared.hash()]);
+        let (found_id, found) = crate::reclaim::find_installed_completion(&mut medium, &mk.id())
+            .unwrap()
+            .expect("the marker is discoverable on sqlite");
+        assert_eq!(found_id, marker_id);
+        assert_eq!(found, marker);
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk.id()).unwrap();
+        // The duplicate key resolves by exact-content verification.
+        let (repeat_id, repeat) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
+        assert_eq!(repeat_id, marker_id);
+        assert_eq!(repeat, marker);
+        medium.validate().unwrap();
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }

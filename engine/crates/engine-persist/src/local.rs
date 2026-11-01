@@ -1646,10 +1646,21 @@ impl CanonicalMedium for LocalFileMedium {
             // discipline: hash-verify the bytes — a mismatched file
             // at an audited name is PRESERVED evidence, never
             // authenticated unfinished retirement (never pending).
-            if let Ok(bytes) = fs::read(self.object_path(identity))
-                && hash_object(&bytes) == *identity
-            {
-                return Ok(true);
+            // The read itself is CLASSIFIED, never swallowed: a
+            // genuinely absent path is the absence; a failed read
+            // (permissions, transient I/O, an inaccessible path) is
+            // a typed refusal — an unverifiable observation never
+            // silently contributes to a completed result.
+            match fs::read(self.object_path(identity)) {
+                Ok(bytes) => {
+                    if hash_object(&bytes) == *identity {
+                        return Ok(true);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(io_err("probe object", &self.object_path(identity), e));
+                }
             }
             for path in self.quarantine_family(identity)? {
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -1857,10 +1868,19 @@ impl LocalFileMedium {
         // (4) The manifest reread with the resume tolerance: a
         // PRESENT retiring record's objects must equal its actual
         // content references; an ABSENT one is the protocol-accounted
-        // resume.
+        // resume — but ONLY in the deletion-prefix shape. The (E1)
+        // recovery boundary: this provider's pass 1 deletes
+        // newest-first, so a genuine interruption leaves the absent
+        // set as a PREFIX of the unit order (an absent unit is never
+        // followed by a present one). Any other absence pattern is
+        // evidence of missing storage, never proof of a prior
+        // authorized deletion — the fabricated-audit-with-missing-
+        // data shape fails closed.
+        let mut present_seen = false;
         for unit in &ledger.units {
             let record_path = self.object_path(&unit.record);
             if record_path.is_file() {
+                present_seen = true;
                 let bytes = self.load_object(&unit.record)?;
                 let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
                 if unit.objects != record.content_refs {
@@ -1868,6 +1888,10 @@ impl LocalFileMedium {
                         rule: "reclaim/units-objects-mismatch",
                     });
                 }
+            } else if present_seen {
+                return Err(MediumError::Chain {
+                    rule: "reclaim/absence-not-deletion-prefix",
+                });
             }
         }
         // (5) The survivor partition under the same boundary — and
@@ -2247,6 +2271,9 @@ mod exclusion_tests {
             epochs.push(tick);
         }
         let [_, p1, p2, sk] = [chain[0], chain[1], chain[2], chain[3]];
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let p2_bytes = medium.read_record(&p2).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[p2_bytes]);
         let metadata = CheckpointMetadata::new(
             sk,
             p2,
@@ -2255,8 +2282,8 @@ mod exclusion_tests {
                 ReclaimedIndexEntry::new(None, p2, epochs[2]),
                 ReclaimedIndexEntry::new(None, sk, epochs[3]),
             ],
-            [7; 32],
-            [9; 32],
+            range_digest,
+            seed,
         );
         let meta_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
         let mk_record =
@@ -2266,8 +2293,10 @@ mod exclusion_tests {
             .unwrap();
 
         // A REAL audit of the checkpoint's retirement index (the
-        // ledger's units ARE the index; the bindings ARE the
-        // metadata's).
+        // ledger's units ARE the index, NEWEST-FIRST; the bindings
+        // ARE the metadata's).
+        let p2_refs = medium.read_record(&p2).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
         let ledger = ReclamationLedger {
             mk: mk_record.id(),
             sk,
@@ -2278,17 +2307,24 @@ mod exclusion_tests {
             journal_files: Vec::new(),
             units: vec![
                 ReclaimUnit {
-                    record: p2,
-                    objects: vec![object.hash()],
+                    record: sk,
+                    objects: sk_refs,
                 },
                 ReclaimUnit {
-                    record: sk,
-                    objects: vec![object.hash()],
+                    record: p2,
+                    objects: p2_refs,
                 },
             ],
         };
         let (audit_record, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 6).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // The retirement EXECUTED — the marker's admission verifies
+        // the actual post-execution state.
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record,
+            units: ledger.units.clone(),
+        };
+        let execution = medium.reclaim(&directive).unwrap();
         let current = medium.head().unwrap().unwrap();
 
         // The FABRICATED-MK marker (the review's counterexample:
@@ -2350,15 +2386,39 @@ mod exclusion_tests {
         // compromised-key scenario, exercised at the verification
         // layer in the execution-switch increment.
         //
-        // The ADMITTED marker over the REAL audit: CAS-bound (a HEAD
-        // advancement refuses; the current head accepts).
+        // P2-F4: the RECEIPT check — a caller-constructed marker
+        // whose certified count disagrees with the verified state
+        // refuses (the admission never trusts the claim).
+        let wrong_count = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: mk_record.id(),
+            batch: 0,
+            source: audit_record,
+            mandatory_count: execution.mandatory.len() as u64 + 1,
+            deferred: execution.deferred.clone(),
+            journal_files: Vec::new(),
+        };
+        let error = publish_reclamation_complete(&mut medium, &wrong_count, now, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-count-mismatch"
+                }
+            ),
+            "the mismatched receipt refuses: {error:?}"
+        );
+        // The ADMITTED marker over the REAL executed retirement:
+        // constructed from the verified execution outcome,
+        // CAS-bound (a HEAD advancement refuses; the current head
+        // accepts).
         let marker = ReclamationComplete {
             kind: CompletionKind::Batch,
             mk: mk_record.id(),
             batch: 0,
             source: audit_record,
-            mandatory_count: 2,
-            deferred: Vec::new(),
+            mandatory_count: execution.mandatory.len() as u64,
+            deferred: execution.deferred.clone(),
             journal_files: Vec::new(),
         };
         let epoch = medium.read_record(&now).unwrap().epoch;
@@ -2928,12 +2988,8 @@ mod exclusion_tests {
         // unit order are the two knobs (the on-chain records and the
         // metadata are immutable, so the fabricated commitments live
         // in a store built with them from the start).
-        let build = |digest_override: Option<[u8; 32]>, order_oldest_first: bool| {
-            let root = temp_store(match (&digest_override, order_oldest_first) {
-                (Some(_), _) => "fabricated-digest",
-                (None, true) => "oldest-first",
-                _ => "legitimate",
-            });
+        let build = |label: &str, digest_override: Option<[u8; 32]>, order_oldest_first: bool| {
+            let root = temp_store(label);
             let mut medium = LocalFileMedium::open(root.clone()).unwrap();
             let shared = StoredObject::new({
                 let mut enc = engine_core::Encoder::new();
@@ -3022,14 +3078,23 @@ mod exclusion_tests {
             };
             let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
             assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
-            (root, medium, audit, mk.id(), shared.hash(), private.hash())
+            (
+                root,
+                medium,
+                audit,
+                mk.id(),
+                shared.hash(),
+                private.hash(),
+                ledger,
+            )
         };
 
         // (E1) The fabricated digest (equal in the metadata and the
         // ledger, the seed correct): the recomputation refuses;
         // nothing deleted.
         {
-            let (root, mut medium, audit, mk, _shared, private) = build(Some([9; 32]), false);
+            let (root, mut medium, audit, mk, _shared, private, _ledger) =
+                build("e1-fabricated", Some([9; 32]), false);
             let (ledger, _meta) =
                 crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
             let directive = crate::reclaim::ReclaimDirective {
@@ -3054,7 +3119,8 @@ mod exclusion_tests {
         }
         // (E2) The oldest-first unit order: the order check refuses.
         {
-            let (root, mut medium, audit, mk, _shared, private) = build(None, true);
+            let (root, mut medium, audit, mk, _shared, private, _ledger) =
+                build("e2-oldest-first", None, true);
             let (ledger, _meta) =
                 crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
             let directive = crate::reclaim::ReclaimDirective {
@@ -3080,7 +3146,8 @@ mod exclusion_tests {
         // (E4) The legitimate execution + the append WITHOUT a
         // manual validate: the cursor invalidation rebuilds.
         {
-            let (root, mut medium, audit, mk, _shared, _private) = build(None, false);
+            let (root, mut medium, audit, mk, _shared, _private, _ledger) =
+                build("e4-legitimate", None, false);
             let (ledger, _meta) =
                 crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
             let directive = crate::reclaim::ReclaimDirective {
@@ -3107,5 +3174,276 @@ mod exclusion_tests {
             assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn a_fabricated_audit_with_a_non_prefix_absence_refuses() {
+        // (E1) The recovery-authorization boundary: a missing
+        // retiring publication in a NON-prefix pattern (the oldest
+        // digest member gone while the SK — the newest unit —
+        // remains) is a shape pass 1 never produces. Physical
+        // absence is evidence of missing storage, never proof of a
+        // prior authorized deletion: the FABRICATED audit cannot
+        // ride the resume tolerance, and a genuine audit that lost a
+        // non-prefix record fails closed the same way.
+        let build = |label: &str, digest_override: Option<[u8; 32]>| {
+            let root = temp_store(label);
+            let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+            let shared = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"shared-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let private = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"private-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2np", 0)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&p1, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let r1 = RevisionRecord::regular(head, epoch, 2)
+                .with_content_refs(vec![shared.hash(), private.hash()]);
+            medium
+                .append(&r1, &[shared.clone(), private.clone()], Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let sk = RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&sk, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+            let real_digest = crate::checkpoint::chain_range_digest(&seed, &[r1.canonical_bytes()]);
+            let digest = digest_override.unwrap_or(real_digest);
+            let meta = CheckpointMetadata::new(
+                sk.id(),
+                r1.id(),
+                vec![SkipEntry::new(Hash::ZERO, p1.id())],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1.id(), 2),
+                    ReclaimedIndexEntry::new(None, sk.id(), 3),
+                ],
+                digest,
+                seed,
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let mk = RevisionRecord::regular(sk.id(), epoch, 4)
+                .with_content_refs(vec![meta_object.hash()]);
+            medium
+                .append(&mk, std::slice::from_ref(&meta_object), Some(sk.id()))
+                .unwrap();
+            let r1_refs = medium.read_record(&r1.id()).unwrap().content_refs.clone();
+            let sk_refs = medium.read_record(&sk.id()).unwrap().content_refs.clone();
+            let ledger = ReclamationLedger {
+                mk: mk.id(),
+                sk: sk.id(),
+                range_digest: digest,
+                seed,
+                records: 2,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units: vec![
+                    ReclaimUnit {
+                        record: sk.id(),
+                        objects: sk_refs,
+                    },
+                    ReclaimUnit {
+                        record: r1.id(),
+                        objects: r1_refs,
+                    },
+                ],
+            };
+            let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            (root, medium, audit, shared.hash(), private.hash(), ledger)
+        };
+        // The fabricated digest + the non-prefix absence: the
+        // provider must not continue deletion merely because the
+        // missing record resembles an interrupted retirement.
+        {
+            let (root, mut medium, audit, shared, private, ledger) =
+                build("e1-np-fabricated", Some([9; 32]));
+            let oldest = ledger.units.last().unwrap().record;
+            std::fs::remove_file(medium.object_path(&oldest)).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclaim/absence-not-deletion-prefix"
+                    }
+                ),
+                "the non-prefix absence refuses: {error:?}"
+            );
+            // Nothing further deleted: the SK record and every
+            // object remain.
+            let newest = ledger.units.first().unwrap().record;
+            assert!(medium.object_path(&newest).is_file());
+            assert!(medium.object_path(&private).is_file());
+            assert!(medium.object_path(&shared).is_file());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // The GENUINE digest + the non-prefix absence (external
+        // storage loss): the same fail-closed refusal — the absence
+        // pattern is the evidence, independent of the audit's
+        // authenticity.
+        {
+            let (root, mut medium, audit, _shared, _private, ledger) = build("e1-np-genuine", None);
+            let oldest = ledger.units.last().unwrap().record;
+            std::fs::remove_file(medium.object_path(&oldest)).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclaim/absence-not-deletion-prefix"
+                    }
+                ),
+                "the genuine audit fails closed on loss: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn a_probe_read_failure_is_typed_not_silent() {
+        // (E5) A read failure on a mandatory identity's normal path
+        // is NOT an absence: the probe refuses typed — an
+        // unverifiable observation never silently contributes to a
+        // completed result. A directory at the object path is the
+        // deterministic cross-platform unreadable read.
+        let (root, mut medium, audit, mk, _shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        // The retirement executed: every mandatory identity is gone,
+        // the probe reports complete — the completion-critical
+        // observation.
+        medium.reclaim(&directive).unwrap();
+        assert!(!medium.reclaim_pending(&directive).unwrap());
+        // A directory at the (now absent) object path is the
+        // deterministic cross-platform unreadable read: the probe
+        // must refuse typed, never silently report complete over an
+        // unverifiable observation.
+        let private_path = medium.object_path(&private);
+        std::fs::create_dir(&private_path).unwrap();
+        let error = medium.reclaim_pending(&directive).unwrap_err();
+        assert!(
+            matches!(error, MediumError::Io { .. }),
+            "the read failure is a typed refusal: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_trusted_completion_receipt_installs_verifies_and_resumes() {
+        // (P2-F4) The trusted completion receipt: after the
+        // executed retirement, complete_reclamation verifies the
+        // recovery-safe audit authority and the ACTUAL
+        // postconditions, constructs the marker FROM the verified
+        // state, and installs it through the CAS-bound admission.
+        // The trusted consumer verifies the installed marker; a
+        // fresh-process reopen rediscovers it; a repeated call
+        // resolves the duplicate deterministic key by DISCOVERING
+        // and exactly verifying the installed marker — never
+        // inferring success from the key alone.
+        let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        medium.reclaim(&directive).unwrap();
+        // The trusted receipt path.
+        let (marker_id, marker) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap();
+        assert_eq!(marker.kind, crate::reclaim::CompletionKind::Batch);
+        assert_eq!(marker.batch, 0);
+        assert_eq!(marker.source, audit);
+        assert_eq!(marker.deferred, vec![shared]);
+        // The installed marker discovered and verified — the
+        // read-side authority.
+        let (found_id, found) = crate::reclaim::find_installed_completion(&mut medium, &mk)
+            .unwrap()
+            .expect("the marker is discoverable");
+        assert_eq!(found_id, marker_id);
+        assert_eq!(found, marker);
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap();
+        // The mandatory-empty postcondition holds; the deferred
+        // survivor is present; the private object is gone.
+        assert!(!medium.reclaim_pending(&directive).unwrap());
+        assert!(medium.object_path(&shared).is_file());
+        assert!(!medium.object_path(&private).is_file());
+        // The duplicate deterministic key: the repeated call
+        // discovers and exactly verifies the installed marker.
+        let (repeat_id, repeat) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap();
+        assert_eq!(repeat_id, marker_id);
+        assert_eq!(repeat, marker);
+        // The fresh-process reopen: the discovery and the
+        // verification survive the restart.
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(&root).unwrap();
+        let (reopen_id, reopen_marker) =
+            crate::reclaim::find_installed_completion(&mut reopened, &mk)
+                .unwrap()
+                .expect("the marker survives the reopen");
+        assert_eq!(reopen_id, marker_id);
+        assert_eq!(reopen_marker, marker);
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_id, &mk).unwrap();
+        reopened.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn an_incomplete_retirement_refuses_completion() {
+        // (P2-F4) The admission's state verification: a retirement
+        // whose records are still present (the deletion never ran)
+        // cannot certify completion — the typed refusal names the
+        // still-present record, and nothing is installed.
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        let error = crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/record-still-present"
+                }
+            ),
+            "the incomplete retirement refuses: {error:?}"
+        );
+        assert!(
+            crate::reclaim::find_installed_completion(&mut medium, &mk)
+                .unwrap()
+                .is_none(),
+            "no marker was installed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
