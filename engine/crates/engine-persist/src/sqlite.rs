@@ -1033,9 +1033,9 @@ fn reclaim_authorized_tx(
     // newest-first under one transaction, so a GENUINE process
     // interruption rolls back to the all-present state — a
     // prefix-shaped absence here is always external degradation,
-    // accepted under the OWNER-RATIFIED legacy recovery assumption
-    // (Option B, 2026-11-01: the same documented, narrower trust as
-    // the file provider; no redundant durable begin-record exists
+    // currently accepted under the SAME unresolved recovery-policy
+    // question as the file provider (the owner decision PENDING —
+    // Options A/B/C, none ratified; no durable begin-record exists
     // on this provider, whose atomic boundary never produces the
     // partial shape itself). A non-prefix pattern is evidence of
     // missing storage, never proof of a prior authorized deletion —

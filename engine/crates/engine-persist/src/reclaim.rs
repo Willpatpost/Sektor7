@@ -2067,7 +2067,13 @@ pub fn verify_reclamation_complete(
             std::collections::BTreeSet::new();
         for unit in &later_ledger.units {
             for identity in unit.objects.iter().copied() {
-                if later_covered.contains(&identity) {
+                // The defensive set-membership invariant: only an
+                // identity the recomputation actually classified
+                // MANDATORY may be accounted (an identity outside the
+                // reclassified set is attribution-incoherent).
+                if later_covered.contains(&identity)
+                    && later_partition.mandatory.contains(&identity)
+                {
                     match medium.read_object(&identity) {
                         Err(MediumError::MissingObject { .. }) => {
                             later_accounted.insert(identity);

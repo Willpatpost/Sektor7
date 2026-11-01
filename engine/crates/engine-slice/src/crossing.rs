@@ -2074,7 +2074,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // (R4-L1) A marker whose historical attribution is mid-flight:
         // re-verified at the pass's end (a later retirement's
         // completion within this pass may resolve it).
-        let mut historical: Option<(Hash, Hash, MediumError)> = None;
+        let mut historical: Vec<(Hash, Hash)> = Vec::new();
         for candidate in summary.checkpoints[generations as usize..].iter().rev() {
             let mk_record = medium
                 .read_record(candidate)
@@ -2190,7 +2190,7 @@ impl<S: MediumSource> SessionCrossing<S> {
                                 // re-verification below fails closed
                                 // when nothing resolves it. This is
                                 // never a silent acceptance.
-                                historical = Some((marker_id, *candidate, error));
+                                historical.push((marker_id, *candidate));
                             }
                         }
                         None => {
@@ -2229,16 +2229,18 @@ impl<S: MediumSource> SessionCrossing<S> {
             // later retirement's marker ensured during THIS pass may
             // have resolved the accounting; a still-failing marker is
             // a genuine fail-closed state (never silently accepted).
-            if let Some((marker_id, historical_mk, _error)) = historical
-                && let Err(retry) = engine_persist::reclaim::verify_reclamation_complete(
+            // (R4-L2) EVERY deferred historical certification is
+            // revalidated independently; a still-failing marker is a
+            // genuine fail-closed state — never a silent acceptance,
+            // never a lost obligation.
+            for (marker_id, historical_mk) in &historical {
+                if let Err(retry) = engine_persist::reclaim::verify_reclamation_complete(
                     &mut medium,
-                    &marker_id,
-                    &historical_mk,
-                )
-            {
-                // A still-failing marker is a genuine fail-closed
-                // state — never a silent acceptance.
-                return Err(PipelineError::Medium(retry).into());
+                    marker_id,
+                    historical_mk,
+                ) {
+                    return Err(PipelineError::Medium(retry).into());
+                }
             }
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
@@ -2482,6 +2484,21 @@ impl<S: MediumSource> SessionCrossing<S> {
         let _completion =
             engine_persist::reclaim::complete_reclamation(&mut medium, &ledger_id, &oldest_mk)
                 .map_err(PipelineError::Medium)?;
+        // (R4-L2) The maintenance boundary: the deferred obligations
+        // survive the early target selection — revalidated after
+        // this retirement's completion (its own marker may have
+        // resolved them); a still-failing marker fails closed (the
+        // report never falsely implies all encountered historical
+        // evidence was verified).
+        for (marker_id, historical_mk) in &historical {
+            if let Err(retry) = engine_persist::reclaim::verify_reclamation_complete(
+                &mut medium,
+                marker_id,
+                historical_mk,
+            ) {
+                return Err(PipelineError::Medium(retry).into());
+            }
+        }
         Ok(ReclamationReport {
             ledger: ledger_id,
             mk: oldest_mk,

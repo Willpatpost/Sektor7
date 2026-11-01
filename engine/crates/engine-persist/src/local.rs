@@ -1876,9 +1876,10 @@ impl LocalFileMedium {
         // evidence of missing storage, never proof of a prior
         // authorized deletion — the fabricated-audit-with-missing-
         // data shape fails closed. The prefix-shaped acceptance is
-        // the OWNER-RATIFIED legacy recovery assumption (Option B,
-        // 2026-11-01): the documented, narrower trust under which
-        // the range digest is NOT proven for absent members.
+        // the UNRESOLVED recovery-policy question (Option A/B/C —
+        // the owner decision is PENDING; no option is ratified): the
+        // documented, narrower trust under which the range digest is
+        // NOT proven for absent members.
         let mut present_seen = false;
         for unit in &ledger.units {
             let record_path = self.object_path(&unit.record);
@@ -3829,12 +3830,13 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn the_ratified_prefix_recovery_assumption_proceeds_on_the_unverified_audit() {
-        // (P2-R1, OPTION B RATIFIED 2026-11-01) The owner ratified
-        // the legacy recovery assumption: a proper newest-first
-        // deletion-prefix absence is accepted as interruption
-        // evidence under the documented, narrower trust assumptions.
-        // WHAT IS PROVEN on this path: the exact audit identity and
+    #[ignore = "P2-R1: the proper-prefix recovery-authority ambiguity — the owner decision PENDING (Options A/B/C, none ratified); this test demonstrates the current prefix-shaped trust; the assertion flips to refusal when the owner ratifies Option A or C"]
+    fn the_prefix_recovery_assumption_is_unresolved_and_proceeds_pending_the_owner_decision() {
+        // (P2-R1, UNRESOLVED — NO OPTION RATIFIED) The recovery
+        // policy is an open owner decision: a proper newest-first
+        // deletion-prefix absence is currently accepted as
+        // interruption evidence (the implementation's existing
+        // behavior — NOT an owner-approved policy). WHAT IS PROVEN on this path: the exact audit identity and
         // deterministic key, the MK-bound hash-verified metadata,
         // the units-vs-index equality, the strictly-descending
         // order, the founding-derived seed, the prefix shape itself,
@@ -3968,10 +3970,11 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
-        // The RATIFIED behavior (Option B): the deletion PROCEEDS
-        // on the unverified audit — the digest is never recomputed
-        // (R3 absent), and the prefix shape is the accepted
-        // interruption evidence.
+        // The CURRENT behavior (the unresolved policy): the deletion
+        // PROCEEDS on the unverified audit — the digest is never
+        // recomputed (R3 absent). This assertion flips to a typed
+        // refusal when the owner ratifies Option A (strict
+        // fail-closed) or Option C (new durable evidence).
         let outcome = medium.reclaim(&directive).unwrap();
         assert!(outcome.removed >= 2, "the deletion proceeded");
         assert!(!medium.object_path(&r2).is_file());
