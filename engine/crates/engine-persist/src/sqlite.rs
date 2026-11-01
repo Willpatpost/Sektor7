@@ -1030,11 +1030,16 @@ fn reclaim_authorized_tx(
     // table read; an absent retiring record is the protocol-
     // accounted resume — but ONLY in the deletion-prefix shape: the
     // (E1) recovery boundary. This provider's pass 1 deletes
-    // newest-first under one transaction, so a genuine interruption
-    // rolls back to the all-present state; an absent row in a non-
-    // prefix pattern is evidence of missing storage, never proof of
-    // a prior authorized deletion — the fabricated-audit-with-
-    // missing-data shape fails closed).
+    // newest-first under one transaction, so a GENUINE process
+    // interruption rolls back to the all-present state — a
+    // prefix-shaped absence here is always external degradation,
+    // accepted under the OWNER-RATIFIED legacy recovery assumption
+    // (Option B, 2026-11-01: the same documented, narrower trust as
+    // the file provider; no redundant durable begin-record exists
+    // on this provider, whose atomic boundary never produces the
+    // partial shape itself). A non-prefix pattern is evidence of
+    // missing storage, never proof of a prior authorized deletion —
+    // the fabricated-audit-with-missing-data shape fails closed).
     let mut present_seen = false;
     for unit in &ledger.units {
         if record_exists(tx, &unit.record)? {

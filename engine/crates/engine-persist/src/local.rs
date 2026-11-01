@@ -1875,7 +1875,10 @@ impl LocalFileMedium {
         // followed by a present one). Any other absence pattern is
         // evidence of missing storage, never proof of a prior
         // authorized deletion — the fabricated-audit-with-missing-
-        // data shape fails closed.
+        // data shape fails closed. The prefix-shaped acceptance is
+        // the OWNER-RATIFIED legacy recovery assumption (Option B,
+        // 2026-11-01): the documented, narrower trust under which
+        // the range digest is NOT proven for absent members.
         let mut present_seen = false;
         for unit in &ledger.units {
             let record_path = self.object_path(&unit.record);
@@ -3826,21 +3829,23 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    #[ignore = "P2-R1: the proper-prefix recovery-authority ambiguity — the owner decision pending (the three options in the delivery report); this test demonstrates the current prefix-shaped trust; the assertion flips to refusal when the owner ratifies Option A or C"]
-    fn a_fabricated_audit_with_a_proper_prefix_absence_proceeds_pending_the_owner_decision() {
-        // (P2-R1) The review's counterexample: the units newest-first
-        // [SK, R3, R2, R1] with R1..R3 digest-covered; the storage
-        // loses the PROPER prefix {SK, R3} (the shape a genuine
-        // mid-pass-1 interruption leaves); the installed audit
-        // carries MATCHING FABRICATED digest values (equal in the
-        // metadata and the ledger, the seed founding-derived). The
-        // provider accepts the prefix shape, all_present is false
-        // (R3 absent) so the range digest is never recomputed, and
-        // the deletion proceeds on the unverified audit. The
-        // existing durable v1 evidence CANNOT distinguish this from
-        // a genuine interruption — the owner decision (Options A/B/
-        // C) is pending; until then this test documents the
-        // ambiguity rather than ratifying it.
+    fn the_ratified_prefix_recovery_assumption_proceeds_on_the_unverified_audit() {
+        // (P2-R1, OPTION B RATIFIED 2026-11-01) The owner ratified
+        // the legacy recovery assumption: a proper newest-first
+        // deletion-prefix absence is accepted as interruption
+        // evidence under the documented, narrower trust assumptions.
+        // WHAT IS PROVEN on this path: the exact audit identity and
+        // deterministic key, the MK-bound hash-verified metadata,
+        // the units-vs-index equality, the strictly-descending
+        // order, the founding-derived seed, the prefix shape itself,
+        // and the survivor partition protecting every
+        // survivor-referenced object. WHAT IS NOT PROVEN: the range
+        // digest, for any absent digest member — the review's
+        // counterexample below proceeds on the unverified audit,
+        // exactly as the ratified assumption accepts. The units
+        // newest-first [SK, R3, R2, R1] with R1..R3 digest-covered;
+        // the storage loses the PROPER prefix {SK, R3}; the audit
+        // carries MATCHING FABRICATED digest values.
         let root = temp_store("r1-proper-prefix");
         let mut medium = LocalFileMedium::open(root.clone()).unwrap();
         let shared = StoredObject::new({
@@ -3963,16 +3968,375 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
-        // The CURRENT behavior (the ambiguity): the deletion
-        // PROCEEDS on the unverified audit — the digest was never
-        // recomputed (R3 absent). This assertion flips to a typed
-        // refusal when the owner ratifies Option A (strict
-        // fail-closed) or Option C (new durable evidence).
+        // The RATIFIED behavior (Option B): the deletion PROCEEDS
+        // on the unverified audit — the digest is never recomputed
+        // (R3 absent), and the prefix shape is the accepted
+        // interruption evidence.
         let outcome = medium.reclaim(&directive).unwrap();
         assert!(outcome.removed >= 2, "the deletion proceeded");
         assert!(!medium.object_path(&r2).is_file());
         assert!(!medium.object_path(&private.hash()).is_file());
         assert!(medium.object_path(&shared.hash()).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    fn two_retirement_store(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        LocalFileMedium,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        crate::reclaim::ReclaimDirective,
+        crate::reclaim::ReclamationLedger,
+    ) {
+        // The two-checkpoint campaign: F(fobj) → A1(X) → SK1(fobj)
+        // → MK1 → [auditA published by the caller] → B1(X) → SK2
+        // (fobj) → MK2 → [auditB published by the caller]. X is
+        // shared between A's range and B's range: A defers it (B1,
+        // a survivor of A, references it); B mandates it (nothing
+        // surviving B references it). Returns (root, medium,
+        // auditA, mk1, mk2, x, fobj, directiveA, ledgerB).
+        let root = temp_store(label);
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let fobj = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b" founding-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let x = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"the-shared-deferred-x");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![fobj.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&fobj), None)
+            .unwrap();
+        let step = |medium: &mut LocalFileMedium, refs: Vec<Hash>, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, &[], Some(head)).unwrap();
+            record.id()
+        };
+        // hmm — the append with objects must supply them; a helper
+        // closure cannot borrow medium twice, so inline below.
+        let _ = &step;
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let a1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![x.hash()]);
+        medium
+            .append(&a1, std::slice::from_ref(&x), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk1 = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![fobj.hash()]);
+        medium
+            .append(&sk1, std::slice::from_ref(&fobj), Some(head))
+            .unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let a1_bytes = medium.read_record(&a1.id()).unwrap().canonical_bytes();
+        let digest_a = crate::checkpoint::chain_range_digest(&seed, &[a1_bytes]);
+        let meta1 = CheckpointMetadata::new(
+            sk1.id(),
+            a1.id(),
+            vec![SkipEntry::new(Hash::ZERO, founding.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, a1.id(), 1),
+                ReclaimedIndexEntry::new(None, sk1.id(), 2),
+            ],
+            digest_a,
+            seed,
+        );
+        let meta1_object = StoredObject::new(meta1.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk1 =
+            RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![meta1_object.hash()]);
+        medium
+            .append(&mk1, std::slice::from_ref(&meta1_object), Some(head))
+            .unwrap();
+        let a1_refs = vec![x.hash()];
+        let sk1_refs = vec![fobj.hash()];
+        let ledger_a = ReclamationLedger {
+            mk: mk1.id(),
+            sk: sk1.id(),
+            range_digest: digest_a,
+            seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: sk1.id(),
+                    objects: sk1_refs,
+                },
+                ReclaimUnit {
+                    record: a1.id(),
+                    objects: a1_refs,
+                },
+            ],
+        };
+        let (audit_a, outcome) = publish_reclamation_ledger(&mut medium, &ledger_a, 4).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let directive_a = crate::reclaim::ReclaimDirective {
+            audit_record: audit_a,
+            units: ledger_a.units.clone(),
+        };
+        // The later range: B1(X) → SK2(fobj) → MK2.
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let b1 = RevisionRecord::regular(head, epoch, 5).with_content_refs(vec![x.hash()]);
+        medium
+            .append(&b1, std::slice::from_ref(&x), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk2 = RevisionRecord::regular(head, epoch, 6).with_content_refs(vec![fobj.hash()]);
+        medium
+            .append(&sk2, std::slice::from_ref(&fobj), Some(head))
+            .unwrap();
+        let b1_bytes = medium.read_record(&b1.id()).unwrap().canonical_bytes();
+        let digest_b = crate::checkpoint::chain_range_digest(&seed, &[b1_bytes]);
+        let meta2 = CheckpointMetadata::new(
+            sk2.id(),
+            b1.id(),
+            vec![SkipEntry::new(Hash::ZERO, audit_a)],
+            vec![
+                ReclaimedIndexEntry::new(None, b1.id(), 5),
+                ReclaimedIndexEntry::new(None, sk2.id(), 6),
+            ],
+            digest_b,
+            seed,
+        );
+        let meta2_object = StoredObject::new(meta2.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk2 =
+            RevisionRecord::regular(head, epoch, 7).with_content_refs(vec![meta2_object.hash()]);
+        medium
+            .append(&mk2, std::slice::from_ref(&meta2_object), Some(head))
+            .unwrap();
+        let b1_refs = vec![x.hash()];
+        let sk2_refs = vec![fobj.hash()];
+        let ledger_b = ReclamationLedger {
+            mk: mk2.id(),
+            sk: sk2.id(),
+            range_digest: digest_b,
+            seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: sk2.id(),
+                    objects: sk2_refs,
+                },
+                ReclaimUnit {
+                    record: b1.id(),
+                    objects: b1_refs,
+                },
+            ],
+        };
+        (
+            root,
+            medium,
+            audit_a,
+            mk1.id(),
+            mk2.id(),
+            x.hash(),
+            fobj.hash(),
+            directive_a,
+            ledger_b,
+        )
+    }
+    #[test]
+    fn a_later_audit_that_never_executed_relaxes_nothing() {
+        // (P2-R2) The historical-validation counterexample: an
+        // on-chain marker with an INCORRECT certified count, then a
+        // LATER CANONICAL AUDIT for another checkpoint above it that
+        // never executes. The audit is reclamation-SHAPED evidence,
+        // not a completed retirement — it deleted nothing, so it
+        // must relax nothing: the reader's full obligation equality
+        // still refuses the malformed marker.
+        let (root, mut medium, audit_a, mk1, mk2, _x, _fobj, directive_a, ledger_b) =
+            two_retirement_store("r2-later-audit");
+        medium.reclaim(&directive_a).unwrap();
+        // The adversarial wrong-count marker for A, installed through
+        // the in-crate admitted append.
+        let head = medium.head().unwrap().unwrap();
+        let parent_epoch = medium.read_record(&head).unwrap().epoch;
+        let wrong = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: mk1,
+            batch: 0,
+            source: audit_a,
+            mandatory_count: 9,
+            deferred: vec![_x, _fobj],
+            journal_files: Vec::new(),
+        };
+        let object = StoredObject::new(wrong.canonical_bytes()).unwrap();
+        let record = RevisionRecord::regular(head, parent_epoch, 99)
+            .with_idempotency_key(crate::reclaim::reclamation_complete_idempotency_key(
+                &mk1,
+                Some(0),
+            ))
+            .with_content_refs(vec![object.hash()]);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        let outcome = medium.append_admitted(admitted, Some(head)).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let wrong_id = record.id();
+        // The later canonical audit for MK2, published ABOVE the
+        // malformed marker — never executed.
+        let (_audit_b, outcome) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &wrong_id, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-count-mismatch"
+                }
+            ),
+            "the never-executed later audit relaxes nothing: {error:?}"
+        );
+        let _ = mk2;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_concurrent_retirement_schedule_is_safe() {
+        // (P2-R4) The deterministic interleaving (the review's
+        // schedule): reclamation A finished its mandatory deletion;
+        // completion A verifies and observes the deferred object X;
+        // the previously installed audit B authorizes X's deletion;
+        // B's execution runs BETWEEN A's verification and A's CAS
+        // publication (the test-only interleaving medium fires it on
+        // the admitted append) — deleting X WITHOUT advancing HEAD;
+        // A's marker publishes anyway. The schedule's resolution:
+        // A's marker is valid (its live claims are stable; its
+        // deferred list is the authorization record), the immediate
+        // historical verification FAILS CLOSED (X absent, B not yet
+        // completed — no accounting), and once B completes, A's
+        // marker verifies through the per-object accounting (X's
+        // absence is covered by B's completed retirement's own
+        // audited manifest). The same test proves the legitimate
+        // earlier-marker-whose-deferred-is-later-retired case and
+        // the multi-generation reopen verification.
+        let (root, mut medium, audit_a, mk1, _mk2, x, _fobj, directive_a, ledger_b) =
+            two_retirement_store("r4-schedule");
+        medium.reclaim(&directive_a).unwrap();
+        assert!(medium.object_path(&x).is_file(), "X survives A (deferred)");
+        // The previously installed audit for B (above A's range,
+        // never yet executed).
+        let (audit_b, outcome) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let directive_b = crate::reclaim::ReclaimDirective {
+            audit_record: audit_b,
+            units: ledger_b.units.clone(),
+        };
+        // THE INTERLEAVING: B's execution fires between A's
+        // completion verification and A's marker publication.
+        struct InterleavingMedium<'a> {
+            inner: &'a mut LocalFileMedium,
+            interleave: Option<crate::reclaim::ReclaimDirective>,
+        }
+        impl CanonicalMedium for InterleavingMedium<'_> {
+            fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+                self.inner.head()
+            }
+            fn append_admitted(
+                &mut self,
+                admitted: crate::medium::AdmittedAppend,
+                expected_parent: Option<Hash>,
+            ) -> Result<AppendOutcome, MediumError> {
+                if let Some(directive) = self.interleave.take() {
+                    self.inner.reclaim(&directive)?;
+                }
+                self.inner.append_admitted(admitted, expected_parent)
+            }
+            fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+                self.inner.read_record(id)
+            }
+            fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+                self.inner.read_object(hash)
+            }
+            fn validate(&mut self) -> Result<crate::medium::ChainSummary, MediumError> {
+                self.inner.validate()
+            }
+            fn reconcile_unknown(
+                &mut self,
+                candidate: &Hash,
+            ) -> Result<crate::medium::Reconciliation, MediumError> {
+                self.inner.reconcile_unknown(candidate)
+            }
+            fn durability_tier(&self) -> crate::medium::SyncTier {
+                self.inner.durability_tier()
+            }
+            fn reclaim(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+                self.inner.reclaim(directive)
+            }
+            fn reclaim_pending(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<bool, MediumError> {
+                self.inner.reclaim_pending(directive)
+            }
+        }
+        let mut interleaved = InterleavingMedium {
+            inner: &mut medium,
+            interleave: Some(directive_b.clone()),
+        };
+        let (marker_a, marker) =
+            crate::reclaim::complete_reclamation(&mut interleaved, &audit_a, &mk1).unwrap();
+        drop(interleaved);
+        // B's execution ran inside the completion window: X is gone,
+        // HEAD never advanced by B (reclamation deletes only).
+        assert!(!medium.object_path(&x).is_file(), "B deleted X");
+        assert!(
+            marker.deferred.contains(&x),
+            "A's marker carries X as its deferred authorization record"
+        );
+        // The immediate historical verification FAILS CLOSED: X is
+        // absent and B has not completed (no marker, no accounting).
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-count-mismatch"
+                }
+            ),
+            "the mid-flight schedule fails closed (the interleaved deletion changed the recomputable partition before B completed): {error:?}"
+        );
+        // B completes; A's marker now verifies through the per-
+        // object accounting (X's absence covered by B's completed
+        // retirement's audited manifest).
+        let (marker_b, marker_b_content) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit_b, &_mk2).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_b, &_mk2).unwrap();
+        assert!(!marker_b_content.deferred.contains(&x));
+        // The multi-generation reopen: both historical markers verify
+        // after the fresh-process restart.
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(&root).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_a, &mk1).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_b, &_mk2).unwrap();
+        reopened.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

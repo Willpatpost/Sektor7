@@ -1865,27 +1865,28 @@ pub fn find_installed_completion(
 /// reclamation evidence, the FULL obligation equality (the
 /// recomputed partition, the mandatory-count, the deferred set,
 /// every mandatory identity absent, every deferred identity
-/// present); when later reclamation evidence exists, the
-/// deletion-side obligations are checked in their SUPerset form
-/// (every recomputed-mandatory identity absent — a later authorized
-/// retirement may have legitimately consumed an object this batch
-/// deferred, so the deferred-presence and set-equality observations
-/// are not stable across later retirements and are not live
-/// claims).
+/// present); when later COMPLETED retirements stand above (their
+/// markers installed — the only mechanism that can have deleted
+/// objects this batch deferred), each divergent claim is accounted
+/// per-object against the later completed retirement's own audited
+/// manifest: a later audit that never executed deletes nothing and
+/// relaxes nothing. The precise provable claims are documented on
+/// the semantic recheck below.
 pub fn verify_reclamation_complete(
     medium: &mut dyn CanonicalMedium,
     marker_record: &Hash,
     mk: &Hash,
 ) -> Result<ReclamationComplete, MediumError> {
     // (1) The membership descent: walk the authoritative ancestry
-    // until the marker record is encountered; observe any later
-    // reclamation evidence above it.
+    // until the marker record is encountered; collect the LATER
+    // COMPLETION MARKERS above it (a completed retirement's
+    // certificate — never a mere audit, which may never execute).
     const MAX_DESCENT: u64 = 1 << 20;
     let mut current = medium
         .head()?
         .ok_or(MediumError::Chain { rule: "unfounded" })?;
     let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
-    let mut later_reclamation = false;
+    let mut later_marker_sources: Vec<Hash> = Vec::new();
     let mut installed = false;
     for _ in 0..MAX_DESCENT {
         if current == *marker_record {
@@ -1896,8 +1897,14 @@ pub fn verify_reclamation_complete(
         if let Some(object) = record.content_refs.first().copied() {
             let bytes = medium.read_object(&object)?;
             let domain = StoredObject::new(bytes.clone())?.domain().to_owned();
-            if domain == RECLAMATION_LEDGER_DOMAIN || domain == RECLAMATION_COMPLETE_DOMAIN {
-                later_reclamation = true;
+            if domain == RECLAMATION_COMPLETE_DOMAIN {
+                // A completion marker ABOVE the requested one: a
+                // completed later retirement (the domain gate means
+                // only the verified admission installs these). Its
+                // source audit names the manifest whose deletion it
+                // certified.
+                let decoded = ReclamationComplete::decode(&bytes).map_err(MediumError::Format)?;
+                later_marker_sources.push(decoded.source);
             } else if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
                 skip_table = Some(
                     crate::checkpoint::CheckpointMetadata::decode(&bytes)
@@ -2000,8 +2007,55 @@ pub fn verify_reclamation_complete(
             Err(other) => return Err(other),
         }
     }
-    if !later_reclamation {
-        if marker.mandatory_count != partition.mandatory.len() as u64 {
+    if !later_marker_sources.is_empty() {
+        // The later-completed coverage: the union of the later
+        // COMPLETED retirements' source-ledger manifests (a marker
+        // above means the retirement completed — the domain gate
+        // means only the verified admission installs these).
+        let mut later_covered: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
+        for source in &later_marker_sources {
+            let audit_record = medium.read_record(source)?;
+            if let Some(object) = audit_record.content_refs.first().copied() {
+                let bytes = medium.read_object(&object)?;
+                if StoredObject::new(bytes.clone())?.domain() == RECLAMATION_LEDGER_DOMAIN {
+                    let later_ledger =
+                        ReclamationLedger::decode(&bytes).map_err(MediumError::Format)?;
+                    for unit in &later_ledger.units {
+                        later_covered.insert(unit.record);
+                        for object in &unit.objects {
+                            later_covered.insert(*object);
+                        }
+                    }
+                }
+            }
+        }
+        // The accounted set: THIS ledger's identities that are
+        // absent now and covered by a later COMPLETED retirement —
+        // the reclassification a legitimate later retirement's
+        // certified deletion causes. A later audit that never
+        // executed has no marker and contributes NOTHING.
+        let mut accounted: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
+        for unit in &ledger.units {
+            let mut candidates = vec![unit.record];
+            candidates.extend(unit.objects.iter().copied());
+            for identity in candidates {
+                if later_covered.contains(&identity)
+                    && medium.read_object(&identity).is_err()
+                    && accounted.insert(identity)
+                {
+                    // The identity's absence is accounted by the
+                    // later completed retirement's own manifest.
+                }
+            }
+        }
+        let reconstructed_deferred: std::collections::BTreeSet<Hash> = partition
+            .deferred
+            .iter()
+            .copied()
+            .chain(accounted.iter().copied())
+            .collect();
+        let reconstructed_mandatory = partition.mandatory.len().saturating_sub(accounted.len());
+        if marker.mandatory_count != reconstructed_mandatory as u64 {
             return Err(MediumError::Chain {
                 rule: "reclamation-complete/mandatory-count-mismatch",
             });
@@ -2011,19 +2065,45 @@ pub fn verify_reclamation_complete(
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<Hash>>()
-            != partition
-                .deferred
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<Hash>>()
+            != reconstructed_deferred
         {
             return Err(MediumError::Chain {
                 rule: "reclamation-complete/deferred-mismatch",
             });
         }
+        // The still-deferred identities remain present and
+        // hash-verified; the accounted ones are absent BY the later
+        // completed retirement's certified deletion.
         for identity in &partition.deferred {
             medium.read_object(identity)?;
         }
+        return Ok(marker);
+    }
+    // No later completed retirement: the FULL obligation equality
+    // (a later audit that never executed deletes nothing and
+    // relaxes nothing).
+    if marker.mandatory_count != partition.mandatory.len() as u64 {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mandatory-count-mismatch",
+        });
+    }
+    if marker
+        .deferred
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<Hash>>()
+        != partition
+            .deferred
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<Hash>>()
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/deferred-mismatch",
+        });
+    }
+    for identity in &partition.deferred {
+        medium.read_object(identity)?;
     }
     Ok(marker)
 }
