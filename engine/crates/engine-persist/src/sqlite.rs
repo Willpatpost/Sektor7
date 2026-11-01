@@ -2336,3 +2336,103 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+    use crate::checkpoint::{CheckpointMetadata, ReclaimedIndexEntry, SkipEntry};
+    use crate::medium::CanonicalMedium;
+    use crate::record::{AuthorityMode, RevisionRecord};
+
+    #[test]
+    fn a_successful_exclusion_walk_over_a_real_checkpoint_range_sqlite() {
+        // The SQLite positive-exclusion regression (the review's §5
+        // requirement — the second provider's agreement with the
+        // local result): a REAL hand-crafted checkpoint with the
+        // authenticated self-skip; a successful nonempty
+        // simulated-retirement walk over the audited range; the
+        // survivor and reclaimed sets verified; the physical rows
+        // untouched; the ordinary state intact.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2sqlex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let object = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let mut chain: Vec<Hash> = Vec::new();
+        let mut epochs: Vec<u64> = Vec::new();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2sq", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        chain.push(founding.id());
+        epochs.push(0);
+        for tick in 1..=3u64 {
+            let record = RevisionRecord::regular(*chain.last().unwrap(), tick - 1, tick)
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(
+                    &record,
+                    std::slice::from_ref(&object),
+                    Some(*chain.last().unwrap()),
+                )
+                .unwrap();
+            chain.push(record.id());
+            epochs.push(tick);
+        }
+        let [_, p1, p2, sk] = [chain[0], chain[1], chain[2], chain[3]];
+        let metadata = CheckpointMetadata::new(
+            sk,
+            p2,
+            vec![SkipEntry::new(Hash::ZERO, p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, p2, epochs[2]),
+                ReclaimedIndexEntry::new(None, sk, epochs[3]),
+            ],
+            [7; 32],
+            [9; 32],
+        );
+        let meta_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let mk_record =
+            RevisionRecord::regular(sk, epochs[3], 5).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk_record, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        assert_eq!(head, mk_record.id());
+
+        let excluded: BTreeSet<Hash> = [p2, sk].into_iter().collect();
+        let walked = walk_chain_excluding(&medium.conn, head, &excluded).unwrap();
+        assert_eq!(
+            walked.summary.records, 3,
+            "MK, P1, F walk — the local agreement"
+        );
+        assert_eq!(walked.summary.reclaimed_records, 2);
+        assert_eq!(walked.cursor.reclaimed.get(&p2), Some(&epochs[2]));
+        assert_eq!(walked.cursor.reclaimed.get(&sk), Some(&epochs[3]));
+        assert!(!walked.cursor.record_ids.contains(&p2));
+        assert!(!walked.cursor.record_ids.contains(&sk));
+        assert!(walked.cursor.record_ids.contains(&mk_record.id()));
+
+        // The physical rows are untouched; the authoritative state
+        // observes the ACTUAL chain.
+        let authoritative = medium.validate().unwrap();
+        assert_eq!(authoritative.records, 5);
+        let summary = medium.head().unwrap().unwrap();
+        assert_eq!(summary, mk_record.id());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

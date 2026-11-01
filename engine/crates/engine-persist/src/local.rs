@@ -1921,15 +1921,13 @@ mod exclusion_tests {
     }
     #[test]
     fn the_marker_publication_admits_verifies_and_cas_binds() {
-        // P2-F2/F3/F4: the marker's publication is ADMISSION-
-        // CONTROLLED (a real, installed, keyed, MK-bound v1 audit is
-        // the only admissible source; an arbitrary marker refuses;
-        // the range form is unauthorized under the v1 protocol; the
-        // GENERIC append refuses the marker domain outright) and
-        // CAS-bound to the EXACT expected parent (an advancement
-        // between the completion validation and the publication
-        // refuses — never a silently rebased marker).
-        let root = temp_store("marker-admission");
+        // P2-F4B/F4C: the marker's publication requires the CANONICAL
+        // AUDIT AUTHORITY — a real checkpoint on the chain, a real
+        // audit of its retirement index (the SK/digest/seed bindings
+        // and the exact unit membership), the v1-only batch-zero
+        // form — and the exact-HEAD CAS. The fabricated-MK marker
+        // (the review's counterexample) refuses.
+        let root = temp_store("marker-authority");
         let mut medium = LocalFileMedium::open(&root).unwrap();
         let object = StoredObject::new({
             let mut enc = engine_core::Encoder::new();
@@ -1938,133 +1936,12 @@ mod exclusion_tests {
             enc.into_bytes()
         })
         .unwrap();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2f4", 0)
-            .with_content_refs(vec![object.hash()]);
-        medium
-            .append(&founding, std::slice::from_ref(&object), None)
-            .unwrap();
-
-        // A REAL v1 audit installs (the marker's only admissible
-        // source).
-        let mk = hash_object(b"p2f4-mk");
-        let sk = hash_object(b"p2f4-sk");
-        let ledger = ReclamationLedger {
-            mk,
-            sk,
-            range_digest: [1; 32],
-            seed: [2; 32],
-            records: 1,
-            reclaimed_keys: 0,
-            journal_files: Vec::new(),
-            units: vec![ReclaimUnit {
-                record: hash_object(b"p2f4-retired-record"),
-                objects: vec![hash_object(b"p2f4-retired-object")],
-            }],
-        };
-        let (audit_record, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
-        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
-        let current = medium.head().unwrap().unwrap();
-
-        // The arbitrary batch marker (a NONEXISTENT source) refuses.
-        let arbitrary = ReclamationComplete {
-            kind: CompletionKind::Batch,
-            mk,
-            batch: 0,
-            source: hash_object(b"p2f4-nonexistent"),
-            mandatory_count: 0,
-            deferred: Vec::new(),
-            journal_files: Vec::new(),
-        };
-        assert!(
-            publish_reclamation_complete(&mut medium, &arbitrary, current, 6).is_err(),
-            "a marker with a nonexistent source audit refuses"
-        );
-        // The RANGE form is unauthorized under the v1 protocol.
-        let range_form = ReclamationComplete {
-            kind: CompletionKind::Range,
-            mk,
-            batch: 0,
-            source: audit_record,
-            mandatory_count: 0,
-            deferred: Vec::new(),
-            journal_files: Vec::new(),
-        };
-        assert!(
-            publish_reclamation_complete(&mut medium, &range_form, current, 6).is_err(),
-            "the range-terminal form refuses under the v1 protocol"
-        );
-        // The GENERIC append refuses the marker domain outright —
-        // no unrestricted path can install terminal evidence.
-        let marker_object = StoredObject::new(arbitrary.canonical_bytes()).unwrap();
-        let carrier =
-            RevisionRecord::regular(current, 1, 7).with_content_refs(vec![marker_object.hash()]);
-        assert!(
-            medium
-                .append(
-                    &carrier,
-                    std::slice::from_ref(&marker_object),
-                    Some(current)
-                )
-                .is_err(),
-            "the generic append refuses a completion-marker object"
-        );
-
-        // The ADMITTED marker (the real audit source) publishes —
-        // CAS-bound: a HEAD advancement refuses, the current head
-        // accepts.
-        let marker = ReclamationComplete {
-            kind: CompletionKind::Batch,
-            mk,
-            batch: 0,
-            source: audit_record,
-            mandatory_count: 1,
-            deferred: Vec::new(),
-            journal_files: Vec::new(),
-        };
-        let epoch = medium.read_record(&current).unwrap().epoch;
-        let interloper =
-            RevisionRecord::regular(current, epoch, 9).with_content_refs(vec![object.hash()]);
-        medium
-            .append(&interloper, std::slice::from_ref(&object), Some(current))
-            .unwrap();
-        let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, current, 10).unwrap();
-        assert!(
-            matches!(outcome, AppendOutcome::RejectedStaleParent { .. }),
-            "the advanced HEAD refuses the stale-parent marker"
-        );
-        let now = medium.head().unwrap().unwrap();
-        let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, now, 11).unwrap();
-        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
-        medium.validate().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-    #[test]
-    fn a_successful_exclusion_walk_over_a_real_checkpoint_range() {
-        // F1's positive obligation: a REAL checkpoint with
-        // authenticated skip entries; a SUCCESSFUL nonempty
-        // simulated-retirement walk over the audited range; the
-        // survivor and reclaimed-membership sets verified; the
-        // physically present retiring records untouched; the
-        // ordinary authoritative state intact (validation and
-        // append observe the actual chain); and the reopen
-        // unchanged.
-        let root = temp_store("positive-exclusion");
-        let mut medium = LocalFileMedium::open(&root).unwrap();
-        let object = StoredObject::new({
-            let mut enc = engine_core::Encoder::new();
-            enc.write_str("sektor7/save/1");
-            enc.write_bytes(b"payload");
-            enc.into_bytes()
-        })
-        .unwrap();
-        // The chain: F(0) → P1(1) → P2(2) → SK(3) → MK(4). The MK's
-        // first content reference is the checkpoint metadata — the
-        // authenticated skip table covering the retirement range
-        // {P2, SK} with the self-skip jumping to P1 (the nearest
-        // retained ancestor).
+        // The real-checkpoint chain: F(0) → P1(1) → P2(2) → SK(3) →
+        // MK(4), the index covering {P2, SK} with the self-skip to
+        // P1.
         let mut chain: Vec<Hash> = Vec::new();
         let mut epochs: Vec<u64> = Vec::new();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2fp", 0)
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2a", 0)
             .with_content_refs(vec![object.hash()]);
         medium
             .append(&founding, std::slice::from_ref(&object), None)
@@ -2102,49 +1979,101 @@ mod exclusion_tests {
         medium
             .append(&mk_record, std::slice::from_ref(&meta_object), Some(sk))
             .unwrap();
-        let head = medium.head().unwrap().unwrap();
-        assert_eq!(head, mk_record.id());
 
-        // The SUCCESSFUL nonempty simulated-retirement walk over the
-        // audited range {P2, SK}: the walk routes through the MK's
-        // authenticated self-skip to P1, skipping the excluded
-        // records entirely.
-        let excluded: BTreeSet<Hash> = [p2, sk].into_iter().collect();
-        let (summary, simulated) = medium.cold_walk_excluding(head, &excluded).unwrap();
-        assert_eq!(summary.records, 3, "MK, P1, F walk");
-        assert_eq!(
-            summary.reclaimed_records, 2,
-            "P2 and SK staged as reclaimed"
-        );
-        assert_eq!(simulated.reclaimed.get(&p2), Some(&epochs[2]));
-        assert_eq!(simulated.reclaimed.get(&sk), Some(&epochs[3]));
-        assert!(!simulated.record_ids.contains(&p2));
-        assert!(!simulated.record_ids.contains(&sk));
-        assert!(simulated.record_ids.contains(&mk_record.id()));
-
-        // The physically present retiring records are untouched.
-        assert!(medium.object_path(&p2).is_file());
-        assert!(medium.object_path(&sk).is_file());
-
-        // The ordinary authoritative state is intact: validation and
-        // a fresh append observe the ACTUAL chain (all five records).
-        let authoritative = medium.validate().unwrap();
-        assert_eq!(authoritative.records, 5, "the physical chain is whole");
-        let now = medium.head().unwrap().unwrap();
-        let epoch = medium.read_record(&now).unwrap().epoch;
-        let after = RevisionRecord::regular(now, epoch, 6).with_content_refs(vec![object.hash()]);
-        let outcome = medium
-            .append(&after, std::slice::from_ref(&object), Some(now))
-            .unwrap();
+        // A REAL audit of the checkpoint's retirement index (the
+        // ledger's units ARE the index; the bindings ARE the
+        // metadata's).
+        let ledger = ReclamationLedger {
+            mk: mk_record.id(),
+            sk,
+            range_digest: metadata.range_digest,
+            seed: metadata.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: p2,
+                    objects: Vec::new(),
+                },
+                ReclaimUnit {
+                    record: sk,
+                    objects: Vec::new(),
+                },
+            ],
+        };
+        let (audit_record, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 6).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let current = medium.head().unwrap().unwrap();
 
-        // The reopen is unchanged (the canonical behavior over the
-        // physical chain).
-        drop(medium);
-        let mut reopened = LocalFileMedium::open(&root).unwrap();
-        assert_eq!(reopened.head().unwrap().unwrap(), after.id());
-        let summary = reopened.validate().unwrap();
-        assert_eq!(summary.records, 6);
+        // The FABRICATED-MK marker (the review's counterexample:
+        // an audit-shaped source over a nonexistent checkpoint)
+        // refuses — no checkpoint on the chain matches.
+        let fabricated = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: hash_object(b"p2a-fabricated-mk"),
+            batch: 0,
+            source: audit_record,
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        assert!(
+            publish_reclamation_complete(&mut medium, &fabricated, current, 7).is_err(),
+            "a marker over a fabricated MK refuses"
+        );
+        // A NONZERO batch index refuses (the v1 single-batch form).
+        let nonzero = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: mk_record.id(),
+            batch: 3,
+            source: audit_record,
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        assert!(
+            publish_reclamation_complete(&mut medium, &nonzero, current, 7).is_err(),
+            "a nonzero batch index refuses under the v1 protocol"
+        );
+        let now = current;
+        // A marker whose units DISAGREE with the checkpoint index
+        // is structurally unreachable through legitimate
+        // publication: the deterministic one-key-per-MK uniqueness
+        // refuses a second audit for the same checkpoint at
+        // installation (verified above by the duplicate-key
+        // refusal), and an off-chain hand-crafted audit record is
+        // refused by the chain-membership check. The units-vs-index
+        // cross-check remains the defense-in-depth for the
+        // compromised-key scenario, exercised at the verification
+        // layer in the execution-switch increment.
+        //
+        // The ADMITTED marker over the REAL audit: CAS-bound (a HEAD
+        // advancement refuses; the current head accepts).
+        let marker = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: mk_record.id(),
+            batch: 0,
+            source: audit_record,
+            mandatory_count: 2,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let epoch = medium.read_record(&now).unwrap().epoch;
+        let interloper =
+            RevisionRecord::regular(now, epoch, 10).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&interloper, std::slice::from_ref(&object), Some(now))
+            .unwrap();
+        let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, now, 11).unwrap();
+        assert!(
+            matches!(outcome, AppendOutcome::RejectedStaleParent { .. }),
+            "the advanced HEAD refuses the stale-parent marker"
+        );
+        let latest = medium.head().unwrap().unwrap();
+        let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, latest, 12).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        medium.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

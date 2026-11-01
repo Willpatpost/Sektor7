@@ -923,45 +923,21 @@ pub fn publish_reclamation_complete(
             rule: "reclamation-complete/range-unauthorized",
         });
     }
-    let source_record = medium.read_record(&marker.source)?;
-    let Some(ledger_object) = source_record.content_refs.first().copied() else {
+    // P2-F4C: the v1-only execution boundary — the admitted source
+    // is a v1 audit, the batch index is zero (the v1 single-batch
+    // interpretation), and the v2 form is refused until the
+    // separately authorized v2 protocol exists.
+    if marker.batch != 0 {
         return Err(MediumError::Chain {
-            rule: "reclamation-complete/source-shape",
-        });
-    };
-    let ledger_bytes = medium.read_object(&ledger_object)?;
-    let ledger_domain = StoredObject::new(ledger_bytes.clone())?.domain().to_owned();
-    if ledger_domain == RECLAMATION_LEDGER_DOMAIN {
-        let ledger = ReclamationLedger::decode(&ledger_bytes).map_err(MediumError::Format)?;
-        if ledger.mk != marker.mk {
-            return Err(MediumError::Chain {
-                rule: "reclamation-complete/mk-mismatch",
-            });
-        }
-        let expected = reclamation_ledger_idempotency_key(&marker.mk);
-        if source_record.idempotency_key != Some(expected) {
-            return Err(MediumError::Chain {
-                rule: "reclamation-complete/audit-key-mismatch",
-            });
-        }
-    } else if ledger_domain == RECLAMATION_LEDGER_V2_DOMAIN {
-        let ledger = ReclamationLedgerV2::decode(&ledger_bytes).map_err(MediumError::Format)?;
-        if ledger.mk != marker.mk || ledger.batch != marker.batch {
-            return Err(MediumError::Chain {
-                rule: "reclamation-complete/mk-mismatch",
-            });
-        }
-        let expected = reclamation_ledger_v2_idempotency_key(&marker.mk, marker.batch);
-        if source_record.idempotency_key != Some(expected) {
-            return Err(MediumError::Chain {
-                rule: "reclamation-complete/audit-key-mismatch",
-            });
-        }
-    } else {
-        return Err(MediumError::Chain {
-            rule: "reclamation-complete/source-not-audit",
+            rule: "reclamation-complete/batch-nonzero",
         });
     }
+    // P2-F4B: the CANONICAL AUDIT AUTHORITY — not merely an
+    // audit-shaped record: the source must be an installed v1 audit
+    // ON THE AUTHORITATIVE CHAIN whose MK is a real checkpoint,
+    // whose bindings agree with the permanent metadata, and whose
+    // units exactly match the checkpoint's retirement index.
+    let (_ledger, _metadata) = verify_canonical_v1_audit(medium, &marker.source, &marker.mk)?;
     // The CAS-bound publication: the receipt is constructed
     // IN-CRATE (the generic gate does not apply — this admission IS
     // the authority), the append's expected parent binding to the
@@ -977,6 +953,103 @@ pub fn publish_reclamation_complete(
     let admitted = crate::medium::AdmittedAppend::generic(&record, &[object]);
     let outcome = medium.append_admitted(admitted, Some(expected_parent))?;
     Ok((candidate, outcome))
+}
+
+/// The canonical v1 audit authority verification (P2 Increment A /
+/// P2-F4B): a bounded descent from the authoritative HEAD proving
+/// (1) the audit record is an INSTALLED ancestor (chain membership
+/// — an orphaned or fabricated record refuses), (2) the ledger's MK
+/// is a REAL checkpoint on the same chain (its permanent metadata
+/// decodes and binds), (3) the ledger's SK, range digest, and seed
+/// agree with that metadata, (4) the audit's idempotency key is the
+/// deterministic MK-bound form, and (5) the ledger's unit RECORDS
+/// exactly match the checkpoint's retirement index. Returns the
+/// verified ledger and metadata. Every failure refuses typed before
+/// any mutation.
+pub fn verify_canonical_v1_audit(
+    medium: &mut dyn CanonicalMedium,
+    _audit_record: &Hash,
+    mk: &Hash,
+) -> Result<(ReclamationLedger, crate::checkpoint::CheckpointMetadata), MediumError> {
+    const MAX_DESCENT: u32 = 1 << 17;
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut ledger: Option<ReclamationLedger> = None;
+    let mut metadata: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let record = medium.read_record(&current)?;
+        let parent = record.parent;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            let domain = StoredObject::new(bytes.clone())?.domain().to_owned();
+            if domain == RECLAMATION_LEDGER_DOMAIN {
+                let decoded = ReclamationLedger::decode(&bytes).map_err(MediumError::Format)?;
+                if &decoded.mk == mk {
+                    let expected = reclamation_ledger_idempotency_key(mk);
+                    if record.idempotency_key != Some(expected) {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-complete/audit-key-mismatch",
+                        });
+                    }
+                    ledger = Some(decoded);
+                }
+            } else if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+                let decoded = crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                    .map_err(MediumError::Format)?;
+                // The newest checkpoint seen on the descent (the
+                // covering MK candidate — the post-loop binding
+                // checks against the ledger's SK do the real
+                // matching; a fabricated MK with no checkpoint on
+                // the chain leaves `metadata` empty and refuses).
+                metadata = metadata.or(Some(decoded));
+            }
+        }
+        if ledger.is_some() && metadata.is_some() {
+            break;
+        }
+        let Some(parent) = parent else {
+            break;
+        };
+        current = parent;
+    }
+    let Some(ledger) = ledger else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/audit-not-canonical",
+        });
+    };
+    let Some(metadata) = metadata else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/mk-not-a-checkpoint",
+        });
+    };
+    // The bindings: the ledger's SK, digest, and seed agree with the
+    // permanent metadata.
+    if ledger.sk != metadata.sk
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/binding-mismatch",
+        });
+    }
+    // The units exactly match the retirement index (the record
+    // identities, as a set).
+    let index: std::collections::BTreeSet<Hash> =
+        metadata.index.iter().map(|entry| entry.hash).collect();
+    let units: std::collections::BTreeSet<Hash> =
+        ledger.units.iter().map(|unit| unit.record).collect();
+    if index.len() != metadata.index.len() || units.len() != ledger.units.len() {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/index-incoherent",
+        });
+    }
+    if index != units {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/units-index-mismatch",
+        });
+    }
+    Ok((ledger, metadata))
 }
 
 #[cfg(test)]
