@@ -2308,4 +2308,118 @@ mod exclusion_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_survivor_partition_defers_shared_and_deduplicates() {
+        // The trusted directive's decision core: over the
+        // real-checkpoint fixture, the partition (a) DEFERS an
+        // object a surviving record also references (never deleted
+        // merely because a retiring record names it), (b) classifies
+        // a multi-unit shared object exactly ONCE, and (c) marks
+        // the retiring records and the unshared objects MANDATORY.
+        let root = temp_store("partition");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        // F(0) → P1(1, references SHARED — the surviving root) →
+        // R1(2, SHARED + PRIVATE) → R2(3, SHARED) → SK(4) → MK(5,
+        // the index {R1, R2, SK}, the self-skip to P1).
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2p", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&p1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = RevisionRecord::regular(head, epoch, 2)
+            .with_content_refs(vec![shared.hash(), private.hash()]);
+        medium
+            .append(&r1, &[shared.clone(), private.clone()], Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r2 = RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&r2, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 4).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r2.id(),
+            vec![SkipEntry::new(Hash::ZERO, p1.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, r1.id(), 2),
+                ReclaimedIndexEntry::new(None, r2.id(), 3),
+                ReclaimedIndexEntry::new(None, sk.id(), 4),
+            ],
+            [1; 32],
+            [2; 32],
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk =
+            RevisionRecord::regular(sk.id(), epoch, 5).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk.id()))
+            .unwrap();
+        let head = mk.id();
+
+        // The survivor set: the exclusion walk over the audited
+        // range {R1, R2, SK}.
+        let excluded: BTreeSet<Hash> = [r1.id(), r2.id(), sk.id()].into_iter().collect();
+        let (_summary, simulated) = medium.cold_walk_excluding(head, &excluded).unwrap();
+        // The audited units (the correct manifests): R1 carries
+        // SHARED + PRIVATE; R2 carries SHARED; SK carries SHARED —
+        // SHARED appears in THREE units.
+        let units = vec![
+            ReclaimUnit {
+                record: r1.id(),
+                objects: vec![shared.hash(), private.hash()],
+            },
+            ReclaimUnit {
+                record: r2.id(),
+                objects: vec![shared.hash()],
+            },
+            ReclaimUnit {
+                record: sk.id(),
+                objects: vec![shared.hash()],
+            },
+        ];
+        let outcome = crate::reclaim::partition_reclaim(&units, &simulated.reachable);
+        // SHARED is DEFERRED (P1 — a surviving root — references it),
+        // classified exactly once despite three unit appearances.
+        assert_eq!(outcome.deferred, vec![shared.hash()]);
+        // MANDATORY: the three retiring records + PRIVATE (referenced
+        // only by the retiring R1) — SHARED absent.
+        let mut expected_mandatory = vec![r1.id(), private.hash(), r2.id(), sk.id()];
+        expected_mandatory.sort();
+        let mut mandatory = outcome.mandatory.clone();
+        mandatory.sort();
+        assert_eq!(mandatory, expected_mandatory);
+        assert!(!mandatory.contains(&shared.hash()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

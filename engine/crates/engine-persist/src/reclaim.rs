@@ -886,6 +886,48 @@ pub struct ReclaimOutcome {
     pub deferred: Vec<Hash>,
 }
 
+/// The survivor-aware Mandatory/Deferred partition (the trusted
+/// directive's decision core): given the verified audit's units and
+/// the SURVIVOR SET — the exclusion walk's reachable identities,
+/// everything that must remain reachable after the authorized
+/// retirement — classify every audited identity. Identity-set
+/// semantics throughout: a shared object appearing in multiple
+/// units classifies exactly once (deleted at most once), and an
+/// object referenced by ANY surviving root is DEFERRED regardless
+/// of how many retiring units name it. The retiring records
+/// themselves are mandatory (the audit's exact membership
+/// authorizes their removal; the exclusion walk never reaches
+/// them). The result is reproducible from verified canonical
+/// evidence after an interruption (the same units and the same
+/// walk derive the same partition).
+pub fn partition_reclaim(
+    units: &[ReclaimUnit],
+    survivors: &std::collections::BTreeSet<Hash>,
+) -> ReclaimOutcome {
+    let mut mandatory: Vec<Hash> = Vec::new();
+    let mut deferred: Vec<Hash> = Vec::new();
+    let mut seen: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
+    for unit in units {
+        if seen.insert(unit.record) {
+            mandatory.push(unit.record);
+        }
+        for object in &unit.objects {
+            if survivors.contains(object) {
+                if seen.insert(*object) {
+                    deferred.push(*object);
+                }
+            } else if seen.insert(*object) {
+                mandatory.push(*object);
+            }
+        }
+    }
+    ReclaimOutcome {
+        removed: 0,
+        mandatory,
+        deferred,
+    }
+}
+
 /// Publishes the completion marker revision: a regular revision
 /// whose single content object is the marker, keyed
 /// deterministically by the marker's KIND (the batch form by the MK
