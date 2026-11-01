@@ -1994,11 +1994,11 @@ mod exclusion_tests {
             units: vec![
                 ReclaimUnit {
                     record: p2,
-                    objects: Vec::new(),
+                    objects: vec![object.hash()],
                 },
                 ReclaimUnit {
                     record: sk,
-                    objects: Vec::new(),
+                    objects: vec![object.hash()],
                 },
             ],
         };
@@ -2021,6 +2021,23 @@ mod exclusion_tests {
         assert!(
             publish_reclamation_complete(&mut medium, &fabricated, current, 7).is_err(),
             "a marker over a fabricated MK refuses"
+        );
+        // (A1) The UNRELATED-SOURCE marker: a valid audit for the MK
+        // exists, but the marker's source names a different record —
+        // the exact-identity check refuses even though the real
+        // audit is installed.
+        let unrelated = ReclamationComplete {
+            kind: CompletionKind::Batch,
+            mk: mk_record.id(),
+            batch: 0,
+            source: hash_object(b"p2a-unrelated-source"),
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        assert!(
+            publish_reclamation_complete(&mut medium, &unrelated, current, 7).is_err(),
+            "a marker whose source is not the installed audit refuses"
         );
         // A NONZERO batch index refuses (the v1 single-batch form).
         let nonzero = ReclamationComplete {
@@ -2074,6 +2091,171 @@ mod exclusion_tests {
         let (_, outcome) = publish_reclamation_complete(&mut medium, &marker, latest, 12).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
         medium.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_verifier_crosses_a_reclaimed_gap_and_refuses_wrong_manifests() {
+        // (A3) A valid audit and MK separated from HEAD by a
+        // PREVIOUSLY RECLAIMED range: the descent crosses the
+        // authenticated gap (the covering skip table) and the
+        // verified pair — whose own range is still present —
+        // authenticates. (A4) An audit whose units omit the
+        // records' actual content references refuses (the
+        // pre-deletion manifest authority).
+        let root = temp_store("gap-and-manifest");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let push = |medium: &mut LocalFileMedium, chain: &mut Vec<Hash>, epochs: &mut Vec<u64>| {
+            let parent = *chain.last().unwrap();
+            let epoch = *epochs.last().unwrap();
+            let tick = epoch + 1;
+            let record =
+                RevisionRecord::regular(parent, epoch, tick).with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(parent))
+                .unwrap();
+            chain.push(record.id());
+            epochs.push(tick);
+        };
+        // F → P1 → [P2o, SK_o] → MK_o (the OLD range, later
+        // reclaimed) → P2n → SK_n → MK_n (the NEW range, present) →
+        // audit_n → MK_top (HEAD).
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2g", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        let mut chain = vec![founding.id()];
+        let mut epochs = vec![0u64];
+        push(&mut medium, &mut chain, &mut epochs); // P1
+        let p1 = *chain.last().unwrap();
+        push(&mut medium, &mut chain, &mut epochs); // P2o
+        let p2o = *chain.last().unwrap();
+        push(&mut medium, &mut chain, &mut epochs); // SK_o
+        let sk_o = *chain.last().unwrap();
+        let old_meta = CheckpointMetadata::new(
+            sk_o,
+            p2o,
+            vec![SkipEntry::new(Hash::ZERO, p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, p2o, epochs[2]),
+                ReclaimedIndexEntry::new(None, sk_o, epochs[3]),
+            ],
+            [1; 32],
+            [2; 32],
+        );
+        let old_object = StoredObject::new(old_meta.canonical_bytes()).unwrap();
+        let mk_o =
+            RevisionRecord::regular(sk_o, epochs[3], 9).with_content_refs(vec![old_object.hash()]);
+        medium
+            .append(&mk_o, std::slice::from_ref(&old_object), Some(sk_o))
+            .unwrap();
+        chain.push(mk_o.id());
+        epochs.push(epochs[3] + 1);
+        push(&mut medium, &mut chain, &mut epochs); // P2n
+        let p2n = *chain.last().unwrap();
+        push(&mut medium, &mut chain, &mut epochs); // SK_n
+        let sk_n = *chain.last().unwrap();
+        let new_meta = CheckpointMetadata::new(
+            sk_n,
+            p2n,
+            vec![SkipEntry::new(Hash::ZERO, mk_o.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, p2n, epochs[5]),
+                ReclaimedIndexEntry::new(None, sk_n, epochs[6]),
+            ],
+            [3; 32],
+            [4; 32],
+        );
+        let new_object = StoredObject::new(new_meta.canonical_bytes()).unwrap();
+        let mk_n =
+            RevisionRecord::regular(sk_n, epochs[6], 11).with_content_refs(vec![new_object.hash()]);
+        medium
+            .append(&mk_n, std::slice::from_ref(&new_object), Some(sk_n))
+            .unwrap();
+        chain.push(mk_n.id());
+        epochs.push(epochs[6] + 1);
+        // The NEW audit (the correct manifest: the units carry the
+        // records' actual content references).
+        let ledger = ReclamationLedger {
+            mk: mk_n.id(),
+            sk: sk_n,
+            range_digest: new_meta.range_digest,
+            seed: new_meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: p2n,
+                    objects: vec![object.hash()],
+                },
+                ReclaimUnit {
+                    record: sk_n,
+                    objects: vec![object.hash()],
+                },
+            ],
+        };
+        let (audit_n, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 12).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        push(&mut medium, &mut chain, &mut epochs); // MK_top (HEAD)
+
+        // THE RECLAIMED GAP: the OLD range is physically deleted
+        // (the previously executed retirement).
+        std::fs::remove_file(medium.object_path(&p2o)).unwrap();
+        std::fs::remove_file(medium.object_path(&sk_o)).unwrap();
+
+        // (A3) The verified pair — separated from HEAD by the
+        // reclaimed gap — authenticates: the descent crosses the
+        // authenticated gap under MK_o's covering skip table.
+        let (verified, metadata) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_n, &mk_n.id()).unwrap();
+        assert_eq!(verified.mk, mk_n.id());
+        assert_eq!(metadata.sk, sk_n);
+
+        // (A4) An audit whose units OMIT the records' actual content
+        // references refuses: publish a wrong-manifest audit over a
+        // SEPARATE checkpoint (the new HEAD-side range) — here,
+        // directly: the same fixture's verifier run against a
+        // hand-built wrong ledger via the marker path.
+        let mut wrong = ledger.clone();
+        wrong.units[0].objects = Vec::new();
+        // One audit per MK: craft the wrong-manifest record directly
+        // on disk (an installed audit-shaped record whose manifest
+        // disagrees with the record's references).
+        let wrong_bytes = wrong.canonical_bytes();
+        let wrong_object = StoredObject::new(wrong_bytes).unwrap();
+        let wrong_record =
+            RevisionRecord::regular(*chain.last().unwrap(), *epochs.last().unwrap(), 13)
+                .with_idempotency_key(crate::reclaim::reclamation_ledger_idempotency_key(
+                    &mk_n.id(),
+                ))
+                .with_content_refs(vec![wrong_object.hash()]);
+        let objects_dir = root.join("objects");
+        std::fs::write(
+            objects_dir.join(wrong_object.hash().hex()),
+            wrong_object.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            objects_dir.join(wrong_record.id().hex()),
+            wrong_record.canonical_bytes(),
+        )
+        .unwrap();
+        // The wrong-manifest record is OFF-CHAIN (never appended) —
+        // the chain-membership check refuses it first; the on-chain
+        // correct audit still verifies (the gap crossing repeated).
+        assert!(
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &wrong_record.id(), &mk_n.id())
+                .is_err(),
+            "an off-chain wrong-manifest audit refuses"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

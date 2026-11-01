@@ -955,54 +955,84 @@ pub fn publish_reclamation_complete(
     Ok((candidate, outcome))
 }
 
-/// The canonical v1 audit authority verification (P2 Increment A /
-/// P2-F4B): a bounded descent from the authoritative HEAD proving
-/// (1) the audit record is an INSTALLED ancestor (chain membership
-/// — an orphaned or fabricated record refuses), (2) the ledger's MK
-/// is a REAL checkpoint on the same chain (its permanent metadata
-/// decodes and binds), (3) the ledger's SK, range digest, and seed
-/// agree with that metadata, (4) the audit's idempotency key is the
-/// deterministic MK-bound form, and (5) the ledger's unit RECORDS
-/// exactly match the checkpoint's retirement index. Returns the
-/// verified ledger and metadata. Every failure refuses typed before
-/// any mutation.
+/// The canonical v1 audit authority verification (P2 Increment A,
+/// corrected per A1-A4): a gap-aware authoritative descent proving
+/// (A1) the EXACT supplied audit revision identity is encountered on
+/// the chain — its computed identity, its first content object's
+/// strict v1-ledger decode, its MK, and its deterministic MK-bound
+/// key all checked AT that record (an unrelated or fabricated
+/// source refuses even when a valid audit for the MK exists);
+/// (A2) the requested MK is bound BY REVISION IDENTITY — the record
+/// whose identity equals the MK, whose first reference strictly
+/// decodes as checkpoint metadata whose SK is that record's parent
+/// (a newer checkpoint's metadata never substitutes); (A3) the
+/// descent crosses legitimately reclaimed gaps ONLY under the most
+/// recent authenticated checkpoint's skip table (the established
+/// discovery discipline — uncovered gaps refuse fail-closed; the
+/// descent bound is a documented safety valve, not a schema limit);
+/// and (A4) the pre-deletion manifest authority — every unit's
+/// record is hash-verified by identity and its object list equals
+/// the record's actual content references (the v1 collection
+/// contract; omitted, extraneous, or mismatched deletion identities
+/// refuse). Post-interruption resume verification — where retiring
+/// records may already be deleted — is the manifest-driven
+/// recovery's own path, never this pre-deletion boundary.
 pub fn verify_canonical_v1_audit(
     medium: &mut dyn CanonicalMedium,
-    _audit_record: &Hash,
+    audit_record: &Hash,
     mk: &Hash,
 ) -> Result<(ReclamationLedger, crate::checkpoint::CheckpointMetadata), MediumError> {
-    const MAX_DESCENT: u32 = 1 << 17;
+    // The safety-valve descent bound: each iteration consumes one
+    // present record or one authenticated skip jump; a campaign
+    // exceeding this refuses typed (the documented operational
+    // limit — the same policy class as the survivor-walk bound,
+    // pending the owner's numerical ratification).
+    const MAX_DESCENT: u64 = 1 << 20;
     let mut current = medium
         .head()?
         .ok_or(MediumError::Chain { rule: "unfounded" })?;
     let mut ledger: Option<ReclamationLedger> = None;
     let mut metadata: Option<crate::checkpoint::CheckpointMetadata> = None;
+    // (A3) The traversal skip table: the most recent checkpoint
+    // metadata seen on the descent (ANY checkpoint — the gap-cover
+    // authority), distinct from the requested MK's own metadata.
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
     for _ in 0..MAX_DESCENT {
         let record = medium.read_record(&current)?;
         let parent = record.parent;
         if let Some(object) = record.content_refs.first().copied() {
             let bytes = medium.read_object(&object)?;
             let domain = StoredObject::new(bytes.clone())?.domain().to_owned();
-            if domain == RECLAMATION_LEDGER_DOMAIN {
-                let decoded = ReclamationLedger::decode(&bytes).map_err(MediumError::Format)?;
-                if &decoded.mk == mk {
-                    let expected = reclamation_ledger_idempotency_key(mk);
-                    if record.idempotency_key != Some(expected) {
-                        return Err(MediumError::Chain {
-                            rule: "reclamation-complete/audit-key-mismatch",
-                        });
-                    }
-                    ledger = Some(decoded);
-                }
-            } else if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+            if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
                 let decoded = crate::checkpoint::CheckpointMetadata::decode(&bytes)
                     .map_err(MediumError::Format)?;
-                // The newest checkpoint seen on the descent (the
-                // covering MK candidate — the post-loop binding
-                // checks against the ledger's SK do the real
-                // matching; a fabricated MK with no checkpoint on
-                // the chain leaves `metadata` empty and refuses).
-                metadata = metadata.or(Some(decoded));
+                skip_table = Some(decoded.clone());
+                // (A2) The requested MK, bound by revision identity:
+                // this record IS the MK, its metadata's SK is its
+                // own parent.
+                if current == *mk {
+                    if decoded.sk != parent.unwrap_or(Hash::ZERO) {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-complete/mk-binding-mismatch",
+                        });
+                    }
+                    metadata = Some(decoded);
+                }
+            } else if domain == RECLAMATION_LEDGER_DOMAIN && current == *audit_record {
+                // (A1) The EXACT requested audit identity.
+                let decoded = ReclamationLedger::decode(&bytes).map_err(MediumError::Format)?;
+                if decoded.mk != *mk {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/mk-mismatch",
+                    });
+                }
+                let expected = reclamation_ledger_idempotency_key(mk);
+                if record.idempotency_key != Some(expected) {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-complete/audit-key-mismatch",
+                    });
+                }
+                ledger = Some(decoded);
             }
         }
         if ledger.is_some() && metadata.is_some() {
@@ -1011,7 +1041,35 @@ pub fn verify_canonical_v1_audit(
         let Some(parent) = parent else {
             break;
         };
-        current = parent;
+        // (A3) The gap-aware advance: a present parent follows
+        // normally; an absent parent crosses ONLY under the most
+        // recent authenticated skip table (the owner/self-skip
+        // distinction preserved); an uncovered gap refuses.
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    // The skip owner's own parent (the SK) is
+                    // absent: the self-skip names the owner's
+                    // nearest retained ancestor.
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
     }
     let Some(ledger) = ledger else {
         return Err(MediumError::Chain {
@@ -1024,7 +1082,7 @@ pub fn verify_canonical_v1_audit(
         });
     };
     // The bindings: the ledger's SK, digest, and seed agree with the
-    // permanent metadata.
+    // requested MK's permanent metadata.
     if ledger.sk != metadata.sk
         || ledger.range_digest != metadata.range_digest
         || ledger.seed != metadata.seed
@@ -1034,7 +1092,7 @@ pub fn verify_canonical_v1_audit(
         });
     }
     // The units exactly match the retirement index (the record
-    // identities, as a set).
+    // identities, as a set — no omission, no extraneous entry).
     let index: std::collections::BTreeSet<Hash> =
         metadata.index.iter().map(|entry| entry.hash).collect();
     let units: std::collections::BTreeSet<Hash> =
@@ -1048,6 +1106,20 @@ pub fn verify_canonical_v1_audit(
         return Err(MediumError::Chain {
             rule: "reclamation-complete/units-index-mismatch",
         });
+    }
+    // (A4) The pre-deletion manifest authority: every unit's record
+    // is hash-verified by identity and its object list equals the
+    // record's actual content references (the v1 collection
+    // contract — a deletion manifest that omits or adds objects
+    // refuses).
+    for unit in &ledger.units {
+        let record_bytes = medium.read_object(&unit.record)?;
+        let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+        if unit.objects != record.content_refs {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/units-objects-mismatch",
+            });
+        }
     }
     Ok((ledger, metadata))
 }
