@@ -2557,4 +2557,89 @@ mod exclusion_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_first_installed_wrong_manifest_refuses_on_sqlite() {
+        // (B3 on the second provider) The FIRST installed audit with
+        // an omitted or injected object manifest refuses at the
+        // exact comparison — the records-table read path.
+        for wrong_objects in [
+            Vec::new(),
+            vec![crate::hash::hash_object(b"p2c3s-injected")],
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "s7-p2c3s-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+            let object = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2c3s", 0)
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&object), None)
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let r1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![object.hash()]);
+            medium
+                .append(&r1, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            let meta = CheckpointMetadata::new(
+                r1.id(),
+                r1.id(),
+                Vec::new(),
+                vec![ReclaimedIndexEntry::new(None, r1.id(), 1)],
+                [1; 32],
+                [2; 32],
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let mk =
+                RevisionRecord::regular(r1.id(), 1, 2).with_content_refs(vec![meta_object.hash()]);
+            medium
+                .append(&mk, std::slice::from_ref(&meta_object), Some(r1.id()))
+                .unwrap();
+            let ledger = crate::reclaim::ReclamationLedger {
+                mk: mk.id(),
+                sk: r1.id(),
+                range_digest: meta.range_digest,
+                seed: meta.seed,
+                records: 1,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units: vec![crate::reclaim::ReclaimUnit {
+                    record: r1.id(),
+                    objects: wrong_objects,
+                }],
+            };
+            let (audit, outcome) =
+                crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 3).unwrap();
+            assert!(matches!(
+                outcome,
+                crate::medium::AppendOutcome::Accepted { .. }
+            ));
+            let error = crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk.id())
+                .expect_err("the wrong manifest refuses on SQLite");
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/units-objects-mismatch"
+                    }
+                ),
+                "the exact error class: {error:?}"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 }

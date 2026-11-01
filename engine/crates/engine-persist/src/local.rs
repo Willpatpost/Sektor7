@@ -2192,7 +2192,9 @@ mod exclusion_tests {
 
         // (B2) The target pair — BELOW the gap — verifies: the
         // descent from MK_new meets the absent SK_n, crosses via
-        // MK_new's self-skip to MK_o (the retained ancestor), and
+        // MK_new's self-skip to audit_o (the NEAREST RETAINED
+        // ancestor — the retained record on the reclaimed span's
+        // top), and
         // authenticates the exact audit and MK. The crossing was
         // NECESSARY (the gap is physical).
         let (verified, metadata) =
@@ -2201,6 +2203,109 @@ mod exclusion_tests {
         assert_eq!(metadata.sk, r1);
         assert_eq!(verified.units.len(), 1);
         assert!(!medium.object_path(&sk_n).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The shared first-installed wrong-manifest fixture: a valid
+    /// checkpoint, a genuine range record, and a FIRST audit
+    /// installed through the ordinary publication route — correct
+    /// identities, bindings, and key, but a deliberately incorrect
+    /// object manifest.
+    fn wrong_manifest_store(
+        wrong_objects: Vec<Hash>,
+    ) -> (std::path::PathBuf, LocalFileMedium, Hash, Hash) {
+        let root = temp_store("wrong-manifest");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2c3", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&r1, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+        let meta = CheckpointMetadata::new(
+            r1.id(),
+            r1.id(),
+            Vec::new(),
+            vec![ReclaimedIndexEntry::new(None, r1.id(), 1)],
+            [1; 32],
+            [2; 32],
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(r1.id(), 1, 2).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(r1.id()))
+            .unwrap();
+        let ledger = ReclamationLedger {
+            mk: mk.id(),
+            sk: r1.id(),
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![ReclaimUnit {
+                record: r1.id(),
+                objects: wrong_objects,
+            }],
+        };
+        let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 3).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        (root, medium, audit, mk.id())
+    }
+
+    #[test]
+    fn the_first_installed_audit_omitting_a_referenced_object_refuses() {
+        // (B3, omission) A FIRST installed audit — the valid
+        // checkpoint, the correct record identity, bindings, and
+        // key — whose unit OMITS the object the retiring record
+        // actually references. The audit IS on the authoritative
+        // chain; the verifier reaches the manifest comparison and
+        // refuses with the exact class; nothing was deleted.
+        let (root, mut medium, audit, mk) = wrong_manifest_store(Vec::new());
+        let error = crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk)
+            .expect_err("the omitted manifest refuses at the comparison");
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/units-objects-mismatch"
+                }
+            ),
+            "the exact error class: {error:?}"
+        );
+        assert!(medium.object_path(&audit).is_file(), "nothing was deleted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_first_installed_audit_injecting_an_unrelated_object_refuses() {
+        // (B3, injection) The same first-installed shape, but the
+        // unit includes an UNRELATED object identity the record
+        // never referenced.
+        let (root, mut medium, audit, mk) =
+            wrong_manifest_store(vec![hash_object(b"p2c3-injected")]);
+        let error = crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk)
+            .expect_err("the injected manifest refuses at the comparison");
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/units-objects-mismatch"
+                }
+            ),
+            "the exact error class: {error:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
