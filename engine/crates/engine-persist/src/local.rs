@@ -4339,4 +4339,98 @@ mod exclusion_tests {
         reopened.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn a_fabricated_later_marker_never_relaxes_an_earlier_certification() {
+        // (P2-R2-H1) The adversarial cascade: a legitimate earlier
+        // marker, then a LATER completion-shaped record installed
+        // through the in-crate adversarial append route. The
+        // fabricated later marker fails its OWN verification (the
+        // cascade: the key at collection, the source audit, the
+        // stable claims, its own obligation equality) — so the
+        // earlier marker's verification REFUSES rather than
+        // accepting the malformed evidence as attribution. Both the
+        // wrong-content and the wrong-key variants refuse.
+        let (root, mut medium, audit_a, mk1, _mk2, x, _fobj, directive_a, ledger_b) =
+            two_retirement_store("r2h1-fabricated-later");
+        medium.reclaim(&directive_a).unwrap();
+        let (marker_a, _marker) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit_a, &mk1).unwrap();
+        let (audit_b, outcome) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // B's execution (so the divergence the fabricated marker
+        // would need to account actually exists).
+        medium
+            .reclaim(&crate::reclaim::ReclaimDirective {
+                audit_record: audit_b,
+                units: ledger_b.units.clone(),
+            })
+            .unwrap();
+        assert!(!medium.object_path(&x).is_file());
+        // The FABRICATED later marker (the wrong mandatory count)
+        // via the in-crate adversarial append.
+        let install = |medium: &mut LocalFileMedium,
+                       marker: &crate::reclaim::ReclamationComplete,
+                       valid_key: bool|
+         -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let parent_epoch = medium.read_record(&head).unwrap().epoch;
+            let key = if valid_key {
+                crate::reclaim::reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch))
+            } else {
+                b"the-wrong-key".to_vec()
+            };
+            let object = StoredObject::new(marker.canonical_bytes()).unwrap();
+            let record = RevisionRecord::regular(head, parent_epoch, 98)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            record.id()
+        };
+        let wrong_content = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: _mk2,
+            batch: 0,
+            source: audit_b,
+            mandatory_count: 42,
+            deferred: vec![_fobj],
+            journal_files: Vec::new(),
+        };
+        let _fabricated_id = install(&mut medium, &wrong_content, true);
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/later-marker-incoherent"
+                }
+            ),
+            "the fabricated later marker refuses the cascade: {error:?}"
+        );
+        // The wrong-key variant refuses at collection.
+        let wrong_key = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: _mk2,
+            batch: 0,
+            source: audit_b,
+            mandatory_count: 3,
+            deferred: vec![_fobj],
+            journal_files: Vec::new(),
+        };
+        let _wrong_key_id = install(&mut medium, &wrong_key, false);
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/marker-key-mismatch"
+                }
+            ),
+            "the wrong-key later marker refuses at collection: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

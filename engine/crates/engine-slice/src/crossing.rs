@@ -2071,6 +2071,10 @@ impl<S: MediumSource> SessionCrossing<S> {
         // AUDITED range whose manifest IS fully satisfied (completed
         // — skipped, never repeated).
         let mut target: Option<ReclaimTarget> = None;
+        // (R4-L1) A marker whose historical attribution is mid-flight:
+        // re-verified at the pass's end (a later retirement's
+        // completion within this pass may resolve it).
+        let mut historical: Option<(Hash, Hash, MediumError)> = None;
         for candidate in summary.checkpoints[generations as usize..].iter().rev() {
             let mk_record = medium
                 .read_record(candidate)
@@ -2161,12 +2165,33 @@ impl<S: MediumSource> SessionCrossing<S> {
                         .map_err(PipelineError::Medium)?
                     {
                         Some((marker_id, _marker)) => {
-                            engine_persist::reclaim::verify_reclamation_complete(
+                            if let Err(error) = engine_persist::reclaim::verify_reclamation_complete(
                                 &mut medium,
                                 &marker_id,
                                 candidate,
-                            )
-                            .map_err(PipelineError::Medium)?;
+                            ) {
+                                let accounting_class = matches!(
+                                    error,
+                                    MediumError::Chain {
+                                        rule: "reclamation-complete/mandatory-count-mismatch"
+                                    } | MediumError::Chain {
+                                        rule: "reclamation-complete/deferred-mismatch"
+                                    }
+                                );
+                                if !accounting_class {
+                                    return Err(PipelineError::Medium(error).into());
+                                }
+                                // (R4-L1) The historical-attribution
+                                // intermediate state: a LATER
+                                // retirement's completion — possibly
+                                // ensured later in THIS pass — may
+                                // resolve this marker's accounting.
+                                // Continue the scan; the deferred
+                                // re-verification below fails closed
+                                // when nothing resolves it. This is
+                                // never a silent acceptance.
+                                historical = Some((marker_id, *candidate, error));
+                            }
                         }
                         None => {
                             engine_persist::reclaim::complete_reclamation(
@@ -2200,6 +2225,21 @@ impl<S: MediumSource> SessionCrossing<S> {
             }
         }
         let Some((oldest_mk, sk, metadata, installed)) = target else {
+            // (R4-L1) The deferred historical re-verification: a
+            // later retirement's marker ensured during THIS pass may
+            // have resolved the accounting; a still-failing marker is
+            // a genuine fail-closed state (never silently accepted).
+            if let Some((marker_id, historical_mk, _error)) = historical
+                && let Err(retry) = engine_persist::reclaim::verify_reclamation_complete(
+                    &mut medium,
+                    &marker_id,
+                    &historical_mk,
+                )
+            {
+                // A still-failing marker is a genuine fail-closed
+                // state — never a silent acceptance.
+                return Err(PipelineError::Medium(retry).into());
+            }
             return Err(TransitionError::InstallIncompatible {
                 region: 0,
                 detail: "reclaim/nothing-eligible",
