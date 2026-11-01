@@ -1113,8 +1113,14 @@ pub fn verify_canonical_v1_audit(
     // contract — a deletion manifest that omits or adds objects
     // refuses).
     for unit in &ledger.units {
-        let record_bytes = medium.read_object(&unit.record)?;
-        let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+        // (B1) The provider's RECORD-specific hash-verified read —
+        // the cross-provider interface (SQLite stores revision
+        // records in their own table; read_object is the
+        // content-object namespace and would refuse a valid SQLite
+        // audit whose records are absent from the objects table).
+        // Both providers' read_record implementations load and
+        // hash-verify the canonical record bytes.
+        let record = medium.read_record(&unit.record)?;
         if unit.objects != record.content_refs {
             return Err(MediumError::Chain {
                 rule: "reclamation-complete/units-objects-mismatch",

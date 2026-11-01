@@ -2435,4 +2435,126 @@ mod exclusion_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_verifier_crosses_a_reclaimed_gap_on_sqlite() {
+        // (B1/B2 on the second provider) The genuine gap crossing
+        // over SQLite — the target audit and MK BELOW a reclaimed
+        // range; the descent crosses the authenticated skip; the
+        // A4 manifest check exercises read_record (the records
+        // table, the cross-provider interface).
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2b2sq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let object = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let step = |medium: &mut SqliteMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record =
+                RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2b2s", 0)
+            .with_content_refs(vec![object.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&object), None)
+            .unwrap();
+        let _p1 = step(&mut medium, 1);
+        let r1 = step(&mut medium, 2);
+        let r1_epoch = medium.read_record(&r1).unwrap().epoch;
+        let old_meta = CheckpointMetadata::new(
+            r1,
+            r1,
+            Vec::new(),
+            vec![ReclaimedIndexEntry::new(None, r1, r1_epoch)],
+            [1; 32],
+            [2; 32],
+        );
+        let old_object = StoredObject::new(old_meta.canonical_bytes()).unwrap();
+        let mk_o =
+            RevisionRecord::regular(r1, r1_epoch, 9).with_content_refs(vec![old_object.hash()]);
+        medium
+            .append(&mk_o, std::slice::from_ref(&old_object), Some(r1))
+            .unwrap();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk_o.id(),
+            sk: r1,
+            range_digest: old_meta.range_digest,
+            seed: old_meta.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![crate::reclaim::ReclaimUnit {
+                record: r1,
+                objects: vec![object.hash()],
+            }],
+        };
+        let (audit_o, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 10).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let p2n = step(&mut medium, 11);
+        let p2n_epoch = medium.read_record(&p2n).unwrap().epoch;
+        let sk_n = step(&mut medium, 12);
+        let sk_n_epoch = medium.read_record(&sk_n).unwrap().epoch;
+        let new_meta = CheckpointMetadata::new(
+            sk_n,
+            p2n,
+            vec![SkipEntry::new(Hash::ZERO, audit_o)],
+            vec![
+                ReclaimedIndexEntry::new(None, p2n, p2n_epoch),
+                ReclaimedIndexEntry::new(None, sk_n, sk_n_epoch),
+            ],
+            [3; 32],
+            [4; 32],
+        );
+        let new_object = StoredObject::new(new_meta.canonical_bytes()).unwrap();
+        let mk_new = RevisionRecord::regular(sk_n, sk_n_epoch, 13)
+            .with_content_refs(vec![new_object.hash()]);
+        medium
+            .append(&mk_new, std::slice::from_ref(&new_object), Some(sk_n))
+            .unwrap();
+        // THE RECLAIMED GAP: delete the NEW range's rows from BOTH
+        // tables (the provider's own retirement shape).
+        for id in [p2n, sk_n] {
+            medium
+                .conn
+                .execute(
+                    "DELETE FROM records WHERE hash = ?1",
+                    params![id.as_bytes()],
+                )
+                .unwrap();
+            medium
+                .conn
+                .execute(
+                    "DELETE FROM objects WHERE hash = ?1",
+                    params![id.as_bytes()],
+                )
+                .unwrap();
+        }
+        let (verified, metadata) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_o, &mk_o.id()).unwrap();
+        assert_eq!(verified.mk, mk_o.id());
+        assert_eq!(metadata.sk, r1);
+        assert_eq!(verified.units.len(), 1);
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

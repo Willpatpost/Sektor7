@@ -2094,15 +2094,13 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn the_verifier_crosses_a_reclaimed_gap_and_refuses_wrong_manifests() {
-        // (A3) A valid audit and MK separated from HEAD by a
-        // PREVIOUSLY RECLAIMED range: the descent crosses the
-        // authenticated gap (the covering skip table) and the
-        // verified pair — whose own range is still present —
-        // authenticates. (A4) An audit whose units omit the
-        // records' actual content references refuses (the
-        // pre-deletion manifest authority).
-        let root = temp_store("gap-and-manifest");
+    fn the_verifier_crosses_a_reclaimed_gap_to_reach_the_target() {
+        // (B2) The GENUINE gap crossing: the target audit and MK sit
+        // BELOW a later checkpoint whose retirement range has been
+        // physically reclaimed — the descent must cross the
+        // authenticated missing-parent gap BEFORE reaching the
+        // target pair.
+        let root = temp_store("gap-crossing");
         let mut medium = LocalFileMedium::open(&root).unwrap();
         let object = StoredObject::new({
             let mut enc = engine_core::Encoder::new();
@@ -2111,151 +2109,98 @@ mod exclusion_tests {
             enc.into_bytes()
         })
         .unwrap();
-        let push = |medium: &mut LocalFileMedium, chain: &mut Vec<Hash>, epochs: &mut Vec<u64>| {
-            let parent = *chain.last().unwrap();
-            let epoch = *epochs.last().unwrap();
-            let tick = epoch + 1;
+        // Each append reads the CURRENT head's epoch from the medium
+        // itself (no side-tracked arrays).
+        let step = |medium: &mut LocalFileMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
             let record =
-                RevisionRecord::regular(parent, epoch, tick).with_content_refs(vec![object.hash()]);
+                RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![object.hash()]);
             medium
-                .append(&record, std::slice::from_ref(&object), Some(parent))
+                .append(&record, std::slice::from_ref(&object), Some(head))
                 .unwrap();
-            chain.push(record.id());
-            epochs.push(tick);
+            record.id()
         };
-        // F → P1 → [P2o, SK_o] → MK_o (the OLD range, later
-        // reclaimed) → P2n → SK_n → MK_n (the NEW range, present) →
-        // audit_n → MK_top (HEAD).
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2g", 0)
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2b2", 0)
             .with_content_refs(vec![object.hash()]);
         medium
             .append(&founding, std::slice::from_ref(&object), None)
             .unwrap();
-        let mut chain = vec![founding.id()];
-        let mut epochs = vec![0u64];
-        push(&mut medium, &mut chain, &mut epochs); // P1
-        let p1 = *chain.last().unwrap();
-        push(&mut medium, &mut chain, &mut epochs); // P2o
-        let p2o = *chain.last().unwrap();
-        push(&mut medium, &mut chain, &mut epochs); // SK_o
-        let sk_o = *chain.last().unwrap();
+        let _p1 = step(&mut medium, 1);
+        let r1 = step(&mut medium, 2);
+        let r1_epoch = medium.read_record(&r1).unwrap().epoch;
         let old_meta = CheckpointMetadata::new(
-            sk_o,
-            p2o,
-            vec![SkipEntry::new(Hash::ZERO, p1)],
-            vec![
-                ReclaimedIndexEntry::new(None, p2o, epochs[2]),
-                ReclaimedIndexEntry::new(None, sk_o, epochs[3]),
-            ],
+            r1,
+            r1,
+            Vec::new(),
+            vec![ReclaimedIndexEntry::new(None, r1, r1_epoch)],
             [1; 32],
             [2; 32],
         );
         let old_object = StoredObject::new(old_meta.canonical_bytes()).unwrap();
         let mk_o =
-            RevisionRecord::regular(sk_o, epochs[3], 9).with_content_refs(vec![old_object.hash()]);
+            RevisionRecord::regular(r1, r1_epoch, 9).with_content_refs(vec![old_object.hash()]);
         medium
-            .append(&mk_o, std::slice::from_ref(&old_object), Some(sk_o))
+            .append(&mk_o, std::slice::from_ref(&old_object), Some(r1))
             .unwrap();
-        chain.push(mk_o.id());
-        epochs.push(epochs[3] + 1);
-        push(&mut medium, &mut chain, &mut epochs); // P2n
-        let p2n = *chain.last().unwrap();
-        push(&mut medium, &mut chain, &mut epochs); // SK_n
-        let sk_n = *chain.last().unwrap();
+        // The target audit (the correct manifest: R1's actual refs).
+        let ledger = ReclamationLedger {
+            mk: mk_o.id(),
+            sk: r1,
+            range_digest: old_meta.range_digest,
+            seed: old_meta.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![ReclaimUnit {
+                record: r1,
+                objects: vec![object.hash()],
+            }],
+        };
+        let (audit_o, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 10).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // The NEW range above the audit (to be reclaimed).
+        let p2n = step(&mut medium, 11);
+        let p2n_epoch = medium.read_record(&p2n).unwrap().epoch;
+        let sk_n = step(&mut medium, 12);
+        let sk_n_epoch = medium.read_record(&sk_n).unwrap().epoch;
         let new_meta = CheckpointMetadata::new(
             sk_n,
             p2n,
-            vec![SkipEntry::new(Hash::ZERO, mk_o.id())],
+            // The self-skip targets the NEAREST RETAINED ancestor
+            // below the reclaimed span {P2n, SK_n} — the audit
+            // revision itself (the retained record standing on the
+            // reclaimed range's top).
+            vec![SkipEntry::new(Hash::ZERO, audit_o)],
             vec![
-                ReclaimedIndexEntry::new(None, p2n, epochs[5]),
-                ReclaimedIndexEntry::new(None, sk_n, epochs[6]),
+                ReclaimedIndexEntry::new(None, p2n, p2n_epoch),
+                ReclaimedIndexEntry::new(None, sk_n, sk_n_epoch),
             ],
             [3; 32],
             [4; 32],
         );
         let new_object = StoredObject::new(new_meta.canonical_bytes()).unwrap();
-        let mk_n =
-            RevisionRecord::regular(sk_n, epochs[6], 11).with_content_refs(vec![new_object.hash()]);
+        let mk_new = RevisionRecord::regular(sk_n, sk_n_epoch, 13)
+            .with_content_refs(vec![new_object.hash()]);
         medium
-            .append(&mk_n, std::slice::from_ref(&new_object), Some(sk_n))
+            .append(&mk_new, std::slice::from_ref(&new_object), Some(sk_n))
             .unwrap();
-        chain.push(mk_n.id());
-        epochs.push(epochs[6] + 1);
-        // The NEW audit (the correct manifest: the units carry the
-        // records' actual content references).
-        let ledger = ReclamationLedger {
-            mk: mk_n.id(),
-            sk: sk_n,
-            range_digest: new_meta.range_digest,
-            seed: new_meta.seed,
-            records: 2,
-            reclaimed_keys: 0,
-            journal_files: Vec::new(),
-            units: vec![
-                ReclaimUnit {
-                    record: p2n,
-                    objects: vec![object.hash()],
-                },
-                ReclaimUnit {
-                    record: sk_n,
-                    objects: vec![object.hash()],
-                },
-            ],
-        };
-        let (audit_n, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 12).unwrap();
-        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
-        push(&mut medium, &mut chain, &mut epochs); // MK_top (HEAD)
 
-        // THE RECLAIMED GAP: the OLD range is physically deleted
-        // (the previously executed retirement).
-        std::fs::remove_file(medium.object_path(&p2o)).unwrap();
-        std::fs::remove_file(medium.object_path(&sk_o)).unwrap();
+        // THE RECLAIMED GAP: the NEW range is physically deleted.
+        std::fs::remove_file(medium.object_path(&p2n)).unwrap();
+        std::fs::remove_file(medium.object_path(&sk_n)).unwrap();
 
-        // (A3) The verified pair — separated from HEAD by the
-        // reclaimed gap — authenticates: the descent crosses the
-        // authenticated gap under MK_o's covering skip table.
+        // (B2) The target pair — BELOW the gap — verifies: the
+        // descent from MK_new meets the absent SK_n, crosses via
+        // MK_new's self-skip to MK_o (the retained ancestor), and
+        // authenticates the exact audit and MK. The crossing was
+        // NECESSARY (the gap is physical).
         let (verified, metadata) =
-            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_n, &mk_n.id()).unwrap();
-        assert_eq!(verified.mk, mk_n.id());
-        assert_eq!(metadata.sk, sk_n);
-
-        // (A4) An audit whose units OMIT the records' actual content
-        // references refuses: publish a wrong-manifest audit over a
-        // SEPARATE checkpoint (the new HEAD-side range) — here,
-        // directly: the same fixture's verifier run against a
-        // hand-built wrong ledger via the marker path.
-        let mut wrong = ledger.clone();
-        wrong.units[0].objects = Vec::new();
-        // One audit per MK: craft the wrong-manifest record directly
-        // on disk (an installed audit-shaped record whose manifest
-        // disagrees with the record's references).
-        let wrong_bytes = wrong.canonical_bytes();
-        let wrong_object = StoredObject::new(wrong_bytes).unwrap();
-        let wrong_record =
-            RevisionRecord::regular(*chain.last().unwrap(), *epochs.last().unwrap(), 13)
-                .with_idempotency_key(crate::reclaim::reclamation_ledger_idempotency_key(
-                    &mk_n.id(),
-                ))
-                .with_content_refs(vec![wrong_object.hash()]);
-        let objects_dir = root.join("objects");
-        std::fs::write(
-            objects_dir.join(wrong_object.hash().hex()),
-            wrong_object.bytes(),
-        )
-        .unwrap();
-        std::fs::write(
-            objects_dir.join(wrong_record.id().hex()),
-            wrong_record.canonical_bytes(),
-        )
-        .unwrap();
-        // The wrong-manifest record is OFF-CHAIN (never appended) —
-        // the chain-membership check refuses it first; the on-chain
-        // correct audit still verifies (the gap crossing repeated).
-        assert!(
-            crate::reclaim::verify_canonical_v1_audit(&mut medium, &wrong_record.id(), &mk_n.id())
-                .is_err(),
-            "an off-chain wrong-manifest audit refuses"
-        );
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_o, &mk_o.id()).unwrap();
+        assert_eq!(verified.mk, mk_o.id());
+        assert_eq!(metadata.sk, r1);
+        assert_eq!(verified.units.len(), 1);
+        assert!(!medium.object_path(&sk_n).is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
