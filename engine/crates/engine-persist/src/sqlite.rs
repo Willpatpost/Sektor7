@@ -3564,4 +3564,179 @@ mod exclusion_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_historical_accounting_classifies_sqlite_failures_typed() {
+        // (P2-R2-H2, the SQLite provider) The historical accounting
+        // distinguishes the failure classes on the second provider:
+        // a CORRUPT object row under its original hash is NEVER
+        // accepted deletion evidence (the typed refusal propagates —
+        // never MissingObject); a fabricated later marker refuses
+        // the cascade; the multi-generation reopen verifies both
+        // genuine markers.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2has-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2has", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject]| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, refs.len() as u64 + 10)
+                .with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared));
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
+        let sk = step(&mut medium, std::slice::from_ref(&shared));
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            range_digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk.id(),
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        medium.reclaim(&directive).unwrap();
+        let (marker_id, _marker) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
+        // THE CORRUPT ROW under the deferred survivor's hash: the
+        // historical verification's deferred-presence read must
+        // propagate the typed integrity failure — never
+        // MissingObject, never accepted deletion evidence.
+        medium
+            .conn
+            .execute(
+                "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                params![b"corrupted-bytes".to_vec(), shared.hash().as_bytes()],
+            )
+            .unwrap();
+        let error = crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk.id())
+            .unwrap_err();
+        assert!(
+            !matches!(error, MediumError::MissingObject { .. }),
+            "the corruption is never classified as absence: {error:?}"
+        );
+        // Restore the authentic bytes; the marker verifies again.
+        medium
+            .conn
+            .execute(
+                "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                params![shared.bytes().to_vec(), shared.hash().as_bytes()],
+            )
+            .unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk.id()).unwrap();
+        // THE FABRICATED LATER MARKER (the wrong content, installed
+        // through the in-crate adversarial append): the cascade
+        // refuses — it never becomes attribution evidence.
+        let head = medium.head().unwrap().unwrap();
+        let parent_epoch = medium.read_record(&head).unwrap().epoch;
+        let wrong = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: mk.id(),
+            batch: 0,
+            source: audit,
+            mandatory_count: 42,
+            deferred: vec![shared.hash()],
+            journal_files: Vec::new(),
+        };
+        let object = StoredObject::new(wrong.canonical_bytes()).unwrap();
+        let record = RevisionRecord::regular(head, parent_epoch, 98)
+            .with_idempotency_key(crate::reclaim::reclamation_complete_idempotency_key(
+                &mk.id(),
+                Some(0),
+            ))
+            .with_content_refs(vec![object.hash()]);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        // THE DUPLICATE-KEY DISCIPLINE: the genuine marker already
+        // holds this checkpoint's deterministic completion key — the
+        // fabricated same-key record is refused at the append (no
+        // second marker can ever install; nothing is silently
+        // accepted).
+        let outcome = medium.append_admitted(admitted, Some(head)).unwrap_err();
+        assert!(
+            matches!(
+                outcome,
+                MediumError::Chain {
+                    rule: "duplicate-idempotency-key"
+                }
+            ),
+            "the fabricated same-key marker refuses: {outcome:?}"
+        );
+        // THE MULTI-GENERATION REOPEN: the genuine marker verifies
+        // after the fresh-process restart.
+        drop(medium);
+        let mut reopened = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_id, &mk.id()).unwrap();
+        reopened.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -31,7 +31,8 @@ use engine_persist::{
     read_journal_generations,
 };
 use engine_slice::crossing::{
-    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
+    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, ARM_RECLAIM_BEFORE_COMPLETION,
+    SessionCrossing, TransitionError,
 };
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
@@ -2270,4 +2271,252 @@ fn the_old_journals_retire_only_after_the_durability_is_recovered() {
         Ok(_) => panic!("a completed reclamation never repeats"),
     };
     assert_eq!(detail, "reclaim/nothing-eligible");
+}
+
+// --------------------------- the R4-L1 mid-flight convergence (the
+// review's required crossing-level crash/restart regression)
+
+/// The shared-object two-checkpoint campaign (the R4-L1 topology):
+/// the standard two-checkpoint flow with ONE injected record — after
+/// checkpoint 1 (the crossing dropped and recovered around the
+/// injection, so no stale medium handle survives it), a
+/// hand-appended regular record R_x referencing S1's own snapshot
+/// object. THE SHARING: checkpoint 1's retirement DEFERS the object
+/// (R_x, a survivor above that range, references it); checkpoint
+/// 2's retirement MANDATES it (R_x is a range member; nothing above
+/// references it). The deterministic campaign makes the identities
+/// reproducible across the child, the twin, and the parent.
+fn shared_object_campaign_at(
+    store: &Path,
+    journal_path: &Path,
+    campaign: &str,
+) -> (Hash, Hash, Hash) {
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(journal_path).unwrap();
+    let mut crossing = SessionCrossing::open(store, journal, campaign).unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm")
+    };
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    let report1 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the first checkpoint publishes");
+    let s1 = report1.range[report1.range.len() - 1];
+    drop(spine);
+    drop(director);
+    drop(crossing);
+    // THE INJECTION: R_x referencing S1's snapshot object (a fresh
+    // medium handle over the dropped crossing's store).
+    let s1_object = {
+        let mut medium = LocalFileMedium::open(store).unwrap();
+        let refs = medium.read_record(&s1).unwrap().content_refs;
+        let bytes = medium.read_object(&refs[0]).unwrap();
+        StoredObject::new(bytes).unwrap()
+    };
+    {
+        let mut medium = LocalFileMedium::open(store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r_x =
+            RevisionRecord::regular(head, epoch, 77).with_content_refs(vec![s1_object.hash()]);
+        let outcome = medium
+            .append(&r_x, std::slice::from_ref(&s1_object), Some(head))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+    }
+    // The second window + checkpoint 2 (the range now includes R_x).
+    let (mut spine, mut director, mut crossing) =
+        SessionCrossing::recover(store, journal_path, campaign)
+            .expect("the post-injection recovery works");
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let report2 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the second checkpoint publishes");
+    // The third checkpoint: the retention window's protected newest
+    // — with it, the maintenance scan (window 1) covers MK1 and MK2
+    // while MK3 stays protected, so retirement B is genuinely
+    // actionable.
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the third checkpoint publishes");
+    drop(spine);
+    drop(director);
+    drop(crossing);
+    (s1_object.hash(), report1.mk, report2.mk)
+}
+
+/// The R4-L1 child (the mid-flight real death): the shared-object
+/// campaign, retirement A completing WITH its marker (the normal
+/// flow), then retirement B under the armed before-completion seam —
+/// the process dies AFTER B's full destructive work (the shared
+/// object deleted) and BEFORE B's completion marker. The crash
+/// state: A's marker mid-flight-inconsistent, no B marker.
+#[test]
+fn pp_b3_reclaim_child_before_completion() {
+    let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal = std::env::var(RECLAIM_CHILD_JOURNAL_ENV).unwrap();
+    let (_s1_object, _mk1, _mk2) =
+        shared_object_campaign_at(Path::new(&store), Path::new(&journal), "child-mid-flight");
+    // Retirement A: the normal flow — the marker installed, the
+    // shared object DEFERRED (R_x above the range references it).
+    {
+        let (_spine, _director, mut crossing) =
+            SessionCrossing::recover(Path::new(&store), Path::new(&journal), "child-mid-flight")
+                .expect("the child's recovery works");
+        crossing
+            .reclaim_checkpoint(Path::new(&journal), 1)
+            .expect("retirement A completes with its marker");
+    }
+    // Retirement B: the armed seam dies after the work, before the
+    // marker.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(Path::new(&store), Path::new(&journal), "child-mid-flight")
+            .expect("the child's second recovery works");
+    ARM_RECLAIM_BEFORE_COMPLETION.store(true, Ordering::SeqCst);
+    crossing
+        .reclaim_checkpoint(Path::new(&journal), 1)
+        .expect("the child reaches the armed seam");
+    panic!("the armed seam must terminate the child before this point");
+}
+
+#[test]
+fn the_mid_flight_historical_marker_converges_through_the_real_crossing() {
+    // (R4-L1) THE AUTONOMOUS RECOVERY PROOF: a genuine child process
+    // dies in the mid-flight historical state (A's marker installed
+    // with the deferred shared object; B's execution deleted it; no
+    // B marker). The recovery runs the ORDINARY maintenance workflow
+    // — SessionCrossing::recover plus reclaim_checkpoint, NO manual
+    // complete_reclamation, no bypass of the crossing's selection —
+    // and must converge: B's completion marker installed through the
+    // crossing's own complete branch, A's historical marker verified
+    // after B is authenticated as complete, every retirement keeping
+    // its audit identity (no duplicate canonical consequence), and
+    // the campaign reopening and validating cleanly.
+    let dir = TestDir::new("death-before-completion");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_reclaim_child_before_completion"])
+        .env(RECLAIM_CHILD_STORE_ENV, dir.store())
+        .env(RECLAIM_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "the child died after B's destructive work, before B's completion marker"
+    );
+    // THE TWIN: the same deterministic campaign reclaimed cleanly —
+    // the identities (the shared object, the MKs) and the intended
+    // end state.
+    let twin = TestDir::new("death-before-completion-twin");
+    let (shared_object, mk1, mk2) =
+        shared_object_campaign_at(&twin.store(), &twin.journal(), "child-mid-flight");
+    {
+        let (_spine, _director, mut twin_crossing) =
+            SessionCrossing::recover(&twin.store(), &twin.journal(), "child-mid-flight")
+                .expect("the twin's recovery works");
+        twin_crossing
+            .reclaim_checkpoint(&twin.journal(), 1)
+            .expect("the twin's retirement A completes");
+        twin_crossing
+            .reclaim_checkpoint(&twin.journal(), 1)
+            .expect("the twin's retirement B completes");
+    }
+    // The crash state's durable facts: the shared object gone (B's
+    // execution), no B marker yet.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert!(
+            medium.read_object(&shared_object).is_err(),
+            "B's execution deleted the shared deferred object"
+        );
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, &mk2)
+                .unwrap()
+                .is_none(),
+            "B's completion marker is not yet installed"
+        );
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, &mk1)
+                .unwrap()
+                .is_some(),
+            "A's completion marker IS installed (the mid-flight one)"
+        );
+    }
+    // THE AUTONOMOUS RECOVERY: the ordinary maintenance — the
+    // crossing's own selection, ensure, and verification.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-mid-flight")
+            .expect("the post-crash recovery works");
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the maintenance call resolves the mid-flight state, got {other:?}"),
+        Ok(_) => panic!("an all-complete campaign never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+    drop(crossing);
+    // THE CONVERGENCE: B's marker installed (through the crossing's
+    // complete branch), A's historical marker VERIFIED after B is
+    // authenticated as complete (the mid-flight resolution), the
+    // audits intact, the chain validating, the campaign reopenable.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let (marker_b, _b) = engine_persist::reclaim::find_installed_completion(&mut medium, &mk2)
+            .unwrap()
+            .expect("B's completion marker was installed autonomously");
+        engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker_b, &mk2)
+            .expect("B's marker verifies");
+        let (marker_a, marker_a_content) =
+            engine_persist::reclaim::find_installed_completion(&mut medium, &mk1)
+                .unwrap()
+                .expect("A's completion marker is present");
+        engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1)
+            .expect("A's mid-flight historical marker verifies after B completed");
+        assert!(
+            marker_a_content.deferred.contains(&shared_object),
+            "A's marker carries the shared object as its deferred authorization record"
+        );
+        // The audits: exactly one ledger record per MK (the
+        // deterministic keys refuse duplicates structurally; the
+        // chain validates over the full gapped history).
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.checkpoints.len(),
+            3,
+            "all three checkpoints remain discoverable"
+        );
+        assert_eq!(
+            summary.reclaimed_records,
+            twin_summary_reclaimed(&twin),
+            "the same membership universe as the cleanly-reclaimed twin"
+        );
+    }
+    // THE REOPEN: the campaign recovers and validates again.
+    {
+        let (_spine, _director, _crossing) =
+            SessionCrossing::recover(&dir.store(), &dir.journal(), "child-mid-flight")
+                .expect("the post-convergence reopen works");
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium
+            .validate()
+            .expect("the full canonical history validates");
+    }
+    let _ = (mk1, mk2);
+}
+
+/// The twin's reclaimed-membership count (the comparison anchor).
+fn twin_summary_reclaimed(twin: &TestDir) -> u64 {
+    let mut medium = LocalFileMedium::open(twin.store()).unwrap();
+    medium.validate().unwrap().reclaimed_records
 }

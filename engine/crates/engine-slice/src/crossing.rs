@@ -2481,6 +2481,12 @@ impl<S: MediumSource> SessionCrossing<S> {
         // inside). The terminal evidence maintenance discovery
         // recognizes: a completed v1 retirement never reselects as
         // unfinished work.
+        // (test-only — see [`ARM_RECLAIM_BEFORE_COMPLETION`], the
+        // R4-L1 real-death evidence): the process dies AFTER the
+        // retirement's full destructive work and BEFORE its
+        // completion marker — the mid-flight historical state an
+        // EARLIER marker's verification must converge through.
+        reclaim_before_completion_seam();
         let _completion =
             engine_persist::reclaim::complete_reclamation(&mut medium, &ledger_id, &oldest_mk)
                 .map_err(PipelineError::Medium)?;
@@ -2956,6 +2962,25 @@ pub static ARM_RECLAIM_AFTER_MEDIUM: AtomicBool = AtomicBool::new(false);
 fn reclaim_after_medium_seam() {
     if ARM_RECLAIM_AFTER_MEDIUM.load(Ordering::Relaxed) {
         std::process::exit(12);
+    }
+}
+
+/// Test-only (the R4-L1 deterministic fault injection): when armed,
+/// the process terminates AFTER the retirement's destructive work
+/// (the medium reclamation, the journal retirement, the
+/// postconditions) and BEFORE the completion marker's publication —
+/// the exact mid-flight historical state (an EARLIER marker's
+/// deferred object deleted by THIS retirement, no marker yet for
+/// it) the crossing's autonomous recovery must converge through.
+/// Engine code never arms this; the static is process-local.
+#[doc(hidden)]
+pub static ARM_RECLAIM_BEFORE_COMPLETION: AtomicBool = AtomicBool::new(false);
+
+/// The before-completion seam's exit point (see
+/// [`ARM_RECLAIM_BEFORE_COMPLETION`]).
+fn reclaim_before_completion_seam() {
+    if ARM_RECLAIM_BEFORE_COMPLETION.load(Ordering::Relaxed) {
+        std::process::exit(13);
     }
 }
 
