@@ -4436,4 +4436,276 @@ mod exclusion_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_completion_unknown_and_duplicate_reconciliation_branches() {
+        // (T1, the final reconciliation evidence) The ACTUAL
+        // complete_reclamation control flow over a test-only
+        // CanonicalMedium wrapper (a real LocalFileMedium beneath —
+        // the authenticated audit and storage state are genuine;
+        // only the append/reconcile outcomes are injected):
+        // Unknown→Installed (the real append happened; the
+        // reconciliation discovers the installed candidate — the
+        // correct marker, no duplication); Unknown→NotInstalled (the
+        // retry proceeds through the correct admission and CAS —
+        // installed ONCE); Unknown→Unverifiable (the helper refuses
+        // without fabricating completion); and the duplicate key
+        // with MISMATCHING content (the discovery-and-exact-verify
+        // path refuses — the key's presence is never success).
+        enum Inject {
+            Installed,
+            NotInstalled,
+            Unverifiable,
+        }
+        struct UnknownMedium<'a> {
+            inner: &'a mut LocalFileMedium,
+            inject: Inject,
+            armed: bool,
+        }
+        impl CanonicalMedium for UnknownMedium<'_> {
+            fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+                self.inner.head()
+            }
+            fn append_admitted(
+                &mut self,
+                admitted: crate::medium::AdmittedAppend,
+                expected_parent: Option<Hash>,
+            ) -> Result<AppendOutcome, MediumError> {
+                if !self.armed {
+                    return self.inner.append_admitted(admitted, expected_parent);
+                }
+                self.armed = false;
+                match self.inject {
+                    Inject::Installed => {
+                        // The REAL append happens; the outcome is the
+                        // injected uncertain commit.
+                        self.inner.append_admitted(admitted, expected_parent)?;
+                        Ok(AppendOutcome::Unknown {
+                            reason: crate::medium::UnknownReason::CommitUncertain,
+                        })
+                    }
+                    Inject::NotInstalled => {
+                        // The append never happens; the retry must
+                        // proceed through the correct admission.
+                        Ok(AppendOutcome::Unknown {
+                            reason: crate::medium::UnknownReason::ObjectWriteFailed,
+                        })
+                    }
+                    Inject::Unverifiable => Ok(AppendOutcome::Unknown {
+                        reason: crate::medium::UnknownReason::HeadPublishFailed,
+                    }),
+                }
+            }
+            fn reconcile_unknown(
+                &mut self,
+                candidate: &Hash,
+            ) -> Result<crate::medium::Reconciliation, MediumError> {
+                match self.inject {
+                    Inject::Installed => self.inner.reconcile_unknown(candidate),
+                    Inject::NotInstalled => Ok(crate::medium::Reconciliation::NotInstalled {
+                        head: self.inner.head()?,
+                    }),
+                    Inject::Unverifiable => Ok(crate::medium::Reconciliation::Unverifiable {
+                        reason: "the injected uncertain outcome".to_owned(),
+                    }),
+                }
+            }
+            fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+                self.inner.read_record(id)
+            }
+            fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+                self.inner.read_object(hash)
+            }
+            fn validate(&mut self) -> Result<crate::medium::ChainSummary, MediumError> {
+                self.inner.validate()
+            }
+            fn durability_tier(&self) -> crate::medium::SyncTier {
+                self.inner.durability_tier()
+            }
+            fn reclaim(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+                self.inner.reclaim(directive)
+            }
+            fn reclaim_pending(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<bool, MediumError> {
+                self.inner.reclaim_pending(directive)
+            }
+        }
+        let marker_domain_records = |medium: &mut LocalFileMedium| -> usize {
+            // Count the completion-domain records on the chain.
+            let mut current = medium.head().unwrap().unwrap();
+            let mut count = 0usize;
+            loop {
+                let record = medium.read_record(&current).unwrap();
+                if let Some(object) = record.content_refs.first()
+                    && let Ok(bytes) = medium.read_object(object)
+                    && StoredObject::new(bytes)
+                        .map(|o| o.domain() == crate::reclaim::RECLAMATION_COMPLETE_DOMAIN)
+                        .unwrap_or(false)
+                {
+                    count += 1;
+                }
+                // The walk stops at the reclaimed gap — the
+                // markers all live above it.
+                match record.parent {
+                    Some(parent) if medium.read_record(&parent).is_ok() => current = parent,
+                    _ => break,
+                }
+            }
+            count
+        };
+        // (1) Unknown → Installed: the real append committed; the
+        // reconciliation discovers it; the helper returns the marker
+        // with NO duplication.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let (marker_id, marker) = {
+                let mut wrapper = UnknownMedium {
+                    inner: &mut medium,
+                    inject: Inject::Installed,
+                    armed: true,
+                };
+                crate::reclaim::complete_reclamation(&mut wrapper, &audit, &mk).unwrap()
+            };
+            assert_eq!(marker.kind, crate::reclaim::CompletionKind::Batch);
+            assert_eq!(marker.source, audit);
+            assert_eq!(
+                marker_domain_records(&mut medium),
+                1,
+                "exactly one completion marker — no duplication"
+            );
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (2) Unknown → NotInstalled: the retry proceeds through the
+        // correct admission and CAS; installed ONCE.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let (marker_id, marker) = {
+                let mut wrapper = UnknownMedium {
+                    inner: &mut medium,
+                    inject: Inject::NotInstalled,
+                    armed: true,
+                };
+                crate::reclaim::complete_reclamation(&mut wrapper, &audit, &mk).unwrap()
+            };
+            assert_eq!(marker.source, audit);
+            assert_eq!(
+                marker_domain_records(&mut medium),
+                1,
+                "the retry installed the marker exactly once"
+            );
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (3) Unknown → Unverifiable: the helper refuses without
+        // fabricating completion; nothing is installed.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let error = {
+                let mut wrapper = UnknownMedium {
+                    inner: &mut medium,
+                    inject: Inject::Unverifiable,
+                    armed: true,
+                };
+                crate::reclaim::complete_reclamation(&mut wrapper, &audit, &mk).unwrap_err()
+            };
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/unknown-unverifiable"
+                    }
+                ),
+                "the unverifiable outcome refuses: {error:?}"
+            );
+            assert_eq!(
+                marker_domain_records(&mut medium),
+                0,
+                "nothing was installed"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (4) The duplicate key with MISMATCHING content: the
+        // deterministic key is held by an adversarial wrong-content
+        // marker; the duplicate-resolution path discovers it, finds
+        // the content does not match the verified state, and REFUSES
+        // — the key's presence is never success.
+        {
+            let (root, mut medium, audit, mk, shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            // The adversarial wrong-content marker at the SAME
+            // deterministic key (the in-crate append — the corrupted-
+            // in-crate-path threat).
+            let head = medium.head().unwrap().unwrap();
+            let parent_epoch = medium.read_record(&head).unwrap().epoch;
+            let wrong = crate::reclaim::ReclamationComplete {
+                kind: crate::reclaim::CompletionKind::Batch,
+                mk,
+                batch: 0,
+                source: audit,
+                mandatory_count: 42,
+                deferred: vec![shared],
+                journal_files: Vec::new(),
+            };
+            let object = StoredObject::new(wrong.canonical_bytes()).unwrap();
+            let record = RevisionRecord::regular(head, parent_epoch, 97)
+                .with_idempotency_key(crate::reclaim::reclamation_complete_idempotency_key(
+                    &mk,
+                    Some(0),
+                ))
+                .with_content_refs(vec![object.hash()]);
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+            let outcome = medium.append_admitted(admitted, Some(head)).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            let error = crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/duplicate-content-mismatch"
+                    }
+                ),
+                "the mismatched duplicate refuses: {error:?}"
+            );
+            assert_eq!(
+                marker_domain_records(&mut medium),
+                1,
+                "no second marker — only the adversarial one stands, refused"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 }
