@@ -2183,6 +2183,34 @@ pub fn verify_reclamation_complete(
     Ok(marker)
 }
 
+/// The TEST-ONLY adversarial completion-marker install (the R4-L2/
+/// R4-L3 regressions): publishes a caller-constructed marker through
+/// the in-crate admitted append, BYPASSING the admission's state
+/// verification — exactly the corrupted-in-crate-path threat the
+/// consumer's independent verification must catch. COMPILE-TIME
+/// ISOLATED: exists only under the composite-test-fixture feature
+/// (never in a production build).
+#[cfg(feature = "composite-test-fixture")]
+#[doc(hidden)]
+pub fn test_only_install_completion_marker(
+    medium: &mut dyn CanonicalMedium,
+    marker: &ReclamationComplete,
+    tick: u64,
+) -> Result<Hash, MediumError> {
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let parent_epoch = medium.read_record(&head)?.epoch;
+    let key = reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch));
+    let object = StoredObject::new(marker.canonical_bytes())?;
+    let record = RevisionRecord::regular(head, parent_epoch, tick)
+        .with_idempotency_key(key)
+        .with_content_refs(vec![object.hash()]);
+    let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+    medium.append_admitted(admitted, Some(head))?;
+    Ok(record.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2176,6 +2176,8 @@ impl<S: MediumSource> SessionCrossing<S> {
                                         rule: "reclamation-complete/mandatory-count-mismatch"
                                     } | MediumError::Chain {
                                         rule: "reclamation-complete/deferred-mismatch"
+                                    } | MediumError::Chain {
+                                        rule: "reclamation-complete/later-marker-incoherent"
                                     }
                                 );
                                 if !accounting_class {

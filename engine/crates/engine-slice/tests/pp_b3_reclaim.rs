@@ -2515,6 +2515,568 @@ fn the_mid_flight_historical_marker_converges_through_the_real_crossing() {
     let _ = (mk1, mk2);
 }
 
+/// The multi-deferred campaign (the R4-L2 matrix): TWO shared
+/// objects — X1 (S1's snapshot object) deferred by retirement A1
+/// via the injected R_x1, X2 (S3's snapshot object) deferred by
+/// retirement A2 via the injected R_x2. Both injections sit above
+/// checkpoint 2 so retirement B (checkpoint 3's range) retires them
+/// — EXCEPT in the partial variant, where R_x2 sits above
+/// checkpoint 3 (the window range): B deletes X1 but never X2. The
+/// fourth checkpoint holds the retention window.
+fn multi_deferred_campaign_at(
+    store: &Path,
+    journal_path: &Path,
+    campaign: &str,
+    partial: bool,
+) -> (Hash, Hash, Hash, Hash, Hash) {
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(journal_path).unwrap();
+    let mut crossing = SessionCrossing::open(store, journal, campaign).unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the captures confirm")
+    };
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    let report1 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the first checkpoint publishes");
+    let s1 = report1.range[report1.range.len() - 1];
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let report2 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the second checkpoint publishes");
+    let s3 = report2.range[report2.range.len() - 1];
+    drop(spine);
+    drop(director);
+    drop(crossing);
+    let object_of = |record: Hash| -> StoredObject {
+        let mut medium = LocalFileMedium::open(store).unwrap();
+        let refs = medium.read_record(&record).unwrap().content_refs;
+        let bytes = medium.read_object(&refs[0]).unwrap();
+        StoredObject::new(bytes).unwrap()
+    };
+    let x1_object = object_of(s1);
+    let x2_object = object_of(s3);
+    {
+        let mut medium = LocalFileMedium::open(store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r_x1 =
+            RevisionRecord::regular(head, epoch, 77).with_content_refs(vec![x1_object.hash()]);
+        let outcome = medium
+            .append(&r_x1, std::slice::from_ref(&x1_object), Some(head))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+    }
+    if !partial {
+        // The full-resolution variant: R_x2 joins B's range.
+        let mut medium = LocalFileMedium::open(store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r_x2 =
+            RevisionRecord::regular(head, epoch, 78).with_content_refs(vec![x2_object.hash()]);
+        let outcome = medium
+            .append(&r_x2, std::slice::from_ref(&x2_object), Some(head))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+    }
+    let (mut spine, mut director, mut crossing) =
+        SessionCrossing::recover(store, journal_path, campaign)
+            .expect("the post-injection recovery works");
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    let report3 = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the third checkpoint publishes (retirement B's range)");
+    if partial {
+        // The partial variant: R_x2 sits ABOVE B's range (the window
+        // range) — B never deletes X2.
+        drop(spine);
+        drop(director);
+        drop(crossing);
+        {
+            let mut medium = LocalFileMedium::open(store).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let r_x2 =
+                RevisionRecord::regular(head, epoch, 78).with_content_refs(vec![x2_object.hash()]);
+            let outcome = medium
+                .append(&r_x2, std::slice::from_ref(&x2_object), Some(head))
+                .unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        }
+        let (mut spine, mut director, mut crossing) =
+            SessionCrossing::recover(store, journal_path, campaign)
+                .expect("the partial variant's recovery works");
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the fourth checkpoint publishes");
+        drop(spine);
+        drop(director);
+        drop(crossing);
+        return (
+            x1_object.hash(),
+            x2_object.hash(),
+            report1.mk,
+            report2.mk,
+            report3.mk,
+        );
+    }
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    run_ticks_near(&mut spine, &mut director, &near, 20);
+    crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the fourth checkpoint publishes");
+    drop(spine);
+    drop(director);
+    drop(crossing);
+    (
+        x1_object.hash(),
+        x2_object.hash(),
+        report1.mk,
+        report2.mk,
+        report3.mk,
+    )
+}
+
+/// The R4-L2 child (both variants): A1 and A2 complete with their
+/// markers, then B dies under the armed before-completion seam —
+/// BOTH historical markers go mid-flight in the full variant; X1
+/// alone in the partial variant.
+#[test]
+fn pp_b3_reclaim_child_multi_deferred() {
+    let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
+        return;
+    };
+    let journal = std::env::var(RECLAIM_CHILD_JOURNAL_ENV).unwrap();
+    let partial = std::env::var("S7_PP_B3_MULTI_PARTIAL").is_ok();
+    let (_x1, _x2, _mk1, _mk2, _mk3) = multi_deferred_campaign_at(
+        Path::new(&store),
+        Path::new(&journal),
+        "child-multi-deferred",
+        partial,
+    );
+    for _ in 0..2 {
+        let (_spine, _director, mut crossing) = SessionCrossing::recover(
+            Path::new(&store),
+            Path::new(&journal),
+            "child-multi-deferred",
+        )
+        .expect("the child's recovery works");
+        crossing
+            .reclaim_checkpoint(Path::new(&journal), 1)
+            .expect("the retirement completes with its marker");
+    }
+    let (_spine, _director, mut crossing) = SessionCrossing::recover(
+        Path::new(&store),
+        Path::new(&journal),
+        "child-multi-deferred",
+    )
+    .expect("the child's third recovery works");
+    ARM_RECLAIM_BEFORE_COMPLETION.store(true, Ordering::SeqCst);
+    crossing
+        .reclaim_checkpoint(Path::new(&journal), 1)
+        .expect("the child reaches the armed seam");
+    panic!("the armed seam must terminate the child before this point");
+}
+
+#[test]
+fn multiple_deferred_historical_markers_all_resolve_through_maintenance() {
+    // (R4-L2, Case A — full resolution) TWO independently deferred
+    // historical markers go mid-flight when B's execution deletes
+    // both shared objects; the ordinary maintenance (recover +
+    // reclaim_checkpoint, no manual completion) installs B's marker
+    // through the crossing's complete branch and BOTH deferred
+    // markers resolve at the end-of-pass revalidation; both verify
+    // after the fresh reopen.
+    let dir = TestDir::new("multi-deferred-full");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pp_b3_reclaim_child_multi_deferred"])
+        .env(RECLAIM_CHILD_STORE_ENV, dir.store())
+        .env(RECLAIM_CHILD_JOURNAL_ENV, dir.journal())
+        .status()
+        .expect("the child spawns");
+    assert_eq!(status.code(), Some(13));
+    let twin = TestDir::new("multi-deferred-full-twin");
+    let (x1, x2, mk1, mk2, mk3) = multi_deferred_campaign_at(
+        &twin.store(),
+        &twin.journal(),
+        "child-multi-deferred",
+        false,
+    );
+    for _ in 0..3 {
+        let (_spine, _director, mut twin_crossing) =
+            SessionCrossing::recover(&twin.store(), &twin.journal(), "child-multi-deferred")
+                .expect("the twin's recovery works");
+        twin_crossing
+            .reclaim_checkpoint(&twin.journal(), 1)
+            .expect("the twin's retirement completes");
+    }
+    // The crash state: both shared objects gone, no B marker.
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert!(medium.read_object(&x1).is_err());
+        assert!(medium.read_object(&x2).is_err());
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, &mk3)
+                .unwrap()
+                .is_none()
+        );
+    }
+    // THE AUTONOMOUS MAINTENANCE: both deferred markers resolve.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "child-multi-deferred")
+            .expect("the post-crash recovery works");
+    let detail = match crossing.reclaim_checkpoint(&dir.journal(), 1) {
+        Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+        Err(other) => panic!("the maintenance resolves both, got {other:?}"),
+        Ok(_) => panic!("an all-complete campaign never repeats"),
+    };
+    assert_eq!(detail, "reclaim/nothing-eligible");
+    drop(crossing);
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        for mk in [mk1, mk2, mk3] {
+            let (marker, _) = engine_persist::reclaim::find_installed_completion(&mut medium, &mk)
+                .unwrap()
+                .expect("the marker is installed");
+            engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker, &mk)
+                .unwrap();
+        }
+        let summary = medium.validate().unwrap();
+        let twin_summary = {
+            let mut twin_medium = LocalFileMedium::open(twin.store()).unwrap();
+            twin_medium.validate().unwrap()
+        };
+        assert_eq!(summary.checkpoints, twin_summary.checkpoints);
+        assert_eq!(summary.reclaimed_records, twin_summary.reclaimed_records);
+        assert_eq!(summary.reclaimed_keys, twin_summary.reclaimed_keys);
+    }
+    // The reopen.
+    {
+        let (_spine, _director, _crossing) =
+            SessionCrossing::recover(&dir.store(), &dir.journal(), "child-multi-deferred")
+                .expect("the post-convergence reopen works");
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.validate().expect("the canonical history validates");
+    }
+}
+
+#[test]
+fn multiple_deferred_historical_markers_partial_resolution_fails_closed() {
+    // (R4-L2 Case B + R4-L3) The partial resolution and the
+    // post-commit error in one campaign: A1 completes genuinely
+    // (its deferred X1 covered by B's range); A2's retirement
+    // executes at the medium level with a WRONG-content marker (the
+    // in-crate adversarial append — the genuinely unresolvable
+    // obligation); B is PENDING. The FIRST maintenance selects and
+    // COMMITS B (its audit, deletion, and marker — resolving A1's
+    // now-mid-flight marker) and then fails closed on A2's wrong
+    // marker — a post-commit error, not a rollback. The SECOND
+    // maintenance recognizes the committed work (no second audit or
+    // marker), resolves A1 through B's authenticated completion
+    // evidence, preserves and refuses A2's unresolvable marker, and
+    // reproduces the classification — no duplicate canonical effect.
+    let dir = TestDir::new("multi-deferred-partial");
+    let (x1, _x2, mk1, mk2, _mk3) =
+        multi_deferred_campaign_at(&dir.store(), &dir.journal(), "multi-deferred-partial", true);
+    // A1 completes genuinely through the crossing.
+    {
+        let (_spine, _director, mut crossing) =
+            SessionCrossing::recover(&dir.store(), &dir.journal(), "multi-deferred-partial")
+                .expect("A1's recovery works");
+        crossing
+            .reclaim_checkpoint(&dir.journal(), 1)
+            .expect("retirement A1 completes with its genuine marker");
+    }
+    // A2's retirement at the medium level with the WRONG-content
+    // marker (the unresolvable obligation).
+    let marker_a2 = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        let a2_mk = *summary.checkpoints.iter().rev().nth(1).unwrap();
+        assert_eq!(a2_mk, mk2);
+        let mk_record = medium.read_record(&a2_mk).unwrap();
+        let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+        let meta = engine_persist::checkpoint::CheckpointMetadata::decode(&meta_bytes).unwrap();
+        let mut indexed: Vec<&engine_persist::checkpoint::ReclaimedIndexEntry> =
+            meta.index.iter().collect();
+        indexed.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.epoch));
+        let mut units = Vec::new();
+        for entry in &indexed {
+            let record = medium.read_record(&entry.hash).unwrap();
+            units.push(engine_persist::reclaim::ReclaimUnit {
+                record: entry.hash,
+                objects: record.content_refs.clone(),
+            });
+        }
+        let ledger = engine_persist::reclaim::ReclamationLedger {
+            mk: a2_mk,
+            sk: meta.sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: meta.range_records,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units,
+        };
+        let head = medium.head().unwrap().unwrap();
+        let tick = medium.read_record(&head).unwrap().tick.saturating_add(1);
+        let (audit_a2, _) =
+            engine_persist::reclaim::publish_reclamation_ledger(&mut medium, &ledger, tick)
+                .unwrap();
+        medium
+            .reclaim(&engine_persist::reclaim::ReclaimDirective {
+                audit_record: audit_a2,
+                units: ledger.units.clone(),
+            })
+            .unwrap();
+        // The WRONG-content marker (the adversarial in-crate append).
+        let head = medium.head().unwrap().unwrap();
+        let parent_epoch = medium.read_record(&head).unwrap().epoch;
+        let wrong = engine_persist::reclaim::ReclamationComplete {
+            kind: engine_persist::reclaim::CompletionKind::Batch,
+            mk: a2_mk,
+            batch: 0,
+            source: audit_a2,
+            mandatory_count: 42,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let _ = head;
+        let _ = parent_epoch;
+        engine_persist::reclaim::test_only_install_completion_marker(&mut medium, &wrong, 98)
+            .unwrap()
+    };
+    // THE FIRST MAINTENANCE: B selected and COMMITTED; the
+    // post-commit error on A2's wrong marker.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "multi-deferred-partial")
+            .expect("the maintenance recovery works");
+    let error = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the unresolved A2 marker fails after B's commit");
+    drop(crossing);
+    let records_after_first = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.validate().unwrap().records
+    };
+    // THE SECOND MAINTENANCE: the committed work recognized, A1
+    // resolved through B's evidence, A2 preserved and refused.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "multi-deferred-partial")
+            .expect("the second maintenance recovery works");
+    let retry = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the unresolved obligation still fails closed");
+    drop(crossing);
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        // A1: the cascade's CONSERVATIVE POISONING — A2's wrong
+        // marker stands ABOVE A1's, so A1's historical verification
+        // refuses through the cascade (later-marker-incoherent)
+        // rather than trusting an unverified gap. This is the
+        // never-silent design: an unresolved obligation blocks the
+        // OLDER history fail-closed; it is never skipped, never
+        // silently accepted. (The resolved marker — B's, the newest
+        // — IS recognized below.)
+        let (marker_a1, _) = engine_persist::reclaim::find_installed_completion(&mut medium, &mk1)
+            .unwrap()
+            .expect("A1's marker is present");
+        let a1_error =
+            engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker_a1, &mk1)
+                .expect_err("A1's verification refuses through the poisoned cascade");
+        assert!(
+            matches!(
+                a1_error,
+                engine_persist::MediumError::Chain {
+                    rule: "reclamation-complete/later-marker-incoherent"
+                }
+            ),
+            "the poisoning is the typed cascade refusal: {a1_error:?}"
+        );
+        // A2 PRESERVED and REFUSED.
+        assert!(
+            engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker_a2, &mk2)
+                .is_err(),
+            "A2's wrong-content marker refuses"
+        );
+        // No duplicate canonical effect across the retries.
+        let after = medium.validate().unwrap().records;
+        assert_eq!(
+            records_after_first, after,
+            "no second audit or marker across the restarts"
+        );
+        assert_eq!(
+            format!("{retry:?}"),
+            format!("{error:?}"),
+            "the retry reproduces the classification"
+        );
+        let _ = x1;
+    }
+}
+
+#[test]
+fn the_post_publication_failure_restarts_idempotently() {
+    // (R4-L3) The post-commit error: retirement A completes at the
+    // medium level with a WRONG-content marker (the unresolvable
+    // obligation, installed through the feature-gated test-only
+    // adversarial helper); retirement B is PENDING. The maintenance
+    // SELECTS B, commits its full Phase B (the audit, the deletion,
+    // the completion marker), and THEN returns the integrity error —
+    // a post-commit error, not a rollback. The restart discovers the
+    // committed work (no second audit or marker, no further
+    // deletion), reproduces the classification, and A's unresolved
+    // obligation remains correctly refused.
+    let dir = TestDir::new("post-publication");
+    let (x, mk1) = {
+        let near = near_region_4();
+        let far = far_from_region_4();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(dir.journal()).unwrap();
+        let mut crossing =
+            SessionCrossing::open(&dir.store(), journal, "post-publication").unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the captures confirm")
+        };
+        durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+        run_ticks_near(&mut spine, &mut director, &near, 100);
+        let report1 = crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the first checkpoint publishes");
+        let s1 = report1.range[report1.range.len() - 1];
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the second checkpoint publishes");
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        run_ticks_near(&mut spine, &mut director, &near, 20);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the third checkpoint publishes (the window)");
+        drop(spine);
+        drop(director);
+        drop(crossing);
+        let x_object = {
+            let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+            let refs = medium.read_record(&s1).unwrap().content_refs;
+            let bytes = medium.read_object(&refs[0]).unwrap();
+            StoredObject::new(bytes).unwrap()
+        };
+        (x_object.hash(), report1.mk)
+    };
+    // Retirement A at the medium level with the WRONG-content marker.
+    let marker_a = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        let summary = medium.validate().unwrap();
+        let a_mk = *summary.checkpoints.last().unwrap();
+        assert_eq!(a_mk, mk1);
+        let mk_record = medium.read_record(&a_mk).unwrap();
+        let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+        let meta = engine_persist::checkpoint::CheckpointMetadata::decode(&meta_bytes).unwrap();
+        let mut indexed: Vec<&engine_persist::checkpoint::ReclaimedIndexEntry> =
+            meta.index.iter().collect();
+        indexed.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.epoch));
+        let mut units = Vec::new();
+        for entry in &indexed {
+            let record = medium.read_record(&entry.hash).unwrap();
+            units.push(engine_persist::reclaim::ReclaimUnit {
+                record: entry.hash,
+                objects: record.content_refs.clone(),
+            });
+        }
+        let ledger = engine_persist::reclaim::ReclamationLedger {
+            mk: a_mk,
+            sk: meta.sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: meta.range_records,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units,
+        };
+        let head = medium.head().unwrap().unwrap();
+        let tick = medium.read_record(&head).unwrap().tick.saturating_add(1);
+        let (audit_a, _) =
+            engine_persist::reclaim::publish_reclamation_ledger(&mut medium, &ledger, tick)
+                .unwrap();
+        medium
+            .reclaim(&engine_persist::reclaim::ReclaimDirective {
+                audit_record: audit_a,
+                units: ledger.units.clone(),
+            })
+            .unwrap();
+        let wrong = engine_persist::reclaim::ReclamationComplete {
+            kind: engine_persist::reclaim::CompletionKind::Batch,
+            mk: a_mk,
+            batch: 0,
+            source: audit_a,
+            mandatory_count: 42,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        engine_persist::reclaim::test_only_install_completion_marker(&mut medium, &wrong, 98)
+            .unwrap()
+    };
+    // THE FIRST MAINTENANCE: B selected and COMMITTED; the
+    // post-commit error on A's wrong marker.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "post-publication")
+            .expect("the maintenance recovery works");
+    let error = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the unresolved historical obligation fails after the commit");
+    drop(crossing);
+    let records_after_first = {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        medium.validate().unwrap().records
+    };
+    // THE RESTART: the committed work recognized, nothing duplicated.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "post-publication")
+            .expect("the restart recovery works");
+    let retry = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the restart reproduces the classification");
+    drop(crossing);
+    {
+        let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+        assert!(
+            engine_persist::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1)
+                .is_err(),
+            "A's unresolved marker refuses"
+        );
+        let after = medium.validate().unwrap().records;
+        assert_eq!(
+            records_after_first, after,
+            "no second audit or marker across the restart"
+        );
+        assert_eq!(
+            format!("{retry:?}"),
+            format!("{error:?}"),
+            "the restart reproduces the classification"
+        );
+        let _ = x;
+    }
+}
+
 /// The twin's reclaimed-membership count (the comparison anchor).
 fn twin_summary_reclaimed(twin: &TestDir) -> u64 {
     let mut medium = LocalFileMedium::open(twin.store()).unwrap();

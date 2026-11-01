@@ -3739,4 +3739,242 @@ mod exclusion_tests {
         reopened.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_sqlite_two_retirement_attribution_cascade_verifies_and_refuses() {
+        // (P2-R2-H1/H2, the genuine SQLite matrix) The two-retirement
+        // attribution: A defers the shared X (the later range's B1
+        // references it), B mandates and deletes it, both complete —
+        // A's historical marker verifies through B's AUTHENTICATED
+        // completion evidence, both verify after the fresh reopen.
+        // The adversarial variants: a fabricated later marker (a
+        // foreign MK with its own valid key — it INSTALLS and
+        // REACHES the cascade) refuses at its own source-audit
+        // authentication; a corrupted row resurrected at the deleted
+        // X's hash propagates the typed integrity failure through
+        // the accounting — never classified as absence.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2casc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let fobj = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"founding-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let x = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"the-shared-deferred-x");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2casc", 0)
+            .with_content_refs(vec![fobj.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&fobj), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        // A's range: A1(X) → SK1(fobj) → MK1 → auditA.
+        let a1 = step(&mut medium, std::slice::from_ref(&x), 1);
+        let sk1 = step(&mut medium, std::slice::from_ref(&fobj), 2);
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let a1_bytes = medium.read_record(&a1).unwrap().canonical_bytes();
+        let digest_a = crate::checkpoint::chain_range_digest(&seed, &[a1_bytes]);
+        let meta1 = CheckpointMetadata::new(
+            sk1,
+            a1,
+            vec![SkipEntry::new(Hash::ZERO, founding.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, a1, 1),
+                ReclaimedIndexEntry::new(None, sk1, 2),
+            ],
+            digest_a,
+            seed,
+        );
+        let meta1_object = StoredObject::new(meta1.canonical_bytes()).unwrap();
+        let mk1 = step(&mut medium, std::slice::from_ref(&meta1_object), 3);
+        let ledger_a = crate::reclaim::ReclamationLedger {
+            mk: mk1,
+            sk: sk1,
+            range_digest: digest_a,
+            seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk1,
+                    objects: vec![fobj.hash()],
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: a1,
+                    objects: vec![x.hash()],
+                },
+            ],
+        };
+        let (audit_a, _) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger_a, 4).unwrap();
+        // B's range: B1(X) → SK2(fobj) → MK2 → auditB.
+        let b1 = step(&mut medium, std::slice::from_ref(&x), 5);
+        let sk2 = step(&mut medium, std::slice::from_ref(&fobj), 6);
+        let b1_bytes = medium.read_record(&b1).unwrap().canonical_bytes();
+        let digest_b = crate::checkpoint::chain_range_digest(&seed, &[b1_bytes]);
+        let meta2 = CheckpointMetadata::new(
+            sk2,
+            b1,
+            vec![SkipEntry::new(Hash::ZERO, audit_a)],
+            vec![
+                ReclaimedIndexEntry::new(None, b1, 5),
+                ReclaimedIndexEntry::new(None, sk2, 6),
+            ],
+            digest_b,
+            seed,
+        );
+        let meta2_object = StoredObject::new(meta2.canonical_bytes()).unwrap();
+        let mk2 = step(&mut medium, std::slice::from_ref(&meta2_object), 7);
+        let ledger_b = crate::reclaim::ReclamationLedger {
+            mk: mk2,
+            sk: sk2,
+            range_digest: digest_b,
+            seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk2,
+                    objects: vec![fobj.hash()],
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: b1,
+                    objects: vec![x.hash()],
+                },
+            ],
+        };
+        let (audit_b, _) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+        // Both retirements execute and complete.
+        let directive_a = crate::reclaim::ReclaimDirective {
+            audit_record: audit_a,
+            units: ledger_a.units.clone(),
+        };
+        medium.reclaim(&directive_a).unwrap();
+        let (marker_a, marker_a_content) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit_a, &mk1).unwrap();
+        assert!(
+            marker_a_content.deferred.contains(&x.hash()),
+            "A defers the shared X (B1, a survivor above A, references it)"
+        );
+        let directive_b = crate::reclaim::ReclaimDirective {
+            audit_record: audit_b,
+            units: ledger_b.units.clone(),
+        };
+        medium.reclaim(&directive_b).unwrap();
+        let (marker_b, _) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit_b, &mk2).unwrap();
+        // A's historical marker verifies through B's authenticated
+        // completion evidence (the per-object accounting).
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_b, &mk2).unwrap();
+        // THE CORRUPTED ROW resurrected at the deleted X's hash: the
+        // accounting's absence read propagates the typed integrity
+        // failure — never classified as absence, never accepted
+        // deletion evidence.
+        medium
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+                params![
+                    x.hash().as_bytes().to_vec(),
+                    "sektor7/save/1",
+                    b"corrupted-resurrected".to_vec()
+                ],
+            )
+            .unwrap();
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::HashMismatch { .. } | MediumError::ReferencedObjectCorrupt { .. }
+            ),
+            "the corrupted resurrected row propagates the typed integrity failure: {error:?}"
+        );
+        // Remove the corrupted row: the genuine accounting resumes.
+        medium
+            .conn
+            .execute(
+                "DELETE FROM objects WHERE hash = ?1",
+                params![x.hash().as_bytes()],
+            )
+            .unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap();
+        // THE MULTI-GENERATION REOPEN: both markers verify after the
+        // fresh-process restart.
+        drop(medium);
+        let mut reopened = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_a, &mk1).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut reopened, &marker_b, &mk2).unwrap();
+        reopened.validate().unwrap();
+        drop(reopened);
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        // THE FABRICATED LATER MARKER — a FOREIGN MK with its own
+        // valid deterministic key: it INSTALLS (no duplicate) and
+        // REACHES the cascade, refusing at its own source-audit
+        // authentication (the audit's ledger is bound to MK2, not
+        // the foreign MK).
+        let foreign_mk = crate::hash::hash_object(b"the-fabricated-foreign-mk");
+        let head = medium.head().unwrap().unwrap();
+        let parent_epoch = medium.read_record(&head).unwrap().epoch;
+        let fabricated = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: foreign_mk,
+            batch: 0,
+            source: audit_b,
+            mandatory_count: 3,
+            deferred: vec![fobj.hash()],
+            journal_files: Vec::new(),
+        };
+        let object = StoredObject::new(fabricated.canonical_bytes()).unwrap();
+        let record = RevisionRecord::regular(head, parent_epoch, 98)
+            .with_idempotency_key(crate::reclaim::reclamation_complete_idempotency_key(
+                &foreign_mk,
+                Some(0),
+            ))
+            .with_content_refs(vec![object.hash()]);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        let outcome = medium.append_admitted(admitted, Some(head)).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-complete/mk-mismatch"
+                }
+            ),
+            "the fabricated foreign-MK later marker refuses at its own source-audit authentication: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
