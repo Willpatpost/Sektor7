@@ -1642,7 +1642,13 @@ impl CanonicalMedium for LocalFileMedium {
         let survivors = self.survivor_set_locked(head, &ledger)?;
         let partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
         for identity in &partition.mandatory {
-            if self.object_path(identity).is_file() {
+            // (E5) The normal-path probe matches the deletion
+            // discipline: hash-verify the bytes — a mismatched file
+            // at an audited name is PRESERVED evidence, never
+            // authenticated unfinished retirement (never pending).
+            if let Ok(bytes) = fs::read(self.object_path(identity))
+                && hash_object(&bytes) == *identity
+            {
                 return Ok(true);
             }
             for path in self.quarantine_family(identity)? {
@@ -1834,16 +1840,20 @@ impl LocalFileMedium {
     /// — the audit accounts for it; an absent SURVIVOR record fails
     /// the walk closed).
     fn reclaim_authorized_locked(
-        &self,
+        &mut self,
         directive: &crate::reclaim::ReclaimDirective,
     ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
         // (1-3) The authentication and the directive cross-check.
-        let (ledger, _metadata, head) = self.authenticate_audit_locked(&directive.audit_record)?;
+        let (ledger, metadata, head) = self.authenticate_audit_locked(&directive.audit_record)?;
         if ledger.units != directive.units {
             return Err(MediumError::Chain {
                 rule: "reclaim/directive-units-mismatch",
             });
         }
+        // (E2) The newest-first retirement order: the persisted unit
+        // sequence must be strictly descending by indexed epoch —
+        // the provider never trusts the caller's construction.
+        crate::reclaim::verify_newest_first_order(&ledger.units, &metadata)?;
         // (4) The manifest reread with the resume tolerance: a
         // PRESENT retiring record's objects must equal its actual
         // content references; an ABSENT one is the protocol-accounted
@@ -1860,10 +1870,55 @@ impl LocalFileMedium {
                 }
             }
         }
-        // (5) The survivor partition under the same boundary.
-        let survivors = self.survivor_set_locked(head, &ledger)?;
+        // (5) The survivor partition under the same boundary — and
+        // the E1 range commitments: the founding-derived seed
+        // (ALWAYS verifiable — the founding is permanent) and, on
+        // the FIRST execution (every range publication present),
+        // the recomputed range digest over the canonical bytes (a
+        // fabricated-but-matching stored commitment refuses; the
+        // interrupted resume with absent publications trusts the
+        // durable audit — the ratified recovery contract).
+        let (_summary, simulated) =
+            self.cold_walk_excluding(head, &ledger.units.iter().map(|unit| unit.record).collect())?;
+        crate::reclaim::verify_founding_seed(&metadata, &simulated.founding)?;
+        let all_present = ledger
+            .units
+            .iter()
+            .all(|unit| unit.record == ledger.sk || self.object_path(&unit.record).is_file());
+        if all_present {
+            let mut digest_members: Vec<(u64, Hash)> = ledger
+                .units
+                .iter()
+                .filter(|unit| unit.record != ledger.sk)
+                .filter_map(|unit| {
+                    metadata
+                        .index
+                        .iter()
+                        .find(|e| e.hash == unit.record)
+                        .map(|e| (e.epoch, unit.record))
+                })
+                .collect();
+            digest_members.sort_unstable_by_key(|(epoch, _)| *epoch);
+            let mut range_bytes = Vec::with_capacity(digest_members.len());
+            for (_, record) in digest_members {
+                range_bytes.push(self.load_object(&record)?);
+            }
+            let recomputed = crate::checkpoint::chain_range_digest(&metadata.seed, &range_bytes);
+            if recomputed != ledger.range_digest {
+                return Err(MediumError::Chain {
+                    rule: "reclaim/range-digest-mismatch",
+                });
+            }
+        }
+        let survivors = simulated.reachable;
         let mut partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
         let mut removed = 0u64;
+        // (E4) The cursor lifecycle: once the mutation phase begins,
+        // the pre-retirement cursor is NEVER authoritative — the
+        // invalidation precedes pass 1 (an interrupted mutation
+        // leaves the safe invalidated state; the next operation
+        // rebuilds via the authenticated walk).
+        self.cursor = None;
         // (6) PASS 1 — the retiring records, newest-first (the
         // ledger's unit order — the crossing's Phase A collection
         // order; never the index's hash order), idempotent. The
@@ -2698,6 +2753,13 @@ mod exclusion_tests {
             .unwrap();
         let head = medium.head().unwrap().unwrap();
         let epoch = medium.read_record(&head).unwrap().epoch;
+        // The E1 authentic commitments: the seed derives from the
+        // campaign founding; the range digest is COMPUTED over the
+        // retiring publications' canonical bytes (the Phase A
+        // discipline). The E2 order: the units run NEWEST-first
+        // (SK, then R1 — descending epoch).
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1.canonical_bytes()]);
         let meta = CheckpointMetadata::new(
             sk.id(),
             r1.id(),
@@ -2706,8 +2768,8 @@ mod exclusion_tests {
                 ReclaimedIndexEntry::new(None, r1.id(), 2),
                 ReclaimedIndexEntry::new(None, sk.id(), 3),
             ],
-            [1; 32],
-            [2; 32],
+            range_digest,
+            seed,
         );
         let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
         let mk =
@@ -2730,12 +2792,12 @@ mod exclusion_tests {
             journal_files: Vec::new(),
             units: vec![
                 ReclaimUnit {
-                    record: r1.id(),
-                    objects: r1_refs,
-                },
-                ReclaimUnit {
                     record: sk.id(),
                     objects: sk_refs,
+                },
+                ReclaimUnit {
+                    record: r1.id(),
+                    objects: r1_refs,
                 },
             ],
         };
@@ -2852,5 +2914,198 @@ mod exclusion_tests {
         assert!(!medium.reclaim_pending(&directive).unwrap());
         medium.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_fabricated_range_commitments_and_wrong_order_refuse() {
+        // (E1) The equal-but-FABRICATED stored commitments: the
+        // metadata and the ledger carry the SAME wrong digest (the
+        // seed correctly founding-derived) — the provider RECOMPUTES
+        // the range digest over the canonical bytes and refuses
+        // before any deletion. (E2) The oldest-first unit order
+        // refuses. (E4) The post-retirement append works WITHOUT a
+        // manual validate (the cursor invalidation rebuilds).
+        // A parameterized fixture: the digest commitment and the
+        // unit order are the two knobs (the on-chain records and the
+        // metadata are immutable, so the fabricated commitments live
+        // in a store built with them from the start).
+        let build = |digest_override: Option<[u8; 32]>, order_oldest_first: bool| {
+            let root = temp_store(match (&digest_override, order_oldest_first) {
+                (Some(_), _) => "fabricated-digest",
+                (None, true) => "oldest-first",
+                _ => "legitimate",
+            });
+            let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+            let shared = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"shared-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let private = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"private-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2e", 0)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&p1, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let r1 = RevisionRecord::regular(head, epoch, 2)
+                .with_content_refs(vec![shared.hash(), private.hash()]);
+            medium
+                .append(&r1, &[shared.clone(), private.clone()], Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let sk = RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&sk, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+            let real_digest = crate::checkpoint::chain_range_digest(&seed, &[r1.canonical_bytes()]);
+            let digest = digest_override.unwrap_or(real_digest);
+            let meta = CheckpointMetadata::new(
+                sk.id(),
+                r1.id(),
+                vec![SkipEntry::new(Hash::ZERO, p1.id())],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1.id(), 2),
+                    ReclaimedIndexEntry::new(None, sk.id(), 3),
+                ],
+                digest,
+                seed,
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let mk = RevisionRecord::regular(sk.id(), epoch, 4)
+                .with_content_refs(vec![meta_object.hash()]);
+            medium
+                .append(&mk, std::slice::from_ref(&meta_object), Some(sk.id()))
+                .unwrap();
+            let r1_refs = medium.read_record(&r1.id()).unwrap().content_refs.clone();
+            let sk_refs = medium.read_record(&sk.id()).unwrap().content_refs.clone();
+            let mut units = vec![
+                ReclaimUnit {
+                    record: sk.id(),
+                    objects: sk_refs,
+                },
+                ReclaimUnit {
+                    record: r1.id(),
+                    objects: r1_refs,
+                },
+            ];
+            if order_oldest_first {
+                units.reverse();
+            }
+            let ledger = ReclamationLedger {
+                mk: mk.id(),
+                sk: sk.id(),
+                range_digest: digest,
+                seed,
+                records: 2,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units,
+            };
+            let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            (root, medium, audit, mk.id(), shared.hash(), private.hash())
+        };
+
+        // (E1) The fabricated digest (equal in the metadata and the
+        // ledger, the seed correct): the recomputation refuses;
+        // nothing deleted.
+        {
+            let (root, mut medium, audit, mk, _shared, private) = build(Some([9; 32]), false);
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclaim/range-digest-mismatch"
+                    }
+                ),
+                "the fabricated digest refuses: {error:?}"
+            );
+            assert!(
+                medium.object_path(&private).is_file(),
+                "nothing was deleted"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (E2) The oldest-first unit order: the order check refuses.
+        {
+            let (root, mut medium, audit, mk, _shared, private) = build(None, true);
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclaim/unit-order-not-newest-first"
+                    }
+                ),
+                "the oldest-first order refuses: {error:?}"
+            );
+            assert!(
+                medium.object_path(&private).is_file(),
+                "nothing was deleted"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (E4) The legitimate execution + the append WITHOUT a
+        // manual validate: the cursor invalidation rebuilds.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = build(None, false);
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            // NO validate() call — the immediate append must use the
+            // rebuilt post-retirement state.
+            let object = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"post-retirement-no-validate");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record =
+                RevisionRecord::regular(head, epoch, 10).with_content_refs(vec![object.hash()]);
+            let outcome = medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

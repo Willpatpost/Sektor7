@@ -988,7 +988,14 @@ impl CanonicalMedium for SqliteMedium {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| sqlite_err("begin reclaim transaction", e))?;
-        let outcome = reclaim_authorized_tx(&tx, directive)?;
+        let outcome = reclaim_authorized_tx(&tx, directive);
+        // (E4) The cursor lifecycle: the mutation phase was reached —
+        // the pre-retirement cursor is never authoritative afterward
+        // (a rollback leaves nothing deleted, but the invalidated
+        // state is uniformly safe; the next operation rebuilds via
+        // the authenticated walk).
+        self.cursor = None;
+        let outcome = outcome?;
         tx.commit()
             .map_err(|e| sqlite_err("commit reclaim transaction", e))?;
         Ok(outcome)
@@ -1011,12 +1018,14 @@ fn reclaim_authorized_tx(
     tx: &rusqlite::Transaction<'_>,
     directive: &crate::reclaim::ReclaimDirective,
 ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
-    let (ledger, _metadata, head) = authenticate_audit_tx(tx, &directive.audit_record)?;
+    let (ledger, metadata, head) = authenticate_audit_tx(tx, &directive.audit_record)?;
     if ledger.units != directive.units {
         return Err(MediumError::Chain {
             rule: "reclaim/directive-units-mismatch",
         });
     }
+    // (E2) The newest-first retirement order.
+    crate::reclaim::verify_newest_first_order(&ledger.units, &metadata)?;
     // The manifest reread with the resume tolerance (the records-
     // table read; an absent retiring record is the protocol-
     // accounted resume).
@@ -1031,9 +1040,45 @@ fn reclaim_authorized_tx(
             }
         }
     }
-    // The survivor partition under the same transaction.
+    // The survivor partition under the same transaction — and the
+    // E1 range commitments: the founding-derived seed (always
+    // verifiable) and, on the FIRST execution (every range
+    // publication present), the recomputed range digest.
     let exclusion: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
     let walked = walk_chain_excluding(tx, head, &exclusion)?;
+    crate::reclaim::verify_founding_seed(&metadata, &walked.cursor.founding)?;
+    let mut all_present = true;
+    for unit in &ledger.units {
+        if unit.record != ledger.sk && !record_exists(tx, &unit.record)? {
+            all_present = false;
+            break;
+        }
+    }
+    if all_present {
+        let mut digest_members: Vec<(u64, Hash)> = ledger
+            .units
+            .iter()
+            .filter(|unit| unit.record != ledger.sk)
+            .filter_map(|unit| {
+                metadata
+                    .index
+                    .iter()
+                    .find(|e| e.hash == unit.record)
+                    .map(|e| (e.epoch, unit.record))
+            })
+            .collect();
+        digest_members.sort_unstable_by_key(|(epoch, _)| *epoch);
+        let mut range_bytes = Vec::with_capacity(digest_members.len());
+        for (_, record) in digest_members {
+            range_bytes.push(load_record_verified(tx, &record)?);
+        }
+        let recomputed = crate::checkpoint::chain_range_digest(&metadata.seed, &range_bytes);
+        if recomputed != ledger.range_digest {
+            return Err(MediumError::Chain {
+                rule: "reclaim/range-digest-mismatch",
+            });
+        }
+    }
     let survivors = walked.cursor.reachable;
     let mut partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
     let mut removed = 0u64;
@@ -1049,10 +1094,28 @@ fn reclaim_authorized_tx(
         removed += count as u64;
     }
     // PASS 2 — the deduplicated MANDATORY objects only (the deferred
-    // identities never touched); the row deletion is the audited
-    // identity's own (the hash-verified reads during the
-    // authentication established the integrity).
+    // identities never touched). (E3) The content-integrity
+    // verification: each PRESENT row's stored bytes are read and
+    // hash-verified INSIDE the transaction before deletion — a
+    // corrupted row under an audited hash is PRESERVED evidence
+    // (the typed integrity refusal rolls the whole transaction
+    // back); an absent row is the resume (already reclaimed).
     for identity in &partition.mandatory {
+        let bytes: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT bytes FROM objects WHERE hash = ?1",
+                params![identity.as_bytes()],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(no_rows_as_none)
+            .map_err(|e| sqlite_err("probe object before delete", e))?;
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        if hash_object(&bytes) != *identity {
+            return Err(MediumError::ReferencedObjectCorrupt { hash: *identity });
+        }
         let count = tx
             .execute(
                 "DELETE FROM objects WHERE hash = ?1",
@@ -2989,6 +3052,10 @@ mod exclusion_tests {
         let _p1 = step(&mut medium, std::slice::from_ref(&shared));
         let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
         let sk = step(&mut medium, std::slice::from_ref(&shared));
+        // The E1 authentic commitments + the E2 newest-first order.
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
         let meta = CheckpointMetadata::new(
             sk,
             r1,
@@ -2997,8 +3064,8 @@ mod exclusion_tests {
                 ReclaimedIndexEntry::new(None, r1, 2),
                 ReclaimedIndexEntry::new(None, sk, 3),
             ],
-            [1; 32],
-            [2; 32],
+            range_digest,
+            seed,
         );
         let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
         let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
@@ -3017,12 +3084,12 @@ mod exclusion_tests {
             journal_files: Vec::new(),
             units: vec![
                 crate::reclaim::ReclaimUnit {
-                    record: r1,
-                    objects: r1_refs,
-                },
-                crate::reclaim::ReclaimUnit {
                     record: sk,
                     objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
                 },
             ],
         };
@@ -3069,6 +3136,157 @@ mod exclusion_tests {
         assert_eq!(shared_present, 1, "the shared object survives");
         assert!(!medium.reclaim_pending(&directive).unwrap());
         medium.validate().unwrap();
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_corrupted_object_row_refuses_and_rolls_back_on_sqlite() {
+        // (E3) The object pass reads and HASH-VERIFIES each present
+        // row's bytes before the DELETE: a corrupted row at the
+        // audited hash key (the bytes no longer hash to the key)
+        // refuses with the TYPED ReferencedObjectCorrupt and the
+        // single BEGIN IMMEDIATE transaction rolls back — NOTHING
+        // deleted, both tables unchanged. Restoring the authentic
+        // bytes lets the same directive execute successfully.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2cor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2cor", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject]| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, refs.len() as u64 + 10)
+                .with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared));
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
+        let sk = step(&mut medium, std::slice::from_ref(&shared));
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            range_digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk.id(),
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let exists = |medium: &SqliteMedium, table: &str, id: Hash| -> i64 {
+            medium
+                .conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE hash = ?1)"),
+                    params![id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        // Corrupt the private object's stored bytes — the hash KEY
+        // stays, the bytes no longer hash to it.
+        medium
+            .conn
+            .execute(
+                "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                params![b"corrupted-bytes".to_vec(), private.hash().as_bytes()],
+            )
+            .unwrap();
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(error, MediumError::ReferencedObjectCorrupt { .. }),
+            "the typed corruption refusal: {error:?}"
+        );
+        // The full rollback: the retiring records AND the corrupted
+        // object row are all still present.
+        assert_eq!(exists(&medium, "records", r1), 1);
+        assert_eq!(exists(&medium, "records", sk), 1);
+        assert_eq!(exists(&medium, "objects", private.hash()), 1);
+        // Restore the authentic bytes and re-run the SAME directive:
+        // the execution succeeds.
+        medium
+            .conn
+            .execute(
+                "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                params![private.bytes().to_vec(), private.hash().as_bytes()],
+            )
+            .unwrap();
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert_eq!(outcome.deferred, vec![shared.hash()]);
+        for id in [private.hash(), r1, sk] {
+            assert_eq!(
+                exists(&medium, "records", id) + exists(&medium, "objects", id),
+                0
+            );
+        }
+        assert_eq!(exists(&medium, "objects", shared.hash()), 1);
+        assert!(!medium.reclaim_pending(&directive).unwrap());
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }

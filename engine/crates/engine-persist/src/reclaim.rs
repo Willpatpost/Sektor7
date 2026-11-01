@@ -941,6 +941,54 @@ pub fn partition_reclaim(
     })
 }
 
+/// The E2 retirement-order verification: the persisted unit
+/// sequence must be strictly DESCENDING by indexed epoch (the
+/// newest-first retirement order — the crossing's Phase A
+/// collection order). The provider never trusts the caller's
+/// construction: an oldest-first or unsorted ledger refuses before
+/// any mutation (the interrupted-prefix recovery property depends
+/// on the order).
+pub fn verify_newest_first_order(
+    units: &[ReclaimUnit],
+    metadata: &crate::checkpoint::CheckpointMetadata,
+) -> Result<(), MediumError> {
+    let mut previous: Option<u64> = None;
+    for unit in units {
+        let Some(entry) = metadata.index.iter().find(|e| e.hash == unit.record) else {
+            return Err(MediumError::Chain {
+                rule: "reclaim/unit-not-indexed",
+            });
+        };
+        if let Some(previous_epoch) = previous
+            && entry.epoch >= previous_epoch
+        {
+            return Err(MediumError::Chain {
+                rule: "reclaim/unit-order-not-newest-first",
+            });
+        }
+        previous = Some(entry.epoch);
+    }
+    Ok(())
+}
+
+/// The E1 founding-derived seed verification: the checkpoint's
+/// stored seed must equal `compute_digest_seed(founding)` — the
+/// campaign's permanent founding identity (never reclaimed; the
+/// check is computable on BOTH the first execution and the resume).
+/// A fabricated seed value refuses.
+pub fn verify_founding_seed(
+    metadata: &crate::checkpoint::CheckpointMetadata,
+    founding: &Hash,
+) -> Result<(), MediumError> {
+    let expected = crate::checkpoint::compute_digest_seed(founding);
+    if metadata.seed != expected {
+        return Err(MediumError::Chain {
+            rule: "reclaim/seed-not-founding-derived",
+        });
+    }
+    Ok(())
+}
+
 /// Publishes the completion marker revision: a regular revision
 /// whose single content object is the marker, keyed
 /// deterministically by the marker's KIND (the batch form by the MK
