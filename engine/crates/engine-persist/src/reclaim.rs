@@ -1520,10 +1520,15 @@ pub fn verify_installed_v1_audit(
 
 /// The trait-level survivor object set: the gap-aware cold walk
 /// from the authoritative HEAD to the founding, EXCLUDING the
-/// retiring records — every content object reachable from the
-/// surviving chain (the partition input for the completion
-/// verification; the same discipline as the providers' internal
-/// walks, expressed over the public hash-verified reads).
+/// retiring records — the partition input for the completion
+/// verification. The closure is PARITY-EXACT with the providers'
+/// authenticated exclusion walks (P2-R3): every walked record's
+/// identity, every content object it references, AND the VERIFIED
+/// transitive composite closure — a surviving /2 snapshot root's
+/// chunks are reachable through its manifest (each dependency
+/// hash-verified and envelope-verified against its manifest entry
+/// before it joins the set; a missing, corrupt, or malformed chunk
+/// fails the walk closed).
 pub fn survivor_objects(
     medium: &mut dyn CanonicalMedium,
     exclusion: &std::collections::BTreeSet<Hash>,
@@ -1537,19 +1542,44 @@ pub fn survivor_objects(
     for _ in 0..MAX_DESCENT {
         let record = medium.read_record(&current)?;
         if !exclusion.contains(&current) {
-            for object in &record.content_refs {
-                reachable.insert(*object);
+            reachable.insert(current);
+            for reference in &record.content_refs {
+                let bytes = medium.read_object(reference)?;
+                reachable.insert(*reference);
+                // The composite-closure expansion: a record whose
+                // first reference is a /2 snapshot manifest carries
+                // its chunks transitively — the same verified
+                // semantics as the providers' walks.
+                if reference == record.content_refs.first().unwrap()
+                    && StoredObject::new(bytes.clone())?.domain()
+                        == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
+                {
+                    let manifest =
+                        crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                    for entry in &manifest.entries {
+                        let chunk_bytes = medium.read_object(&entry.identity)?;
+                        crate::composite_append::verify_chunk_dependency(
+                            &chunk_bytes,
+                            &entry.identity,
+                            &manifest,
+                        )
+                        .map_err(|_error| MediumError::Chain {
+                            rule: "composite-closure-verification",
+                        })?;
+                        reachable.insert(entry.identity);
+                    }
+                }
             }
-        }
-        if let Some(object) = record.content_refs.first().copied() {
-            let bytes = medium.read_object(&object)?;
-            if StoredObject::new(bytes.clone())?.domain()
-                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
-            {
-                skip_table = Some(
-                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
-                        .map_err(MediumError::Format)?,
-                );
+            if let Some(object) = record.content_refs.first().copied() {
+                let bytes = medium.read_object(&object)?;
+                if StoredObject::new(bytes.clone())?.domain()
+                    == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+                {
+                    skip_table = Some(
+                        crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                            .map_err(MediumError::Format)?,
+                    );
+                }
             }
         }
         let Some(parent) = record.parent else {
@@ -1638,6 +1668,24 @@ pub fn verify_completion_state(
 /// reconciled; the duplicate deterministic key resolved by
 /// discovering and EXACTLY verifying the installed marker — never
 /// inferring success from the key alone).
+///
+/// (P2-R4) The completion-publication coordination: the marker's
+/// LIVE certified claims — every retiring record absent, every
+/// mandatory identity absent — are STABLE under every legal
+/// concurrent storage operation (the only mutations are deletions
+/// by authenticated reclamation; a deletion never falsifies an
+/// absence claim), so the multi-read verification sequence plus the
+/// CAS append cannot publish a marker whose live claims are false
+/// at installation, even when another maintenance operation runs
+/// without HEAD advancement. The deferred list is the batch's
+/// AUTHORIZATION record (what this audit classified as shared and
+/// authorized to preserve): its admission-time presence check
+/// either passes on a consistent observation or fails closed
+/// (retryable — the retry recomputes against the then-current
+/// state); a concurrent later authorized retirement that consumes a
+/// deferred object does not falsify the authorization, and the
+/// consumer's later-evidence relaxation recognizes exactly that
+/// case.
 pub fn complete_reclamation(
     medium: &mut dyn CanonicalMedium,
     source: &Hash,
@@ -1801,19 +1849,94 @@ pub fn find_installed_completion(
 }
 
 /// The trusted completion consumer: the read-side authority for
-/// maintenance and discovery decisions. Establishes the marker's
-/// STRUCTURAL authority — the record's deterministic key, the
-/// strict decode, the v1 boundary gates (Batch kind, batch zero),
-/// and the source audit authenticated in the recovery-safe form.
-/// The marker's certified STATE was verified at admission (only the
-/// in-crate admission can install this domain); a marker-shaped
-/// object without actual completion authority cannot present this
-/// keyed, MK-bound, canonical-audit-sourced form.
+/// maintenance and discovery decisions. (P2-R2) The verification is
+/// INDEPENDENT of the writer's honesty: (1) CANONICAL MEMBERSHIP —
+/// the marker revision must be ENCOUNTERED on the authoritative
+/// HEAD ancestry (a hash-valid, keyed, correctly-sourced marker
+/// that is not installed on the chain is not terminal evidence);
+/// the same descent observes whether any LATER reclamation evidence
+/// (an audit or a completion marker) stands above this marker —
+/// the only mechanism that can shrink the survivor closure; (2) the
+/// structural authority — the record's deterministic key, the
+/// strict decode, the v1 boundary gates; (3) the recovery-safe
+/// source-audit authentication; (4) the SEMANTIC RECHECK against
+/// the live state — the retiring records absent (stable under every
+/// legal concurrent operation) and, when this marker is the NEWEST
+/// reclamation evidence, the FULL obligation equality (the
+/// recomputed partition, the mandatory-count, the deferred set,
+/// every mandatory identity absent, every deferred identity
+/// present); when later reclamation evidence exists, the
+/// deletion-side obligations are checked in their SUPerset form
+/// (every recomputed-mandatory identity absent — a later authorized
+/// retirement may have legitimately consumed an object this batch
+/// deferred, so the deferred-presence and set-equality observations
+/// are not stable across later retirements and are not live
+/// claims).
 pub fn verify_reclamation_complete(
     medium: &mut dyn CanonicalMedium,
     marker_record: &Hash,
     mk: &Hash,
 ) -> Result<ReclamationComplete, MediumError> {
+    // (1) The membership descent: walk the authoritative ancestry
+    // until the marker record is encountered; observe any later
+    // reclamation evidence above it.
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut later_reclamation = false;
+    let mut installed = false;
+    for _ in 0..MAX_DESCENT {
+        if current == *marker_record {
+            installed = true;
+            break;
+        }
+        let record = medium.read_record(&current)?;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            let domain = StoredObject::new(bytes.clone())?.domain().to_owned();
+            if domain == RECLAMATION_LEDGER_DOMAIN || domain == RECLAMATION_COMPLETE_DOMAIN {
+                later_reclamation = true;
+            } else if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            break;
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if !installed {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/marker-not-installed",
+        });
+    }
+    // (2) The structural authority.
     let record = medium.read_record(marker_record)?;
     let Some(object) = record.content_refs.first().copied() else {
         return Err(MediumError::Chain {
@@ -1843,9 +1966,65 @@ pub fn verify_reclamation_complete(
             rule: "reclamation-complete/marker-key-mismatch",
         });
     }
-    // The source audit's authority in the recovery-safe form: the
-    // completed retirement's records are absent by construction.
-    verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    // (3) The source audit's authority in the recovery-safe form:
+    // the completed retirement's records are absent by construction.
+    let (ledger, _metadata) = verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    // (4) The semantic recheck. The retiring records absent (the
+    // records-table read — the cross-provider interface) is the
+    // stable live claim; the full obligation equality applies when
+    // this marker is the newest reclamation evidence; the superset
+    // deletion-side check applies when later evidence stands above.
+    for unit in &ledger.units {
+        match medium.read_record(&unit.record) {
+            Err(MediumError::MissingObject { .. }) => {}
+            Ok(_) => {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/record-still-present",
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let exclusion: std::collections::BTreeSet<Hash> =
+        ledger.units.iter().map(|unit| unit.record).collect();
+    let survivors = survivor_objects(medium, &exclusion)?;
+    let partition = partition_reclaim(&ledger.units, &survivors)?;
+    for identity in &partition.mandatory {
+        match medium.read_object(identity) {
+            Err(MediumError::MissingObject { .. }) => {}
+            Ok(_) => {
+                return Err(MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-residue",
+                });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if !later_reclamation {
+        if marker.mandatory_count != partition.mandatory.len() as u64 {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/mandatory-count-mismatch",
+            });
+        }
+        if marker
+            .deferred
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<Hash>>()
+            != partition
+                .deferred
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<Hash>>()
+        {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/deferred-mismatch",
+            });
+        }
+        for identity in &partition.deferred {
+            medium.read_object(identity)?;
+        }
+    }
     Ok(marker)
 }
 

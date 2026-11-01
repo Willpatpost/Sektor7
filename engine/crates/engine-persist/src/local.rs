@@ -3446,4 +3446,533 @@ mod exclusion_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_completion_consumer_independently_verifies_terminal_authority() {
+        // (P2-R2) The reader's verification is INDEPENDENT of the
+        // writer's honesty: a hash-valid, keyed, correctly-sourced
+        // marker that is NOT on the authoritative ancestry refuses;
+        // an ON-CHAIN marker whose certified count or deferred set
+        // disagrees with the recomputed obligations refuses; a
+        // marker over an unexecuted retirement refuses. The
+        // adversarial on-chain installs use the in-crate admitted
+        // append directly — exactly the bypass a corrupted in-crate
+        // path would represent.
+        let install =
+            |medium: &mut LocalFileMedium, marker: &crate::reclaim::ReclamationComplete| -> Hash {
+                let head = medium.head().unwrap().unwrap();
+                let parent_epoch = medium.read_record(&head).unwrap().epoch;
+                let key = crate::reclaim::reclamation_complete_idempotency_key(
+                    &marker.mk,
+                    Some(marker.batch),
+                );
+                let object = StoredObject::new(marker.canonical_bytes()).unwrap();
+                let record = RevisionRecord::regular(head, parent_epoch, 99)
+                    .with_idempotency_key(key)
+                    .with_content_refs(vec![object.hash()]);
+                let admitted =
+                    crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+                let outcome = medium.append_admitted(admitted, Some(head)).unwrap();
+                assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+                record.id()
+            };
+        // (1) The wrong-count marker ON the chain: the consumer's
+        // strict newest-evidence recheck refuses.
+        {
+            let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let wrong = crate::reclaim::ReclamationComplete {
+                kind: crate::reclaim::CompletionKind::Batch,
+                mk,
+                batch: 0,
+                source: audit,
+                mandatory_count: 9,
+                deferred: vec![shared],
+                journal_files: Vec::new(),
+            };
+            let marker_id = install(&mut medium, &wrong);
+            let error = crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/mandatory-count-mismatch"
+                    }
+                ),
+                "the wrong count refuses: {error:?}"
+            );
+            let _ = (private, shared);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (2) The wrong-deferred marker ON the chain.
+        {
+            let (root, mut medium, audit, mk, _shared, private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let wrong = crate::reclaim::ReclamationComplete {
+                kind: crate::reclaim::CompletionKind::Batch,
+                mk,
+                batch: 0,
+                source: audit,
+                mandatory_count: 3,
+                deferred: vec![private],
+                journal_files: Vec::new(),
+            };
+            let marker_id = install(&mut medium, &wrong);
+            let error = crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/deferred-mismatch"
+                    }
+                ),
+                "the wrong deferred set refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (3) The marker over an UNEXECUTED retirement: the
+        // record-still-present refusal.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let marker = crate::reclaim::ReclamationComplete {
+                kind: crate::reclaim::CompletionKind::Batch,
+                mk,
+                batch: 0,
+                source: audit,
+                mandatory_count: 3,
+                deferred: Vec::new(),
+                journal_files: Vec::new(),
+            };
+            let marker_id = install(&mut medium, &marker);
+            let error = crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/record-still-present"
+                    }
+                ),
+                "the uncertified completion refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (4) The OFF-CHAIN marker: hash-valid, keyed, correctly
+        // sourced — but hand-written into the object namespace, never
+        // appended: the membership descent never encounters it.
+        {
+            let (root, mut medium, audit, mk, shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            medium.reclaim(&directive).unwrap();
+            let (marker_id, marker) =
+                crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap();
+            // The off-chain variant: a DIFFERENT record (a different
+            // parent/tick) carrying the same marker object — written
+            // directly into the object namespace, never appended.
+            let head = medium.head().unwrap().unwrap();
+            let parent_epoch = medium.read_record(&head).unwrap().epoch;
+            let object = StoredObject::new(marker.canonical_bytes()).unwrap();
+            let off_chain = RevisionRecord::regular(head, parent_epoch, 123)
+                .with_idempotency_key(crate::reclaim::reclamation_complete_idempotency_key(
+                    &mk,
+                    Some(0),
+                ))
+                .with_content_refs(vec![object.hash()]);
+            std::fs::write(medium.object_path(&object.hash()), object.bytes()).unwrap();
+            std::fs::write(
+                medium.object_path(&off_chain.id()),
+                off_chain.canonical_bytes(),
+            )
+            .unwrap();
+            let error =
+                crate::reclaim::verify_reclamation_complete(&mut medium, &off_chain.id(), &mk)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-complete/marker-not-installed"
+                    }
+                ),
+                "the off-chain marker refuses: {error:?}"
+            );
+            // The legitimate installed marker still verifies.
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap();
+            let _ = shared;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    #[cfg(feature = "composite-test-fixture")]
+    fn the_composite_survivor_closure_is_parity_exact() {
+        // (P2-R3) The completion verification's survivor closure is
+        // PARITY-EXACT with the provider's authenticated exclusion
+        // walk: a surviving /2 snapshot root references a chunk
+        // through its verified manifest; a retiring record directly
+        // references the SAME chunk. The provider classifies it
+        // Deferred (preserved); the trait-level completion walk must
+        // agree — the marker records it deferred and the completion
+        // does not refuse over the legitimately preserved chunk.
+        crate::composite_append::test_enable_composite_publication();
+        let root = temp_store("r3-composite");
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        // The full-grammar manifest fixture (the known-valid section
+        // structure); the LEDGER TAIL chunk is the shared dependency
+        // the retiring record also references.
+        let mut seed = 3u8;
+        let mut entries = Vec::new();
+        let mut chunks = Vec::new();
+        for tag in [
+            crate::composite_manifest::TAG_HEADER,
+            crate::composite_manifest::TAG_NEAR,
+            crate::composite_manifest::TAG_FAR,
+            crate::composite_manifest::TAG_BLOCKED,
+            crate::composite_manifest::TAG_HELD,
+            crate::composite_manifest::TAG_LEDGER_META,
+        ] {
+            let payload = vec![seed; 10 + seed as usize];
+            seed = seed.wrapping_add(1);
+            let object = crate::composite_manifest::encode_chunk_envelope(tag, &payload);
+            entries.push(crate::composite_manifest::ManifestEntry {
+                tag,
+                identity: object.hash(),
+                payload_length: payload.len() as u64,
+                kind: crate::composite_manifest::SectionKind::Singleton,
+            });
+            chunks.push(object);
+        }
+        let sealed_width = 4u64 * 31;
+        for _ in 0..2 {
+            let payload = vec![seed; sealed_width as usize];
+            seed = seed.wrapping_add(1);
+            let object = crate::composite_manifest::encode_chunk_envelope(
+                crate::composite_manifest::TAG_LEDGER_RECORDS,
+                &payload,
+            );
+            entries.push(crate::composite_manifest::ManifestEntry {
+                tag: crate::composite_manifest::TAG_LEDGER_RECORDS,
+                identity: object.hash(),
+                payload_length: sealed_width,
+                kind: crate::composite_manifest::SectionKind::LedgerSealed,
+            });
+            chunks.push(object);
+        }
+        let tail_payload = vec![seed; 2 * 31];
+        let shared_chunk = crate::composite_manifest::encode_chunk_envelope(
+            crate::composite_manifest::TAG_LEDGER_RECORDS,
+            &tail_payload,
+        );
+        entries.push(crate::composite_manifest::ManifestEntry {
+            tag: crate::composite_manifest::TAG_LEDGER_RECORDS,
+            identity: shared_chunk.hash(),
+            payload_length: tail_payload.len() as u64,
+            kind: crate::composite_manifest::SectionKind::LedgerTail,
+        });
+        for tag in [
+            crate::composite_manifest::TAG_WORLD,
+            crate::composite_manifest::TAG_DIRECTOR,
+        ] {
+            let payload = vec![seed; 10 + seed as usize];
+            seed = seed.wrapping_add(1);
+            let object = crate::composite_manifest::encode_chunk_envelope(tag, &payload);
+            entries.push(crate::composite_manifest::ManifestEntry {
+                tag,
+                identity: object.hash(),
+                payload_length: payload.len() as u64,
+                kind: crate::composite_manifest::SectionKind::Singleton,
+            });
+            chunks.push(object);
+        }
+        let manifest = crate::composite_manifest::CompositeManifest {
+            history_kind: crate::composite_manifest::HistoryKind::Full,
+            ledger_boundary: 4,
+            composed_length: entries.iter().map(|entry| entry.payload_length).sum(),
+            entries,
+        };
+        let snapshot_root =
+            StoredObject::new(crate::composite_manifest::encode(&manifest)).unwrap();
+        // The chain: F(shared) → R1(the shared chunk as its content
+        // object) → SK(shared) → MK → SNAPSHOT (the root-only
+        // composite record reusing the shared chunk).
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"plain-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2r3", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 =
+            RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared_chunk.hash()]);
+        medium
+            .append(&r1, std::slice::from_ref(&shared_chunk), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&plain), Some(head))
+            .unwrap();
+        let seed_value = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1.id()).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed_value, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r1.id(),
+            vec![SkipEntry::new(Hash::ZERO, founding.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, r1.id(), 2),
+                ReclaimedIndexEntry::new(None, sk.id(), 3),
+            ],
+            range_digest,
+            seed_value,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk =
+            RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        // The composite snapshot ABOVE the checkpoint, reusing the
+        // shared chunk (published by R1).
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let snap =
+            RevisionRecord::regular(head, epoch, 4).with_content_refs(vec![snapshot_root.hash()]);
+        let reused_identity = shared_chunk.hash();
+        let request = crate::composite_append::CompositeAppend {
+            record: &snap,
+            root: &snapshot_root,
+            new_chunks: &chunks,
+            reused_chunks: std::slice::from_ref(&reused_identity),
+        };
+        let outcome = medium.append_composite(&request, Some(head)).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // The audit over the retirement index.
+        let r1_refs = vec![shared_chunk.hash()];
+        let sk_refs = vec![plain.hash()];
+        let ledger = ReclamationLedger {
+            mk: mk.id(),
+            sk: sk.id(),
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: sk.id(),
+                    objects: sk_refs,
+                },
+                ReclaimUnit {
+                    record: r1.id(),
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        // The provider's execution: the shared chunk is DEFERRED (a
+        // survivor through the snapshot's verified manifest) and
+        // physically PRESERVED.
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert!(
+            outcome.deferred.contains(&shared_chunk.hash()),
+            "the provider classifies the shared chunk deferred"
+        );
+        assert!(medium.object_path(&shared_chunk.hash()).is_file());
+        // The completion: the trait-level closure agrees — the
+        // marker records the shared chunk deferred, the mandatory-
+        // empty check does not refuse over the preserved chunk.
+        let (marker_id, marker) =
+            crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
+        assert!(
+            marker.deferred.contains(&shared_chunk.hash()),
+            "the completion walk classifies the shared chunk deferred (parity)"
+        );
+        crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk.id()).unwrap();
+        assert!(medium.object_path(&shared_chunk.hash()).is_file());
+        medium.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    #[ignore = "P2-R1: the proper-prefix recovery-authority ambiguity — the owner decision pending (the three options in the delivery report); this test demonstrates the current prefix-shaped trust; the assertion flips to refusal when the owner ratifies Option A or C"]
+    fn a_fabricated_audit_with_a_proper_prefix_absence_proceeds_pending_the_owner_decision() {
+        // (P2-R1) The review's counterexample: the units newest-first
+        // [SK, R3, R2, R1] with R1..R3 digest-covered; the storage
+        // loses the PROPER prefix {SK, R3} (the shape a genuine
+        // mid-pass-1 interruption leaves); the installed audit
+        // carries MATCHING FABRICATED digest values (equal in the
+        // metadata and the ledger, the seed founding-derived). The
+        // provider accepts the prefix shape, all_present is false
+        // (R3 absent) so the range digest is never recomputed, and
+        // the deletion proceeds on the unverified audit. The
+        // existing durable v1 evidence CANNOT distinguish this from
+        // a genuine interruption — the owner decision (Options A/B/
+        // C) is pending; until then this test documents the
+        // ambiguity rather than ratifying it.
+        let root = temp_store("r1-proper-prefix");
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2r1", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&p1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        // The three digest-covered range publications plus the SK.
+        let mut range_records = Vec::new();
+        for tick in 2..=4u64 {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs = if tick == 3 {
+                vec![shared.hash(), private.hash()]
+            } else {
+                vec![shared.hash()]
+            };
+            let objects: Vec<StoredObject> = if tick == 3 {
+                vec![shared.clone(), private.clone()]
+            } else {
+                vec![shared.clone()]
+            };
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, &objects, Some(head)).unwrap();
+            range_records.push(record);
+        }
+        let [r1, r2, r3] = [
+            range_records[0].id(),
+            range_records[1].id(),
+            range_records[2].id(),
+        ];
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 5).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let member_bytes: Vec<Vec<u8>> = [r1, r2, r3]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let _real_digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let fabricated = [9; 32];
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, p1.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, r2, 3),
+                ReclaimedIndexEntry::new(None, r3, 4),
+                ReclaimedIndexEntry::new(None, sk.id(), 5),
+            ],
+            fabricated,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk =
+            RevisionRecord::regular(head, epoch, 6).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        let mut refs_of = |id: Hash| medium.read_record(&id).unwrap().content_refs.clone();
+        let ledger = ReclamationLedger {
+            mk: mk.id(),
+            sk: sk.id(),
+            range_digest: fabricated,
+            seed,
+            records: 4,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: sk.id(),
+                    objects: refs_of(sk.id()),
+                },
+                ReclaimUnit {
+                    record: r3,
+                    objects: refs_of(r3),
+                },
+                ReclaimUnit {
+                    record: r2,
+                    objects: refs_of(r2),
+                },
+                ReclaimUnit {
+                    record: r1,
+                    objects: refs_of(r1),
+                },
+            ],
+        };
+        let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 7).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // The proper-prefix loss: SK and R3 gone, R2 and R1 present.
+        std::fs::remove_file(medium.object_path(&sk.id())).unwrap();
+        std::fs::remove_file(medium.object_path(&r3)).unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        // The CURRENT behavior (the ambiguity): the deletion
+        // PROCEEDS on the unverified audit — the digest was never
+        // recomputed (R3 absent). This assertion flips to a typed
+        // refusal when the owner ratifies Option A (strict
+        // fail-closed) or Option C (new durable evidence).
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert!(outcome.removed >= 2, "the deletion proceeded");
+        assert!(!medium.object_path(&r2).is_file());
+        assert!(!medium.object_path(&private.hash()).is_file());
+        assert!(medium.object_path(&shared.hash()).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
