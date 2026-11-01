@@ -35,8 +35,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use engine_persist::{
-    AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ObjectClass, ReclaimUnit,
-    Reconciliation, RevisionRecord, StoredObject, SyncTier, UnknownReason,
+    AppendOutcome, CanonicalMedium, ChainSummary, Hash, MediumError, ObjectClass, Reconciliation,
+    RevisionRecord, StoredObject, SyncTier, UnknownReason,
 };
 
 use crate::store::{MediumSource, SessionStore, StoreLocation};
@@ -84,10 +84,10 @@ pub enum MediumOp {
         candidate: Hash,
     },
     Reclaim {
-        units: Vec<ReclaimUnit>,
+        directive: engine_persist::ReclaimDirective,
     },
     ReclaimPending {
-        units: Vec<ReclaimUnit>,
+        directive: engine_persist::ReclaimDirective,
     },
     Checkpoint,
     /// The maintenance FIFO barrier (PP-B4 checkpoint 4): a no-op
@@ -107,7 +107,7 @@ pub enum WorkerReply {
     ClassifyObject(ObjectClass),
     Validate(ChainSummary),
     Reconcile(Reconciliation),
-    Reclaim(u64),
+    Reclaim(engine_persist::ReclaimOutcome),
     ReclaimPending(bool),
     Checkpoint,
     /// A queued job was canceled before it started (the optional-
@@ -509,9 +509,9 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
         MediumOp::ReconcileUnknown { candidate } => store
             .reconcile_unknown(&candidate)
             .map(WorkerReply::Reconcile),
-        MediumOp::Reclaim { units } => store.reclaim(&units).map(WorkerReply::Reclaim),
-        MediumOp::ReclaimPending { units } => store
-            .reclaim_pending(&units)
+        MediumOp::Reclaim { directive } => store.reclaim(&directive).map(WorkerReply::Reclaim),
+        MediumOp::ReclaimPending { directive } => store
+            .reclaim_pending(&directive)
             .map(WorkerReply::ReclaimPending),
         MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
         MediumOp::Barrier => Ok(WorkerReply::Barrier),
@@ -680,18 +680,24 @@ impl CanonicalMedium for WorkerMedium {
         self.tier
     }
 
-    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
+    fn reclaim(
+        &mut self,
+        directive: &engine_persist::ReclaimDirective,
+    ) -> Result<engine_persist::ReclaimOutcome, MediumError> {
         match self.request(MediumOp::Reclaim {
-            units: units.to_vec(),
+            directive: directive.clone(),
         })? {
             WorkerReply::Reclaim(count) => Ok(count),
             other => unreachable!("the reclaim request returned {other:?}"),
         }
     }
 
-    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
+    fn reclaim_pending(
+        &mut self,
+        directive: &engine_persist::ReclaimDirective,
+    ) -> Result<bool, MediumError> {
         match self.request(MediumOp::ReclaimPending {
-            units: units.to_vec(),
+            directive: directive.clone(),
         })? {
             WorkerReply::ReclaimPending(pending) => Ok(pending),
             other => unreachable!("the reclaim-pending request returned {other:?}"),

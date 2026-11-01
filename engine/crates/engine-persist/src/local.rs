@@ -74,7 +74,6 @@ use crate::medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, Reconciliation, StoredObject,
     SyncTier, UnknownReason,
 };
-use crate::reclaim::ReclaimUnit;
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 
 /// The HEAD pointer's domain (a persisted wire format; visible to
@@ -1318,97 +1317,6 @@ impl LocalFileMedium {
         }
     }
 
-    /// Phase B's delete half (PP-B3, the review corrective F4):
-    /// remove each AUDITED unit — the record object and its
-    /// referenced content objects — from the reclamation ledger's
-    /// manifest, never a re-read of a possibly-absent record (an
-    /// interrupted deletion converges on the retry instead of
-    /// orphaning content). Idempotent (absent files are already
-    /// reclaimed, never errors); the eligibility was verified and
-    /// audited BEFORE this call (Phase A); bytes are never rewritten.
-    /// A unit's content objects that the v1.4 sweep QUARANTINED after
-    /// an interrupted deletion are removed from the quarantine too —
-    /// the audit authorizes their removal wherever they are, so the
-    /// retry converges on the intended storage state rather than
-    /// persisting orphaned evidence. Returns the count of files
-    /// removed by this call.
-    fn reclaim_units_locked(&self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
-        let quarantine_dir = self.root.join(QUARANTINE_DIR);
-        let mut removed = 0u64;
-        for (index, unit) in units.iter().enumerate() {
-            let record_path = self.object_path(&unit.record);
-            if record_path.is_file() {
-                fs::remove_file(&record_path)
-                    .map_err(|e| io_err("reclaim record", &record_path, e))?;
-                removed += 1;
-            }
-            // The genuine mid-unit crash seam (test-only — see
-            // [`ARM_RECLAIM_MID_UNIT`]): the record object IS removed;
-            // its referenced content objects never run — the exact
-            // orphaning window the audited manifest closes on the
-            // retry.
-            reclaim_mid_unit_seam();
-            // The genuine last-unit crash seam (test-only — see
-            // [`ARM_RECLAIM_LAST_UNIT`], the review corrective R1's
-            // real-kill evidence): the LAST indexed record is removed
-            // while its referenced content objects have not run —
-            // record presence alone would then misclassify the
-            // reclamation as complete.
-            if index + 1 == units.len() {
-                reclaim_last_unit_seam();
-            }
-            for object in &unit.objects {
-                let object_path = self.object_path(object);
-                if object_path.is_file() {
-                    fs::remove_file(&object_path)
-                        .map_err(|e| io_err("reclaim object", &object_path, e))?;
-                    removed += 1;
-                }
-                let quarantined = quarantine_dir.join(object.hex());
-                if quarantined.is_file() {
-                    fs::remove_file(&quarantined)
-                        .map_err(|e| io_err("reclaim quarantined object", &quarantined, e))?;
-                    removed += 1;
-                }
-                let reason = quarantine_dir.join(format!("{}.reason", object.hex()));
-                if reason.is_file() {
-                    fs::remove_file(&reason)
-                        .map_err(|e| io_err("reclaim quarantine reason", &reason, e))?;
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
-    }
-
-    /// The whole-manifest completion probe (the review corrective
-    /// R1): any remaining audited byte — a unit's record file, a
-    /// referenced content object in place, or a copy the orphan
-    /// sweep moved into quarantine (with its reason file) — means
-    /// the reclamation is NOT complete, however many record files
-    /// are already gone. Read-only, lock-free (existence checks
-    /// against the same paths [`Self::reclaim_units_locked`]
-    /// removes).
-    fn reclaim_pending_locked(&self, units: &[ReclaimUnit]) -> bool {
-        let quarantine_dir = self.root.join(QUARANTINE_DIR);
-        for unit in units {
-            if self.object_path(&unit.record).is_file() {
-                return true;
-            }
-            for object in &unit.objects {
-                if self.object_path(object).is_file()
-                    || quarantine_dir.join(object.hex()).is_file()
-                    || quarantine_dir
-                        .join(format!("{}.reason", object.hex()))
-                        .is_file()
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     // ---------------------------------------------------- orphan protocol
 
     /// Moves an object into quarantine with its bytes and a reason
@@ -1702,15 +1610,337 @@ impl CanonicalMedium for LocalFileMedium {
         self.platform_tier
     }
 
-    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
+    fn reclaim(
+        &mut self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+        // THE TRUSTED BOUNDARY (K2-C2B P2): the exclusive HEAD.lock
+        // covers the authentication, the partition, and the
+        // deletion — no authoritative state can change between the
+        // decision and its destructive consequences. The
+        // capture-then-unlock discipline: no early return leaks the
+        // lock.
         self.lock()?;
-        let removed = self.reclaim_units_locked(units);
+        let outcome = self.reclaim_authorized_locked(directive);
         let _ = self.unlock();
-        removed
+        outcome
     }
 
-    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
-        Ok(self.reclaim_pending_locked(units))
+    fn reclaim_pending(
+        &mut self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<bool, MediumError> {
+        // The Mandatory-only probe: the same authentication and
+        // partition (lock-free — the advisory read), the mandatory
+        // identities across their authenticated storage forms.
+        let (ledger, _metadata, head) = self.authenticate_audit_locked(&directive.audit_record)?;
+        if ledger.units != directive.units {
+            return Err(MediumError::Chain {
+                rule: "reclaim/directive-units-mismatch",
+            });
+        }
+        let survivors = self.survivor_set_locked(head, &ledger)?;
+        let partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
+        for identity in &partition.mandatory {
+            if self.object_path(identity).is_file() {
+                return Ok(true);
+            }
+            for path in self.quarantine_family(identity)? {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.ends_with(".reason") {
+                    continue;
+                }
+                if path.is_file() {
+                    let bytes = fs::read(&path)
+                        .map_err(|e| io_err("probe quarantined evidence", &path, e))?;
+                    if hash_object(&bytes) == *identity {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The trusted reclamation internals (K2-C2B P2) — all under the
+/// already-held HEAD.lock, all using the INTERNAL hash-verified
+/// read primitives (the public reads' own lock/unlock pairs would
+/// break this boundary).
+impl LocalFileMedium {
+    /// The canonical audit authentication under the boundary: the
+    /// gap-aware descent from the authoritative HEAD over the
+    /// internal reads — the exact audit identity (the hash-verified
+    /// load BY identity), the MK derived from the decoded ledger,
+    /// the deterministic key, the requested MK's metadata bound by
+    /// revision identity, the SK/digest/seed bindings, and the exact
+    /// units-vs-index membership. The RECOVERY-SAFE form: the
+    /// per-unit manifest reread is NOT here (the main flow applies
+    /// it with the resume tolerance — an absent retiring record is
+    /// accounted for by the durable audit).
+    fn authenticate_audit_locked(
+        &self,
+        audit_record: &Hash,
+    ) -> Result<(crate::reclaim::ReclamationLedger, CheckpointMetadata, Hash), MediumError> {
+        const MAX_DESCENT: u64 = 1 << 20;
+        let mut current = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let head = current;
+        let mut ledger: Option<crate::reclaim::ReclamationLedger> = None;
+        let mut metadata: Option<CheckpointMetadata> = None;
+        let mut skip_table: Option<CheckpointMetadata> = None;
+        for _ in 0..MAX_DESCENT {
+            let bytes = self.load_object(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            let parent = record.parent;
+            if let Some(object) = record.content_refs.first().copied() {
+                let object_bytes = self.load_object(&object)?;
+                let domain = StoredObject::new(object_bytes.clone())?.domain().to_owned();
+                if domain == CHECKPOINT_METADATA_DOMAIN {
+                    let decoded =
+                        CheckpointMetadata::decode(&object_bytes).map_err(MediumError::Format)?;
+                    skip_table = Some(decoded.clone());
+                    if let Some(ledger) = ledger.as_ref()
+                        && current == ledger.mk
+                        && decoded.sk != parent.unwrap_or(Hash::ZERO)
+                    {
+                        return Err(MediumError::Chain {
+                            rule: "reclaim/mk-binding-mismatch",
+                        });
+                    }
+                    if let Some(ledger) = ledger.as_ref()
+                        && current == ledger.mk
+                    {
+                        metadata = Some(decoded);
+                    }
+                } else if domain == crate::reclaim::RECLAMATION_LEDGER_DOMAIN
+                    && current == *audit_record
+                {
+                    let decoded = crate::reclaim::ReclamationLedger::decode(&object_bytes)
+                        .map_err(MediumError::Format)?;
+                    let expected = crate::reclaim::reclamation_ledger_idempotency_key(&decoded.mk);
+                    if record.idempotency_key != Some(expected) {
+                        return Err(MediumError::Chain {
+                            rule: "reclaim/audit-key-mismatch",
+                        });
+                    }
+                    ledger = Some(decoded);
+                }
+            }
+            if ledger.is_some() && metadata.is_some() {
+                break;
+            }
+            let Some(parent) = parent else {
+                break;
+            };
+            if self.object_path(&parent).is_file() {
+                current = parent;
+            } else {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+        }
+        let Some(ledger) = ledger else {
+            return Err(MediumError::Chain {
+                rule: "reclaim/audit-not-canonical",
+            });
+        };
+        let Some(metadata) = metadata else {
+            return Err(MediumError::Chain {
+                rule: "reclaim/mk-not-a-checkpoint",
+            });
+        };
+        if ledger.sk != metadata.sk
+            || ledger.range_digest != metadata.range_digest
+            || ledger.seed != metadata.seed
+        {
+            return Err(MediumError::Chain {
+                rule: "reclaim/binding-mismatch",
+            });
+        }
+        let index: BTreeSet<Hash> = metadata.index.iter().map(|entry| entry.hash).collect();
+        let units: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+        if index.len() != metadata.index.len()
+            || units.len() != ledger.units.len()
+            || index != units
+        {
+            return Err(MediumError::Chain {
+                rule: "reclaim/units-index-mismatch",
+            });
+        }
+        Ok((ledger, metadata, head))
+    }
+
+    /// The survivor set under the boundary: the exclusion walk over
+    /// the audited retiring records (pure `&self` — the authoritative
+    /// cursor is never touched).
+    fn survivor_set_locked(
+        &self,
+        head: Hash,
+        ledger: &crate::reclaim::ReclamationLedger,
+    ) -> Result<BTreeSet<Hash>, MediumError> {
+        let exclusion: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+        let (_summary, simulated) = self.cold_walk_excluding(head, &exclusion)?;
+        Ok(simulated.reachable)
+    }
+
+    /// The W1 quarantine name-family discovery: ONE bounded read_dir
+    /// pass collecting every entry in the identity's family (the
+    /// plain name, the .reason sidecar, the suffixed incidents and
+    /// their sidecars) — the directory listing is the truth; sparse
+    /// suffixes cannot be missed.
+    fn quarantine_family(&self, identity: &Hash) -> Result<Vec<PathBuf>, MediumError> {
+        let dir = self.root.join(QUARANTINE_DIR);
+        let plain = identity.hex();
+        let prefix = format!("{plain}.");
+        let mut family = Vec::new();
+        let entries = fs::read_dir(&dir).map_err(|e| io_err("read quarantine dir", &dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err("read quarantine entry", &dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_family = name == plain
+                || name == format!("{plain}.reason")
+                || (name.starts_with(&prefix) && {
+                    let rest = &name[plain.len() + 1..];
+                    let digits = rest.strip_suffix(".reason").unwrap_or(rest);
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                });
+            if is_family {
+                family.push(dir.join(name));
+            }
+        }
+        Ok(family)
+    }
+
+    /// The trusted two-pass execution under the boundary. Every
+    /// authorization refusal occurs BEFORE any mutation; the passes
+    /// are idempotent and restart-safe (the resume from the durable
+    /// audit: an absent retiring record's manifest reread is skipped
+    /// — the audit accounts for it; an absent SURVIVOR record fails
+    /// the walk closed).
+    fn reclaim_authorized_locked(
+        &self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+        // (1-3) The authentication and the directive cross-check.
+        let (ledger, _metadata, head) = self.authenticate_audit_locked(&directive.audit_record)?;
+        if ledger.units != directive.units {
+            return Err(MediumError::Chain {
+                rule: "reclaim/directive-units-mismatch",
+            });
+        }
+        // (4) The manifest reread with the resume tolerance: a
+        // PRESENT retiring record's objects must equal its actual
+        // content references; an ABSENT one is the protocol-accounted
+        // resume.
+        for unit in &ledger.units {
+            let record_path = self.object_path(&unit.record);
+            if record_path.is_file() {
+                let bytes = self.load_object(&unit.record)?;
+                let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+                if unit.objects != record.content_refs {
+                    return Err(MediumError::Chain {
+                        rule: "reclaim/units-objects-mismatch",
+                    });
+                }
+            }
+        }
+        // (5) The survivor partition under the same boundary.
+        let survivors = self.survivor_set_locked(head, &ledger)?;
+        let mut partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
+        let mut removed = 0u64;
+        // (6) PASS 1 — the retiring records, newest-first (the
+        // ledger's unit order — the crossing's Phase A collection
+        // order; never the index's hash order), idempotent. The
+        // genuine crash seams (the real-kill evidence): the
+        // mid-record-pass window after each record deletion, and the
+        // last-record/before-objects window — the two-pass
+        // schedule's interruption boundaries.
+        for (index, unit) in ledger.units.iter().enumerate() {
+            let record_path = self.object_path(&unit.record);
+            if record_path.is_file() {
+                fs::remove_file(&record_path)
+                    .map_err(|e| io_err("reclaim record", &record_path, e))?;
+                removed += 1;
+            }
+            reclaim_mid_unit_seam();
+            if index + 1 == ledger.units.len() {
+                reclaim_last_unit_seam();
+            }
+        }
+        // (7) PASS 2 — the deduplicated MANDATORY objects only (the
+        // partition's output is already deduplicated); the deferred
+        // identities are never touched. The W1 discipline on every
+        // form: hash-authenticate before deleting; preserve
+        // mismatched or unrelated evidence; the sidecars follow
+        // their authenticated evidence (an orphaned sidecar is the
+        // residue of THIS identity's cleanup).
+        for identity in &partition.mandatory {
+            let object_path = self.object_path(identity);
+            if object_path.is_file() {
+                let bytes = fs::read(&object_path)
+                    .map_err(|e| io_err("reclaim object read", &object_path, e))?;
+                if hash_object(&bytes) == *identity {
+                    fs::remove_file(&object_path)
+                        .map_err(|e| io_err("reclaim object", &object_path, e))?;
+                    removed += 1;
+                }
+                // A mismatched file at the audited name is preserved
+                // evidence — never removed on a filename match.
+            }
+            for path in self.quarantine_family(identity)? {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.ends_with(".reason") {
+                    // A sidecar: the residue rule — it follows its
+                    // evidence; an orphan (the evidence absent or
+                    // just removed) is THIS cleanup's residue. The
+                    // is-file tolerance: the evidence's own
+                    // companion removal may have already removed
+                    // this sidecar within the same family pass
+                    // (idempotent convergence).
+                    let evidence = path.with_file_name(name.trim_end_matches(".reason"));
+                    if !evidence.is_file() && path.is_file() {
+                        fs::remove_file(&path)
+                            .map_err(|e| io_err("reclaim sidecar residue", &path, e))?;
+                        removed += 1;
+                    }
+                } else if path.is_file() {
+                    // An evidence file: hash-authenticate BEFORE
+                    // deleting; a mismatch is preserved suspicious
+                    // evidence.
+                    let bytes = fs::read(&path)
+                        .map_err(|e| io_err("reclaim quarantined read", &path, e))?;
+                    if hash_object(&bytes) == *identity {
+                        fs::remove_file(&path)
+                            .map_err(|e| io_err("reclaim quarantined", &path, e))?;
+                        removed += 1;
+                        let sidecar = path.with_file_name(format!("{name}.reason"));
+                        if sidecar.is_file() {
+                            fs::remove_file(&sidecar)
+                                .map_err(|e| io_err("reclaim sidecar", &sidecar, e))?;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        partition.removed = removed;
+        Ok(partition)
     }
 }
 
@@ -2408,7 +2638,7 @@ mod exclusion_tests {
                 objects: vec![shared.hash()],
             },
         ];
-        let outcome = crate::reclaim::partition_reclaim(&units, &simulated.reachable);
+        let outcome = crate::reclaim::partition_reclaim(&units, &simulated.reachable).unwrap();
         // SHARED is DEFERRED (P1 — a surviving root — references it),
         // classified exactly once despite three unit appearances.
         assert_eq!(outcome.deferred, vec![shared.hash()]);
@@ -2420,6 +2650,207 @@ mod exclusion_tests {
         mandatory.sort();
         assert_eq!(mandatory, expected_mandatory);
         assert!(!mandatory.contains(&shared.hash()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The shared trusted-execution fixture: the real-checkpoint
+    /// chain with a surviving root sharing an object with the
+    /// retiring range, and the installed audit.
+    fn trusted_execution_store() -> (std::path::PathBuf, LocalFileMedium, Hash, Hash, Hash, Hash) {
+        let root = temp_store("trusted-exec");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2tx", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&p1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = RevisionRecord::regular(head, epoch, 2)
+            .with_content_refs(vec![shared.hash(), private.hash()]);
+        medium
+            .append(&r1, &[shared.clone(), private.clone()], Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r1.id(),
+            vec![SkipEntry::new(Hash::ZERO, p1.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, r1.id(), 2),
+                ReclaimedIndexEntry::new(None, sk.id(), 3),
+            ],
+            [1; 32],
+            [2; 32],
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk =
+            RevisionRecord::regular(sk.id(), epoch, 4).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk.id()))
+            .unwrap();
+        // The units' object lists use the records' CANONICAL
+        // reference order (with_content_refs sorts — the manifest
+        // must match the canonical form exactly).
+        let r1_refs = medium.read_record(&r1.id()).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk.id()).unwrap().content_refs.clone();
+        let ledger = ReclamationLedger {
+            mk: mk.id(),
+            sk: sk.id(),
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                ReclaimUnit {
+                    record: r1.id(),
+                    objects: r1_refs,
+                },
+                ReclaimUnit {
+                    record: sk.id(),
+                    objects: sk_refs,
+                },
+            ],
+        };
+        let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        (root, medium, audit, mk.id(), shared.hash(), private.hash())
+    }
+
+    #[test]
+    fn the_trusted_directive_executes_with_shared_object_survival() {
+        // The successful authenticated directive: the retiring
+        // records and the PRIVATE object deleted; the SHARED object
+        // (referenced by the surviving P1) SURVIVES; the deferred
+        // classification reported; the post-retirement validation,
+        // append, and reopen all work; the pending probe reports
+        // complete.
+        let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+        // The units come from the ledger (the verifier's own decode
+        // — the caller's candidate must match the installed
+        // manifest exactly).
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let outcome = medium.reclaim(&directive).unwrap();
+        // The deferred set: the shared object (never deleted).
+        assert_eq!(outcome.deferred, vec![shared]);
+        assert!(!outcome.mandatory.contains(&shared));
+        // The private object and the two retiring records are gone.
+        assert!(!medium.object_path(&private).is_file());
+        // The shared object survives on disk.
+        assert!(medium.object_path(&shared).is_file());
+        // The pending probe: complete (no mandatory form remains).
+        assert!(!medium.reclaim_pending(&directive).unwrap());
+        // The post-retirement chain validates; a fresh append works;
+        // the reopen behaves.
+        medium.validate().unwrap();
+        let append_object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"post-retirement");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let after =
+            RevisionRecord::regular(head, epoch, 9).with_content_refs(vec![append_object.hash()]);
+        let outcome = medium
+            .append(&after, std::slice::from_ref(&append_object), Some(head))
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(&root).unwrap();
+        reopened.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_wrong_units_directive_refuses_leaving_storage_unchanged() {
+        // The candidate manifest that disagrees with the installed
+        // ledger refuses BEFORE any mutation — the physical storage
+        // unchanged.
+        let (root, mut medium, audit, mk, _shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        let mut skewed = ledger.units.clone();
+        skewed[0].objects = Vec::new();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: skewed,
+        };
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclaim/directive-units-mismatch"
+                }
+            ),
+            "the exact refusal: {error:?}"
+        );
+        // Nothing was deleted: the private object and both records
+        // remain.
+        assert!(medium.object_path(&private).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_interrupted_execution_resumes_from_the_persisted_audit() {
+        // The interrupted recovery: the record pass partially
+        // executed (one record physically deleted by hand — the
+        // crash shape); the SAME directive resumes and completes
+        // (the absent record's manifest reread is skipped — the
+        // durable audit accounts for it), the shared object still
+        // survives, and the result converges.
+        let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        // The crash shape: the FIRST unit's record is gone; its
+        // objects remain.
+        let interrupted_record = ledger.units[0].record;
+        std::fs::remove_file(medium.object_path(&interrupted_record)).unwrap();
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert_eq!(outcome.deferred, vec![shared]);
+        assert!(!medium.object_path(&private).is_file());
+        assert!(medium.object_path(&shared).is_file());
+        assert!(!medium.reclaim_pending(&directive).unwrap());
+        medium.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

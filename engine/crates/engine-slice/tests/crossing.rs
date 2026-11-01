@@ -1826,15 +1826,18 @@ impl CanonicalMedium for CoveringRaceMedium {
         self.inner.durability_tier()
     }
 
-    fn reclaim(&mut self, units: &[engine_persist::ReclaimUnit]) -> Result<u64, MediumError> {
-        self.inner.reclaim(units)
+    fn reclaim(
+        &mut self,
+        directive: &engine_persist::ReclaimDirective,
+    ) -> Result<engine_persist::ReclaimOutcome, MediumError> {
+        self.inner.reclaim(directive)
     }
 
     fn reclaim_pending(
         &mut self,
-        units: &[engine_persist::ReclaimUnit],
+        directive: &engine_persist::ReclaimDirective,
     ) -> Result<bool, MediumError> {
-        self.inner.reclaim_pending(units)
+        self.inner.reclaim_pending(directive)
     }
 
     fn checkpoint(&mut self) -> Result<(), MediumError> {

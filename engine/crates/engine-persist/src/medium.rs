@@ -603,33 +603,44 @@ pub trait CanonicalMedium {
     /// What `Accepted` establishes on this platform.
     fn durability_tier(&self) -> SyncTier;
 
-    /// The explicit reclamation delete (PP-B3's Phase B, the review
-    /// corrective F4): remove the AUDITED units — each record object
-    /// and its referenced content objects, from the reclamation
-    /// ledger's manifest, never a re-read of a possibly-absent
-    /// record — IDEMPOTENTLY (an absent row or file is already
-    /// reclaimed, never an error; a re-run deletes only what
-    /// remains, and an interrupted unit's orphaned objects are
-    /// discoverable from the manifest). The eligibility was verified
-    /// and audited BEFORE this call (Phase A) — the delete trusts
-    /// the audit and never rewrites bytes. A half-deleted unit
-    /// referenced by a RETAINED record fails closed at the next
-    /// validation (the existing MissingObject). Returns the count of
-    /// objects removed by this call.
-    fn reclaim(&mut self, units: &[crate::reclaim::ReclaimUnit]) -> Result<u64, MediumError>;
+    /// The TRUSTED reclamation execution (K2-C2B P2): remove the
+    /// audited retirement under PROVIDER-AUTHENTICATED authority —
+    /// the directive names the exact installed audit revision and
+    /// the caller's candidate manifest; the provider independently
+    /// establishes, UNDER its coordination boundary (the local
+    /// exclusive HEAD.lock / the SQLite write-serialized
+    /// transaction), the audit's canonical chain membership, its
+    /// deterministic MK-bound key, the checkpoint's permanent
+    /// metadata and bindings, the exact directive-vs-ledger
+    /// manifest equality, and the survivor-aware Mandatory/Deferred
+    /// partition — and ONLY then executes the ratified two-pass
+    /// schedule (the retiring records newest-first; then the
+    /// deduplicated MANDATORY objects, the deferred identities
+    /// never touched). A caller-supplied manifest is a CANDIDATE,
+    /// never independent deletion authority; every authorization
+    /// refusal occurs BEFORE any mutation. The execution is
+    /// idempotent and restart-safe: an interrupted retirement
+    /// resumes from the durable audit (an absent retiring record is
+    /// accounted for by the authenticated protocol; an absent
+    /// SURVIVOR record or required object remains an integrity
+    /// failure). The local provider's W1 quarantine discipline
+    /// applies to every mandatory storage form.
+    fn reclaim(
+        &mut self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<crate::reclaim::ReclaimOutcome, MediumError>;
 
-    /// The manifest-completion probe (PP-B3's Phase B, the review
-    /// corrective R1): does ANY audited byte remain — a unit's
-    /// record object, a referenced content object, or a copy the
-    /// orphan sweep quarantined? A reclamation's completion is
-    /// judged against the WHOLE audited manifest, never record
-    /// presence alone: an interrupted Phase B that removed every
-    /// record file but not yet the objects (or the sweep-moved
-    /// copies) is RESTARTABLE WORK, not a completed reclamation.
-    /// Read-only; the same manifest [`Self::reclaim`] deletes from.
+    /// The Mandatory-only completion probe (K2-C2B P2): does any
+    /// MANDATORY authenticated retirement byte remain — the
+    /// partition-derived mandatory identities across their normal
+    /// and (for the local provider) quarantined storage forms? The
+    /// deferred identities (shared with surviving roots) never
+    /// count as pending; preserved suspicious evidence never
+    /// misclassifies as unfinished work. Read-only; the same
+    /// directive [`Self::reclaim`] executes.
     fn reclaim_pending(
         &mut self,
-        units: &[crate::reclaim::ReclaimUnit],
+        directive: &crate::reclaim::ReclaimDirective,
     ) -> Result<bool, MediumError>;
 
     /// The graceful lifecycle boundary (PP-B1's ratified provider

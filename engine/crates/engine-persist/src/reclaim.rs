@@ -903,7 +903,20 @@ pub struct ReclaimOutcome {
 pub fn partition_reclaim(
     units: &[ReclaimUnit],
     survivors: &std::collections::BTreeSet<Hash>,
-) -> ReclaimOutcome {
+) -> Result<ReclaimOutcome, MediumError> {
+    // The defensive invariant (the provider-execution review): a
+    // retiring-record identity that ALSO appears in the survivor set
+    // is an internal inconsistency — the authenticated exclusion
+    // never reaches the audited records, so an overlap means the
+    // inputs disagree. Refuse before deletion; never silently
+    // override reachability.
+    for unit in units {
+        if survivors.contains(&unit.record) {
+            return Err(MediumError::Chain {
+                rule: "reclaim-partition/record-survivor-overlap",
+            });
+        }
+    }
     let mut mandatory: Vec<Hash> = Vec::new();
     let mut deferred: Vec<Hash> = Vec::new();
     let mut seen: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
@@ -921,11 +934,11 @@ pub fn partition_reclaim(
             }
         }
     }
-    ReclaimOutcome {
+    Ok(ReclaimOutcome {
         removed: 0,
         mandatory,
         deferred,
-    }
+    })
 }
 
 /// Publishes the completion marker revision: a regular revision

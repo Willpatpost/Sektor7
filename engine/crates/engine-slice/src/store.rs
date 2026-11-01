@@ -191,20 +191,23 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
-    fn reclaim(&mut self, units: &[engine_persist::ReclaimUnit]) -> Result<u64, MediumError> {
+    fn reclaim(
+        &mut self,
+        directive: &engine_persist::ReclaimDirective,
+    ) -> Result<engine_persist::ReclaimOutcome, MediumError> {
         match self {
-            SessionStore::Local(medium) => medium.reclaim(units),
-            SessionStore::Sqlite(medium) => medium.reclaim(units),
+            SessionStore::Local(medium) => medium.reclaim(directive),
+            SessionStore::Sqlite(medium) => medium.reclaim(directive),
         }
     }
 
     fn reclaim_pending(
         &mut self,
-        units: &[engine_persist::ReclaimUnit],
+        directive: &engine_persist::ReclaimDirective,
     ) -> Result<bool, MediumError> {
         match self {
-            SessionStore::Local(medium) => medium.reclaim_pending(units),
-            SessionStore::Sqlite(medium) => medium.reclaim_pending(units),
+            SessionStore::Local(medium) => medium.reclaim_pending(directive),
+            SessionStore::Sqlite(medium) => medium.reclaim_pending(directive),
         }
     }
 

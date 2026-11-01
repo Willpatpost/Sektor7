@@ -2137,7 +2137,10 @@ impl<S: MediumSource> SessionCrossing<S> {
                             || journal_dir.join(format!("{name}.lock")).is_file()
                     });
                     if medium
-                        .reclaim_pending(&ledger.units)
+                        .reclaim_pending(&engine_persist::ReclaimDirective {
+                            audit_record: record_id,
+                            units: ledger.units.clone(),
+                        })
                         .map_err(PipelineError::Medium)?
                         || journals_pending
                     {
@@ -2335,8 +2338,12 @@ impl<S: MediumSource> SessionCrossing<S> {
         // objects are discoverable from the ledger — including
         // copies the v1.4 sweep quarantined).
         let removed_objects = medium
-            .reclaim(&ledger.units)
-            .map_err(PipelineError::Medium)?;
+            .reclaim(&engine_persist::ReclaimDirective {
+                audit_record: ledger_id,
+                units: ledger.units.clone(),
+            })
+            .map_err(PipelineError::Medium)?
+            .removed;
         // THE MEDIUM-COMMITTED/JOURNAL-RETIREMENT-UNCOMMITTED crash
         // seam (test-only — see [`ARM_RECLAIM_AFTER_MEDIUM`], the
         // review corrective R1's real-kill evidence): every

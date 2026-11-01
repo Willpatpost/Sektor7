@@ -81,7 +81,6 @@ use crate::medium::{
     AppendOutcome, CanonicalMedium, ChainSummary, MediumError, ObjectClass, Reconciliation,
     StoredObject, SyncTier, UnknownReason,
 };
-use crate::reclaim::ReclaimUnit;
 use crate::record::{AuthorityMode, RecordKind, RevisionRecord};
 
 /// The `meta` row keys (the design's §3.1 layout).
@@ -969,7 +968,16 @@ impl CanonicalMedium for SqliteMedium {
         SyncTier::TransactionalWalFull
     }
 
-    fn reclaim(&mut self, units: &[ReclaimUnit]) -> Result<u64, MediumError> {
+    fn reclaim(
+        &mut self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+        // THE TRUSTED BOUNDARY (K2-C2B P2): ONE write-serialized
+        // transaction covers the authentication, the partition, and
+        // the deletion — the decision and its destructive
+        // consequences are atomic (an interruption is the full
+        // rollback: nothing deleted, the retry from scratch; the
+        // manifest-driven convergence holds trivially).
         if self.read_only {
             return Err(MediumError::Sqlite {
                 op: "reclaim",
@@ -978,84 +986,373 @@ impl CanonicalMedium for SqliteMedium {
         }
         let tx = self
             .conn
-            .transaction()
-            .map_err(|e| sqlite_err("begin reclaim", e))?;
-        let mut removed = 0u64;
-        // The manifest-driven deletes (the review corrective F4):
-        // never a re-read of a possibly-absent record — every
-        // deletion comes from the audited units, and the single
-        // transaction makes the whole Phase B atomic on this
-        // provider (an interrupted process leaves either the
-        // pre-transaction state or the completed deletion — no
-        // partial unit, no orphaned row).
-        for unit in units {
-            match tx.execute(
-                "DELETE FROM records WHERE hash = ?1",
-                params![unit.record.as_bytes()],
-            ) {
-                Ok(count) => removed += count as u64,
-                Err(error) => {
-                    let _ = tx.rollback();
-                    return Err(sqlite_err("delete record", error));
-                }
-            }
-            for object in &unit.objects {
-                match tx.execute(
-                    "DELETE FROM objects WHERE hash = ?1",
-                    params![object.as_bytes()],
-                ) {
-                    Ok(count) => removed += count as u64,
-                    Err(error) => {
-                        let _ = tx.rollback();
-                        return Err(sqlite_err("delete object", error));
-                    }
-                }
-            }
-        }
-        tx.commit().map_err(|e| sqlite_err("commit reclaim", e))?;
-        Ok(removed)
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_err("begin reclaim transaction", e))?;
+        let outcome = reclaim_authorized_tx(&tx, directive)?;
+        tx.commit()
+            .map_err(|e| sqlite_err("commit reclaim transaction", e))?;
+        Ok(outcome)
     }
 
-    fn reclaim_pending(&mut self, units: &[ReclaimUnit]) -> Result<bool, MediumError> {
-        // The whole-manifest completion probe (the review corrective
-        // R1) over this provider's atomicity model: the Phase-B
-        // transaction is all-or-nothing, so any remaining row — a
-        // unit's record row or a referenced object row — means the
-        // transaction never committed and the reclamation is
-        // restartable work, never a completed one. The raw 32-byte
-        // identity blobs, the established binding form.
-        for unit in units {
-            let record_pending = self
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM records WHERE hash = ?1)",
-                    params![unit.record.as_bytes()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|found| found != 0)
-                .map_err(|e| sqlite_err("probe reclaim record", e))?;
-            if record_pending {
-                return Ok(true);
-            }
-            for object in &unit.objects {
-                let object_pending = self
-                    .conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
-                        params![object.as_bytes()],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|found| found != 0)
-                    .map_err(|e| sqlite_err("probe reclaim object", e))?;
-                if object_pending {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+    fn reclaim_pending(
+        &mut self,
+        directive: &crate::reclaim::ReclaimDirective,
+    ) -> Result<bool, MediumError> {
+        // The Mandatory-only probe (the advisory read over the plain
+        // connection — the same logical authority contract).
+        reclaim_pending_authorized(&self.conn, directive)
     }
 }
 
+/// The trusted reclamation internals (K2-C2B P2) — the transaction-
+/// scoped authentication and execution (the same logical authority
+/// contract as the local provider's locked form).
+fn reclaim_authorized_tx(
+    tx: &rusqlite::Transaction<'_>,
+    directive: &crate::reclaim::ReclaimDirective,
+) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+    let (ledger, _metadata, head) = authenticate_audit_tx(tx, &directive.audit_record)?;
+    if ledger.units != directive.units {
+        return Err(MediumError::Chain {
+            rule: "reclaim/directive-units-mismatch",
+        });
+    }
+    // The manifest reread with the resume tolerance (the records-
+    // table read; an absent retiring record is the protocol-
+    // accounted resume).
+    for unit in &ledger.units {
+        if record_exists(tx, &unit.record)? {
+            let bytes = load_record_verified(tx, &unit.record)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            if unit.objects != record.content_refs {
+                return Err(MediumError::Chain {
+                    rule: "reclaim/units-objects-mismatch",
+                });
+            }
+        }
+    }
+    // The survivor partition under the same transaction.
+    let exclusion: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+    let walked = walk_chain_excluding(tx, head, &exclusion)?;
+    let survivors = walked.cursor.reachable;
+    let mut partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
+    let mut removed = 0u64;
+    // PASS 1 — the retiring records, newest-first (the ledger's unit
+    // order), idempotent.
+    for unit in &ledger.units {
+        let count = tx
+            .execute(
+                "DELETE FROM records WHERE hash = ?1",
+                params![unit.record.as_bytes()],
+            )
+            .map_err(|e| sqlite_err("delete record", e))?;
+        removed += count as u64;
+    }
+    // PASS 2 — the deduplicated MANDATORY objects only (the deferred
+    // identities never touched); the row deletion is the audited
+    // identity's own (the hash-verified reads during the
+    // authentication established the integrity).
+    for identity in &partition.mandatory {
+        let count = tx
+            .execute(
+                "DELETE FROM objects WHERE hash = ?1",
+                params![identity.as_bytes()],
+            )
+            .map_err(|e| sqlite_err("delete object", e))?;
+        removed += count as u64;
+    }
+    partition.removed = removed;
+    Ok(partition)
+}
+
+/// The transaction-scoped canonical audit authentication (the same
+/// discipline as the local provider's locked form: the exact audit
+/// identity via the hash-verified load, the MK from the decoded
+/// ledger, the deterministic key, the requested MK's metadata bound
+/// by revision identity, the bindings, and the units-vs-index
+/// membership — the recovery-safe form without the per-unit
+/// reread).
+fn authenticate_audit_tx(
+    tx: &rusqlite::Transaction<'_>,
+    audit_record: &Hash,
+) -> Result<
+    (
+        crate::reclaim::ReclamationLedger,
+        crate::checkpoint::CheckpointMetadata,
+        Hash,
+    ),
+    MediumError,
+> {
+    authenticate_audit_on(tx, audit_record)
+}
+
+#[allow(dead_code)]
+fn authenticate_audit_tx_unused(
+    tx: &rusqlite::Transaction<'_>,
+    audit_record: &Hash,
+) -> Result<
+    (
+        crate::reclaim::ReclamationLedger,
+        crate::checkpoint::CheckpointMetadata,
+        Hash,
+    ),
+    MediumError,
+> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let head = current;
+    let mut ledger: Option<crate::reclaim::ReclamationLedger> = None;
+    let mut metadata: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let bytes = load_record_verified(tx, &current)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        let parent = record.parent;
+        if let Some(object) = record.content_refs.first().copied() {
+            let object_bytes = load_object_verified(tx, &object)?;
+            let domain = StoredObject::new(object_bytes.clone())?.domain().to_owned();
+            if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+                let decoded = crate::checkpoint::CheckpointMetadata::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                skip_table = Some(decoded.clone());
+                if let Some(ledger) = ledger.as_ref()
+                    && current == ledger.mk
+                {
+                    if decoded.sk != parent.unwrap_or(Hash::ZERO) {
+                        return Err(MediumError::Chain {
+                            rule: "reclaim/mk-binding-mismatch",
+                        });
+                    }
+                    metadata = Some(decoded);
+                }
+            } else if domain == crate::reclaim::RECLAMATION_LEDGER_DOMAIN
+                && current == *audit_record
+            {
+                let decoded = crate::reclaim::ReclamationLedger::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                let expected = crate::reclaim::reclamation_ledger_idempotency_key(&decoded.mk);
+                if record.idempotency_key != Some(expected) {
+                    return Err(MediumError::Chain {
+                        rule: "reclaim/audit-key-mismatch",
+                    });
+                }
+                ledger = Some(decoded);
+            }
+        }
+        if ledger.is_some() && metadata.is_some() {
+            break;
+        }
+        let Some(parent) = parent else {
+            break;
+        };
+        if record_exists(tx, &parent)? {
+            current = parent;
+        } else {
+            let Some(table) = skip_table.as_ref() else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            let target = if table.sk == parent {
+                table
+                    .self_skip()
+                    .map(|entry| entry.nearest_retained_ancestor)
+            } else {
+                table
+                    .skip_for(&current)
+                    .map(|entry| entry.nearest_retained_ancestor)
+            };
+            let Some(target) = target else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            current = target;
+        }
+    }
+    let Some(ledger) = ledger else {
+        return Err(MediumError::Chain {
+            rule: "reclaim/audit-not-canonical",
+        });
+    };
+    let Some(metadata) = metadata else {
+        return Err(MediumError::Chain {
+            rule: "reclaim/mk-not-a-checkpoint",
+        });
+    };
+    if ledger.sk != metadata.sk
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "reclaim/binding-mismatch",
+        });
+    }
+    let index: BTreeSet<Hash> = metadata.index.iter().map(|entry| entry.hash).collect();
+    let units: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+    if index.len() != metadata.index.len() || units.len() != ledger.units.len() || index != units {
+        return Err(MediumError::Chain {
+            rule: "reclaim/units-index-mismatch",
+        });
+    }
+    Ok((ledger, metadata, head))
+}
+
+/// The Mandatory-only probe over the plain connection (the advisory
+/// read; the same authentication and partition).
+fn reclaim_pending_authorized(
+    conn: &Connection,
+    directive: &crate::reclaim::ReclaimDirective,
+) -> Result<bool, MediumError> {
+    let (ledger, _metadata, head) = authenticate_audit_conn(conn, &directive.audit_record)?;
+    if ledger.units != directive.units {
+        return Err(MediumError::Chain {
+            rule: "reclaim/directive-units-mismatch",
+        });
+    }
+    let exclusion: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+    let walked = walk_chain_excluding(conn, head, &exclusion)?;
+    let survivors = walked.cursor.reachable;
+    let partition = crate::reclaim::partition_reclaim(&ledger.units, &survivors)?;
+    for identity in &partition.mandatory {
+        let present: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1 UNION ALL                  SELECT 1 FROM records WHERE hash = ?1 LIMIT 1)",
+                params![identity.as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(|e| sqlite_err("probe mandatory identity", e))?;
+        if present != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The plain-connection variant of the audit authentication (the
+/// probe path — the same checks over the unlocked reads).
+fn authenticate_audit_conn(
+    conn: &Connection,
+    audit_record: &Hash,
+) -> Result<
+    (
+        crate::reclaim::ReclamationLedger,
+        crate::checkpoint::CheckpointMetadata,
+        Hash,
+    ),
+    MediumError,
+> {
+    // The identical discipline over the plain connection: reuse the
+    // transaction form through the connection's own implicit read
+    // consistency (SQLite's connection-scoped snapshot).
+    authenticate_audit_on(conn, audit_record)
+}
+
+/// The shared descent over ANY connection or transaction handle.
+fn authenticate_audit_on(
+    conn: &Connection,
+    audit_record: &Hash,
+) -> Result<
+    (
+        crate::reclaim::ReclamationLedger,
+        crate::checkpoint::CheckpointMetadata,
+        Hash,
+    ),
+    MediumError,
+> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = read_meta_head(conn)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let head = current;
+    let mut ledger: Option<crate::reclaim::ReclamationLedger> = None;
+    let mut metadata: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let bytes = load_record_verified(conn, &current)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        let parent = record.parent;
+        if let Some(object) = record.content_refs.first().copied() {
+            let object_bytes = load_object_verified(conn, &object)?;
+            let domain = StoredObject::new(object_bytes.clone())?.domain().to_owned();
+            if domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
+                let decoded = crate::checkpoint::CheckpointMetadata::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                skip_table = Some(decoded.clone());
+                if let Some(ledger) = ledger.as_ref()
+                    && current == ledger.mk
+                {
+                    if decoded.sk != parent.unwrap_or(Hash::ZERO) {
+                        return Err(MediumError::Chain {
+                            rule: "reclaim/mk-binding-mismatch",
+                        });
+                    }
+                    metadata = Some(decoded);
+                }
+            } else if domain == crate::reclaim::RECLAMATION_LEDGER_DOMAIN
+                && current == *audit_record
+            {
+                let decoded = crate::reclaim::ReclamationLedger::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                let expected = crate::reclaim::reclamation_ledger_idempotency_key(&decoded.mk);
+                if record.idempotency_key != Some(expected) {
+                    return Err(MediumError::Chain {
+                        rule: "reclaim/audit-key-mismatch",
+                    });
+                }
+                ledger = Some(decoded);
+            }
+        }
+        if ledger.is_some() && metadata.is_some() {
+            break;
+        }
+        let Some(parent) = parent else {
+            break;
+        };
+        if record_exists(conn, &parent)? {
+            current = parent;
+        } else {
+            let Some(table) = skip_table.as_ref() else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            let target = if table.sk == parent {
+                table
+                    .self_skip()
+                    .map(|entry| entry.nearest_retained_ancestor)
+            } else {
+                table
+                    .skip_for(&current)
+                    .map(|entry| entry.nearest_retained_ancestor)
+            };
+            let Some(target) = target else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            current = target;
+        }
+    }
+    let Some(ledger) = ledger else {
+        return Err(MediumError::Chain {
+            rule: "reclaim/audit-not-canonical",
+        });
+    };
+    let Some(metadata) = metadata else {
+        return Err(MediumError::Chain {
+            rule: "reclaim/mk-not-a-checkpoint",
+        });
+    };
+    if ledger.sk != metadata.sk
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "reclaim/binding-mismatch",
+        });
+    }
+    let index: BTreeSet<Hash> = metadata.index.iter().map(|entry| entry.hash).collect();
+    let units: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+    if index.len() != metadata.index.len() || units.len() != ledger.units.len() || index != units {
+        return Err(MediumError::Chain {
+            rule: "reclaim/units-index-mismatch",
+        });
+    }
+    Ok((ledger, metadata, head))
+}
+
+// ------------------------------------------------------------ the inserts
 // ------------------------------------------------------------ the inserts
 
 /// The transaction's insert phases: every object insert-once with
@@ -2641,5 +2938,138 @@ mod exclusion_tests {
             drop(medium);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+    #[test]
+    fn the_trusted_directive_executes_on_sqlite() {
+        // The trusted execution on the second provider: the
+        // successful authenticated directive under BEGIN IMMEDIATE —
+        // the retiring records and the private object deleted from
+        // both tables; the SHARED object (referenced by the
+        // surviving root) SURVIVES; the deferred classification
+        // reported; the pending probe complete; the post-retirement
+        // validation works.
+        let root = std::env::temp_dir().join(format!(
+            "s7-p2txs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2txs", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject]| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, refs.len() as u64 + 10)
+                .with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared));
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()]);
+        let sk = step(&mut medium, std::slice::from_ref(&shared));
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            [1; 32],
+            [2; 32],
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = RevisionRecord::regular(sk, 3, 14).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(sk))
+            .unwrap();
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk: mk.id(),
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert_eq!(outcome.deferred, vec![shared.hash()]);
+        assert!(!outcome.mandatory.contains(&shared.hash()));
+        // The private object and both retiring records are gone from
+        // BOTH tables; the shared object survives.
+        let conn = &medium.conn;
+        for id in [private.hash(), r1, sk] {
+            let objects: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                    params![id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let records: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE hash = ?1)",
+                    params![id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(objects + records, 0, "the mandatory identity is gone");
+        }
+        let shared_present: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)",
+                params![shared.hash().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_present, 1, "the shared object survives");
+        assert!(!medium.reclaim_pending(&directive).unwrap());
+        medium.validate().unwrap();
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

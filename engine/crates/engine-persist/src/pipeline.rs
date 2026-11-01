@@ -3052,14 +3052,17 @@ mod tests {
         fn durability_tier(&self) -> SyncTier {
             self.inner.durability_tier()
         }
-        fn reclaim(&mut self, units: &[crate::reclaim::ReclaimUnit]) -> Result<u64, MediumError> {
-            self.inner.reclaim(units)
+        fn reclaim(
+            &mut self,
+            directive: &crate::reclaim::ReclaimDirective,
+        ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+            self.inner.reclaim(directive)
         }
         fn reclaim_pending(
             &mut self,
-            units: &[crate::reclaim::ReclaimUnit],
+            directive: &crate::reclaim::ReclaimDirective,
         ) -> Result<bool, MediumError> {
-            self.inner.reclaim_pending(units)
+            self.inner.reclaim_pending(directive)
         }
     }
 
