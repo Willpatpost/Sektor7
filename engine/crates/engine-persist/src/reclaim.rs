@@ -328,6 +328,24 @@ pub fn is_reclamation_ledger_family(domain: &str) -> bool {
     domain.starts_with(RECLAMATION_LEDGER_FAMILY)
 }
 
+/// The completion-marker domain gate for the GENERIC append (the
+/// P2-F4 correction): a completion-marker object may enter the
+/// chain ONLY through the admission-controlled
+/// [`publish_reclamation_complete`] boundary — a syntactically
+/// valid marker appended through the unrestricted generic path
+/// refuses typed, so no caller can install trusted terminal
+/// evidence merely by encoding correct bytes.
+pub fn enforce_completion_marker_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if object.domain() == RECLAMATION_COMPLETE_DOMAIN {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The v2 reclamation ledger: the ratified closure-expanded,
 /// batch-scoped audit. The units carry each retiring record's
 /// direct references PLUS its verified composite closure (collected
@@ -889,24 +907,75 @@ pub fn publish_reclamation_complete(
     expected_parent: Hash,
     tick: u64,
 ) -> Result<(Hash, AppendOutcome), MediumError> {
+    // THE ADMISSION (P2-F4): a completion marker may become trusted
+    // retirement evidence ONLY through this boundary — the generic
+    // append refuses the marker domain typed, and this admission
+    // verifies the marker's semantic authorization BEFORE the
+    // receipt: the source audit must be an installed, keyed,
+    // MK-bound ledger revision. A syntactically valid marker with a
+    // nonexistent, orphaned, mismatched, or unkeyed source refuses
+    // typed with nothing mutated.
+    if marker.kind == CompletionKind::Range {
+        // The range-terminal protocol belongs to the separately
+        // authorized later package — it cannot be used to claim
+        // completion under the v1 protocol.
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/range-unauthorized",
+        });
+    }
+    let source_record = medium.read_record(&marker.source)?;
+    let Some(ledger_object) = source_record.content_refs.first().copied() else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/source-shape",
+        });
+    };
+    let ledger_bytes = medium.read_object(&ledger_object)?;
+    let ledger_domain = StoredObject::new(ledger_bytes.clone())?.domain().to_owned();
+    if ledger_domain == RECLAMATION_LEDGER_DOMAIN {
+        let ledger = ReclamationLedger::decode(&ledger_bytes).map_err(MediumError::Format)?;
+        if ledger.mk != marker.mk {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/mk-mismatch",
+            });
+        }
+        let expected = reclamation_ledger_idempotency_key(&marker.mk);
+        if source_record.idempotency_key != Some(expected) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/audit-key-mismatch",
+            });
+        }
+    } else if ledger_domain == RECLAMATION_LEDGER_V2_DOMAIN {
+        let ledger = ReclamationLedgerV2::decode(&ledger_bytes).map_err(MediumError::Format)?;
+        if ledger.mk != marker.mk || ledger.batch != marker.batch {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/mk-mismatch",
+            });
+        }
+        let expected = reclamation_ledger_v2_idempotency_key(&marker.mk, marker.batch);
+        if source_record.idempotency_key != Some(expected) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-complete/audit-key-mismatch",
+            });
+        }
+    } else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/source-not-audit",
+        });
+    }
+    // The CAS-bound publication: the receipt is constructed
+    // IN-CRATE (the generic gate does not apply — this admission IS
+    // the authority), the append's expected parent binding to the
+    // exact verified HEAD.
     let bytes = marker.canonical_bytes();
     let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&expected_parent)?.epoch;
-    let key = match marker.kind {
-        CompletionKind::Batch => {
-            reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch))
-        }
-        CompletionKind::Range => reclamation_complete_idempotency_key(&marker.mk, None),
-    };
+    let key = reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch));
     let record = RevisionRecord::regular(expected_parent, parent_epoch, tick)
         .with_idempotency_key(key)
         .with_content_refs(vec![object.hash()]);
     let candidate = record.id();
-    let outcome = medium.append(
-        &record,
-        std::slice::from_ref(&object),
-        Some(expected_parent),
-    )?;
+    let admitted = crate::medium::AdmittedAppend::generic(&record, &[object]);
+    let outcome = medium.append_admitted(admitted, Some(expected_parent))?;
     Ok((candidate, outcome))
 }
 

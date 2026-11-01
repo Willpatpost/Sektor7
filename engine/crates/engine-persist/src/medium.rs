@@ -507,6 +507,10 @@ pub trait CanonicalMedium {
         expected_parent: Option<Hash>,
     ) -> Result<AppendOutcome, MediumError> {
         crate::composite_append::enforce_snapshot_family_gate(objects)?;
+        // The P2-F4 correction: a completion marker may enter ONLY
+        // through the admission-controlled publication boundary —
+        // the generic path refuses it typed.
+        crate::reclaim::enforce_completion_marker_gate(objects)?;
         let admitted = AdmittedAppend::generic(record, objects);
         self.append_admitted(admitted, expected_parent)
     }
