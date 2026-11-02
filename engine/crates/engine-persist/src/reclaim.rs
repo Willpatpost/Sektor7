@@ -200,6 +200,13 @@ fn read_hash(dec: &mut Decoder, section: &'static str) -> Result<Hash, SaveError
 
 fn read_digest(dec: &mut Decoder, section: &'static str) -> Result<[u8; 32], SaveError> {
     let bytes = dec.read_bytes(32, section)?;
+    // The exact-width requirement (the OC-C1-E corrective):
+    // read_bytes treats its argument as a MAXIMUM, so a shorter
+    // declared length reaches the copy and would panic — a malformed
+    // digest is a typed failure, never a panic.
+    if bytes.len() != 32 {
+        return Err(SaveError::Integrity("reclamation/digest-width"));
+    }
     let mut digest = [0u8; 32];
     digest.copy_from_slice(bytes);
     Ok(digest)
@@ -344,6 +351,158 @@ pub fn enforce_completion_marker_gate(objects: &[StoredObject]) -> Result<(), Me
         }
     }
     Ok(())
+}
+
+// ------------------------------------- the OC-C1 ratified begin-record codec
+//
+// The owner-ratified durable execution-authorization evidence
+// (engine-persist/reclamation-begin/1, the 206-byte canonical form).
+// OC-C1 delivers the codec, the publication gate, and the reader
+// support ONLY — the trusted admission, the execution-boundary
+// enforcement, and the completion integration belong to the later
+// separately authorized checkpoints.
+
+/// The ratified begin-record domain (34 UTF-8 bytes).
+pub const RECLAMATION_BEGIN_DOMAIN: &str = "engine-persist/reclamation-begin/1";
+
+/// The ratified begin-record version.
+pub const RECLAMATION_BEGIN_VERSION: u32 = 1;
+
+/// The begin-family prefix: EVERY version in this family is refused
+/// by the generic publication path (an unsupported future variant
+/// can never ride it).
+pub const RECLAMATION_BEGIN_FAMILY: &str = "engine-persist/reclamation-begin/";
+
+/// The begin-record's deterministic key domain (one begin per MK,
+/// ever — mirroring the audit and completion-marker disciplines).
+pub const RECLAMATION_BEGIN_KEY_DOMAIN: &str = "engine-persist/reclamation-begin-key/1";
+
+/// Whether a domain belongs to the reclamation-begin family (any
+/// version).
+pub fn is_reclamation_begin_family(domain: &str) -> bool {
+    domain.starts_with(RECLAMATION_BEGIN_FAMILY)
+}
+
+/// The begin revision's deterministic idempotency key (derived from
+/// the reclaimed MK).
+pub fn reclamation_begin_idempotency_key(mk: &Hash) -> Vec<u8> {
+    format!("{RECLAMATION_BEGIN_KEY_DOMAIN}:{}", mk.hex()).into_bytes()
+}
+
+/// The ratified durable execution-authorization evidence: the exact
+/// MK, the installed source-audit identity (transitively the whole
+/// hash-verified ledger), the verified range digest, and the
+/// founding-derived seed — the bindings a future trusted admission
+/// constructs from verified values and the recovery reader
+/// re-establishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclamationBegin {
+    /// The retired checkpoint's key-record identity.
+    pub mk: Hash,
+    /// The installed v1 audit's revision identity.
+    pub source: Hash,
+    /// The recomputed-and-matched range digest.
+    pub range_digest: [u8; 32],
+    /// The founding-derived seed.
+    pub seed: [u8; 32],
+}
+
+impl ReclamationBegin {
+    /// The canonical 206-byte encoding (the ratified layout: the
+    /// u64-length-prefixed 34-byte domain, the u32-LE version, and
+    /// four u64-length-prefixed 32-byte fields).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut enc = Encoder::new();
+        enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+        enc.write_u32(RECLAMATION_BEGIN_VERSION);
+        enc.write_bytes(self.mk.as_bytes());
+        enc.write_bytes(self.source.as_bytes());
+        enc.write_bytes(&self.range_digest);
+        enc.write_bytes(&self.seed);
+        enc.into_bytes()
+    }
+
+    /// The strict decode: the exact domain and version, the exact
+    /// hash and digest widths, the zero-identity refusal, and the
+    /// trailing-data refusal — every malformed input is a typed
+    /// failure, never a panic.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        const SECTION: &str = "reclamation-begin";
+        let mut dec = Decoder::new(bytes);
+        dec.read_domain(RECLAMATION_BEGIN_DOMAIN)?;
+        let version = dec.read_u32()?;
+        if version != RECLAMATION_BEGIN_VERSION {
+            return Err(SaveError::Version {
+                observed: version,
+                supported: RECLAMATION_BEGIN_VERSION,
+            });
+        }
+        let read_begin_hash = |dec: &mut Decoder| -> Result<Hash, SaveError> {
+            let bytes = dec.read_bytes(Hash::WIDTH, SECTION)?;
+            Hash::from_bytes(bytes).ok_or(SaveError::Integrity("reclamation-begin/hash-width"))
+        };
+        let mk = read_begin_hash(&mut dec)?;
+        let source = read_begin_hash(&mut dec)?;
+        if mk == Hash::ZERO || source == Hash::ZERO {
+            return Err(SaveError::Integrity("reclamation-begin/zero-identity"));
+        }
+        let range_digest = read_digest(&mut dec, SECTION)?;
+        let seed = read_digest(&mut dec, SECTION)?;
+        dec.finish()?;
+        Ok(Self {
+            mk,
+            source,
+            range_digest,
+            seed,
+        })
+    }
+}
+
+/// The begin-family publication gate: NO version of
+/// engine-persist/reclamation-begin/ may enter the chain through the
+/// unrestricted generic append — the begin is trusted
+/// execution-authorization evidence, installable only through the
+/// future OC-C2 in-crate admission after the full first-execution
+/// verification. A valid codec alone never grants publication
+/// authority.
+pub fn enforce_reclamation_begin_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if is_reclamation_begin_family(object.domain()) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-begin/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The TEST-ONLY begin-record install (the OC-C1 reader-support
+/// regressions): publishes a caller-constructed begin record through
+/// the in-crate admitted append, BYPASSING the future admission's
+/// verification — exactly the corrupted-in-crate-path threat the
+/// OC-C3/OC-C4 authority checks must catch. COMPILE-TIME ISOLATED:
+/// exists only under the composite-test-fixture feature (never in a
+/// production build; the CI's feature-disabled artifact check
+/// enforces the absence).
+#[cfg(feature = "composite-test-fixture")]
+#[doc(hidden)]
+pub fn test_only_install_begin_record(
+    medium: &mut dyn CanonicalMedium,
+    begin: &ReclamationBegin,
+    tick: u64,
+) -> Result<Hash, MediumError> {
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let parent_epoch = medium.read_record(&head)?.epoch;
+    let key = reclamation_begin_idempotency_key(&begin.mk);
+    let object = StoredObject::new(begin.canonical_bytes())?;
+    let record = RevisionRecord::regular(head, parent_epoch, tick)
+        .with_idempotency_key(key)
+        .with_content_refs(vec![object.hash()]);
+    let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+    medium.append_admitted(admitted, Some(head))?;
+    Ok(record.id())
 }
 
 /// The v2 reclamation ledger: the ratified closure-expanded,
@@ -2773,5 +2932,418 @@ mod tests {
             ReclaimPlan::decode(&enc.into_bytes()),
             Err(SaveError::Integrity("reclamation-plan/empty-plan"))
         ));
+    }
+
+    // --------------------------- the OC-C1 codec, gate, and
+    // digest-corrective regressions
+
+    fn sample_begin() -> ReclamationBegin {
+        ReclamationBegin {
+            mk: Hash::from_bytes(&[0x01; 32]).unwrap(),
+            source: Hash::from_bytes(&[0x02; 32]).unwrap(),
+            range_digest: [0x03; 32],
+            seed: [0x04; 32],
+        }
+    }
+
+    #[test]
+    fn the_begin_round_trip_is_byte_deterministic() {
+        let begin = sample_begin();
+        let bytes = begin.canonical_bytes();
+        assert_eq!(bytes.len(), 206, "the ratified canonical length");
+        let restored = ReclamationBegin::decode(&bytes).unwrap();
+        assert_eq!(restored, begin);
+        assert_eq!(restored.canonical_bytes(), bytes);
+        // The golden vector: the exact content hash and the initial
+        // byte layout (the 34-length prefix, the domain, the version).
+        assert_eq!(
+            hash_object(&bytes).hex(),
+            "2a4348f3e1ec4f8aebb94ee751b92700e7a4bc57b697829f22d917d206ad9010"
+        );
+        assert_eq!(&bytes[..8], &[34, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &bytes[8..42],
+            b"engine-persist/reclamation-begin/1".as_slice()
+        );
+        assert_eq!(&bytes[42..46], &[1, 0, 0, 0]);
+        assert_eq!(&bytes[46..54], &[32, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bytes[54], 0x01);
+    }
+
+    #[test]
+    fn the_begin_deterministic_key_is_mk_bound() {
+        let a = Hash::from_bytes(&[0x01; 32]).unwrap();
+        let b = Hash::from_bytes(&[0x02; 32]).unwrap();
+        assert_eq!(
+            reclamation_begin_idempotency_key(&a),
+            reclamation_begin_idempotency_key(&a)
+        );
+        assert_ne!(
+            reclamation_begin_idempotency_key(&a),
+            reclamation_begin_idempotency_key(&b)
+        );
+        assert_eq!(
+            reclamation_begin_idempotency_key(&a),
+            format!("engine-persist/reclamation-begin-key/1:{}", a.hex()).into_bytes()
+        );
+    }
+
+    #[test]
+    fn the_begin_malformed_matrix_refuses_typed() {
+        let begin = sample_begin();
+        let bytes = begin.canonical_bytes();
+        // The incorrect domain.
+        let mut wrong = bytes.clone();
+        wrong[9] = b'X';
+        assert!(matches!(
+            ReclamationBegin::decode(&wrong),
+            Err(SaveError::Domain { .. })
+        ));
+        // The unsupported version.
+        let mut wrong = bytes.clone();
+        wrong[42] = 2;
+        assert!(matches!(
+            ReclamationBegin::decode(&wrong),
+            Err(SaveError::Version { observed: 2, .. })
+        ));
+        // The MK undersized (31 declared): the length prefix shrinks
+        // and the field's bytes shift — construct surgically.
+        let undersized_mk = {
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(&begin.mk.as_bytes()[..31]);
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&undersized_mk),
+            Err(SaveError::Integrity("reclamation-begin/hash-width"))
+        ));
+        // The MK oversized (33 declared): the limit check refuses.
+        let oversized_mk = {
+            let mut extended = begin.mk.as_bytes().to_vec();
+            extended.push(0x01);
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(&extended);
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&oversized_mk),
+            Err(SaveError::Limit { .. })
+        ));
+        // The source undersized/oversized: the same pair.
+        let undersized_source = {
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(&begin.source.as_bytes()[..31]);
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&undersized_source),
+            Err(SaveError::Integrity("reclamation-begin/hash-width"))
+        ));
+        let oversized_source = {
+            let mut extended = begin.source.as_bytes().to_vec();
+            extended.push(0x02);
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(&extended);
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&oversized_source),
+            Err(SaveError::Limit { .. })
+        ));
+        // The digest undersized (31): the typed exact-width refusal —
+        // never a panic (the OC-C1-E corrective).
+        let undersized_digest = {
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&begin.range_digest[..31]);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&undersized_digest),
+            Err(SaveError::Integrity("reclamation/digest-width"))
+        ));
+        // The digest oversized (33): the limit check.
+        let oversized_digest = {
+            let mut extended = begin.range_digest.to_vec();
+            extended.push(0x03);
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&extended);
+            enc.write_bytes(&begin.seed);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&oversized_digest),
+            Err(SaveError::Limit { .. })
+        ));
+        // The seed undersized: the typed width refusal.
+        let undersized_seed = {
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&begin.seed[..31]);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&undersized_seed),
+            Err(SaveError::Integrity("reclamation/digest-width"))
+        ));
+        // The zero identities.
+        let zero_mk = ReclamationBegin {
+            mk: Hash::ZERO,
+            ..sample_begin()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&zero_mk.canonical_bytes()),
+            Err(SaveError::Integrity("reclamation-begin/zero-identity"))
+        ));
+        let zero_source = ReclamationBegin {
+            source: Hash::ZERO,
+            ..sample_begin()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&zero_source.canonical_bytes()),
+            Err(SaveError::Integrity("reclamation-begin/zero-identity"))
+        ));
+        // The truncated length prefix (the input ends mid-prefix):
+        // the typed Truncated failure.
+        assert!(matches!(
+            ReclamationBegin::decode(&bytes[..50]),
+            Err(SaveError::Truncated)
+        ));
+        // The truncated field content (the seed's content cut short
+        // after a complete 32-length prefix): read_count's
+        // remaining-bounds Limit failure — never a panic.
+        assert!(matches!(
+            ReclamationBegin::decode(&bytes[..205]),
+            Err(SaveError::Limit { .. })
+        ));
+        // The single and multiple trailing bytes.
+        let mut trailing_one = bytes.clone();
+        trailing_one.push(0xAA);
+        assert!(matches!(
+            ReclamationBegin::decode(&trailing_one),
+            Err(SaveError::Trailing { leftover: 1 })
+        ));
+        let mut trailing_many = bytes.clone();
+        trailing_many.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert!(matches!(
+            ReclamationBegin::decode(&trailing_many),
+            Err(SaveError::Trailing { leftover: 3 })
+        ));
+    }
+
+    #[test]
+    fn the_persisted_ledger_digest_width_refuses_typed() {
+        // (OC-C1-E) The preexisting read_digest defect: a ledger
+        // whose declared digest length is undersized previously
+        // REACHED copy_from_slice and panicked; the corrective
+        // returns the typed Integrity failure. The oversized
+        // declaration refuses at the limit check.
+        let ledger = sample_ledger();
+        let undersized = {
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_LEDGER_DOMAIN);
+            enc.write_u32(RECLAMATION_LEDGER_VERSION);
+            enc.write_bytes(ledger.mk.as_bytes());
+            enc.write_bytes(ledger.sk.as_bytes());
+            enc.write_bytes(&ledger.range_digest[..31]);
+            enc.write_bytes(&ledger.seed);
+            enc.write_u64(ledger.records);
+            enc.write_u64(ledger.reclaimed_keys);
+            enc.write_count(ledger.journal_files.len());
+            for name in &ledger.journal_files {
+                enc.write_str(name);
+            }
+            enc.write_count(ledger.units.len());
+            for unit in &ledger.units {
+                enc.write_bytes(unit.record.as_bytes());
+                enc.write_count(unit.objects.len());
+                for object in &unit.objects {
+                    enc.write_bytes(object.as_bytes());
+                }
+            }
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationLedger::decode(&undersized),
+            Err(SaveError::Integrity("reclamation/digest-width"))
+        ));
+        let oversized = {
+            let mut extended = ledger.range_digest.to_vec();
+            extended.push(0x07);
+            let mut enc = Encoder::new();
+            enc.write_str(RECLAMATION_LEDGER_DOMAIN);
+            enc.write_u32(RECLAMATION_LEDGER_VERSION);
+            enc.write_bytes(ledger.mk.as_bytes());
+            enc.write_bytes(ledger.sk.as_bytes());
+            enc.write_bytes(&extended);
+            enc.write_bytes(&ledger.seed);
+            enc.write_u64(ledger.records);
+            enc.write_u64(ledger.reclaimed_keys);
+            enc.write_count(ledger.journal_files.len());
+            for name in &ledger.journal_files {
+                enc.write_str(name);
+            }
+            enc.write_count(ledger.units.len());
+            for unit in &ledger.units {
+                enc.write_bytes(unit.record.as_bytes());
+                enc.write_count(unit.objects.len());
+                for object in &unit.objects {
+                    enc.write_bytes(object.as_bytes());
+                }
+            }
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationLedger::decode(&oversized),
+            Err(SaveError::Limit { .. })
+        ));
+        // The valid ledger still round-trips (the compatibility
+        // regression).
+        let valid = ledger.canonical_bytes();
+        assert_eq!(ReclamationLedger::decode(&valid).unwrap(), ledger);
+    }
+
+    #[test]
+    fn the_generic_append_refuses_the_begin_family() {
+        use crate::StoredObject;
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ1-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ1", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        // The ratified /1 begin object: the generic append refuses.
+        let begin_object = StoredObject::new(sample_begin().canonical_bytes()).unwrap();
+        let record =
+            RevisionRecord::regular(head, epoch, 9).with_content_refs(vec![begin_object.hash()]);
+        let error = medium
+            .append(&record, std::slice::from_ref(&begin_object), Some(head))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-begin/generic-append-refused"
+                }
+            ),
+            "the ratified begin refuses the generic append: {error:?}"
+        );
+        // An unsupported family variant (/2): equally refused.
+        let unsupported = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-begin/2");
+            enc.write_u32(1);
+            enc.write_bytes(&[0x01; 32]);
+            enc.write_bytes(&[0x02; 32]);
+            enc.write_bytes(&[0x03; 32]);
+            enc.write_bytes(&[0x04; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record =
+            RevisionRecord::regular(head, epoch, 10).with_content_refs(vec![unsupported.hash()]);
+        let error = medium
+            .append(&record, std::slice::from_ref(&unsupported), Some(head))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-begin/generic-append-refused"
+                }
+            ),
+            "the unsupported family variant refuses: {error:?}"
+        );
+        // The ordinary object publication still works.
+        let record = RevisionRecord::regular(head, epoch, 11).with_content_refs(vec![plain.hash()]);
+        let outcome = medium
+            .append(&record, std::slice::from_ref(&plain), Some(head))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        // The existing completion-marker gate remains enforced.
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: founding.id(),
+            batch: 0,
+            source: founding.id(),
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let marker_object = StoredObject::new(marker.canonical_bytes()).unwrap();
+        let head2 = medium.head().unwrap().unwrap();
+        let epoch2 = medium.read_record(&head2).unwrap().epoch;
+        let record = RevisionRecord::regular(head2, epoch2, 12)
+            .with_content_refs(vec![marker_object.hash()]);
+        let error = medium
+            .append(&record, std::slice::from_ref(&marker_object), Some(head2))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-complete/generic-append-refused"
+                }
+            ),
+            "the completion gate remains enforced: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

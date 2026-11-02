@@ -296,6 +296,16 @@ impl LocalFileMedium {
         self.root.join(OBJECTS_DIR).join(hash.hex())
     }
 
+    /// The test-visible object-namespace path (the OC-C1 reader
+    /// fixtures hand-write begin-family objects the publication
+    /// gates rightly refuse — the content-addressed layout is the
+    /// store's own, never a publication route).
+    #[cfg(any(test, feature = "composite-test-fixture"))]
+    #[doc(hidden)]
+    pub fn object_path_pub(&self, hash: &Hash) -> PathBuf {
+        self.root.join(OBJECTS_DIR).join(hash.hex())
+    }
+
     fn load_object(&self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
         let path = self.object_path(hash);
         let metadata = fs::metadata(&path).map_err(|e| match e.kind() {

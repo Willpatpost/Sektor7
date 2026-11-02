@@ -511,6 +511,11 @@ pub trait CanonicalMedium {
         // through the admission-controlled publication boundary —
         // the generic path refuses it typed.
         crate::reclaim::enforce_completion_marker_gate(objects)?;
+        // The OC-C1-B begin-family gate: no reclamation-begin object
+        // (any version) may enter the chain through the generic
+        // append — the same admission-boundary discipline as the
+        // completion marker.
+        crate::reclaim::enforce_reclamation_begin_gate(objects)?;
         let admitted = AdmittedAppend::generic(record, objects);
         self.append_admitted(admitted, expected_parent)
     }

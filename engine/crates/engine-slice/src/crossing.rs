@@ -3502,6 +3502,29 @@ fn walk_checkpoint_range(
                 record,
                 kind: RangeKind::Anchor,
             });
+        } else if engine_persist::reclaim::is_reclamation_begin_family(&domain) {
+            // The OC-C1 ratified begin-record reader arm: RETAINED
+            // EVIDENCE (the durable execution-authorization record),
+            // strict-decoded — an invalid begin object refuses the
+            // checkpoint, never merely skipped. A begin-FAMILY
+            // domain other than the ratified /1 is UNSUPPORTED, not
+            // ignorable content. Reader recognition is NOT execution
+            // authorization: encountering a begin never licenses
+            // destructive reclamation, completion certification, or
+            // historical attribution (the authority checks belong to
+            // the later separately authorized checkpoints).
+            if domain != engine_persist::reclaim::RECLAMATION_BEGIN_DOMAIN {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/begin-unsupported-version",
+                });
+            }
+            engine_persist::reclaim::ReclamationBegin::decode(&bytes)
+                .map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
         } else if domain == CHECKPOINT_METADATA_DOMAIN {
             // The prior checkpoint's MK — the permanent boundary.
             // Its metadata carries the campaign's founding-derived
@@ -3710,4 +3733,182 @@ fn reclaimable_journal_files(root: &Path) -> Result<Vec<String>, TransitionError
     }
     stale.sort();
     Ok(stale)
+}
+
+#[cfg(test)]
+mod oc_c1_reader_tests {
+    use super::*;
+    use engine_persist::local::LocalFileMedium;
+    use engine_persist::medium::CanonicalMedium;
+    use engine_persist::reclaim::{
+        RECLAMATION_BEGIN_DOMAIN, ReclamationBegin, test_only_install_begin_record,
+    };
+    use engine_persist::record::{AuthorityMode, RevisionRecord};
+    use engine_persist::{Hash, StoredObject};
+
+    fn temp_store(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ1-reader-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn the_begin_record_reads_as_retained_evidence() {
+        // (OC-C1-C) A valid begin record installed through the
+        // compile-time-isolated test-only facility is classified as
+        // RETAINED EVIDENCE (the anchor kind) — it participates in
+        // the ancestry without entering the retiring-publication
+        // set, and the walk completes to the founding. Reader
+        // recognition grants NO execution authority (the authority
+        // checks belong to the later checkpoints).
+        let root = temp_store("retained");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ1r", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let begin = ReclamationBegin {
+            mk: founding.id(),
+            source: founding.id(),
+            range_digest: [0x03; 32],
+            seed: [0x04; 32],
+        };
+        let begin_id = test_only_install_begin_record(&mut medium, &begin, 9).unwrap();
+        // The walk starting AT the begin record: it is walked as an
+        // Anchor, then the descent reaches the founding.
+        let (walked, boundary, _seed) = walk_checkpoint_range(&mut medium, begin_id).unwrap();
+        assert_eq!(boundary, founding.id());
+        let begin_entry = walked
+            .iter()
+            .find(|entry| entry.record.id() == begin_id)
+            .expect("the begin record is walked");
+        assert!(
+            matches!(begin_entry.kind, RangeKind::Anchor),
+            "the begin is retained evidence, never a retiring publication"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_unsupported_begin_family_version_refuses_the_walk() {
+        // (OC-C1-C) A begin-FAMILY domain other than the ratified /1
+        // is UNSUPPORTED, not ignorable content: the walk refuses
+        // typed. The fixture hand-writes the object and record files
+        // (the local store's content-addressed layout) — the generic
+        // append's family gate makes on-chain publication impossible,
+        // so the only construction is the direct file write.
+        let root = temp_store("unsupported");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ1u", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let unsupported = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-begin/2");
+            enc.write_u32(1);
+            enc.write_bytes(&[0x01; 32]);
+            enc.write_bytes(&[0x02; 32]);
+            enc.write_bytes(&[0x03; 32]);
+            enc.write_bytes(&[0x04; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record =
+            RevisionRecord::regular(head, epoch, 9).with_content_refs(vec![unsupported.hash()]);
+        // The direct file write (the test-only construction; no
+        // production publication path exists for the family).
+        std::fs::write(
+            medium.object_path_pub(&unsupported.hash()),
+            unsupported.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let detail = match walk_checkpoint_range(&mut medium, record.id()) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the unsupported version refuses, got {other:?}"),
+            Ok(_) => panic!("the unsupported version never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/begin-unsupported-version");
+        let _ = RECLAMATION_BEGIN_DOMAIN;
+        let _ = Hash::ZERO;
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_malformed_begin_refuses_the_walk() {
+        // (OC-C1-C) A begin-family record whose object fails the
+        // strict decode (here: a truncated canonical form) refuses
+        // the walk typed — never merely skipped.
+        let root = temp_store("malformed");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ1m", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let begin = ReclamationBegin {
+            mk: founding.id(),
+            source: founding.id(),
+            range_digest: [0x03; 32],
+            seed: [0x04; 32],
+        };
+        let truncated = &begin.canonical_bytes()[..100];
+        let malformed_object = StoredObject::new(truncated.to_vec()).unwrap();
+        let record = RevisionRecord::regular(head, epoch, 9)
+            .with_content_refs(vec![malformed_object.hash()]);
+        std::fs::write(
+            medium.object_path_pub(&malformed_object.hash()),
+            malformed_object.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        assert!(walk_checkpoint_range(&mut medium, record.id()).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
