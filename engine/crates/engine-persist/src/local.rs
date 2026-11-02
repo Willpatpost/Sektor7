@@ -4979,6 +4979,30 @@ mod exclusion_tests {
         // reclaim).
         let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
         let head_before = medium.head().unwrap().unwrap();
+        // (OC-P2) The tier gate FIRST: on a ProcessCrashOnly platform
+        // (Windows local) the admission refuses fail-closed — the
+        // ratified destructive-durability policy, demonstrated here
+        // as the platform's actual behavior (the SQLite twin covers
+        // the publication on that platform).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.begin_reclamation(&audit, &mk, 30).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-admission/tier-insufficient"
+                    }
+                ),
+                "the Windows-local tier refuses: {error:?}"
+            );
+            assert_eq!(
+                medium.head().unwrap().unwrap(),
+                head_before,
+                "the refusal leaves the HEAD unchanged"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         // (1) The valid admission.
         let outcome = medium.begin_reclamation(&audit, &mk, 30).unwrap();
         let installed = match outcome {
