@@ -1965,8 +1965,12 @@ impl LocalFileMedium {
             crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
         let outcome = self.append_admitted_locked(admitted, Some(head))?;
         match outcome {
-            crate::medium::AppendOutcome::Accepted { id, .. } => {
-                Ok(crate::reclaim::BeginPublicationOutcome::Accepted { id })
+            crate::medium::AppendOutcome::Accepted { id, tier } => {
+                // (C2-R8) The ACTUAL durability tier of the accepted
+                // append — propagated, never synthesized (the OC-P2
+                // gate above already established FullPosixSequence;
+                // ProcessCrashOnly never reaches this arm).
+                Ok(crate::reclaim::BeginPublicationOutcome::Accepted { id, tier })
             }
             crate::medium::AppendOutcome::RejectedStaleParent { .. } => {
                 // Under the held lock a stale parent means an
@@ -5081,7 +5085,15 @@ mod exclusion_tests {
         // (1) The valid admission.
         let outcome = medium.begin_reclamation(&audit, &mk, 30).unwrap();
         let installed = match outcome {
-            crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+            // (C2-R8) The POSIX admission carries its ACTUAL tier.
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, tier } => {
+                assert_eq!(
+                    tier,
+                    crate::medium::SyncTier::FullPosixSequence,
+                    "the POSIX local admission carries its actual tier"
+                );
+                id
+            }
             other => panic!("the valid admission accepts, got {other:?}"),
         };
         let head_after = medium.head().unwrap().unwrap();
@@ -5294,7 +5306,10 @@ mod exclusion_tests {
         let outcome = medium2.begin_reclamation(&audit2, &mk2, 42).unwrap();
         assert!(matches!(
             outcome,
-            crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+            crate::reclaim::BeginPublicationOutcome::Accepted {
+                tier: crate::medium::SyncTier::FullPosixSequence,
+                ..
+            }
         ));
         // (F3a) The ORPHANED same-key record: hand-written into the
         // object namespace, NEVER on the ancestry — the discovery
@@ -5338,7 +5353,10 @@ mod exclusion_tests {
         assert!(
             matches!(
                 outcome,
-                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                crate::reclaim::BeginPublicationOutcome::Accepted {
+                    tier: crate::medium::SyncTier::FullPosixSequence,
+                    ..
+                }
             ),
             "the orphaned same-key record never blocks or fakes a duplicate: {outcome:?}"
         );
@@ -5697,7 +5715,10 @@ mod exclusion_tests {
         assert!(
             matches!(
                 outcome,
-                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                crate::reclaim::BeginPublicationOutcome::Accepted {
+                    tier: crate::medium::SyncTier::FullPosixSequence,
+                    ..
+                }
             ),
             "the ordinary valid-history admission still succeeds: {outcome:?}"
         );

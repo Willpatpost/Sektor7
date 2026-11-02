@@ -1232,7 +1232,15 @@ fn begin_reclamation_tx(
     )
     .map_err(|e| sqlite_err("begin head advance", e))?;
     Ok((
-        crate::reclaim::BeginPublicationOutcome::Accepted { id: record_id },
+        crate::reclaim::BeginPublicationOutcome::Accepted {
+            id: record_id,
+            // (C2-R8) The truthful transactional tier: this value
+            // surfaces ONLY after the wrapper's successful COMMIT
+            // (the uncertain-commit paths divert to the read-only
+            // reconciliation before returning it), under the
+            // already-verified WAL/FULL configuration.
+            tier: SyncTier::TransactionalWalFull,
+        },
         Some(record_id),
     ))
 }
@@ -4293,7 +4301,16 @@ mod exclusion_tests {
         // The valid admission.
         let outcome = medium.begin_reclamation(&audit, &mk, 30).unwrap();
         let installed = match outcome {
-            crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+            // (C2-R8) The transactional admission carries its ACTUAL
+            // tier.
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, tier } => {
+                assert_eq!(
+                    tier,
+                    SyncTier::TransactionalWalFull,
+                    "the sqlite admission carries its actual tier"
+                );
+                id
+            }
             other => panic!("the sqlite admission accepts, got {other:?}"),
         };
         assert_eq!(medium.head().unwrap().unwrap(), installed);
@@ -4760,7 +4777,16 @@ mod exclusion_tests {
             medium.fault = None;
             let outcome = medium.begin_reclamation(&audit, &mk, 71).unwrap();
             let installed = match outcome {
-                crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+                // (C2-R8) The retry's Accepted carries the
+                // transactional tier.
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, tier } => {
+                    assert_eq!(
+                        tier,
+                        SyncTier::TransactionalWalFull,
+                        "the retry's Accepted carries the transactional tier"
+                    );
+                    id
+                }
                 other => {
                     panic!("the explicit retry after the confirmed absence accepts: {other:?}")
                 }
@@ -5254,7 +5280,16 @@ mod exclusion_tests {
         // (the seed check passes); the naive descent would refuse.
         let outcome = medium.begin_reclamation(&audit_b, &mk2.id(), 75).unwrap();
         let installed = match outcome {
-            crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+            // (C2-R8) The compacted-history admission carries the
+            // transactional tier.
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, tier } => {
+                assert_eq!(
+                    tier,
+                    SyncTier::TransactionalWalFull,
+                    "the compacted-history Accepted carries the transactional tier"
+                );
+                id
+            }
             other => panic!(
                 "the compacted-history founding admits over the authenticated gap: {other:?}"
             ),
@@ -5751,7 +5786,10 @@ mod exclusion_tests {
             assert!(
                 matches!(
                     outcome,
-                    crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    crate::reclaim::BeginPublicationOutcome::Accepted {
+                        tier: SyncTier::TransactionalWalFull,
+                        ..
+                    }
                 ),
                 "the ordinary valid-history admission still succeeds: {outcome:?}"
             );

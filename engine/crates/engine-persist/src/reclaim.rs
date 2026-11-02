@@ -503,14 +503,22 @@ pub fn enforce_reclamation_begin_gate(objects: &[StoredObject]) -> Result<(), Me
 
 /// The typed begin-publication outcome: the truthful classification
 /// an installation, never a guess. `Accepted` carries the provider's
-/// durably-acknowledged installation; `ReconciledInstalled` carries
-/// a canonical-membership-only proof (the durability acknowledgment
+/// durably-acknowledged installation AT THE ACTUAL TIER (C2-R8: the
+/// truthful tier propagated from the accepted append — never
+/// synthesized); `ReconciledInstalled` carries a
+/// canonical-membership-only proof (the durability acknowledgment
 /// remains UNCONFIRMED — the destructive-authorization grade
-/// requires the OC-C3 reaffirmation); the refusals are typed errors.
+/// requires the OC-C3 reaffirmation — NO implied tier); the
+/// refusals are typed errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginPublicationOutcome {
-    /// Installed and durably acknowledged at the provider's tier.
-    Accepted { id: Hash },
+    /// Installed and durably acknowledged at the provider's ACTUAL
+    /// tier (the in-memory contract only — the persisted begin
+    /// format is unaffected).
+    Accepted {
+        id: Hash,
+        tier: crate::medium::SyncTier,
+    },
     /// An uncertain publication reconciled to canonical
     /// installation — membership proven, the durability
     /// acknowledgment UNCONFIRMED.
