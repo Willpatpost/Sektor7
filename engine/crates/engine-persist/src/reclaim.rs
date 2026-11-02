@@ -488,6 +488,134 @@ pub fn enforce_reclamation_begin_gate(objects: &[StoredObject]) -> Result<(), Me
     Ok(())
 }
 
+// ------------------------------------- the OC-C2 trusted begin admission
+//
+// The provider-coordinated publication of the permanent
+// execution-authorization evidence. The admission runs the FULL
+// first-execution verification — the exact canonical audit identity,
+// the MK binding, the complete original retirement evidence (every
+// record present, hash-verified, manifest-equal, SK included), and
+// the INDEPENDENT range-digest recomputation over the actual
+// original bytes — BEFORE constructing the begin from the verified
+// values. A caller may name the audit and the MK; the begin payload
+// is always derived from verified canonical state. OC-C2 does NOT
+// connect this to the destructive execution path (OC-C3).
+
+/// The typed begin-publication outcome: the truthful classification
+/// an installation, never a guess. `Accepted` carries the provider's
+/// durably-acknowledged installation; `ReconciledInstalled` carries
+/// a canonical-membership-only proof (the durability acknowledgment
+/// remains UNCONFIRMED — the destructive-authorization grade
+/// requires the OC-C3 reaffirmation); the refusals are typed errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginPublicationOutcome {
+    /// Installed and durably acknowledged at the provider's tier.
+    Accepted { id: Hash },
+    /// An uncertain publication reconciled to canonical
+    /// installation — membership proven, the durability
+    /// acknowledgment UNCONFIRMED.
+    ReconciledInstalled { id: Hash },
+    /// An uncertain publication reconciled to definite absence — a
+    /// clean retry is appropriate.
+    ReconciledNotInstalled,
+    /// A same-key begin was already installed and its EXACT content
+    /// verified (the idempotent restart — never inferred from key
+    /// occupancy alone).
+    DuplicateVerified { id: Hash },
+}
+
+/// The shared first-execution evidence core (OC-C2-B): given the
+/// already-authenticated ledger and metadata (the provider's own
+/// internal, coordination-respecting authentication) and a
+/// hash-verifying record-bytes reader, verify the complete original
+/// retirement evidence and construct the begin from the verified
+/// values. The reader is provider-injected so the verification runs
+/// under the coordination the provider already holds — no public
+/// trait method, no nested lock, no transaction escape.
+pub fn verify_first_execution_evidence(
+    ledger: &ReclamationLedger,
+    metadata: &crate::checkpoint::CheckpointMetadata,
+    founding: &Hash,
+    read_record_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
+) -> Result<ReclamationBegin, MediumError> {
+    // (B) The checkpoint bindings: the ledger's SK, digest, and seed
+    // agree with the MK's permanent metadata.
+    if ledger.sk != metadata.sk
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "begin-admission/binding-mismatch",
+        });
+    }
+    // The units exactly match the retirement index (the record
+    // identities, as a set — no omission, no extraneous entry).
+    let index: std::collections::BTreeSet<Hash> =
+        metadata.index.iter().map(|entry| entry.hash).collect();
+    let units: std::collections::BTreeSet<Hash> =
+        ledger.units.iter().map(|unit| unit.record).collect();
+    if index.len() != metadata.index.len() || units.len() != ledger.units.len() || index != units {
+        return Err(MediumError::Chain {
+            rule: "begin-admission/units-index-mismatch",
+        });
+    }
+    // The founding-derived seed (always computable — the founding is
+    // permanent).
+    verify_founding_seed(metadata, founding)?;
+    // (C) The complete original retirement evidence: EVERY unit's
+    // record present (SK included — a missing original record
+    // refuses; the deletion-prefix absence is NEVER first-execution
+    // authority) and its manifest exactly equal to its actual
+    // content references.
+    for unit in &ledger.units {
+        let bytes = read_record_bytes(&unit.record)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        if unit.objects != record.content_refs {
+            return Err(MediumError::Chain {
+                rule: "begin-admission/units-objects-mismatch",
+            });
+        }
+    }
+    // The valid newest-first retirement order.
+    verify_newest_first_order(&ledger.units, metadata)?;
+    // (D) The INDEPENDENT range-digest recomputation over the
+    // actual, hash-verified original canonical record bytes, in the
+    // established order, with the founding-derived seed — a
+    // fabricated ledger whose digest merely agrees with the metadata
+    // refuses here (the original history itself must prove the
+    // commitment).
+    let mut digest_members: Vec<(u64, Hash)> = ledger
+        .units
+        .iter()
+        .filter(|unit| unit.record != ledger.sk)
+        .filter_map(|unit| {
+            metadata
+                .index
+                .iter()
+                .find(|e| e.hash == unit.record)
+                .map(|e| (e.epoch, unit.record))
+        })
+        .collect();
+    digest_members.sort_unstable_by_key(|(epoch, _)| *epoch);
+    let mut range_bytes = Vec::with_capacity(digest_members.len());
+    for (_, record) in digest_members {
+        range_bytes.push(read_record_bytes(&record)?);
+    }
+    let recomputed = crate::checkpoint::chain_range_digest(&metadata.seed, &range_bytes);
+    if recomputed != ledger.range_digest {
+        return Err(MediumError::Chain {
+            rule: "begin-admission/range-digest-mismatch",
+        });
+    }
+    // (E) The construction from the verified values only.
+    Ok(ReclamationBegin {
+        mk: ledger.mk,
+        source: Hash::ZERO, // filled by the caller with the authenticated audit identity
+        range_digest: recomputed,
+        seed: metadata.seed,
+    })
+}
+
 /// The TEST-ONLY begin-record install (the OC-C1 reader-support
 /// regressions): publishes a caller-constructed begin record through
 /// the in-crate admitted append, BYPASSING the future admission's

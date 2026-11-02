@@ -1826,6 +1826,253 @@ impl LocalFileMedium {
         Ok(simulated.reachable)
     }
 
+    /// The OC-C2 trusted begin admission and publication under the
+    /// exclusive HEAD.lock (the complete safety-critical sequence
+    /// coordinated; no public trait method, no nested lock): the
+    /// internal audit authentication (the exact identity, the key,
+    /// the MK-bound metadata), the shared first-execution evidence
+    /// core over the INTERNAL hash-verified reads (every record
+    /// present including SK, the manifest equality, the INDEPENDENT
+    /// digest recomputation), the OC-P2 tier gate, and the
+    /// publication via append_locked with the truthful outcome
+    /// classification. NOT connected to the destructive execution
+    /// path (OC-C3).
+    pub fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        self.lock()?;
+        let outcome = self.begin_reclamation_locked(audit, mk, tick);
+        self.unlock()?;
+        outcome
+    }
+
+    fn begin_reclamation_locked(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        // (A) The exact canonical audit identity over the internal
+        // reads: the gap-aware descent, the deterministic key, the
+        // strict decode, the MK binding.
+        let (ledger, metadata, _head) = self.authenticate_audit_locked(audit)?;
+        if ledger.mk != *mk {
+            return Err(MediumError::Chain {
+                rule: "begin-admission/mk-mismatch",
+            });
+        }
+        // The founding identity (the descent to the parentless
+        // record over the internal reads — always computable).
+        let founding = self.founding_identity_locked()?;
+        // (B-D) The shared first-execution evidence core over the
+        // internal hash-verified object reads.
+        let mut begin = crate::reclaim::verify_first_execution_evidence(
+            &ledger,
+            &metadata,
+            &founding,
+            |identity| self.load_object(identity),
+        )?;
+        begin.source = *audit;
+        // (OC-P2) The tier gate: the begin publication requires the
+        // durable-authorization tier — the Windows ProcessCrashOnly
+        // provider refuses fail-closed (the unrelated non-destructive
+        // storage behavior untouched).
+        if self.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            return Err(MediumError::Chain {
+                rule: "begin-admission/tier-insufficient",
+            });
+        }
+        // The duplicate resolution FIRST: a same-key begin already
+        // installed is discovered and EXACTLY verified — never
+        // inferred from key occupancy.
+        if let Some((installed_id, installed)) = self.find_installed_begin_locked(mk)? {
+            if installed == begin {
+                return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified {
+                    id: installed_id,
+                });
+            }
+            return Err(MediumError::Chain {
+                rule: "begin-admission/duplicate-content-mismatch",
+            });
+        }
+        // (6-D) The publication: the canonical revision against the
+        // authoritative HEAD, via the internal append (the lock
+        // already held).
+        let head = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let parent_epoch = self.load_object(&head).map(|b| {
+            RevisionRecord::decode(&b)
+                .map(|r| r.epoch)
+                .map_err(MediumError::Format)
+        })??;
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
+        let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
+        let object = StoredObject::new(begin.canonical_bytes())?;
+        let record = RevisionRecord::regular(head, parent_epoch, tick)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object.hash()]);
+        let record_bytes = record.canonical_bytes();
+        let record_id = crate::hash::hash_object(&record_bytes);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        let outcome = self.append_admitted_locked(admitted, Some(head))?;
+        match outcome {
+            crate::medium::AppendOutcome::Accepted { id, .. } => {
+                Ok(crate::reclaim::BeginPublicationOutcome::Accepted { id })
+            }
+            crate::medium::AppendOutcome::RejectedStaleParent { .. } => {
+                // Under the held lock a stale parent means an
+                // unexpected external mutation — the conservative
+                // typed refusal (a bounded retry belongs to the
+                // caller's next maintenance pass).
+                Err(MediumError::Chain {
+                    rule: "begin-admission/stale-parent",
+                })
+            }
+            crate::medium::AppendOutcome::Unknown { .. } => {
+                match self.reconcile_locked(&record_id)? {
+                    crate::medium::Reconciliation::Installed { id } => {
+                        // Membership proven; the durability
+                        // acknowledgment UNCONFIRMED (the OC-C3
+                        // reaffirmation upgrades it).
+                        Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id })
+                    }
+                    crate::medium::Reconciliation::NotInstalled { .. } => {
+                        Ok(crate::reclaim::BeginPublicationOutcome::ReconciledNotInstalled)
+                    }
+                    crate::medium::Reconciliation::Unverifiable { .. } => Err(MediumError::Chain {
+                        rule: "begin-admission/reconcile-unverifiable",
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The founding identity under the held lock (the internal
+    /// parent-following descent).
+    fn founding_identity_locked(&self) -> Result<Hash, MediumError> {
+        let mut current = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        loop {
+            let bytes = self.load_object(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            match record.parent {
+                Some(parent) if self.object_path(&parent).is_file() => current = parent,
+                _ => return Ok(current),
+            }
+        }
+    }
+
+    /// The begin discovery under the held lock: the descent for the
+    /// deterministic key, the strict decode, the binding checks.
+    fn find_installed_begin_locked(
+        &self,
+        mk: &Hash,
+    ) -> Result<Option<(Hash, crate::reclaim::ReclamationBegin)>, MediumError> {
+        const MAX_DESCENT: u64 = 1 << 20;
+        let key = crate::reclaim::reclamation_begin_idempotency_key(mk);
+        let mut current = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let mut skip_table: Option<CheckpointMetadata> = None;
+        for _ in 0..MAX_DESCENT {
+            let bytes = self.load_object(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            if record.idempotency_key.as_deref() == Some(key.as_slice()) {
+                let Some(object) = record.content_refs.first().copied() else {
+                    return Err(MediumError::Chain {
+                        rule: "begin-admission/installed-malformed",
+                    });
+                };
+                let object_bytes = self.load_object(&object)?;
+                let begin = crate::reclaim::ReclamationBegin::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                if begin.mk != *mk {
+                    return Err(MediumError::Chain {
+                        rule: "begin-admission/installed-mk-mismatch",
+                    });
+                }
+                return Ok(Some((current, begin)));
+            }
+            if let Some(object) = record.content_refs.first().copied() {
+                let object_bytes = self.load_object(&object)?;
+                if StoredObject::new(object_bytes.clone())?.domain()
+                    == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+                {
+                    skip_table = Some(
+                        CheckpointMetadata::decode(&object_bytes).map_err(MediumError::Format)?,
+                    );
+                }
+            }
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            if !self.object_path(&parent).is_file() {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table.self_skip().map(|e| e.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|e| e.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            } else {
+                current = parent;
+            }
+        }
+        Ok(None)
+    }
+
+    /// The internal append under the ALREADY-HELD lock: the same
+    /// structural admission the public path applies before its own
+    /// lock acquisition, then append_locked directly (no nested
+    /// coordination).
+    fn append_admitted_locked(
+        &mut self,
+        admitted: crate::medium::AdmittedAppend,
+        expected_parent: Option<Hash>,
+    ) -> Result<crate::medium::AppendOutcome, MediumError> {
+        let (record, objects, composite) = admitted.parts_for_tests();
+        let record = record.clone();
+        let objects: Vec<StoredObject> = objects.to_vec();
+        let record_bytes = record.canonical_bytes();
+        let reparsed = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+        if reparsed != record {
+            return Err(MediumError::Chain {
+                rule: "record-noncanonical",
+            });
+        }
+        let supplied: BTreeSet<Hash> = objects.iter().map(StoredObject::hash).collect();
+        let declared: BTreeSet<Hash> = record.content_refs.iter().copied().collect();
+        if !composite && supplied != declared {
+            return Err(MediumError::Chain {
+                rule: "content-set-mismatch",
+            });
+        }
+        let record_id = crate::hash::hash_object(&record_bytes);
+        self.append_locked(
+            &record,
+            &objects,
+            expected_parent,
+            &record_bytes,
+            &record_id,
+            composite,
+        )
+    }
+
     /// The W1 quarantine name-family discovery: ONE bounded read_dir
     /// pass collecting every entry in the identity's family (the
     /// plain name, the .reason sidecar, the suffixed incidents and
@@ -4717,5 +4964,182 @@ mod exclusion_tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn the_trusted_begin_admission_publishes_and_refuses() {
+        // (OC-C2) The local trusted admission: the valid fixture
+        // publishes Accepted (the begin on-chain, the deterministic
+        // key, the HEAD advanced); the repeat call resolves the
+        // duplicate by EXACT content verification; the fabricated
+        // digest, the missing original record, and the wrong MK all
+        // refuse BEFORE any publication (the HEAD unchanged). The
+        // admission is NOT connected to the destructive path (the
+        // retirement still executable afterward through the existing
+        // reclaim).
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        let head_before = medium.head().unwrap().unwrap();
+        // (1) The valid admission.
+        let outcome = medium.begin_reclamation(&audit, &mk, 30).unwrap();
+        let installed = match outcome {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+            other => panic!("the valid admission accepts, got {other:?}"),
+        };
+        let head_after = medium.head().unwrap().unwrap();
+        assert_eq!(head_after, installed, "the begin is the new HEAD");
+        assert_ne!(head_after, head_before);
+        // The discovered begin verifies with the exact bindings.
+        let (found_id, found) = crate::reclaim::find_installed_completion(&mut medium, &mk)
+            .unwrap()
+            .map(|(id, _)| (id, ()))
+            .map(|_| (installed, ()))
+            .unwrap_or((installed, ()));
+        let _ = (found_id, found);
+        let begin_record = medium.read_record(&installed).unwrap();
+        let begin_object = medium.read_object(&begin_record.content_refs[0]).unwrap();
+        let begin = crate::reclaim::ReclamationBegin::decode(&begin_object).unwrap();
+        assert_eq!(begin.mk, mk);
+        assert_eq!(begin.source, audit);
+        // (2) The duplicate: the exact-content verification.
+        let outcome = medium.begin_reclamation(&audit, &mk, 31).unwrap();
+        match outcome {
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => {
+                assert_eq!(id, installed)
+            }
+            other => panic!("the duplicate verifies exactly, got {other:?}"),
+        }
+        // (3) The fabricated digest (the E1 fixture): the admission
+        // refuses BEFORE any publication.
+        let (root2, mut medium2, audit2, mk2, _s, _p) = {
+            // Build the fabricated variant via the established
+            // parameterized construction.
+            let r = temp_store("occ2-fabricated");
+            let mut m = LocalFileMedium::open(r.clone()).unwrap();
+            let shared = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"shared-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let private = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"private-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ2f", 0)
+                .with_content_refs(vec![shared.hash()]);
+            m.append(&founding, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let head = m.head().unwrap().unwrap();
+            let epoch = m.read_record(&head).unwrap().epoch;
+            let _ = epoch;
+            let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+            m.append(&p1, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let head = m.head().unwrap().unwrap();
+            let epoch = m.read_record(&head).unwrap().epoch;
+            let r1 = RevisionRecord::regular(head, epoch, 2)
+                .with_content_refs(vec![shared.hash(), private.hash()]);
+            m.append(&r1, &[shared.clone(), private.clone()], Some(head))
+                .unwrap();
+            let head = m.head().unwrap().unwrap();
+            let epoch = m.read_record(&head).unwrap().epoch;
+            let sk = RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![shared.hash()]);
+            m.append(&sk, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+            let r1_bytes = m.read_record(&r1.id()).unwrap().canonical_bytes();
+            let real = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+            let fabricated = [9; 32];
+            let meta = CheckpointMetadata::new(
+                sk.id(),
+                r1.id(),
+                vec![SkipEntry::new(Hash::ZERO, p1.id())],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1.id(), 2),
+                    ReclaimedIndexEntry::new(None, sk.id(), 3),
+                ],
+                fabricated,
+                seed,
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let head = m.head().unwrap().unwrap();
+            let epoch = m.read_record(&head).unwrap().epoch;
+            let mk =
+                RevisionRecord::regular(head, epoch, 4).with_content_refs(vec![meta_object.hash()]);
+            m.append(&mk, std::slice::from_ref(&meta_object), Some(head))
+                .unwrap();
+            let r1_refs = m.read_record(&r1.id()).unwrap().content_refs.clone();
+            let sk_refs = m.read_record(&sk.id()).unwrap().content_refs.clone();
+            let ledger = ReclamationLedger {
+                mk: mk.id(),
+                sk: sk.id(),
+                range_digest: fabricated,
+                seed,
+                records: 2,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units: vec![
+                    ReclaimUnit {
+                        record: sk.id(),
+                        objects: sk_refs,
+                    },
+                    ReclaimUnit {
+                        record: r1.id(),
+                        objects: r1_refs,
+                    },
+                ],
+            };
+            let (audit, outcome) = publish_reclamation_ledger(&mut m, &ledger, 5).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            let _ = real;
+            (r, m, audit, mk.id(), shared.hash(), private.hash())
+        };
+        let head2_before = medium2.head().unwrap().unwrap();
+        let error = medium2.begin_reclamation(&audit2, &mk2, 32).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/range-digest-mismatch"
+                }
+            ),
+            "the fabricated commitment refuses: {error:?}"
+        );
+        assert_eq!(
+            medium2.head().unwrap().unwrap(),
+            head2_before,
+            "the refusal leaves the HEAD unchanged"
+        );
+        let _ = root2;
+        // (4) The missing original record: the deletion-prefix
+        // absence is NEVER first-execution authority.
+        let (root3, mut medium3, audit3, mk3, _s3, _p3) = trusted_execution_store();
+        let (ledger3, _meta3) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium3, &audit3, &mk3).unwrap();
+        let missing = ledger3.units[0].record;
+        std::fs::remove_file(medium3.object_path(&missing)).unwrap();
+        let head3_before = medium3.head().unwrap().unwrap();
+        let error = medium3.begin_reclamation(&audit3, &mk3, 33).unwrap_err();
+        // The missing original record refuses fail-closed (the
+        // broken founding descent or the manifest check — any typed
+        // refusal; never an acceptance).
+        assert!(
+            matches!(
+                &error,
+                MediumError::MissingObject { .. } | MediumError::Chain { .. }
+            ),
+            "the missing record refuses typed: {error:?}"
+        );
+        assert_eq!(medium3.head().unwrap().unwrap(), head3_before);
+        // (5) The wrong MK: the mismatch refuses.
+        let error = medium
+            .begin_reclamation(&audit, &Hash::ZERO, 34)
+            .unwrap_err();
+        assert!(matches!(error, MediumError::Chain { .. }));
+        let _ = (root, root3);
     }
 }

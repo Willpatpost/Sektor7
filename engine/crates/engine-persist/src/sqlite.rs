@@ -1014,6 +1014,128 @@ impl CanonicalMedium for SqliteMedium {
 /// The trusted reclamation internals (K2-C2B P2) — the transaction-
 /// scoped authentication and execution (the same logical authority
 /// contract as the local provider's locked form).
+/// The OC-C2 trusted begin admission and publication under ONE
+/// `BEGIN IMMEDIATE` transaction (the authoritative verification and
+/// the publication coordinated; the transaction-scoped hash-verifying
+/// reads; no public trait method, no nested transaction): the audit
+/// authentication, the shared first-execution evidence core, the
+/// duplicate resolution, and the insertion + the HEAD advance +
+/// the COMMIT — all atomic (a rolled-back admission leaves nothing).
+/// NOT combined with destructive deletion (OC-C3). The tier is the
+/// provider's TransactionalWalFull.
+fn begin_reclamation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    audit: &Hash,
+    mk: &Hash,
+    tick: u64,
+) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+    // (A) The exact canonical audit identity over the
+    // transaction-scoped reads.
+    let (ledger, metadata, _head) = authenticate_audit_tx(tx, audit)?;
+    if ledger.mk != *mk {
+        return Err(MediumError::Chain {
+            rule: "begin-admission/mk-mismatch",
+        });
+    }
+    // The founding identity (the transaction-scoped descent).
+    let founding = {
+        let mut current = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+        loop {
+            let bytes = load_record_verified(tx, &current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            match record.parent {
+                Some(parent) if record_exists(tx, &parent)? => current = parent,
+                _ => break,
+            }
+        }
+        current
+    };
+    // (B-D) The shared first-execution evidence core over the
+    // transaction-scoped hash-verified record reads.
+    let mut begin = crate::reclaim::verify_first_execution_evidence(
+        &ledger,
+        &metadata,
+        &founding,
+        |identity| load_record_verified(tx, identity),
+    )?;
+    begin.source = *audit;
+    // The duplicate resolution: the keyed discovery + the exact
+    // content verification (never key occupancy alone).
+    let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
+    // The duplicate probe: the keyed record row.
+    let keyed: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT bytes FROM records WHERE idem = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(no_rows_as_none)
+        .map_err(|e| sqlite_err("begin duplicate probe", e))?;
+    if let Some(record_bytes) = keyed {
+        let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+        let Some(object) = record.content_refs.first().copied() else {
+            return Err(MediumError::Chain {
+                rule: "begin-admission/installed-malformed",
+            });
+        };
+        let object_bytes = load_object_verified(tx, &object)?;
+        let installed =
+            crate::reclaim::ReclamationBegin::decode(&object_bytes).map_err(MediumError::Format)?;
+        if installed.mk != *mk {
+            return Err(MediumError::Chain {
+                rule: "begin-admission/installed-mk-mismatch",
+            });
+        }
+        if installed == begin {
+            let id = crate::hash::hash_object(&record_bytes);
+            return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id });
+        }
+        return Err(MediumError::Chain {
+            rule: "begin-admission/duplicate-content-mismatch",
+        });
+    }
+    // The publication: the object row + the record row + the HEAD
+    // advance — one atomic unit with the commit.
+    let head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let parent_bytes = load_record_verified(tx, &head)?;
+    let parent = RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
+    let parent_epoch = parent.epoch;
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
+    let object = StoredObject::new(begin.canonical_bytes())?;
+    let record = RevisionRecord::regular(head, parent_epoch, tick)
+        .with_idempotency_key(key.clone())
+        .with_content_refs(vec![object.hash()]);
+    let record_bytes = record.canonical_bytes();
+    let record_id = crate::hash::hash_object(&record_bytes);
+    tx.execute(
+        "INSERT OR IGNORE INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+        params![object.hash().as_bytes(), object.domain(), object.bytes()],
+    )
+    .map_err(|e| sqlite_err("begin object insert", e))?;
+    tx.execute(
+        "INSERT INTO records (hash, bytes, epoch, parent, idem, kind, tick) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        params![
+            record_id.as_bytes(),
+            record_bytes,
+            record.epoch as i64,
+            head.as_bytes(),
+            key,
+            record.tick as i64,
+        ],
+    )
+    .map_err(|e| sqlite_err("begin record insert", e))?;
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'head'",
+        params![record_id.as_bytes()],
+    )
+    .map_err(|e| sqlite_err("begin head advance", e))?;
+    Ok(crate::reclaim::BeginPublicationOutcome::Accepted { id: record_id })
+}
+
 fn reclaim_authorized_tx(
     tx: &rusqlite::Transaction<'_>,
     directive: &crate::reclaim::ReclaimDirective,
@@ -3976,5 +4098,138 @@ mod exclusion_tests {
             "the fabricated foreign-MK later marker refuses at its own source-audit authentication: {error:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_trusted_begin_admission_publishes_on_sqlite() {
+        // (OC-C2) The SQLite twin: the valid admission under ONE
+        // BEGIN IMMEDIATE publishes Accepted (the begin row + the
+        // HEAD advance, atomically committed); the repeat resolves
+        // the duplicate by exact content; the fabricated digest
+        // refuses with nothing committed.
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ2", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let _p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+        let r1 = step(&mut medium, &[shared.clone(), private.clone()], 2);
+        let sk = step(&mut medium, std::slice::from_ref(&shared), 3);
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+        let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, sk, 3),
+            ],
+            range_digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = step(&mut medium, std::slice::from_ref(&meta_object), 4);
+        let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+        let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+        let ledger = crate::reclaim::ReclamationLedger {
+            mk,
+            sk,
+            range_digest: meta.range_digest,
+            seed: meta.seed,
+            records: 2,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![
+                crate::reclaim::ReclaimUnit {
+                    record: sk,
+                    objects: sk_refs,
+                },
+                crate::reclaim::ReclaimUnit {
+                    record: r1,
+                    objects: r1_refs,
+                },
+            ],
+        };
+        let (audit, outcome) =
+            crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
+        // The valid admission.
+        let outcome = medium.begin_reclamation(&audit, &mk, 30).unwrap();
+        let installed = match outcome {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id } => id,
+            other => panic!("the sqlite admission accepts, got {other:?}"),
+        };
+        assert_eq!(medium.head().unwrap().unwrap(), installed);
+        // The duplicate: exact content.
+        let outcome = medium.begin_reclamation(&audit, &mk, 31).unwrap();
+        match outcome {
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => {
+                assert_eq!(id, installed)
+            }
+            other => panic!("the sqlite duplicate verifies, got {other:?}"),
+        }
+        medium.validate().unwrap();
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The OC-C2 trusted begin admission (the transactional twin — see
+/// the free `begin_reclamation_tx`): ONE BEGIN IMMEDIATE covering
+/// the authentication, the evidence core, the duplicate resolution,
+/// and the insertion + the HEAD advance; the uncertain-commit
+/// discipline (never a false confirmation).
+impl SqliteMedium {
+    pub fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_err("begin admission transaction", e))?;
+        let outcome = begin_reclamation_tx(&tx, audit, mk, tick)?;
+        tx.commit().map_err(|_| MediumError::Chain {
+            rule: "begin-admission/commit-uncertain",
+        })?;
+        Ok(outcome)
     }
 }
