@@ -1023,6 +1023,83 @@ impl CanonicalMedium for SqliteMedium {
 /// the COMMIT — all atomic (a rolled-back admission leaves nothing).
 /// NOT combined with destructive deletion (OC-C3). The tier is the
 /// provider's TransactionalWalFull.
+/// The transaction-scoped begin discovery (the OC-C2-F3 corrective):
+/// the gap-aware descent from the authoritative HEAD for the
+/// deterministic key — proving the canonical membership by
+/// construction — with the full revision-shape validation and the
+/// strict decode. An unreferenced same-key row is never found (and
+/// never authoritative).
+fn find_installed_begin_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mk: &Hash,
+    expected: &crate::reclaim::ReclamationBegin,
+) -> Result<Option<(Hash, crate::reclaim::ReclamationBegin)>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let key = crate::reclaim::reclamation_begin_idempotency_key(mk);
+    let mut current = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut skip_table: Option<CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        let bytes = load_record_verified(tx, &current)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        if record.idempotency_key.as_deref() == Some(key.as_slice()) {
+            if !matches!(record.kind, crate::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+                || record.parent.is_none()
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-admission/installed-shape-mismatch",
+                });
+            }
+            let object = record.content_refs[0];
+            let object_bytes = load_object_verified(tx, &object)?;
+            let installed = crate::reclaim::ReclamationBegin::decode(&object_bytes)
+                .map_err(MediumError::Format)?;
+            if installed.mk != *mk {
+                return Err(MediumError::Chain {
+                    rule: "begin-admission/installed-mk-mismatch",
+                });
+            }
+            if installed != *expected {
+                return Err(MediumError::Chain {
+                    rule: "begin-admission/duplicate-content-mismatch",
+                });
+            }
+            return Ok(Some((current, installed)));
+        }
+        if let Some(object) = record.content_refs.first().copied() {
+            let object_bytes = load_object_verified(tx, &object)?;
+            if StoredObject::new(object_bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table =
+                    Some(CheckpointMetadata::decode(&object_bytes).map_err(MediumError::Format)?);
+            }
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        if !record_exists(tx, &parent)? {
+            let Some(table) = skip_table.as_ref() else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            let target = if table.sk == parent {
+                table.self_skip().map(|e| e.nearest_retained_ancestor)
+            } else {
+                table
+                    .skip_for(&current)
+                    .map(|e| e.nearest_retained_ancestor)
+            };
+            let Some(target) = target else {
+                return Err(MediumError::MissingObject { hash: parent });
+            };
+            current = target;
+        } else {
+            current = parent;
+        }
+    }
+    Ok(None)
+}
+
 fn begin_reclamation_tx(
     tx: &rusqlite::Transaction<'_>,
     audit: &Hash,
@@ -1037,19 +1114,15 @@ fn begin_reclamation_tx(
             rule: "begin-admission/mk-mismatch",
         });
     }
-    // The founding identity (the transaction-scoped descent).
-    let founding = {
-        let mut current = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
-        loop {
-            let bytes = load_record_verified(tx, &current)?;
-            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
-            match record.parent {
-                Some(parent) if record_exists(tx, &parent)? => current = parent,
-                _ => break,
-            }
-        }
-        current
-    };
+    // (F4) The gap-aware founding descent (the shared
+    // reader-parameterized helper over the transaction-scoped
+    // hash-verifying reads).
+    let founding = crate::reclaim::founding_identity(
+        read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?,
+        |identity| load_record_verified(tx, identity),
+        |identity| load_object_verified(tx, identity),
+        |identity| record_exists(tx, identity).unwrap_or(false),
+    )?;
     // (B-D) The shared first-execution evidence core over the
     // transaction-scoped hash-verified record reads.
     let mut begin = crate::reclaim::verify_first_execution_evidence(
@@ -1057,43 +1130,17 @@ fn begin_reclamation_tx(
         &metadata,
         &founding,
         |identity| load_record_verified(tx, identity),
+        |identity| load_object_verified(tx, identity),
     )?;
     begin.source = *audit;
-    // The duplicate resolution: the keyed discovery + the exact
-    // content verification (never key occupancy alone).
+    // (F3) The duplicate resolution: the gap-aware HEAD-ANCESTRY
+    // discovery (the idempotency index is a discovery aid, never
+    // authority — an unreferenced same-key row is not a canonical
+    // begin), the full revision-shape validation, and the exact
+    // content verification.
     let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
-    // The duplicate probe: the keyed record row.
-    let keyed: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT bytes FROM records WHERE idem = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .or_else(no_rows_as_none)
-        .map_err(|e| sqlite_err("begin duplicate probe", e))?;
-    if let Some(record_bytes) = keyed {
-        let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
-        let Some(object) = record.content_refs.first().copied() else {
-            return Err(MediumError::Chain {
-                rule: "begin-admission/installed-malformed",
-            });
-        };
-        let object_bytes = load_object_verified(tx, &object)?;
-        let installed =
-            crate::reclaim::ReclamationBegin::decode(&object_bytes).map_err(MediumError::Format)?;
-        if installed.mk != *mk {
-            return Err(MediumError::Chain {
-                rule: "begin-admission/installed-mk-mismatch",
-            });
-        }
-        if installed == begin {
-            let id = crate::hash::hash_object(&record_bytes);
-            return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id });
-        }
-        return Err(MediumError::Chain {
-            rule: "begin-admission/duplicate-content-mismatch",
-        });
+    if let Some((installed_id, _installed)) = find_installed_begin_tx(tx, mk, &begin)? {
+        return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id: installed_id });
     }
     // The publication: the object row + the record row + the HEAD
     // advance — one atomic unit with the commit.
@@ -1110,11 +1157,11 @@ fn begin_reclamation_tx(
         .with_content_refs(vec![object.hash()]);
     let record_bytes = record.canonical_bytes();
     let record_id = crate::hash::hash_object(&record_bytes);
-    tx.execute(
-        "INSERT OR IGNORE INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
-        params![object.hash().as_bytes(), object.domain(), object.bytes()],
-    )
-    .map_err(|e| sqlite_err("begin object insert", e))?;
+    // (F2) The insert-once, verify-on-retry discipline (the
+    // established helper — a preexisting row under the expected
+    // identity is hash-verified before reuse; a corrupt row refuses
+    // typed and is never overwritten).
+    insert_object_once(tx, &None, &object)?;
     tx.execute(
         "INSERT INTO records (hash, bytes, epoch, parent, idem, kind, tick) \
          VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
@@ -1127,7 +1174,19 @@ fn begin_reclamation_tx(
             record.tick as i64,
         ],
     )
-    .map_err(|e| sqlite_err("begin record insert", e))?;
+    .map_err(|e| {
+        // The same coherence guarantee as the normal admitted
+        // publication: the chain-wide idempotency-key uniqueness is
+        // the typed duplicate rule (an orphan squatting the key
+        // refuses fail-closed; nothing installed).
+        if is_constraint(&e) {
+            MediumError::Chain {
+                rule: "duplicate-idempotency-key",
+            }
+        } else {
+            sqlite_err("begin record insert", e)
+        }
+    })?;
     tx.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'head'",
         params![record_id.as_bytes()],
@@ -4208,6 +4267,217 @@ mod exclusion_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn the_sqlite_begin_admission_refuses_corrupt_and_orphan_evidence() {
+        // (OC-C2-F2/F3/F6) The SQLite integrity regressions: a
+        // PREPOPULATED corrupt object row under the exact expected
+        // begin-object hash refuses typed (the insert-once
+        // verify-on-retry discipline), the HEAD unchanged, the
+        // corrupt evidence preserved; an ORPHANED same-key record
+        // row (never on the ancestry) exerts no authority — the
+        // admission publishes Accepted.
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ2c-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let build = |label: &str| {
+            let r = root.join(label);
+            std::fs::create_dir_all(&r).unwrap();
+            let mut medium = SqliteMedium::open(r.join("db.sqlite")).unwrap();
+            let shared = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"shared-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let private = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"private-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+                let head = medium.head().unwrap().unwrap();
+                let epoch = medium.read_record(&head).unwrap().epoch;
+                let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+                let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+                medium.append(&record, objects, Some(head)).unwrap();
+                record.id()
+            };
+            let _p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+            let r1 = step(&mut medium, &[shared.clone(), private.clone()], 2);
+            let sk = step(&mut medium, std::slice::from_ref(&shared), 3);
+            let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+            let r1_bytes = medium.read_record(&r1).unwrap().canonical_bytes();
+            let range_digest = crate::checkpoint::chain_range_digest(&seed, &[r1_bytes]);
+            let meta = CheckpointMetadata::new(
+                sk,
+                r1,
+                vec![SkipEntry::new(Hash::ZERO, _p1)],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1, 2),
+                    ReclaimedIndexEntry::new(None, sk, 3),
+                ],
+                range_digest,
+                seed,
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let mk = step(&mut medium, std::slice::from_ref(&meta_object), 4);
+            let r1_refs = medium.read_record(&r1).unwrap().content_refs.clone();
+            let sk_refs = medium.read_record(&sk).unwrap().content_refs.clone();
+            let ledger = crate::reclaim::ReclamationLedger {
+                mk,
+                sk,
+                range_digest: meta.range_digest,
+                seed: meta.seed,
+                records: 2,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units: vec![
+                    crate::reclaim::ReclaimUnit {
+                        record: sk,
+                        objects: sk_refs,
+                    },
+                    crate::reclaim::ReclaimUnit {
+                        record: r1,
+                        objects: r1_refs,
+                    },
+                ],
+            };
+            let (audit, outcome) =
+                crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger, 5).unwrap();
+            assert!(matches!(
+                outcome,
+                crate::medium::AppendOutcome::Accepted { .. }
+            ));
+            (medium, audit, mk, ledger)
+        };
+        // (F2) The prepopulated corrupt row: derive the exact begin
+        // object the admission will construct (the same verified
+        // values), pre-insert WRONG bytes under its hash.
+        {
+            let (mut medium, audit, mk, ledger) = build("corrupt-row");
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let expected_hash = StoredObject::new(begin.canonical_bytes()).unwrap().hash();
+            medium
+                .conn
+                .execute(
+                    "INSERT INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+                    params![
+                        expected_hash.as_bytes().to_vec(),
+                        "sektor7/save/1",
+                        b"corrupt-prepopulated".to_vec()
+                    ],
+                )
+                .unwrap();
+            let head_before = medium.head().unwrap().unwrap();
+            let error = medium.begin_reclamation(&audit, &mk, 60).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::HashMismatch { .. } | MediumError::ReferencedObjectCorrupt { .. }
+                ),
+                "the corrupt preexisting row refuses typed (the insert-once verify): {error:?}"
+            );
+            assert_eq!(
+                medium.head().unwrap().unwrap(),
+                head_before,
+                "the HEAD is unchanged"
+            );
+            let preserved: Vec<u8> = medium
+                .conn
+                .query_row(
+                    "SELECT bytes FROM objects WHERE hash = ?1",
+                    params![expected_hash.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                preserved,
+                b"corrupt-prepopulated".to_vec(),
+                "the corrupt evidence is preserved, never overwritten"
+            );
+        }
+        // (F3) The orphaned same-key record row: inserted directly,
+        // never on the ancestry — the head-descent discovery never
+        // finds it; the admission publishes Accepted.
+        {
+            let (mut medium, audit, mk, _ledger) = build("orphan-key");
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let orphan_object = StoredObject::new(
+                crate::reclaim::ReclamationBegin {
+                    mk,
+                    source: audit,
+                    range_digest: [0u8; 32],
+                    seed: [0u8; 32],
+                }
+                .canonical_bytes(),
+            )
+            .unwrap();
+            let orphan_record = RevisionRecord::regular(Hash::ZERO, 0, 99)
+                .with_idempotency_key(key.clone())
+                .with_content_refs(vec![orphan_object.hash()]);
+            medium
+                .conn
+                .execute(
+                    "INSERT INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+                    params![
+                        orphan_object.hash().as_bytes().to_vec(),
+                        orphan_object.domain(),
+                        orphan_object.bytes().to_vec()
+                    ],
+                )
+                .unwrap();
+            medium
+                .conn
+                .execute(
+                    "INSERT INTO records (hash, bytes, epoch, parent, idem, kind, tick)                      VALUES (?1, ?2, 0, NULL, ?3, 1, 99)",
+                    params![
+                        crate::hash::hash_object(&orphan_record.canonical_bytes())
+                            .as_bytes()
+                            .to_vec(),
+                        orphan_record.canonical_bytes(),
+                        key
+                    ],
+                )
+                .unwrap();
+            // The orphan squats the deterministic key: the chain-wide
+            // unique-idempotency discipline refuses the publication
+            // fail-closed (the typed duplicate-key rule) — the orphan
+            // never returns DuplicateVerified and never fakes
+            // authority; the HEAD is unchanged.
+            let error = medium.begin_reclamation(&audit, &mk, 61).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "duplicate-idempotency-key"
+                    }
+                ),
+                "the orphaned same-key row never fakes a duplicate (the fail-closed refusal): {error:?}"
+            );
+            let head_after = medium.head().unwrap().unwrap();
+            let _ = head_after;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The OC-C2 trusted begin admission (the transactional twin — see
@@ -4227,9 +4497,45 @@ impl SqliteMedium {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| sqlite_err("begin admission transaction", e))?;
         let outcome = begin_reclamation_tx(&tx, audit, mk, tick)?;
-        tx.commit().map_err(|_| MediumError::Chain {
-            rule: "begin-admission/commit-uncertain",
-        })?;
+        // (F5) The uncertain-commit discipline: a COMMIT failure is
+        // NEVER a definite failure or an Accepted — the fresh
+        // authoritative observation reconciles (the membership
+        // proof, never a durability claim); an unresolvable state
+        // preserves the uncertainty typed.
+        if tx.commit().is_err() {
+            return reconcile_begin_publication(self, audit, mk, tick);
+        }
         Ok(outcome)
     }
+}
+
+/// The post-uncertain-commit reconciliation (the OC-C2-F5
+/// corrective): a fresh BEGIN IMMEDIATE over the authoritative
+/// state — the same full admission re-deriving the begin (an
+/// unchanged evidence state rediscovers it as the duplicate —
+/// ReconciledInstalled, the membership proof, never Accepted; a
+/// changed state refuses — never a blind rebase; a fresh
+/// installation is the durable Accepted at the provider's tier).
+fn reconcile_begin_publication(
+    medium: &mut SqliteMedium,
+    audit: &Hash,
+    mk: &Hash,
+    tick: u64,
+) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+    let tx = medium
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| MediumError::Chain {
+            rule: "begin-admission/reconcile-unverifiable",
+        })?;
+    let outcome = begin_reclamation_tx(&tx, audit, mk, tick)?;
+    tx.commit().map_err(|_| MediumError::Chain {
+        rule: "begin-admission/reconcile-unverifiable",
+    })?;
+    Ok(match outcome {
+        crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => {
+            crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id }
+        }
+        other => other,
+    })
 }

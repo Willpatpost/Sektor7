@@ -1864,15 +1864,27 @@ impl LocalFileMedium {
                 rule: "begin-admission/mk-mismatch",
             });
         }
-        // The founding identity (the descent to the parentless
-        // record over the internal reads — always computable).
-        let founding = self.founding_identity_locked()?;
+        // (F4) The gap-aware founding descent (the shared
+        // reader-parameterized helper over the internal reads — a
+        // missing parent is a gap crossed only under an
+        // authenticated skip table, never mistaken for the
+        // founding).
+        let head_for_founding = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let founding = crate::reclaim::founding_identity(
+            head_for_founding,
+            |identity| self.load_object(identity),
+            |identity| self.load_object(identity),
+            |identity| self.object_path(identity).is_file(),
+        )?;
         // (B-D) The shared first-execution evidence core over the
         // internal hash-verified object reads.
         let mut begin = crate::reclaim::verify_first_execution_evidence(
             &ledger,
             &metadata,
             &founding,
+            |identity| self.load_object(identity),
             |identity| self.load_object(identity),
         )?;
         begin.source = *audit;
@@ -1954,22 +1966,6 @@ impl LocalFileMedium {
         }
     }
 
-    /// The founding identity under the held lock (the internal
-    /// parent-following descent).
-    fn founding_identity_locked(&self) -> Result<Hash, MediumError> {
-        let mut current = self
-            .read_head_file()?
-            .ok_or(MediumError::Chain { rule: "unfounded" })?;
-        loop {
-            let bytes = self.load_object(&current)?;
-            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
-            match record.parent {
-                Some(parent) if self.object_path(&parent).is_file() => current = parent,
-                _ => return Ok(current),
-            }
-        }
-    }
-
     /// The begin discovery under the held lock: the descent for the
     /// deterministic key, the strict decode, the binding checks.
     fn find_installed_begin_locked(
@@ -1986,6 +1982,26 @@ impl LocalFileMedium {
             let bytes = self.load_object(&current)?;
             let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
             if record.idempotency_key.as_deref() == Some(key.as_slice()) {
+                // (F3) The full revision-shape validation — the
+                // head-descent (this walk) proves the canonical
+                // membership; the shape checks below complete the
+                // authority proof (a keyed record is a candidate,
+                // never authority by itself).
+                if !matches!(record.kind, crate::record::RecordKind::Regular) {
+                    return Err(MediumError::Chain {
+                        rule: "begin-admission/installed-shape-mismatch",
+                    });
+                }
+                if record.content_refs.len() != 1 {
+                    return Err(MediumError::Chain {
+                        rule: "begin-admission/installed-shape-mismatch",
+                    });
+                }
+                if record.parent.is_none() {
+                    return Err(MediumError::Chain {
+                        rule: "begin-admission/installed-shape-mismatch",
+                    });
+                }
                 let Some(object) = record.content_refs.first().copied() else {
                     return Err(MediumError::Chain {
                         rule: "begin-admission/installed-malformed",
@@ -5165,5 +5181,171 @@ mod exclusion_tests {
             .unwrap_err();
         assert!(matches!(error, MediumError::Chain { .. }));
         let _ = (root, root3);
+    }
+
+    #[test]
+    fn the_begin_admission_authenticates_the_original_content() {
+        // (OC-C2-F1/F3/F6) The content-evidence and duplicate-shape
+        // regressions: a MISSING referenced content object refuses
+        // typed with the HEAD unchanged; a HASH-CORRUPT content
+        // object (wrong bytes at the audited identity) refuses
+        // typed; an ORPHANED same-key record (off the ancestry) is
+        // never discovered as a duplicate — the admission publishes
+        // Accepted (the orphan has no authority); a MALFORMED
+        // same-key record ON the ancestry (two content refs)
+        // refuses the shape validation.
+        let (root, mut medium, audit, mk, _shared, private) = trusted_execution_store();
+        // (F1a) The missing content object.
+        std::fs::remove_file(medium.object_path(&private)).unwrap();
+        let head_before = medium.head().unwrap().unwrap();
+        let error = medium.begin_reclamation(&audit, &mk, 40).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::MissingObject { .. } | MediumError::HashMismatch { .. }
+            ),
+            "the missing content object refuses: {error:?}"
+        );
+        assert_eq!(medium.head().unwrap().unwrap(), head_before);
+        // (F1b) The hash-corrupt content object (the wrong bytes at
+        // the audited identity — the hash-verifying read refuses).
+        std::fs::write(medium.object_path(&private), b"corrupted-content").unwrap();
+        let error = medium.begin_reclamation(&audit, &mk, 41).unwrap_err();
+        assert!(
+            matches!(error, MediumError::HashMismatch { .. }),
+            "the corrupt content object refuses typed: {error:?}"
+        );
+        assert_eq!(medium.head().unwrap().unwrap(), head_before);
+        // Restore; the admission now succeeds.
+        let (root2, mut medium2, audit2, mk2, _s2, _p2) = trusted_execution_store();
+        let outcome = medium2.begin_reclamation(&audit2, &mk2, 42).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+        ));
+        // (F3a) The ORPHANED same-key record: hand-written into the
+        // object namespace, NEVER on the ancestry — the discovery
+        // (the head descent) must not find it; a fresh store's
+        // admission publishes Accepted (the orphan exerts no
+        // authority).
+        let (root3, mut medium3, audit3, mk3, _s3, _p3) = trusted_execution_store();
+        let founding3 = {
+            let mut current = medium3.head().unwrap().unwrap();
+            loop {
+                let bytes = medium3.read_record(&current).unwrap().canonical_bytes();
+                let id = crate::hash::hash_object(&bytes);
+                let rec = medium3.read_record(&id).unwrap();
+                match rec.parent {
+                    Some(p) => current = p,
+                    None => break id,
+                }
+            }
+        };
+        let key = crate::reclaim::reclamation_begin_idempotency_key(&mk3);
+        let orphan_object = StoredObject::new(
+            crate::reclaim::ReclamationBegin {
+                mk: mk3,
+                source: audit3,
+                range_digest: [0u8; 32],
+                seed: [0u8; 32],
+            }
+            .canonical_bytes(),
+        )
+        .unwrap();
+        let orphan = RevisionRecord::regular(founding3, 0, 99)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![orphan_object.hash()]);
+        std::fs::write(
+            medium3.object_path(&orphan_object.hash()),
+            orphan_object.bytes(),
+        )
+        .unwrap();
+        std::fs::write(medium3.object_path(&orphan.id()), orphan.canonical_bytes()).unwrap();
+        let outcome = medium3.begin_reclamation(&audit3, &mk3, 43).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+            ),
+            "the orphaned same-key record never blocks or fakes a duplicate: {outcome:?}"
+        );
+        // (F3b) The MALFORMED same-key record ON the ancestry: two
+        // content refs — the shape validation refuses.
+        let (root4, mut medium4, audit4, mk4, s4, _p4) = trusted_execution_store();
+        let head4 = medium4.head().unwrap().unwrap();
+        let epoch4 = medium4.read_record(&head4).unwrap().epoch;
+        let begin4 = crate::reclaim::ReclamationBegin {
+            mk: mk4,
+            source: audit4,
+            range_digest: [0u8; 32],
+            seed: [0u8; 32],
+        };
+        let obj4 = StoredObject::new(begin4.canonical_bytes()).unwrap();
+        let malformed = RevisionRecord::regular(head4, epoch4, 98)
+            .with_idempotency_key(crate::reclaim::reclamation_begin_idempotency_key(&mk4))
+            .with_content_refs(vec![obj4.hash(), s4]);
+        let s4_object = medium4.read_object(&s4).unwrap();
+        let s4_stored = StoredObject::new(s4_object).unwrap();
+        // Install the malformed same-key record ON the ancestry via
+        // the in-crate receipt (two content refs — the generic
+        // publication does not refuse the count; the begin
+        // discovery's shape validation must).
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&malformed, &[obj4.clone(), s4_stored]);
+        medium4.append_admitted(admitted, Some(head4)).unwrap();
+        let error = medium4.begin_reclamation(&audit4, &mk4, 44).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/installed-shape-mismatch"
+                }
+            ),
+            "the malformed same-key record refuses the shape validation: {error:?}"
+        );
+        let _ = (root, root2, root3, root4);
+    }
+
+    #[test]
+    fn the_begin_admission_founding_crosses_reclaimed_gaps() {
+        // (OC-C2-F4) The gap-aware founding: after a legitimate
+        // retirement creates an authenticated gap, a LATER
+        // checkpoint's begin admission still derives the TRUE
+        // founding's seed (the naive missing-parent descent would
+        // have stopped at the gap and derived a wrong seed — the
+        // refusal); the shared skip-table crossing reaches the real
+        // founding and the admission succeeds.
+        let (root, mut medium, audit_a, mk1, _mk2, _x1, _x2, _directive_a, _ledger_b) =
+            two_retirement_store("occ2-f4");
+        // Retirement A executes (the gap below MK1's skip tables).
+        let (ledger_a, _meta_a) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_a, &mk1).unwrap();
+        medium
+            .reclaim(&crate::reclaim::ReclaimDirective {
+                audit_record: audit_a,
+                units: ledger_a.units.clone(),
+            })
+            .unwrap();
+        // The later checkpoint B's audit (already installed by the
+        // fixture above A's range).
+        // B's audit PUBLISHED now (the fixture returns the ledger
+        // unpublished) — above A's retired range, over B's intact
+        // records.
+        let (audit_b, outcome_b) = publish_reclamation_ledger(&mut medium, &_ledger_b, 9).unwrap();
+        assert!(matches!(outcome_b, AppendOutcome::Accepted { .. }));
+        // B's admission over the gap-crossed founding: the seed
+        // check must pass via the TRUE founding (the gap-aware
+        // descent) — the naive descent would fail the seed.
+        let outcome = medium.begin_reclamation(&audit_b, &_mk2, 50);
+        match outcome {
+            Ok(crate::reclaim::BeginPublicationOutcome::Accepted { .. }) => {}
+            Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }) => {}
+            Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { .. }) => {}
+            Ok(crate::reclaim::BeginPublicationOutcome::ReconciledNotInstalled) => {}
+            Err(error) => panic!(
+                "the gap-aware founding reaches the TRUE founding (the admission proceeds): {error:?}"
+            ),
+        }
+        let _ = (outcome, root);
     }
 }

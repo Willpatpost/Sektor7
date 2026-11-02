@@ -524,6 +524,74 @@ pub enum BeginPublicationOutcome {
     DuplicateVerified { id: Hash },
 }
 
+/// The gap-aware founding descent (the OC-C2-F4 corrective): the
+/// walk from the authoritative HEAD to the ACTUAL founding revision,
+/// crossing legitimate reclaimed gaps ONLY under authenticated
+/// checkpoint skip tables — a missing parent is evidence of a gap,
+/// never proof of the founding. Reader-parameterized so each
+/// provider runs it under its already-held coordination (the
+/// internal hash-verifying reads; no public trait method, no nested
+/// lock or transaction).
+pub fn founding_identity(
+    head: Hash,
+    read_record_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
+    read_object_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
+    record_present: impl Fn(&Hash) -> bool,
+) -> Result<Hash, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let mut current = head;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let bytes = read_record_bytes(&current)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        if let Some(object) = record.content_refs.first().copied() {
+            let object_bytes = read_object_bytes(&object)?;
+            if StoredObject::new(object_bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&object_bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            // The verified parentless record IS the founding.
+            return Ok(current);
+        };
+        if record_present(&parent) {
+            current = parent;
+            continue;
+        }
+        // The gap: legitimate ONLY under the most recent
+        // authenticated skip table (the self-skip/skip-for
+        // distinction); an uncovered gap refuses fail-closed.
+        let Some(table) = skip_table.as_ref() else {
+            return Err(MediumError::MissingObject { hash: parent });
+        };
+        let target = if table.sk == parent {
+            table
+                .self_skip()
+                .map(|entry| entry.nearest_retained_ancestor)
+        } else {
+            table
+                .skip_for(&current)
+                .map(|entry| entry.nearest_retained_ancestor)
+        };
+        let Some(target) = target else {
+            return Err(MediumError::MissingObject { hash: parent });
+        };
+        current = target;
+    }
+    Err(MediumError::Chain {
+        rule: "begin-admission/founding-descent-bound",
+    })
+}
+
 /// The shared first-execution evidence core (OC-C2-B): given the
 /// already-authenticated ledger and metadata (the provider's own
 /// internal, coordination-respecting authentication) and a
@@ -537,6 +605,7 @@ pub fn verify_first_execution_evidence(
     metadata: &crate::checkpoint::CheckpointMetadata,
     founding: &Hash,
     read_record_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
+    read_object_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
 ) -> Result<ReclamationBegin, MediumError> {
     // (B) The checkpoint bindings: the ledger's SK, digest, and seed
     // agree with the MK's permanent metadata.
@@ -574,6 +643,32 @@ pub fn verify_first_execution_evidence(
             return Err(MediumError::Chain {
                 rule: "begin-admission/units-objects-mismatch",
             });
+        }
+        // (F1) The referenced CONTENT evidence: every original
+        // content object present and hash-verified (the reader is
+        // the provider's hash-verifying read), with the transitive
+        // composite closure verified under the established rules —
+        // a matching ledger list alone is never proof the content
+        // exists intact.
+        for identity in &record.content_refs {
+            let object_bytes = read_object_bytes(identity)?;
+            if StoredObject::new(object_bytes.clone())?.domain()
+                == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
+            {
+                let manifest = crate::composite_manifest::decode(&object_bytes)
+                    .map_err(MediumError::Format)?;
+                for entry in &manifest.entries {
+                    let chunk_bytes = read_object_bytes(&entry.identity)?;
+                    crate::composite_append::verify_chunk_dependency(
+                        &chunk_bytes,
+                        &entry.identity,
+                        &manifest,
+                    )
+                    .map_err(|_error| MediumError::Chain {
+                        rule: "begin-admission/content-closure-verification",
+                    })?;
+                }
+            }
         }
     }
     // The valid newest-first retirement order.
