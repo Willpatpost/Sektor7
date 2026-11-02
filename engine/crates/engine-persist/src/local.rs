@@ -5195,6 +5195,20 @@ mod exclusion_tests {
         // same-key record ON the ancestry (two content refs)
         // refuses the shape validation.
         let (root, mut medium, audit, mk, _shared, private) = trusted_execution_store();
+        // (OC-P2) The tier gate: on a ProcessCrashOnly platform the
+        // admission refuses fail-closed before any evidence check —
+        // the SQLite twin covers the publication there.
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.begin_reclamation(&audit, &mk, 45).unwrap_err();
+            assert!(matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/tier-insufficient"
+                }
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         // (F1a) The missing content object.
         std::fs::remove_file(medium.object_path(&private)).unwrap();
         let head_before = medium.head().unwrap().unwrap();
@@ -5317,6 +5331,19 @@ mod exclusion_tests {
         // founding and the admission succeeds.
         let (root, mut medium, audit_a, mk1, _mk2, _x1, _x2, _directive_a, _ledger_b) =
             two_retirement_store("occ2-f4");
+        // (OC-P2) The tier gate (the Windows-local refusal; the
+        // SQLite twin covers the transactional publication).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.begin_reclamation(&audit_a, &mk1, 55).unwrap_err();
+            assert!(matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/tier-insufficient"
+                }
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         // Retirement A executes (the gap below MK1's skip tables).
         let (ledger_a, _meta_a) =
             crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit_a, &mk1).unwrap();
