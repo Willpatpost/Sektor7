@@ -446,8 +446,20 @@ impl ReclamationBegin {
         if mk == Hash::ZERO || source == Hash::ZERO {
             return Err(SaveError::Integrity("reclamation-begin/zero-identity"));
         }
-        let range_digest = read_digest(&mut dec, SECTION)?;
-        let seed = read_digest(&mut dec, SECTION)?;
+        // The begin-specific exact-width digest read (the ratified
+        // malformed-input contract: reclamation-begin/digest-width —
+        // distinct from the shared ledger helper's classification).
+        let read_begin_digest = |dec: &mut Decoder| -> Result<[u8; 32], SaveError> {
+            let bytes = dec.read_bytes(32, SECTION)?;
+            if bytes.len() != 32 {
+                return Err(SaveError::Integrity("reclamation-begin/digest-width"));
+            }
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(bytes);
+            Ok(digest)
+        };
+        let range_digest = read_begin_digest(&mut dec)?;
+        let seed = read_begin_digest(&mut dec)?;
         dec.finish()?;
         Ok(Self {
             mk,
@@ -501,8 +513,15 @@ pub fn test_only_install_begin_record(
         .with_idempotency_key(key)
         .with_content_refs(vec![object.hash()]);
     let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
-    medium.append_admitted(admitted, Some(head))?;
-    Ok(record.id())
+    match medium.append_admitted(admitted, Some(head))? {
+        crate::medium::AppendOutcome::Accepted { .. } => Ok(record.id()),
+        crate::medium::AppendOutcome::RejectedStaleParent { .. } => Err(MediumError::Chain {
+            rule: "reclamation-begin/test-install-stale-parent",
+        }),
+        crate::medium::AppendOutcome::Unknown { .. } => Err(MediumError::Chain {
+            rule: "reclamation-begin/test-install-unknown",
+        }),
+    }
 }
 
 /// The v2 reclamation ledger: the ratified closure-expanded,
@@ -2366,8 +2385,15 @@ pub fn test_only_install_completion_marker(
         .with_idempotency_key(key)
         .with_content_refs(vec![object.hash()]);
     let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
-    medium.append_admitted(admitted, Some(head))?;
-    Ok(record.id())
+    match medium.append_admitted(admitted, Some(head))? {
+        crate::medium::AppendOutcome::Accepted { .. } => Ok(record.id()),
+        crate::medium::AppendOutcome::RejectedStaleParent { .. } => Err(MediumError::Chain {
+            rule: "reclamation-begin/test-install-stale-parent",
+        }),
+        crate::medium::AppendOutcome::Unknown { .. } => Err(MediumError::Chain {
+            rule: "reclamation-begin/test-install-unknown",
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3084,7 +3110,7 @@ mod tests {
         };
         assert!(matches!(
             ReclamationBegin::decode(&undersized_digest),
-            Err(SaveError::Integrity("reclamation/digest-width"))
+            Err(SaveError::Integrity("reclamation-begin/digest-width"))
         ));
         // The digest oversized (33): the limit check.
         let oversized_digest = {
@@ -3116,7 +3142,24 @@ mod tests {
         };
         assert!(matches!(
             ReclamationBegin::decode(&undersized_seed),
-            Err(SaveError::Integrity("reclamation/digest-width"))
+            Err(SaveError::Integrity("reclamation-begin/digest-width"))
+        ));
+        // The seed oversized (33): the limit check.
+        let oversized_seed = {
+            let mut extended = begin.seed.to_vec();
+            extended.push(0x04);
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(RECLAMATION_BEGIN_DOMAIN);
+            enc.write_u32(RECLAMATION_BEGIN_VERSION);
+            enc.write_bytes(begin.mk.as_bytes());
+            enc.write_bytes(begin.source.as_bytes());
+            enc.write_bytes(&begin.range_digest);
+            enc.write_bytes(&extended);
+            enc.into_bytes()
+        };
+        assert!(matches!(
+            ReclamationBegin::decode(&oversized_seed),
+            Err(SaveError::Limit { .. })
         ));
         // The zero identities.
         let zero_mk = ReclamationBegin {
@@ -3342,6 +3385,90 @@ mod tests {
                 }
             ),
             "the completion gate remains enforced: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(feature = "composite-test-fixture")]
+    fn the_composite_admission_refuses_the_begin_family() {
+        // (OC-C1-B, the alternative public path) The dedicated
+        // composite admission cannot publish a begin-family ROOT
+        // (the root must strictly decode as a composite manifest),
+        // and a begin-family object cannot masquerade as a valid
+        // composite CHUNK (the dependency verification fails).
+        crate::composite_append::test_enable_composite_publication();
+        use crate::StoredObject;
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ1-comp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "occ1c", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let begin_object = StoredObject::new(sample_begin().canonical_bytes()).unwrap();
+        // (1) The begin object as the composite ROOT: the admission
+        // refuses (the root must be a manifest).
+        let root_record =
+            RevisionRecord::regular(head, epoch, 20).with_content_refs(vec![begin_object.hash()]);
+        let request = crate::composite_append::CompositeAppend {
+            record: &root_record,
+            root: &begin_object,
+            new_chunks: &[],
+            reused_chunks: &[],
+        };
+        let error = medium.append_composite(&request, Some(head)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::CompositeAdmission { .. }
+                    | crate::medium::MediumError::Format(_)
+            ),
+            "the begin root refuses the composite admission (the strict manifest decode): {error:?}"
+        );
+        // (2) The begin object as a composite CHUNK: the admission's
+        // dependency verification refuses (a begin object is not a
+        // valid chunk envelope).
+        let chunk_record =
+            RevisionRecord::regular(head, epoch, 21).with_content_refs(vec![begin_object.hash()]);
+        let request = crate::composite_append::CompositeAppend {
+            record: &chunk_record,
+            root: &begin_object,
+            new_chunks: std::slice::from_ref(&begin_object),
+            reused_chunks: &[],
+        };
+        let error = medium.append_composite(&request, Some(head)).unwrap_err();
+        let _ = &error;
+        // Any typed refusal suffices (the manifest decode or the
+        // dependency verification — both precede any write); the
+        // key property: NO Accepted outcome for a begin payload.
+        assert!(
+            !std::matches!(
+                error,
+                crate::medium::MediumError::Chain { rule: "accepted" }
+            ),
+            "the begin chunk never publishes: {error:?}"
         );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
