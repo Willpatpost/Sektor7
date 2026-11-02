@@ -1061,7 +1061,10 @@ fn find_installed_begin_tx(
                 let parent_bytes = load_record_verified(tx, &parent)?;
                 let parent_record =
                     RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
-                if record.epoch != parent_record.epoch.saturating_add(1) {
+                // (C2-R7) Checked arithmetic: an epoch at u64::MAX has
+                // no valid successor — saturation must never make an
+                // incoherent linkage appear coherent.
+                if parent_record.epoch.checked_add(1) != Some(record.epoch) {
                     return Err(MediumError::Chain {
                         rule: "begin-admission/installed-linkage-mismatch",
                     });
@@ -1129,12 +1132,16 @@ fn find_installed_begin_tx(
     Ok(None)
 }
 
+/// The admission's transaction body. Returns the publication outcome
+/// AND the exact attempted candidate revision identity (Some only
+/// when an installation was attempted) — the (C2-R5) identity the
+/// uncertain-commit reconciliation must be bound to.
 fn begin_reclamation_tx(
     tx: &rusqlite::Transaction<'_>,
     audit: &Hash,
     mk: &Hash,
     tick: u64,
-) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+) -> Result<(crate::reclaim::BeginPublicationOutcome, Option<Hash>), MediumError> {
     // (A) The exact canonical audit identity over the
     // transaction-scoped reads.
     let (ledger, metadata, _head) = authenticate_audit_tx(tx, audit)?;
@@ -1169,7 +1176,10 @@ fn begin_reclamation_tx(
     // content verification.
     let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
     if let Some((installed_id, _installed)) = find_installed_begin_tx(tx, mk, &begin)? {
-        return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id: installed_id });
+        return Ok((
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id: installed_id },
+            None,
+        ));
     }
     // The publication: the object row + the record row + the HEAD
     // advance — one atomic unit with the commit.
@@ -1221,7 +1231,10 @@ fn begin_reclamation_tx(
         params![record_id.as_bytes()],
     )
     .map_err(|e| sqlite_err("begin head advance", e))?;
-    Ok(crate::reclaim::BeginPublicationOutcome::Accepted { id: record_id })
+    Ok((
+        crate::reclaim::BeginPublicationOutcome::Accepted { id: record_id },
+        Some(record_id),
+    ))
 }
 
 fn reclaim_authorized_tx(
@@ -4761,10 +4774,26 @@ mod exclusion_tests {
             drop(medium);
             let _ = std::fs::remove_dir_all(&root);
         }
-        // (b) The installed-but-acknowledgment-lost window.
+        // (b) The installed-but-acknowledgment-lost window — the
+        // reconciliation is bound to the EXACT attempted candidate
+        // revision identity (C2-R5).
         {
-            let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
                 sqlite_begin_store("after-commit");
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let head_before = medium.head().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head_before).unwrap().epoch;
+            let candidate = RevisionRecord::regular(head_before, head_epoch, 72)
+                .with_idempotency_key(key.clone())
+                .with_content_refs(vec![object.hash()]);
+            let candidate_id = crate::hash::hash_object(&candidate.canonical_bytes());
             medium.fault = Some(SqliteFaultControl::new().arm(
                 SqliteFaultPoint::AfterCommit,
                 SqliteFaultAction::InjectError,
@@ -4777,11 +4806,14 @@ mod exclusion_tests {
                 ),
             };
             assert_eq!(
+                id, candidate_id,
+                "the reconciled identity is the EXACT attempted candidate revision"
+            );
+            assert_eq!(
                 medium.head().unwrap().unwrap(),
                 id,
                 "the reconciled identity is the installed HEAD"
             );
-            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
             let begin_rows: i64 = medium
                 .conn
                 .query_row(
@@ -4817,7 +4849,7 @@ mod exclusion_tests {
                 )
                 .unwrap();
             let head_before = medium.head().unwrap().unwrap();
-            let error = reconcile_begin_publication(&mut medium, &audit, &mk).unwrap_err();
+            let error = reconcile_begin_publication(&mut medium, &audit, &mk, None).unwrap_err();
             assert!(
                 matches!(
                     error,
@@ -4844,6 +4876,131 @@ mod exclusion_tests {
             assert_eq!(
                 begin_rows, 0,
                 "the unverifiable observation published nothing"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (d) (C2-R5) A DIFFERENT same-key revision than the
+        // attempted candidate: the same valid begin payload under a
+        // different revision identity (a different tick) — the
+        // reconciliation must classify it as separately discovered,
+        // verified duplicate evidence, never ReconciledInstalled for
+        // the original attempt. Exercised through the same reconcile
+        // entry the uncertain path delegates to (the public
+        // admission's duplicate discovery never constructs a second
+        // candidate when one is already installed).
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("different-candidate");
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            // The already-installed begin revision Y (a valid
+            // publication on the current head).
+            let head = medium.head().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head).unwrap().epoch;
+            let installed = RevisionRecord::regular(head, head_epoch, 80)
+                .with_idempotency_key(key.clone())
+                .with_content_refs(vec![object.hash()]);
+            install_sqlite_begin_fake(&mut medium, &installed, &object);
+            let installed_id = crate::hash::hash_object(&installed.canonical_bytes());
+            // The DIFFERENT attempted candidate X (the same payload,
+            // a different tick — a different revision identity).
+            let candidate = RevisionRecord::regular(head, head_epoch, 81)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            let candidate_id = crate::hash::hash_object(&candidate.canonical_bytes());
+            assert_ne!(
+                candidate_id, installed_id,
+                "the fixtures differ in revision identity"
+            );
+            let outcome =
+                reconcile_begin_publication(&mut medium, &audit, &mk, Some(candidate_id)).unwrap();
+            match outcome {
+                crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => {
+                    assert_eq!(
+                        id, installed_id,
+                        "the different same-key revision is the separately discovered duplicate"
+                    )
+                }
+                other => panic!(
+                    "never the attempted candidate's installation for a different revision: {other:?}"
+                ),
+            }
+            assert_eq!(
+                medium.head().unwrap().unwrap(),
+                installed_id,
+                "the observation wrote nothing (the HEAD is the pre-existing installation)"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (e) (C2-R5) The PUBLIC path over a pre-existing different
+        // same-key revision: the admission's own duplicate discovery
+        // verifies Y before constructing any candidate; the
+        // acknowledgment lost in the post-commit window reconciles
+        // to the SAME separately-discovered classification (never
+        // ReconciledInstalled for a candidate that was never
+        // constructed); the explicit retry converges idempotently.
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("ack-lost-duplicate");
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head).unwrap().epoch;
+            let installed = RevisionRecord::regular(head, head_epoch, 82)
+                .with_idempotency_key(key.clone())
+                .with_content_refs(vec![object.hash()]);
+            install_sqlite_begin_fake(&mut medium, &installed, &object);
+            let installed_id = crate::hash::hash_object(&installed.canonical_bytes());
+            medium.fault = Some(SqliteFaultControl::new().arm(
+                SqliteFaultPoint::AfterCommit,
+                SqliteFaultAction::InjectError,
+            ));
+            let outcome = medium.begin_reclamation(&audit, &mk, 83).unwrap();
+            match outcome {
+                crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => {
+                    assert_eq!(id, installed_id)
+                }
+                other => panic!(
+                    "the acknowledgment-lost duplicate admission reconciles to the separately discovered duplicate: {other:?}"
+                ),
+            }
+            let begin_rows: i64 = medium
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE idem = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                begin_rows, 1,
+                "no second publication (exactly the pre-existing installation)"
+            );
+            medium.fault = None;
+            // The explicit retry converges idempotently on the
+            // pre-existing installation.
+            let outcome = medium.begin_reclamation(&audit, &mk, 84).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id }
+                        if id == installed_id
+                ),
+                "the retry converges on the pre-existing installation: {outcome:?}"
             );
             drop(medium);
             let _ = std::fs::remove_dir_all(&root);
@@ -5183,7 +5340,12 @@ mod exclusion_tests {
         // wrong PARENT (a mid-range chain position) strands the
         // audit — the AUTHENTICATION boundary refuses, never the
         // discovery.
-        // (a) The wrong-epoch linkage.
+        // (a) The wrong-epoch linkage — exercised through the
+        // discovery directly: the (C2-R6) authoritative-chain
+        // validation refuses such a HEAD at the public admission
+        // boundary (the epoch-regression rule — its own regression),
+        // so the discovery's own linkage check is the
+        // defense-in-depth boundary.
         {
             let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
                 sqlite_begin_store("wrong-epoch");
@@ -5207,7 +5369,10 @@ mod exclusion_tests {
                 depends_on: Vec::new(),
             };
             install_sqlite_begin_fake(&mut medium, &fake, &object);
-            let error = medium.begin_reclamation(&audit, &mk, 78).unwrap_err();
+            let error = {
+                let tx = medium.conn.transaction().unwrap();
+                find_installed_begin_tx(&tx, &mk, &begin).unwrap_err()
+            };
             assert!(
                 matches!(
                     error,
@@ -5376,8 +5541,10 @@ mod exclusion_tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         // (f) The wrong parent: the same-key record chained onto a
-        // MID-RANGE record (not the head) — the audit is unreachable
-        // from the new HEAD; the AUTHENTICATION boundary refuses.
+        // MID-RANGE record (not the head) — the observed chain no
+        // longer contains the trusted history: the (C2-R6)
+        // authoritative-chain validation refuses at the divergence
+        // boundary (the audit is stranded below the rewrite).
         {
             let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
                 sqlite_begin_store("wrong-parent");
@@ -5402,17 +5569,264 @@ mod exclusion_tests {
             install_sqlite_begin_fake(&mut medium, &fake, &object);
             let error = medium.begin_reclamation(&audit, &mk, 82).unwrap_err();
             assert!(
-                matches!(
-                    error,
-                    MediumError::Chain {
-                        rule: "reclaim/audit-not-canonical"
-                    }
-                ),
-                "the wrong-parent same-key record strands the audit — the authentication refuses: {error:?}"
+                matches!(error, MediumError::Chain { rule: "divergence" }),
+                "the wrong-parent same-key record diverges from the trusted history: {error:?}"
             );
             drop(medium);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+    #[test]
+    fn the_sqlite_begin_admission_requires_authoritative_chain_coherence() {
+        // (C2-R6) A chain carrying an otherwise authentic audit and
+        // original retirement evidence but MALFORMED revisions above
+        // the audit never receives a trusted begin: the admission
+        // runs the SAME transaction-scoped trusted-cursor validation
+        // the normal publication applies — before any duplicate
+        // outcome and before any installation; the ordinary
+        // valid-history admission still succeeds.
+        // (a) The incorrect regular-revision epoch above the audit.
+        {
+            let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+                sqlite_begin_store("chain-epoch");
+            let payload = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"malformed-above-audit");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head).unwrap().epoch;
+            let malformed = RevisionRecord {
+                kind: crate::record::RecordKind::Regular,
+                epoch: head_epoch + 5,
+                parent: Some(head),
+                idempotency_key: None,
+                tick: 96,
+                content_refs: vec![payload.hash()],
+                depends_on: Vec::new(),
+            };
+            let malformed_id = crate::hash::hash_object(&malformed.canonical_bytes());
+            install_sqlite_begin_fake(&mut medium, &malformed, &payload);
+            let error = medium.begin_reclamation(&audit, &mk, 85).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "epoch-regression"
+                    }
+                ),
+                "the malformed epoch above the audit refuses at the authoritative-chain validation: {error:?}"
+            );
+            assert_eq!(
+                read_meta_head(&medium.conn).unwrap().unwrap(),
+                malformed_id,
+                "the HEAD is unchanged (nothing installed; the raw stored head)"
+            );
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin_rows: i64 = medium
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE idem = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(begin_rows, 0, "no begin revision installed");
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) No duplicate success from an invalid authoritative
+        // chain: a VALID same-key begin installed first, then the
+        // malformed revision above it — the admission refuses at the
+        // chain validation, never returns the duplicate.
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("chain-duplicate");
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head).unwrap().epoch;
+            let valid = RevisionRecord::regular(head, head_epoch, 97)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            install_sqlite_begin_fake(&mut medium, &valid, &object);
+            let payload = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"malformed-above-the-begin");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let head_m = medium.head().unwrap().unwrap();
+            let epoch_m = medium.read_record(&head_m).unwrap().epoch;
+            let malformed = RevisionRecord {
+                kind: crate::record::RecordKind::Regular,
+                epoch: epoch_m + 5,
+                parent: Some(head_m),
+                idempotency_key: None,
+                tick: 98,
+                content_refs: vec![payload.hash()],
+                depends_on: Vec::new(),
+            };
+            install_sqlite_begin_fake(&mut medium, &malformed, &payload);
+            let error = medium.begin_reclamation(&audit, &mk, 86).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "epoch-regression"
+                    }
+                ),
+                "no duplicate success from an invalid authoritative chain: {error:?}"
+            );
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let begin_rows: i64 = medium
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE idem = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                begin_rows, 1,
+                "exactly the pre-existing installation, nothing added"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) The invalid general chain structure: the wrong parent
+        // — the observed chain no longer contains the trusted
+        // history (the divergence the normal admission rejects).
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("chain-divergence");
+            let payload = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"divergent-parent");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let r1 = ledger.units[1].record;
+            let r1_epoch = medium.read_record(&r1).unwrap().epoch;
+            let divergent = RevisionRecord {
+                kind: crate::record::RecordKind::Regular,
+                epoch: r1_epoch + 1,
+                parent: Some(r1),
+                idempotency_key: None,
+                tick: 99,
+                content_refs: vec![payload.hash()],
+                depends_on: Vec::new(),
+            };
+            let divergent_id = crate::hash::hash_object(&divergent.canonical_bytes());
+            install_sqlite_begin_fake(&mut medium, &divergent, &payload);
+            let error = medium.begin_reclamation(&audit, &mk, 87).unwrap_err();
+            assert!(
+                matches!(error, MediumError::Chain { rule: "divergence" }),
+                "the divergent rewrite refuses at the authoritative-chain validation: {error:?}"
+            );
+            assert_eq!(
+                read_meta_head(&medium.conn).unwrap().unwrap(),
+                divergent_id,
+                "the HEAD is unchanged (nothing installed; the raw stored head)"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (d) The valid control: the ordinary valid-history admission
+        // still succeeds.
+        {
+            let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+                sqlite_begin_store("chain-valid-control");
+            let outcome = medium.begin_reclamation(&audit, &mk, 88).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                ),
+                "the ordinary valid-history admission still succeeds: {outcome:?}"
+            );
+            medium.validate().unwrap();
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_sqlite_begin_discovery_linkage_refuses_epoch_overflow() {
+        // (C2-R7) The overflow regression: a same-key record at epoch
+        // u64::MAX over a parent at epoch u64::MAX — the checked
+        // linkage refuses (saturation would have made the incoherent
+        // successor appear coherent, and the record would then have
+        // been verified as a canonical duplicate). Exercised through
+        // the discovery directly: the (C2-R6) authoritative-chain
+        // validation refuses such a HEAD at the public admission
+        // boundary first (its own epoch-regression rule).
+        let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+            sqlite_begin_store("epoch-overflow");
+        let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+        let begin = crate::reclaim::ReclamationBegin {
+            mk,
+            source: audit,
+            range_digest: ledger.range_digest,
+            seed: ledger.seed,
+        };
+        let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+        let payload = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"overflow-parent");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        // The parent P at epoch u64::MAX, then the same-key record K
+        // at epoch u64::MAX over it — the corruption-shaped install.
+        let parent_record = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: u64::MAX,
+            parent: Some(head),
+            idempotency_key: None,
+            tick: 100,
+            content_refs: vec![payload.hash()],
+            depends_on: Vec::new(),
+        };
+        let parent_id = crate::hash::hash_object(&parent_record.canonical_bytes());
+        let keyed = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: u64::MAX,
+            parent: Some(parent_id),
+            idempotency_key: Some(key),
+            tick: 101,
+            content_refs: vec![object.hash()],
+            depends_on: Vec::new(),
+        };
+        install_sqlite_begin_fake(&mut medium, &parent_record, &payload);
+        install_sqlite_begin_fake(&mut medium, &keyed, &object);
+        let error = {
+            let tx = medium.conn.transaction().unwrap();
+            find_installed_begin_tx(&tx, &mk, &begin).unwrap_err()
+        };
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/installed-linkage-mismatch"
+                }
+            ),
+            "the epoch overflow refuses the linkage (u64::MAX has no coherent successor): {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -5432,7 +5846,20 @@ impl SqliteMedium {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| sqlite_err("begin admission transaction", e))?;
-        let outcome = begin_reclamation_tx(&tx, audit, mk, tick)?;
+        // (C2-R6) The authoritative-chain validation — the SAME
+        // transaction-scoped trusted-cursor discipline the normal
+        // publication applies (O(0) on the verified head, a bounded
+        // suffix walk on divergence, the cold walk otherwise): a
+        // chain carrying an otherwise authentic audit and retirement
+        // evidence but malformed revisions above the audit never
+        // receives a trusted begin — no duplicate outcome, no
+        // installation.
+        let observed = read_meta_head(&tx)?;
+        if let Err(error) = validate_observed(&tx, &mut self.cursor, &mut self.walks, observed) {
+            let _ = tx.rollback();
+            return Err(error);
+        }
+        let (outcome, candidate) = begin_reclamation_tx(&tx, audit, mk, tick)?;
         // (C2-R1) The fault-wired commit boundary (the established
         // SqliteFaultPoint infrastructure — the same points the
         // normal append path uses): an injected CommitFailure
@@ -5453,27 +5880,37 @@ impl SqliteMedium {
                 fault_check(&self.fault, SqliteFaultPoint::AfterCommit).is_err()
             };
         if uncertain {
-            return reconcile_begin_publication(self, audit, mk);
+            // (C2-R5) The reconciliation is bound to the EXACT
+            // attempted candidate revision identity.
+            return reconcile_begin_publication(self, audit, mk, candidate);
         }
         Ok(outcome)
     }
 }
 
-/// The post-uncertain-commit reconciliation (the C2-R1 corrective):
-/// a READ-ONLY fresh observation — it never publishes, never
-/// inserts, never constructs a replacement candidate. It re-derives
-/// the expected begin from the (read-only) evidence verification,
-/// then the gap-aware HEAD-ancestry discovery: an exact match proves
-/// the canonical installation (ReconciledInstalled — the membership
-/// proof, never Accepted, never a durability claim); a definite
-/// absence returns ReconciledNotInstalled (an EXPLICIT later retry
+/// The post-uncertain-commit reconciliation (the C2-R1/R5
+/// corrective): a READ-ONLY fresh observation — it never publishes,
+/// never inserts, never constructs a replacement candidate. It
+/// validates the authoritative chain under the same trusted-cursor
+/// discipline (a concurrent writer may have changed the state
+/// between the attempt and this observation), re-derives the
+/// expected begin from the (read-only) evidence verification, then
+/// the gap-aware HEAD-ancestry discovery — all bound to the EXACT
+/// attempted candidate identity: the candidate itself canonically
+/// present is ReconciledInstalled (the membership proof, never
+/// Accepted, never a durability claim); a definite absence of any
+/// same-key begin is ReconciledNotInstalled (an EXPLICIT later retry
 /// may revalidate and construct a new candidate — a separate
-/// operation, never this one); any failure is the typed
-/// unverifiable uncertainty.
+/// operation, never this one); a DIFFERENT same-key revision is
+/// separately discovered, verified duplicate evidence
+/// (DuplicateVerified) — never misclassified as the installation of
+/// the attempted candidate; any failure is the typed unverifiable
+/// uncertainty.
 fn reconcile_begin_publication(
     medium: &mut SqliteMedium,
     audit: &Hash,
     mk: &Hash,
+    candidate: Option<Hash>,
 ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
     let tx = medium
         .conn
@@ -5481,6 +5918,15 @@ fn reconcile_begin_publication(
         .map_err(|_| MediumError::Chain {
             rule: "begin-admission/reconcile-unverifiable",
         })?;
+    // (C2-R6, READ-ONLY) The authoritative-chain validation — the
+    // same trusted-cursor discipline, inside the observation's own
+    // snapshot.
+    let observed = read_meta_head(&tx)?;
+    if validate_observed(&tx, &mut medium.cursor, &mut medium.walks, observed).is_err() {
+        return Err(MediumError::Chain {
+            rule: "begin-admission/reconcile-unverifiable",
+        });
+    }
     // (READ-ONLY) The expected begin re-derivation — the
     // authentication, the founding, the evidence core: all reads.
     let (ledger, metadata, _head) = match authenticate_audit_tx(&tx, audit) {
@@ -5524,11 +5970,18 @@ fn reconcile_begin_publication(
         }
     };
     expected.source = *audit;
-    // (READ-ONLY) The discovery: the exact candidate present → the
-    // membership proof; absent → the definite absence.
+    // (READ-ONLY, C2-R5) The discovery bound to the exact attempted
+    // candidate: the candidate itself present → the membership proof;
+    // a DIFFERENT same-key revision → the separately discovered,
+    // verified duplicate evidence (never ReconciledInstalled for the
+    // original attempt); a definite absence → ReconciledNotInstalled.
     match find_installed_begin_tx(&tx, mk, &expected) {
         Ok(Some((id, _installed))) => {
-            Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id })
+            if candidate == Some(id) {
+                Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id })
+            } else {
+                Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id })
+            }
         }
         Ok(None) => Ok(crate::reclaim::BeginPublicationOutcome::ReconciledNotInstalled),
         Err(_) => Err(MediumError::Chain {

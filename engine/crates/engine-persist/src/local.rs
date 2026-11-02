@@ -1845,7 +1845,13 @@ impl LocalFileMedium {
     ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
         self.lock()?;
         let outcome = self.begin_reclamation_locked(audit, mk, tick);
-        self.unlock()?;
+        // (C2-R7) The outcome-preservation discipline (the reviewed
+        // append wrapper's rule): an unlock failure must never
+        // replace an already established Accepted or Unknown
+        // publication disposition with an ordinary definite error —
+        // the OS releases the lock at handle close or process death
+        // either way.
+        let _ = self.unlock();
         outcome
     }
 
@@ -1910,6 +1916,17 @@ impl LocalFileMedium {
                 rule: "begin-admission/tier-insufficient",
             });
         }
+        // (C2-R6) The authoritative-chain validation — the SAME
+        // trusted-cursor discipline the normal append applies under
+        // the held lock (O(0) on the verified head, a bounded suffix
+        // walk on divergence, the cold walk otherwise): a chain
+        // carrying an otherwise authentic audit and retirement
+        // evidence but malformed revisions above the audit never
+        // receives a trusted begin — the early duplicate outcome is
+        // conditional on the chain's validity, and so is the
+        // installation (the internal append revalidates O(0) on the
+        // now-verified head).
+        self.validate_observed(self.read_head_file()?)?;
         // The duplicate resolution FIRST: a same-key begin already
         // installed is discovered and EXACTLY verified — never
         // inferred from key occupancy.
@@ -2023,7 +2040,10 @@ impl LocalFileMedium {
                     let parent_bytes = self.load_object(&parent)?;
                     let parent_record =
                         RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
-                    if record.epoch != parent_record.epoch.saturating_add(1) {
+                    // (C2-R7) Checked arithmetic: an epoch at u64::MAX
+                    // has no valid successor — saturation must never
+                    // make an incoherent linkage appear coherent.
+                    if parent_record.epoch.checked_add(1) != Some(record.epoch) {
                         return Err(MediumError::Chain {
                             rule: "begin-admission/installed-linkage-mismatch",
                         });
@@ -5416,7 +5436,7 @@ mod exclusion_tests {
     }
     #[test]
     fn the_local_begin_discovery_validates_parent_epoch_linkage() {
-        // (C2-R3/R4) The local twin of the linkage regression: a
+        // (C2-R3/R4/R6) The local twin of the linkage regression: a
         // same-key record ON the ancestry whose parent is PRESENT
         // but whose epoch is not parent.epoch+1 refuses at the
         // discovery's linkage — the same coherence the chain
@@ -5424,7 +5444,10 @@ mod exclusion_tests {
         // path enforces the epoch coherence itself, so the wrong-
         // epoch record is installed the corruption-shaped way (the
         // object file, the record file, the HEAD advance) — exactly
-        // the rows the linkage check exists for.
+        // the rows the linkage check exists for. Exercised through
+        // the discovery directly: the (C2-R6) authoritative-chain
+        // validation refuses such a HEAD at the public admission
+        // boundary (its own regression).
         let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
         // (OC-P2) The tier gate (the Windows ProcessCrashOnly
         // refusal; the SQLite twin covers the transactional
@@ -5472,7 +5495,7 @@ mod exclusion_tests {
             enc.into_bytes()
         };
         std::fs::write(root.join(HEAD_FILE), head_bytes).unwrap();
-        let error = medium.begin_reclamation(&audit, &mk, 57).unwrap_err();
+        let error = medium.find_installed_begin_locked(&mk).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -5520,6 +5543,244 @@ mod exclusion_tests {
             "the unreadable presence probe propagates the typed I/O refusal (never an absence): {error:?}"
         );
         std::fs::remove_file(&p1_path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_local_begin_admission_requires_authoritative_chain_coherence() {
+        // (C2-R6) The local twin: a chain carrying an otherwise
+        // authentic audit and retirement evidence but a MALFORMED
+        // revision above the audit never receives a trusted begin —
+        // the trusted-cursor validation under the held lock refuses
+        // before the early duplicate outcome and before the
+        // installation; the valid history still admits.
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        // (OC-P2) The tier gate (the Windows ProcessCrashOnly
+        // refusal; the SQLite twin covers the transactional
+        // publication).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.begin_reclamation(&audit, &mk, 59).unwrap_err();
+            assert!(matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/tier-insufficient"
+                }
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        // (a) The incorrect regular-revision epoch above the audit —
+        // installed the corruption-shaped way (the object file, the
+        // record file, the HEAD advance).
+        let payload = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"malformed-above-audit");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let malformed = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: head_epoch + 5,
+            parent: Some(head),
+            idempotency_key: None,
+            tick: 102,
+            content_refs: vec![payload.hash()],
+            depends_on: Vec::new(),
+        };
+        let malformed_id = crate::hash::hash_object(&malformed.canonical_bytes());
+        std::fs::write(medium.object_path_pub(&payload.hash()), payload.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&malformed_id),
+            malformed.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(HEAD_DOMAIN);
+            enc.write_u32(HEAD_VERSION);
+            enc.write_bytes(malformed_id.as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(root.join(HEAD_FILE), head_bytes).unwrap();
+        let error = medium.begin_reclamation(&audit, &mk, 60).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the malformed revision above the audit refuses at the authoritative-chain validation: {error:?}"
+        );
+        assert_eq!(
+            medium.read_head_file().unwrap().unwrap(),
+            malformed_id,
+            "the HEAD is unchanged (nothing installed; the raw stored head)"
+        );
+        // (b) No duplicate success from an invalid authoritative
+        // chain: a VALID same-key begin installed first (via the
+        // in-crate receipt — it is coherent), then the malformed
+        // revision above it — the admission refuses at the chain
+        // validation, never returns the duplicate.
+        let (root_b, mut medium_b, audit_b, mk_b, _shared_b, _private_b) =
+            trusted_execution_store();
+        let key_b = crate::reclaim::reclamation_begin_idempotency_key(&mk_b);
+        let begin_b = crate::reclaim::ReclamationBegin {
+            mk: mk_b,
+            source: audit_b,
+            range_digest: [0u8; 32],
+            seed: [0u8; 32],
+        };
+        let object_b = StoredObject::new(begin_b.canonical_bytes()).unwrap();
+        let head_b = medium_b.head().unwrap().unwrap();
+        let epoch_b = medium_b.read_record(&head_b).unwrap().epoch;
+        let valid = RevisionRecord::regular(head_b, epoch_b, 103)
+            .with_idempotency_key(key_b)
+            .with_content_refs(vec![object_b.hash()]);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&valid, std::slice::from_ref(&object_b));
+        medium_b.append_admitted(admitted, Some(head_b)).unwrap();
+        let payload_b = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"malformed-above-the-begin");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let head_m = medium_b.head().unwrap().unwrap();
+        let epoch_m = medium_b.read_record(&head_m).unwrap().epoch;
+        let malformed_b = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: epoch_m + 5,
+            parent: Some(head_m),
+            idempotency_key: None,
+            tick: 104,
+            content_refs: vec![payload_b.hash()],
+            depends_on: Vec::new(),
+        };
+        let malformed_b_id = crate::hash::hash_object(&malformed_b.canonical_bytes());
+        std::fs::write(
+            medium_b.object_path_pub(&payload_b.hash()),
+            payload_b.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            medium_b.object_path_pub(&malformed_b_id),
+            malformed_b.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes_b = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(HEAD_DOMAIN);
+            enc.write_u32(HEAD_VERSION);
+            enc.write_bytes(malformed_b_id.as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(root_b.join(HEAD_FILE), head_bytes_b).unwrap();
+        let error = medium_b.begin_reclamation(&audit_b, &mk_b, 61).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "no duplicate success from an invalid authoritative chain: {error:?}"
+        );
+        // (c) The valid control: the ordinary valid-history admission
+        // still succeeds.
+        let (root_c, mut medium_c, audit_c, mk_c, _shared_c, _private_c) =
+            trusted_execution_store();
+        let outcome = medium_c.begin_reclamation(&audit_c, &mk_c, 62).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+            ),
+            "the ordinary valid-history admission still succeeds: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root_b);
+        let _ = std::fs::remove_dir_all(&root_c);
+    }
+
+    #[test]
+    fn the_local_begin_discovery_linkage_refuses_epoch_overflow() {
+        // (C2-R7) The local overflow twin: a same-key record at epoch
+        // u64::MAX over a parent at epoch u64::MAX — the checked
+        // linkage refuses (saturation would have made the incoherent
+        // successor appear coherent). Exercised through the
+        // discovery directly (the discovery is pure storage logic —
+        // no tier dependency; the authoritative-chain validation
+        // refuses such a HEAD at the public admission boundary
+        // first).
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+        let begin = crate::reclaim::ReclamationBegin {
+            mk,
+            source: audit,
+            range_digest: [0u8; 32],
+            seed: [0u8; 32],
+        };
+        let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+        let payload = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"overflow-parent");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        // The parent P at epoch u64::MAX, then the same-key record K
+        // at epoch u64::MAX over it — the corruption-shaped install.
+        let parent_record = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: u64::MAX,
+            parent: Some(head),
+            idempotency_key: None,
+            tick: 105,
+            content_refs: vec![payload.hash()],
+            depends_on: Vec::new(),
+        };
+        let parent_id = crate::hash::hash_object(&parent_record.canonical_bytes());
+        let keyed = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: u64::MAX,
+            parent: Some(parent_id),
+            idempotency_key: Some(key),
+            tick: 106,
+            content_refs: vec![object.hash()],
+            depends_on: Vec::new(),
+        };
+        let keyed_id = crate::hash::hash_object(&keyed.canonical_bytes());
+        std::fs::write(medium.object_path_pub(&payload.hash()), payload.bytes()).unwrap();
+        std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&parent_id),
+            parent_record.canonical_bytes(),
+        )
+        .unwrap();
+        std::fs::write(medium.object_path_pub(&keyed_id), keyed.canonical_bytes()).unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(HEAD_DOMAIN);
+            enc.write_u32(HEAD_VERSION);
+            enc.write_bytes(keyed_id.as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(root.join(HEAD_FILE), head_bytes).unwrap();
+        let error = medium.find_installed_begin_locked(&mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/installed-linkage-mismatch"
+                }
+            ),
+            "the epoch overflow refuses the linkage (u64::MAX has no coherent successor): {error:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
