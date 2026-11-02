@@ -536,7 +536,7 @@ pub fn founding_identity(
     head: Hash,
     read_record_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
     read_object_bytes: impl Fn(&Hash) -> Result<Vec<u8>, MediumError>,
-    record_present: impl Fn(&Hash) -> bool,
+    record_present: impl Fn(&Hash) -> Result<bool, MediumError>,
 ) -> Result<Hash, MediumError> {
     const MAX_DESCENT: u64 = 1 << 20;
     let mut current = head;
@@ -563,7 +563,7 @@ pub fn founding_identity(
             // The verified parentless record IS the founding.
             return Ok(current);
         };
-        if record_present(&parent) {
+        if record_present(&parent)? {
             current = parent;
             continue;
         }

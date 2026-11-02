@@ -1876,7 +1876,20 @@ impl LocalFileMedium {
             head_for_founding,
             |identity| self.load_object(identity),
             |identity| self.load_object(identity),
-            |identity| self.object_path(identity).is_file(),
+            |identity| {
+                // (C2-R2) The typed presence: a genuine NotFound is
+                // the absence; every other filesystem error refuses —
+                // never converted to a missing-parent observation.
+                match std::fs::metadata(self.object_path(identity)) {
+                    Ok(_) => Ok(true),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(io_err(
+                        "founding presence probe",
+                        &self.object_path(identity),
+                        e,
+                    )),
+                }
+            },
         )?;
         // (B-D) The shared first-execution evidence core over the
         // internal hash-verified object reads.
@@ -1997,10 +2010,36 @@ impl LocalFileMedium {
                         rule: "begin-admission/installed-shape-mismatch",
                     });
                 }
-                if record.parent.is_none() {
+                let Some(parent) = record.parent else {
                     return Err(MediumError::Chain {
                         rule: "begin-admission/installed-shape-mismatch",
                     });
+                };
+                // (C2-R3) The parent/epoch linkage — the same
+                // coherence the normal chain validator enforces: a
+                // present parent must carry epoch+1; an absent parent
+                // must be an authenticated skip-table gap.
+                if self.object_path(&parent).is_file() {
+                    let parent_bytes = self.load_object(&parent)?;
+                    let parent_record =
+                        RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
+                    if record.epoch != parent_record.epoch.saturating_add(1) {
+                        return Err(MediumError::Chain {
+                            rule: "begin-admission/installed-linkage-mismatch",
+                        });
+                    }
+                } else {
+                    let Some(table) = skip_table.as_ref() else {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    };
+                    let covered = if table.sk == parent {
+                        table.self_skip().is_some()
+                    } else {
+                        table.skip_for(&current).is_some()
+                    };
+                    if !covered {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    }
                 }
                 let Some(object) = record.content_refs.first().copied() else {
                     return Err(MediumError::Chain {
@@ -5374,5 +5413,113 @@ mod exclusion_tests {
             ),
         }
         let _ = (outcome, root);
+    }
+    #[test]
+    fn the_local_begin_discovery_validates_parent_epoch_linkage() {
+        // (C2-R3/R4) The local twin of the linkage regression: a
+        // same-key record ON the ancestry whose parent is PRESENT
+        // but whose epoch is not parent.epoch+1 refuses at the
+        // discovery's linkage — the same coherence the chain
+        // validator enforces for every regular revision. The append
+        // path enforces the epoch coherence itself, so the wrong-
+        // epoch record is installed the corruption-shaped way (the
+        // object file, the record file, the HEAD advance) — exactly
+        // the rows the linkage check exists for.
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        // (OC-P2) The tier gate (the Windows ProcessCrashOnly
+        // refusal; the SQLite twin covers the transactional
+        // publication).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.begin_reclamation(&audit, &mk, 56).unwrap_err();
+            assert!(matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/tier-insufficient"
+                }
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let head = medium.head().unwrap().unwrap();
+        let head_epoch = medium.read_record(&head).unwrap().epoch;
+        let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+        let begin = crate::reclaim::ReclamationBegin {
+            mk,
+            source: audit,
+            range_digest: [0u8; 32],
+            seed: [0u8; 32],
+        };
+        let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+        // The WRONG EPOCH against a PRESENT parent (the struct
+        // literal — the constructor enforces parent+1).
+        let fake = RevisionRecord {
+            kind: crate::record::RecordKind::Regular,
+            epoch: head_epoch + 5,
+            parent: Some(head),
+            idempotency_key: Some(key),
+            tick: 92,
+            content_refs: vec![object.hash()],
+            depends_on: Vec::new(),
+        };
+        let fake_id = crate::hash::hash_object(&fake.canonical_bytes());
+        std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+        std::fs::write(medium.object_path_pub(&fake_id), fake.canonical_bytes()).unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(HEAD_DOMAIN);
+            enc.write_u32(HEAD_VERSION);
+            enc.write_bytes(fake_id.as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(root.join(HEAD_FILE), head_bytes).unwrap();
+        let error = medium.begin_reclamation(&audit, &mk, 57).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/installed-linkage-mismatch"
+                }
+            ),
+            "the wrong-epoch same-key record refuses at the linkage: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_local_founding_presence_probe_propagates_io_errors() {
+        // (C2-R2/R4) The typed presence: a probe error that is NOT
+        // NotFound — here a symlink loop at the parent's object path,
+        // hit by the founding descent's presence probe before that
+        // parent is ever read — propagates as the typed I/O refusal,
+        // never converted to a missing-parent observation (which
+        // would misread a storage failure as an authenticated gap).
+        // The authentication walk stops at the audit and the MK, so
+        // the FIRST operation to touch the sabotaged path is the
+        // presence probe itself.
+        let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+        let mut chain: Vec<Hash> = Vec::new();
+        let mut current = medium.head().unwrap().unwrap();
+        loop {
+            chain.push(current);
+            let record = medium.read_record(&current).unwrap();
+            match record.parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        // P1: the second-to-last record on the ancestry (probed
+        // during the founding descent, never read before the probe).
+        let p1 = chain[chain.len() - 2];
+        let p1_path = medium.object_path_pub(&p1);
+        std::fs::remove_file(&p1_path).unwrap();
+        std::os::unix::fs::symlink(&p1_path, &p1_path).unwrap();
+        let error = medium.begin_reclamation(&audit, &mk, 58).unwrap_err();
+        assert!(
+            matches!(error, MediumError::Io { .. }),
+            "the unreadable presence probe propagates the typed I/O refusal (never an absence): {error:?}"
+        );
+        std::fs::remove_file(&p1_path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
