@@ -240,7 +240,7 @@ jobs:
       # suites executed one test per process (--exact), restoring the
       # one-thread-per-process invariant SDL requires.
       - name: Tests (workspace, SDL-free suites)
-        run: cargo test --workspace --exclude engine-shell
+        run: cargo test --workspace --exclude engine-shell --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
       - name: Tests (engine-shell, one test per process)
         shell: bash
         run: |
