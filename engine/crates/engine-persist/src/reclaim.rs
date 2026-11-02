@@ -2385,15 +2385,8 @@ pub fn test_only_install_completion_marker(
         .with_idempotency_key(key)
         .with_content_refs(vec![object.hash()]);
     let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
-    match medium.append_admitted(admitted, Some(head))? {
-        crate::medium::AppendOutcome::Accepted { .. } => Ok(record.id()),
-        crate::medium::AppendOutcome::RejectedStaleParent { .. } => Err(MediumError::Chain {
-            rule: "reclamation-begin/test-install-stale-parent",
-        }),
-        crate::medium::AppendOutcome::Unknown { .. } => Err(MediumError::Chain {
-            rule: "reclamation-begin/test-install-unknown",
-        }),
-    }
+    medium.append_admitted(admitted, Some(head))?;
+    Ok(record.id())
 }
 
 #[cfg(test)]
@@ -3447,28 +3440,136 @@ mod tests {
             ),
             "the begin root refuses the composite admission (the strict manifest decode): {error:?}"
         );
-        // (2) The begin object as a composite CHUNK: the admission's
-        // dependency verification refuses (a begin object is not a
-        // valid chunk envelope).
+        // (2) The genuine chunk-dependency regression: a VALID
+        // composite root manifest whose entry DECLARES the begin
+        // object's content hash as its chunk identity, with the
+        // begin object supplied as the corresponding new chunk —
+        // the exact-set rule passes and the admission REACHES
+        // verify_chunk_dependency, which refuses the begin payload
+        // (it is not a session-chunk envelope). The authoritative
+        // HEAD is unchanged and no rejected publication becomes
+        // canonical.
+        // The manifest follows the grammar's fixed section order
+        // (the established fixture structure), with the begin
+        // object's hash declared as the NEAR singleton's chunk
+        // identity — the begin payload supplied as that chunk.
+        let begin_bytes = sample_begin().canonical_bytes();
+        let mut entries = Vec::new();
+        let mut declared_chunks: Vec<StoredObject> = Vec::new();
+        let push_singleton = |entries: &mut Vec<crate::composite_manifest::ManifestEntry>,
+                              declared: &mut Vec<StoredObject>,
+                              tag: &'static str,
+                              payload: Vec<u8>| {
+            let object = crate::composite_manifest::encode_chunk_envelope(tag, &payload);
+            entries.push(crate::composite_manifest::ManifestEntry {
+                tag,
+                identity: object.hash(),
+                payload_length: payload.len() as u64,
+                kind: crate::composite_manifest::SectionKind::Singleton,
+            });
+            declared.push(object);
+        };
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_HEADER,
+            vec![1u8; 11],
+        );
+        // The NEAR slot: the BEGIN object's identity declared as the
+        // chunk identity, with the begin payload supplied for it (the
+        // dependency verification receives the begin bytes).
+        entries.push(crate::composite_manifest::ManifestEntry {
+            tag: crate::composite_manifest::TAG_NEAR,
+            identity: begin_object.hash(),
+            payload_length: begin_bytes.len() as u64,
+            kind: crate::composite_manifest::SectionKind::Singleton,
+        });
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_FAR,
+            vec![2u8; 12],
+        );
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_BLOCKED,
+            vec![3u8; 13],
+        );
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_HELD,
+            vec![4u8; 14],
+        );
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_LEDGER_META,
+            vec![5u8; 15],
+        );
+        let tail_payload = vec![6u8; 62];
+        let tail = crate::composite_manifest::encode_chunk_envelope(
+            crate::composite_manifest::TAG_LEDGER_RECORDS,
+            &tail_payload,
+        );
+        entries.push(crate::composite_manifest::ManifestEntry {
+            tag: crate::composite_manifest::TAG_LEDGER_RECORDS,
+            identity: tail.hash(),
+            payload_length: tail_payload.len() as u64,
+            kind: crate::composite_manifest::SectionKind::LedgerTail,
+        });
+        declared_chunks.push(tail);
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_WORLD,
+            vec![7u8; 16],
+        );
+        push_singleton(
+            &mut entries,
+            &mut declared_chunks,
+            crate::composite_manifest::TAG_DIRECTOR,
+            vec![8u8; 17],
+        );
+        let manifest = crate::composite_manifest::CompositeManifest {
+            history_kind: crate::composite_manifest::HistoryKind::Full,
+            ledger_boundary: 4,
+            composed_length: entries.iter().map(|e| e.payload_length).sum(),
+            entries,
+        };
+        let manifest_root =
+            StoredObject::new(crate::composite_manifest::encode(&manifest)).unwrap();
         let chunk_record =
-            RevisionRecord::regular(head, epoch, 21).with_content_refs(vec![begin_object.hash()]);
+            RevisionRecord::regular(head, epoch, 21).with_content_refs(vec![manifest_root.hash()]);
+        // The supplied set covers every declared identity exactly
+        // (the exact-set rule): the eight constructed chunks plus the
+        // begin payload standing in for the NEAR slot.
+        let mut new_chunks = declared_chunks;
+        new_chunks.push(begin_object.clone());
         let request = crate::composite_append::CompositeAppend {
             record: &chunk_record,
-            root: &begin_object,
-            new_chunks: std::slice::from_ref(&begin_object),
+            root: &manifest_root,
+            new_chunks: &new_chunks,
             reused_chunks: &[],
         };
         let error = medium.append_composite(&request, Some(head)).unwrap_err();
-        let _ = &error;
-        // Any typed refusal suffices (the manifest decode or the
-        // dependency verification — both precede any write); the
-        // key property: NO Accepted outcome for a begin payload.
+        let detail = format!("{error:?}");
         assert!(
-            !std::matches!(
-                error,
-                crate::medium::MediumError::Chain { rule: "accepted" }
-            ),
-            "the begin chunk never publishes: {error:?}"
+            detail.contains("could not be established")
+                && detail.contains("engine-persist/reclamation-begin/1"),
+            "the chunk-DEPENDENCY validator refuses the begin payload at the envelope's foreign-domain check (past the valid manifest and the exact-set rule): {detail}"
+        );
+        // No rejected publication becomes canonical: the HEAD stands
+        // and the record is absent.
+        assert_eq!(
+            medium.head().unwrap().unwrap(),
+            head,
+            "the authoritative HEAD is unchanged by the refusal"
+        );
+        assert!(
+            medium.read_record(&chunk_record.id()).is_err(),
+            "the rejected publication never became canonical"
         );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
