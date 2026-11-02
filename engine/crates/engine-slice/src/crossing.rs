@@ -2488,6 +2488,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // retirement's full destructive work and BEFORE its
         // completion marker — the mid-flight historical state an
         // EARLIER marker's verification must converge through.
+        #[cfg(feature = "crash-test-seams")]
         reclaim_before_completion_seam();
         let _completion =
             engine_persist::reclaim::complete_reclamation(&mut medium, &ledger_id, &oldest_mk)
@@ -2975,11 +2976,17 @@ fn reclaim_after_medium_seam() {
 /// deferred object deleted by THIS retirement, no marker yet for
 /// it) the crossing's autonomous recovery must converge through.
 /// Engine code never arms this; the static is process-local.
+/// COMPILE-TIME ISOLATED (the T2-B corrective): the seam exists
+/// ONLY under the crash-test-seams feature — the production build
+/// carries neither the arm nor the process-exit behavior (the CI's
+/// feature-disabled artifact check enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_RECLAIM_BEFORE_COMPLETION: AtomicBool = AtomicBool::new(false);
 
 /// The before-completion seam's exit point (see
 /// [`ARM_RECLAIM_BEFORE_COMPLETION`]).
+#[cfg(feature = "crash-test-seams")]
 fn reclaim_before_completion_seam() {
     if ARM_RECLAIM_BEFORE_COMPLETION.load(Ordering::Relaxed) {
         std::process::exit(13);

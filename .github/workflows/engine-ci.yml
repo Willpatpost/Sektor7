@@ -62,9 +62,22 @@ jobs:
             echo "the feature-disabled build carries the adversarial marker publisher ($adversarial matches)"
             exit 1
           fi
+          # (T2-B) The crossing's crash-test seams are compile-time
+          # excluded from the production build — the process-exit
+          # arm must be absent from the feature-disabled engine-slice
+          # artifact.
+          slice_rlib="target/debug/libengine_slice.rlib"
+          if [ -f "$slice_rlib" ]; then
+            arms=$(nm "$slice_rlib" | grep -c ARM_RECLAIM_BEFORE_COMPLETION || true)
+            if [ "$arms" != "0" ]; then
+              echo "the feature-disabled build carries the crash-test arm ($arms matches)"
+              exit 1
+            fi
+            echo "crash-seam isolation verified: 0 ARM_RECLAIM_BEFORE_COMPLETION symbols in the feature-disabled engine-slice rlib"
+          fi
           echo "activation isolation verified: 0 activation symbols in the feature-disabled rlib"
       - name: Tests
-        run: cargo test --workspace --features engine-persist/composite-test-fixture
+        run: cargo test --workspace --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
       - name: Fingerprint self-test double run
         shell: bash
         run: |

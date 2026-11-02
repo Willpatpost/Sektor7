@@ -30,9 +30,10 @@ use engine_persist::{
     PipelineError, RevisionRecord, SqliteMedium, StoredObject, T1Journal, active_journal_path,
     read_journal_generations,
 };
+#[cfg(feature = "crash-test-seams")]
+use engine_slice::crossing::ARM_RECLAIM_BEFORE_COMPLETION;
 use engine_slice::crossing::{
-    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, ARM_RECLAIM_BEFORE_COMPLETION,
-    SessionCrossing, TransitionError,
+    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
 };
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
@@ -2286,6 +2287,7 @@ fn the_old_journals_retire_only_after_the_durability_is_recovered() {
 /// 2's retirement MANDATES it (R_x is a range member; nothing above
 /// references it). The deterministic campaign makes the identities
 /// reproducible across the child, the twin, and the parent.
+#[cfg(feature = "crash-test-seams")]
 fn shared_object_campaign_at(
     store: &Path,
     journal_path: &Path,
@@ -2362,6 +2364,7 @@ fn shared_object_campaign_at(
 /// object deleted) and BEFORE B's completion marker. The crash
 /// state: A's marker mid-flight-inconsistent, no B marker.
 #[test]
+#[cfg(feature = "crash-test-seams")]
 fn pp_b3_reclaim_child_before_completion() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
         return;
@@ -2392,6 +2395,7 @@ fn pp_b3_reclaim_child_before_completion() {
 }
 
 #[test]
+#[cfg(feature = "crash-test-seams")]
 fn the_mid_flight_historical_marker_converges_through_the_real_crossing() {
     // (R4-L1) THE AUTONOMOUS RECOVERY PROOF: a genuine child process
     // dies in the mid-flight historical state (A's marker installed
@@ -2655,6 +2659,7 @@ fn multi_deferred_campaign_at(
 /// BOTH historical markers go mid-flight in the full variant; X1
 /// alone in the partial variant.
 #[test]
+#[cfg(feature = "crash-test-seams")]
 fn pp_b3_reclaim_child_multi_deferred() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
         return;
@@ -2692,6 +2697,7 @@ fn pp_b3_reclaim_child_multi_deferred() {
 }
 
 #[test]
+#[cfg(feature = "crash-test-seams")]
 fn multiple_deferred_historical_markers_all_resolve_through_maintenance() {
     // (R4-L2, Case A — full resolution) TWO independently deferred
     // historical markers go mid-flight when B's execution deletes
@@ -3078,6 +3084,7 @@ fn the_post_publication_failure_restarts_idempotently() {
 }
 
 /// The twin's reclaimed-membership count (the comparison anchor).
+#[cfg(feature = "crash-test-seams")]
 fn twin_summary_reclaimed(twin: &TestDir) -> u64 {
     let mut medium = LocalFileMedium::open(twin.store()).unwrap();
     medium.validate().unwrap().reclaimed_records
