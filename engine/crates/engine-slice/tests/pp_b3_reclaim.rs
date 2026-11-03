@@ -2589,6 +2589,24 @@ fn the_mid_flight_historical_marker_converges_through_the_real_crossing() {
     // its audit identity (no duplicate canonical consequence), and
     // the campaign reopening and validating cleanly.
     let dir = TestDir::new("death-before-completion");
+    #[cfg(windows)]
+    {
+        // (OC-C3 CP-2, Windows) The kill seam is legally unreachable
+        // (the crossing refuses the platform tier BEFORE any
+        // deletion) — no child spawn; the typed refusal asserted
+        // through the real crossing path with no forbidden effect.
+        // The POSIX crash/convergence substance is covered on the
+        // eligible platforms.
+        let wdir = TestDir::new("death-before-completion-windows");
+        let (_s1, _mk1, _mk2) =
+            shared_object_campaign_at(&wdir.store(), &wdir.journal(), "child-mid-flight");
+        let (_spine, _director, mut wcrossing) =
+            SessionCrossing::recover(&wdir.store(), &wdir.journal(), "child-mid-flight")
+                .expect("the guard's recovery works");
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
+            return;
+        }
+    }
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "pp_b3_reclaim_child_before_completion"])
         .env(RECLAIM_CHILD_STORE_ENV, dir.store())
@@ -2895,6 +2913,28 @@ fn multiple_deferred_historical_markers_all_resolve_through_maintenance() {
     // markers resolve at the end-of-pass revalidation; both verify
     // after the fresh reopen.
     let dir = TestDir::new("multi-deferred-full");
+    #[cfg(windows)]
+    {
+        // (OC-C3 CP-2, Windows) The kill seam is legally unreachable
+        // (the crossing refuses the platform tier BEFORE any
+        // deletion) — no child spawn; the typed refusal asserted
+        // through the real crossing path with no forbidden effect.
+        // The POSIX crash/convergence substance is covered on the
+        // eligible platforms.
+        let wdir = TestDir::new("multi-deferred-full-windows");
+        let (_x1, _x2, _mk1, _mk2, _mk3) = multi_deferred_campaign_at(
+            &wdir.store(),
+            &wdir.journal(),
+            "child-multi-deferred",
+            false,
+        );
+        let (_spine, _director, mut wcrossing) =
+            SessionCrossing::recover(&wdir.store(), &wdir.journal(), "child-multi-deferred")
+                .expect("the guard's recovery works");
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
+            return;
+        }
+    }
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "pp_b3_reclaim_child_multi_deferred"])
         .env(RECLAIM_CHILD_STORE_ENV, dir.store())
