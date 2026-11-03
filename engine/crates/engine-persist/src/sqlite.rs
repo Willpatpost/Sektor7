@@ -996,8 +996,26 @@ impl CanonicalMedium for SqliteMedium {
         // the authenticated walk).
         self.cursor = None;
         let outcome = outcome?;
-        tx.commit()
-            .map_err(|e| sqlite_err("commit reclaim transaction", e))?;
+        // (OC-C3 CP-2) THE HONEST COMMIT UNCERTAINTY: an injected
+        // CommitFailure (the established seam) rolls the transaction
+        // back; a real COMMIT error leaves the rollback outcome
+        // UNPROVEN (rusqlite 0.40.2's Drop-rollback failures are
+        // silent). Both are the single typed
+        // reclaim/commit-uncertain class — never success, never a
+        // definite absence: the crossing STOPs, and the next
+        // authorized pass independently re-verifies the begin and
+        // the actual deletion state under a fresh transaction.
+        if fault_check(&self.fault, SqliteFaultPoint::CommitFailure).is_err() {
+            let _ = tx.rollback();
+            return Err(MediumError::Chain {
+                rule: "reclaim/commit-uncertain",
+            });
+        }
+        if tx.commit().is_err() {
+            return Err(MediumError::Chain {
+                rule: "reclaim/commit-uncertain",
+            });
+        }
         Ok(outcome)
     }
 
@@ -1372,6 +1390,32 @@ fn reclaim_authorized_tx(
                 rule: "reclaim/absence-not-deletion-prefix",
             });
         }
+    }
+    // (OC-C3 CP-2) THE BEGIN-BOUND DESTRUCTIVE AUTHORIZATION —
+    // inside the SAME provider transaction, before any deletion:
+    // the accepted CP-1 transaction-scoped verification helper (the
+    // recovery-safe authentication, the founding seed, the canonical
+    // verifier, the TransactionalWalFull grade from the read
+    // snapshot's visibility proof — never a separate unlocked
+    // advisory result). The DEFINITE canonical absence is the
+    // crossing's fresh-admission trigger; every corrupt,
+    // mismatched, orphaned, or unverifiable state is its own typed
+    // refusal — never absence.
+    match verify_begin_authority_tx(
+        tx,
+        &directive.audit_record,
+        &ledger.mk,
+        SyncTier::TransactionalWalFull,
+    ) {
+        Ok(_authority) => {}
+        Err(MediumError::Chain {
+            rule: "begin-authority/absent",
+        }) => {
+            return Err(MediumError::Chain {
+                rule: "execution/begin-absent",
+            });
+        }
+        Err(other) => return Err(other),
     }
     // The survivor partition under the same transaction — and the
     // E1 range commitments: the founding-derived seed (always
@@ -3436,6 +3480,17 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the REAL trusted
+        // admission (the execution gate requires it).
+        let begin_outcome = medium.begin_reclamation(&audit, &mk.id(), 221).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         let outcome = medium.reclaim(&directive).unwrap();
         assert_eq!(outcome.deferred, vec![shared.hash()]);
         assert!(!outcome.mandatory.contains(&shared.hash()));
@@ -3582,8 +3637,21 @@ mod exclusion_tests {
                 )
                 .unwrap()
         };
-        // Corrupt the private object's stored bytes — the hash KEY
-        // stays, the bytes no longer hash to it.
+        // (OC-C3 CP-2) The begin-bound migration: the REAL trusted
+        // admission (the execution gate requires it).
+        let begin_outcome = medium.begin_reclamation(&audit, &ledger.mk, 220).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
+        // Corrupt the private object's stored bytes (injected AFTER
+        // the begin's admission — the deeper E3 boundary still
+        // reached) — the hash KEY stays, the bytes no longer hash to
+        // it.
         medium
             .conn
             .execute(
@@ -3592,9 +3660,17 @@ mod exclusion_tests {
             )
             .unwrap();
         let error = medium.reclaim(&directive).unwrap_err();
+        // (OC-C3 CP-2) The corrupted object sits ON the authorization
+        // walk's path (the ancestry record's first reference — read
+        // by the begin-bound gate's hash-verifying walk), so the
+        // typed integrity refusal now surfaces at the GATE's read
+        // (HashMismatch) rather than the PASS-2 probe
+        // (ReferencedObjectCorrupt) — the same typed integrity
+        // refusal and the same full-rollback guarantee, one boundary
+        // earlier.
         assert!(
-            matches!(error, MediumError::ReferencedObjectCorrupt { .. }),
-            "the typed corruption refusal: {error:?}"
+            matches!(error, MediumError::HashMismatch { .. }),
+            "the typed corruption refusal at the gate's hash-verifying read: {error:?}"
         );
         // The full rollback: the retiring records AND the corrupted
         // object row are all still present.
@@ -3861,6 +3937,17 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the REAL trusted
+        // admission (the execution gate requires it).
+        let begin_outcome = medium.begin_reclamation(&audit, &mk.id(), 226).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         medium.reclaim(&directive).unwrap();
         let (marker_id, marker) =
             crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
@@ -3980,6 +4067,17 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the REAL trusted
+        // admission (the execution gate requires it).
+        let begin_outcome = medium.begin_reclamation(&audit, &mk.id(), 222).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         medium.reclaim(&directive).unwrap();
         let (marker_id, _marker) =
             crate::reclaim::complete_reclamation(&mut medium, &audit, &mk.id()).unwrap();
@@ -4145,6 +4243,18 @@ mod exclusion_tests {
         };
         let (audit_a, _) =
             crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger_a, 4).unwrap();
+        // (OC-C3 CP-2) A's begin — the real admission.
+        let begin_a = medium
+            .begin_reclamation(&audit_a, &ledger_a.mk, 224)
+            .unwrap();
+        assert!(
+            matches!(
+                begin_a,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "A's begin admits: {begin_a:?}"
+        );
         // B's range: B1(X) → SK2(fobj) → MK2 → auditB.
         let b1 = step(&mut medium, std::slice::from_ref(&x), 5);
         let sk2 = step(&mut medium, std::slice::from_ref(&fobj), 6);
@@ -4184,6 +4294,18 @@ mod exclusion_tests {
         };
         let (audit_b, _) =
             crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+        // (OC-C3 CP-2) B's begin — the real admission.
+        let begin_b = medium
+            .begin_reclamation(&audit_b, &ledger_b.mk, 225)
+            .unwrap();
+        assert!(
+            matches!(
+                begin_b,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "B's begin admits: {begin_b:?}"
+        );
         // Both retirements execute and complete.
         let directive_a = crate::reclaim::ReclaimDirective {
             audit_record: audit_a,
@@ -5289,6 +5411,19 @@ mod exclusion_tests {
             outcome,
             crate::medium::AppendOutcome::Accepted { .. }
         ));
+        // (OC-C3 CP-2) A's begin — the real admission (the A
+        // execution below requires it under the begin-bound gate).
+        let begin_a = medium
+            .begin_reclamation(&audit_a, &ledger_a.mk, 223)
+            .unwrap();
+        assert!(
+            matches!(
+                begin_a,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "A's begin admits: {begin_a:?}"
+        );
         // The later range: B1(X) → SK2(fobj) → MK2(meta2) — B1/SK2
         // are survivors of A (X deferred: B1 references it).
         let head = medium.head().unwrap().unwrap();
@@ -6125,6 +6260,163 @@ mod exclusion_tests {
             drop(medium);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+    #[test]
+    fn the_r1_attack_refuses_at_every_boundary() {
+        // (OC-C3 CP-2 §9) The R1 attack end-to-end: the forged
+        // self-consistent audit/checkpoint with the original
+        // retirement evidence absent and NO begin ever published —
+        // refused at the provider deletion gate, at the direct
+        // completion publication, and at the completion wrapper;
+        // the failed fresh admission (the degraded evidence) never
+        // manufactures a retroactive begin.
+        let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+            sqlite_begin_store("r1-attack");
+        // THE R1 SHAPE: the original retirement evidence deleted
+        // (the newest-first prefix — exactly what the forged attack
+        // or degradation presents), NO begin ever published.
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        for unit in &ledger.units {
+            medium
+                .conn
+                .execute(
+                    "DELETE FROM records WHERE hash = ?1",
+                    params![unit.record.as_bytes()],
+                )
+                .unwrap();
+        }
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        // (a) The provider deletion gate.
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the R1 state refuses at the provider gate: {error:?}"
+        );
+        // The fresh admission over the degraded evidence FAILS
+        // CLOSED — no retroactive begin (OC-P1).
+        let error = medium.begin_reclamation(&audit, &mk, 240).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::MissingObject { .. }
+                    | MediumError::Chain {
+                        rule: "begin-admission/units-objects-mismatch"
+                    }
+            ),
+            "the degraded evidence cannot be authorized: {error:?}"
+        );
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the gate still refuses after the failed admission: {error:?}"
+        );
+        // (b) The direct completion publication (the independent
+        // boundary).
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: audit,
+            mandatory_count: 2,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let head = read_meta_head(&medium.conn).unwrap().unwrap();
+        let error = crate::reclaim::publish_reclamation_complete(&mut medium, &marker, head, 241)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "the direct publication refuses the beginless state: {error:?}"
+        );
+        // (c) The completion wrapper.
+        let error = crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap_err();
+        // The wrapper refuses at its own earliest boundary for this
+        // state (the mandatory objects still present — the residue
+        // check precedes the publication); either way the beginless
+        // state is NEVER certified.
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                } | MediumError::Chain {
+                    rule: "reclamation-complete/mandatory-residue"
+                } | MediumError::Chain {
+                    rule: "reclamation-complete/record-still-present"
+                }
+            ),
+            "the completion wrapper refuses the beginless state: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_sqlite_execution_commit_uncertainty_is_typed() {
+        // (OC-C3 CP-2 §4/§9) The execution COMMIT uncertainty: the
+        // injected CommitFailure (the established seam) produces the
+        // single typed reclaim/commit-uncertain — never success,
+        // never a definite absence — and the next authorized pass
+        // independently re-verifies the begin and the actual
+        // deletion state, converging.
+        let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+            sqlite_begin_store("commit-uncertain");
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        let begin_outcome = medium.begin_reclamation(&audit, &mk, 242).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the begin admits: {begin_outcome:?}"
+        );
+        medium.fault = Some(SqliteFaultControl::new().arm(
+            SqliteFaultPoint::CommitFailure,
+            SqliteFaultAction::InjectError,
+        ));
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclaim/commit-uncertain"
+                }
+            ),
+            "the execution commit failure is the typed uncertainty: {error:?}"
+        );
+        medium.fault = None;
+        // The next authorized pass converges (the observation found
+        // nothing deleted; the gate re-verified the begin).
+        let outcome = medium.reclaim(&directive).unwrap();
+        assert!(
+            !outcome.mandatory.is_empty(),
+            "the retry converges through the re-verified begin"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

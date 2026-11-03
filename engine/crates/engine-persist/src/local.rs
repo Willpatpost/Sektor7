@@ -2452,6 +2452,39 @@ impl LocalFileMedium {
                 });
             }
         }
+        // (OC-C3 CP-2) THE BEGIN-BOUND DESTRUCTIVE AUTHORIZATION —
+        // every authorization check precedes the FIRST irreversible
+        // mutation (the cursor invalidation, PASS 1, PASS 2). The
+        // platform tier FIRST: ProcessCrashOnly never grants the
+        // destructive grade (regardless of any begin's existence —
+        // an installed, restored, or otherwise discoverable begin
+        // cannot override the platform limitation). Then the
+        // installed-begin authority through the CP-1 lock-held
+        // internal helper (the recovery-safe authentication, the
+        // founding seed, the canonical verifier, the reaffirmation
+        // — NEVER the public wrapper: no lock reacquisition under
+        // the already-held HEAD.lock). The DEFINITE canonical
+        // absence is the crossing's fresh-admission trigger; every
+        // corrupt, mismatched, orphaned, unverifiable, or
+        // insufficient-grade state is its own typed refusal — never
+        // absence. A resumed retirement is never forced through the
+        // OC-C2 first-execution verifier (the recovery-safe path).
+        if self.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            return Err(MediumError::Chain {
+                rule: "execution/begin-tier-insufficient",
+            });
+        }
+        match self.verify_begin_authority_locked(&directive.audit_record, &ledger.mk) {
+            Ok(_authority) => {}
+            Err(MediumError::Chain {
+                rule: "begin-authority/absent",
+            }) => {
+                return Err(MediumError::Chain {
+                    rule: "execution/begin-absent",
+                });
+            }
+            Err(other) => return Err(other),
+        }
         // (5) The survivor partition under the same boundary — and
         // the E1 range commitments: the founding-derived seed
         // (ALWAYS verifiable — the founding is permanent) and, on
@@ -2882,6 +2915,18 @@ mod exclusion_tests {
             audit_record,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the real begin on
+        // the eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(
+            &mut medium,
+            &audit_record,
+            &ledger.mk,
+            &directive,
+            210,
+            &root,
+        ) {
+            return;
+        }
         let execution = medium.reclaim(&directive).unwrap();
         let current = medium.head().unwrap().unwrap();
 
@@ -3442,7 +3487,13 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the real begin on
+        // the eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 202, &root) {
+            return;
+        }
         let outcome = medium.reclaim(&directive).unwrap();
+        medium.reclaim(&directive).unwrap();
         // The deferred set: the shared object (never deleted).
         assert_eq!(outcome.deferred, vec![shared]);
         assert!(!outcome.mandatory.contains(&shared));
@@ -3517,14 +3568,20 @@ mod exclusion_tests {
         let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
         let (ledger, _meta) =
             crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
-        // The crash shape: the FIRST unit's record is gone; its
-        // objects remain.
-        let interrupted_record = ledger.units[0].record;
-        std::fs::remove_file(medium.object_path(&interrupted_record)).unwrap();
         let directive = crate::reclaim::ReclaimDirective {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration (BEFORE the crash
+        // injection — the R4-F5 rule): the real begin on the
+        // eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 201, &root) {
+            return;
+        }
+        // The crash shape (injected AFTER the admission): the FIRST
+        // unit's record is gone; its objects remain.
+        let interrupted_record = ledger.units[0].record;
+        std::fs::remove_file(medium.object_path(&interrupted_record)).unwrap();
         let outcome = medium.reclaim(&directive).unwrap();
         assert_eq!(outcome.deferred, vec![shared]);
         assert!(!medium.object_path(&private).is_file());
@@ -3659,15 +3716,29 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The fabricated state can never be
+            // AUTHORIZED — the admission's own evidence core refuses
+            // it (the property one boundary earlier); the execution
+            // gate refuses the definite begin absence.
+            let admit = medium.begin_reclamation(&audit, &mk, 213).unwrap_err();
             let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    admit,
+                    MediumError::Chain {
+                        rule: "begin-admission/range-digest-mismatch"
+                    }
+                ),
+                "the fabricated digest refuses at the admission's evidence core: {admit:?}"
+            );
             assert!(
                 matches!(
                     error,
                     MediumError::Chain {
-                        rule: "reclaim/range-digest-mismatch"
+                        rule: "execution/begin-absent"
                     }
                 ),
-                "the fabricated digest refuses: {error:?}"
+                "the unauthorized state refuses at the execution gate: {error:?}"
             );
             assert!(
                 medium.object_path(&private).is_file(),
@@ -3685,6 +3756,11 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The E2 order check PRECEDES the
+            // begin-bound gate in the reclaim's own read-only
+            // sequence — the original deeper boundary still reached
+            // unchanged (the property preserved at its exact
+            // boundary).
             let error = medium.reclaim(&directive).unwrap_err();
             assert!(
                 matches!(
@@ -3712,6 +3788,11 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration: the real begin on
+            // the eligible tier; the typed platform refusal otherwise.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 205, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             // NO validate() call — the immediate append must use the
             // rebuilt post-retirement state.
@@ -3887,6 +3968,54 @@ mod exclusion_tests {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
+
+    /// (OC-C3 CP-2) The shared positive-path migration: on the
+    /// eligible tier publish the REAL trusted begin (the accepted
+    /// admission — never a direct installation); on a
+    /// ProcessCrashOnly platform assert the typed execution refusal
+    /// (BEFORE any deletion — every retiring record still present)
+    /// and signal the early return. Returns false when the test
+    /// should stop (the platform refusal path — already cleaned up).
+    fn authorize_or_refuse(
+        medium: &mut LocalFileMedium,
+        audit: &Hash,
+        mk: &Hash,
+        directive: &crate::reclaim::ReclaimDirective,
+        tick: u64,
+        root: &std::path::Path,
+    ) -> bool {
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.reclaim(directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade before deletion: {error:?}"
+            );
+            for unit in &directive.units {
+                assert!(
+                    medium.object_path_pub(&unit.record).is_file(),
+                    "no retiring record deleted by the refusal"
+                );
+            }
+            let _ = std::fs::remove_dir_all(root);
+            return false;
+        }
+        let outcome = medium.begin_reclamation(audit, mk, tick).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {outcome:?}"
+        );
+        true
+    }
+
     #[test]
     fn a_probe_read_failure_is_typed_not_silent() {
         // (E5) A read failure on a mandatory identity's normal path
@@ -3904,6 +4033,11 @@ mod exclusion_tests {
         // The retirement executed: every mandatory identity is gone,
         // the probe reports complete — the completion-critical
         // observation.
+        // (OC-C3 CP-2) The begin-bound migration: the real begin on
+        // the eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 200, &root) {
+            return;
+        }
         medium.reclaim(&directive).unwrap();
         assert!(!medium.reclaim_pending(&directive).unwrap());
         // A directory at the (now absent) object path is the
@@ -3938,6 +4072,11 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: the real begin on
+        // the eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 203, &root) {
+            return;
+        }
         medium.reclaim(&directive).unwrap();
         // The trusted receipt path.
         let (marker_id, marker) =
@@ -4043,6 +4182,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 211, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let wrong = crate::reclaim::ReclamationComplete {
                 kind: crate::reclaim::CompletionKind::Batch,
@@ -4077,6 +4220,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 211, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let wrong = crate::reclaim::ReclamationComplete {
                 kind: crate::reclaim::CompletionKind::Batch,
@@ -4139,6 +4286,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 211, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let (marker_id, marker) =
                 crate::reclaim::complete_reclamation(&mut medium, &audit, &mk).unwrap();
@@ -4360,6 +4511,33 @@ mod exclusion_tests {
             audit_record: audit,
             units: ledger.units.clone(),
         };
+        // (OC-C3 CP-2) The begin-bound migration: on the eligible
+        // tier the REAL admission; on ProcessCrashOnly the typed
+        // execution refusal (nothing deleted — the composite-closure
+        // substance covered on POSIX and the SQLite suites).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.reclaim(&directive).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let begin_outcome = medium.begin_reclamation(&audit, &mk.id(), 245).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         // The provider's execution: the shared chunk is DEFERRED (a
         // survivor through the snapshot's verified manifest) and
         // physically PRESERVED.
@@ -4644,6 +4822,21 @@ mod exclusion_tests {
         };
         let (audit_a, outcome) = publish_reclamation_ledger(&mut medium, &ledger_a, 4).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // (OC-C3 CP-2) A's begin — the REAL trusted admission (the
+        // fixture's executions require it under the begin-bound
+        // gate; on a ProcessCrashOnly platform the admission refuses
+        // and the dependent tests assert the typed execution refusal
+        // instead — the platform policy is unchanged).
+        if medium.durability_tier() == crate::medium::SyncTier::FullPosixSequence {
+            let begin_outcome = medium.begin_reclamation(&audit_a, &mk1.id(), 45).unwrap();
+            assert!(
+                matches!(
+                    begin_outcome,
+                    crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                ),
+                "the fixture's A begin admits: {begin_outcome:?}"
+            );
+        }
         let directive_a = crate::reclaim::ReclaimDirective {
             audit_record: audit_a,
             units: ledger_a.units.clone(),
@@ -4791,12 +4984,31 @@ mod exclusion_tests {
         // the multi-generation reopen verification.
         let (root, mut medium, audit_a, mk1, _mk2, x, _fobj, directive_a, ledger_b) =
             two_retirement_store("r4-schedule");
+        // (OC-C3 CP-2) The begin-bound migration: the real begin on
+        // the eligible tier; the typed platform refusal otherwise.
+        if !authorize_or_refuse(&mut medium, &audit_a, &mk1, &directive_a, 206, &root) {
+            return;
+        }
         medium.reclaim(&directive_a).unwrap();
         assert!(medium.object_path(&x).is_file(), "X survives A (deferred)");
         // The previously installed audit for B (above A's range,
         // never yet executed).
         let (audit_b, outcome) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // (OC-C3 CP-2) B's begin — the real admission (the
+        // interleaved execution inside A's completion window
+        // requires it under the begin-bound gate).
+        let begin_b = medium
+            .begin_reclamation(&audit_b, &ledger_b.mk, 47)
+            .unwrap();
+        assert!(
+            matches!(
+                begin_b,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "B's begin admits: {begin_b:?}"
+        );
         let directive_b = crate::reclaim::ReclaimDirective {
             audit_record: audit_b,
             units: ledger_b.units.clone(),
@@ -4932,6 +5144,18 @@ mod exclusion_tests {
             crate::reclaim::complete_reclamation(&mut medium, &audit_a, &mk1).unwrap();
         let (audit_b, outcome) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+        // (OC-C3 CP-2) B's begin — the real admission.
+        let begin_b = medium
+            .begin_reclamation(&audit_b, &ledger_b.mk, 48)
+            .unwrap();
+        assert!(
+            matches!(
+                begin_b,
+                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "B's begin admits: {begin_b:?}"
+        );
         // B's execution (so the divergence the fabricated marker
         // would need to account actually exists).
         medium
@@ -5159,6 +5383,14 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 212, &root) {
+                return;
+            }
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 212, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let (marker_id, marker) = {
                 let mut wrapper = UnknownMedium {
@@ -5188,6 +5420,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 212, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let (marker_id, marker) = {
                 let mut wrapper = UnknownMedium {
@@ -5216,6 +5452,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 212, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             let error = {
                 let mut wrapper = UnknownMedium {
@@ -5254,6 +5494,10 @@ mod exclusion_tests {
                 audit_record: audit,
                 units: ledger.units.clone(),
             };
+            // (OC-C3 CP-2) The begin-bound migration.
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 212, &root) {
+                return;
+            }
             medium.reclaim(&directive).unwrap();
             // The adversarial wrong-content marker at the SAME
             // deterministic key (the in-crate append — the corrupted-

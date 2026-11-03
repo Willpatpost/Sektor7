@@ -2411,13 +2411,78 @@ impl<S: MediumSource> SessionCrossing<S> {
         // the AUDITED MANIFEST (an interrupted unit's orphaned
         // objects are discoverable from the ledger — including
         // copies the v1.4 sweep quarantined).
-        let removed_objects = medium
-            .reclaim(&engine_persist::ReclaimDirective {
-                audit_record: ledger_id,
-                units: ledger.units.clone(),
-            })
-            .map_err(PipelineError::Medium)?
-            .removed;
+        // (OC-C3 CP-2) THE RECLAIM-FIRST ROUTING: the provider's
+        // execution gate is the authority — the begin-bound
+        // destructive authorization is verified under the provider's
+        // own coordination BEFORE any mutation. The DEFINITE
+        // canonical begin absence (the exact typed rule) is the ONLY
+        // fresh-admission trigger: the accepted OC-C2 trusted
+        // admission through CP-1's trait interface (on a freshly
+        // valid range it publishes; a degraded no-begin range FAILS
+        // CLOSED at the first-execution verifier — the R1 gate).
+        // Only a newly acknowledged Accepted publication with the
+        // required truthful tier permits ONE bounded retry (the
+        // provider-internal gate re-verifies); every other outcome —
+        // ReconciledInstalled, DuplicateVerified,
+        // ReconciledNotInstalled, a lost reply, an unresolved
+        // transport failure — is NOT a newly acknowledged durable
+        // publication: the pass fails closed (a subsequent
+        // authorized pass rediscovers the installed begin through
+        // the provider's own execution gate, independently
+        // establishing the grade — never a second begin publication
+        // to repair uncertainty; the deterministic MK-bound key is
+        // the idempotency boundary). Every other execution refusal
+        // (corrupt, mismatched, orphaned, unverifiable,
+        // insufficient-tier, commit-uncertain) propagates — STOP.
+        let directive = engine_persist::ReclaimDirective {
+            audit_record: ledger_id,
+            units: ledger.units.clone(),
+        };
+        let removed_objects = match medium.reclaim(&directive) {
+            Ok(outcome) => outcome.removed,
+            Err(engine_persist::MediumError::Chain {
+                rule: "execution/begin-absent",
+            }) => {
+                // The one fresh-admission trigger.
+                let tick = medium
+                    .read_record(&ledger_id)
+                    .map_err(PipelineError::Medium)?
+                    .tick
+                    .saturating_add(1);
+                match medium
+                    .begin_reclamation(&ledger_id, &oldest_mk, tick)
+                    .map_err(PipelineError::Medium)?
+                {
+                    engine_persist::reclaim::BeginPublicationOutcome::Accepted { tier, .. }
+                        if tier == engine_persist::SyncTier::TransactionalWalFull
+                            || tier == engine_persist::SyncTier::FullPosixSequence =>
+                    {
+                        // The ONE bounded retry — the provider's
+                        // execution gate re-verifies the begin under
+                        // its own coordination.
+                        medium
+                            .reclaim(&directive)
+                            .map_err(PipelineError::Medium)?
+                            .removed
+                    }
+                    _other => {
+                        // A membership-only, duplicate, absent, or
+                        // otherwise unacknowledged publication is
+                        // never treated as a newly acknowledged
+                        // durable one: fail closed for this pass (a
+                        // subsequent authorized pass rediscovers the
+                        // installed begin through the provider's own
+                        // execution gate — never a second
+                        // publication).
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "reclaim/begin-publication-unacknowledged",
+                        });
+                    }
+                }
+            }
+            Err(other) => return Err(PipelineError::Medium(other).into()),
+        };
         // THE MEDIUM-COMMITTED/JOURNAL-RETIREMENT-UNCOMMITTED crash
         // seam (test-only — see [`ARM_RECLAIM_AFTER_MEDIUM`], the
         // review corrective R1's real-kill evidence): every

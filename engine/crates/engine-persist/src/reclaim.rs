@@ -1701,6 +1701,19 @@ pub fn publish_reclamation_complete(
     // verified in the RECOVERY-SAFE form (the completed
     // retirement's records are absent by construction).
     let (ledger, _metadata) = verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    // (OC-C3 CP-2) THE BEGIN-AUTHORIZED COMPLETION PUBLICATION:
+    // every new terminal marker requires the previously
+    // established, canonical, exactly bound, provider-durable
+    // ReclamationBegin authority — verified through the provider's
+    // CP-1 capability (never a caller-supplied value; canonical
+    // membership alone is never proof of the adequate grade — the
+    // local reaffirmation and the SQLite visibility proof run
+    // inside the provider under its own coordination). This gate is
+    // inside the independently callable publication boundary: the
+    // direct call, the complete_reclamation wrapper, and every
+    // crossing path inherit it; no route can publish a beginless
+    // marker.
+    medium.verify_begin_authority(&marker.source, &marker.mk)?;
     // P2-F4: the verified-completion RECEIPT — the marker's
     // certified obligations are checked against the ACTUAL
     // post-execution state, never the caller's claim: every

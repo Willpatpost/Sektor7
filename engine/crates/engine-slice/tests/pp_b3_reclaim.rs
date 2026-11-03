@@ -298,7 +298,11 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
         // MK2, SK2, S3, MK1, C1, and the founding (S1, the
         // boundary's covering, and SK1 gone) — one more reclaimed,
         // two more appended (the audit, then the terminal marker).
-        assert_eq!(summary.records, 8);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 9);
         // S1's revision is genuinely absent.
         assert!(medium.read_record(&s1).is_err());
     }
@@ -597,8 +601,12 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
         assert_eq!(summary.checkpoints, vec![report2.mk, report1.mk]);
         assert_eq!(summary.reclaimed_records, 6);
         assert_eq!(summary.reclaimed_keys, 6);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision — the
+        // crossing's fresh admission published one additional
+        // canonical revision between the audit and the marker.
         assert_eq!(
-            summary.records, 14,
+            summary.records, 15,
             "F, C1, C2, MK1, S3, COV3, C3, S4, COV4, C4, SK2, MK2, the audit, and the completion marker"
         );
     }
@@ -887,7 +895,7 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
         // The walk: the three audits and their three completion
         // markers, MK4, SK4, C5, COV5, S5, MK3, C4, MK2, C3, MK1,
         // C2, C1, and the founding.
-        assert_eq!(summary.records, 19);
+        assert_eq!(summary.records, 22);
     }
     // THE HISTORICAL UNIVERSE across generations: a key from MK1's
     // range (reclaimed at generation 1) still rejected after
@@ -1014,8 +1022,12 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision — the
+        // crossing's fresh admission published one additional
+        // canonical revision between the audit and the marker.
         assert_eq!(
-            summary.records, 8,
+            summary.records, 9,
             "F, C1, MK1, S3, SK2, MK2, the audit, and the completion marker — no second audit"
         );
     }
@@ -1105,8 +1117,12 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
             summary.reclaimed_records, 1,
             "SK1 alone is reclaimed so far"
         );
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
         assert_eq!(
-            summary.records, 9,
+            summary.records, 10,
             "the walk: F, S1, the covering, C1, MK1, S3, SK2, MK2, and the audit"
         );
     }
@@ -1150,7 +1166,11 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
         );
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 8);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 9);
     }
     let remaining = std::fs::read_dir(dir.store().join("quarantine"))
         .map(|entries| entries.count())
@@ -1216,7 +1236,11 @@ fn the_sqlite_provider_reclaims_with_transactional_atomicity() {
         let mut medium = SqliteMedium::open(dir.db()).unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 8);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 9);
     }
     drop(crossing);
     let (_spine, _director, mut recovered) = SessionCrossing::recover_at(
@@ -1362,7 +1386,7 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
             summary.reclaimed_records, 3,
             "every index member is a gap — record presence alone says complete"
         );
-        assert_eq!(summary.records, 7);
+        assert_eq!(summary.records, 8);
     }
 
     // THE RESUME: the recovery plus the same retry — the whole-
@@ -1396,7 +1420,11 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
         );
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 8);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 9);
     }
 
     // THE CONVERGENCE onto the twin: identical object sets, the
@@ -1540,7 +1568,11 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
         let mut medium = LocalFileMedium::open(dir.store()).unwrap();
         let summary = medium.validate().unwrap();
         assert_eq!(summary.reclaimed_records, 3);
-        assert_eq!(summary.records, 8);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 9);
     }
     let root_lock = {
         let name = dir
@@ -1707,7 +1739,7 @@ fn checkpoints_continue_across_reclamations_and_recover() {
         // completion marker — the audit retained in the ancestry,
         // MK1's reclaimed range skipped under its tables (MK2's
         // range still stands at this point).
-        assert_eq!(summary.records, 13);
+        assert_eq!(summary.records, 14);
         let audit = medium.read_record(&audit1).unwrap();
         medium
             .read_object(audit.content_refs.first().unwrap())
@@ -1769,7 +1801,7 @@ fn checkpoints_continue_across_reclamations_and_recover() {
         // cycle's covering, S4, A1, MK2, MK1, C1, the founding, and
         // the two completion markers — both audits retained in the
         // ancestry, both reclaimed ranges skipped under the tables.
-        assert_eq!(summary.records, 18);
+        assert_eq!(summary.records, 20);
         for report in [&report1, &report2, &report3, &report4] {
             let mk = medium.read_record(&report.mk).unwrap();
             medium
@@ -1909,7 +1941,11 @@ fn the_sqlite_lifecycle_continues_across_reclamations() {
         // S5) are retained range members of the protected
         // checkpoints — the walk carries them with the audits and
         // the two completion markers.
-        assert_eq!(summary.records, 18);
+        // (OC-C3 CP-2) The count accounts explicitly for the
+        // executed retirement's durable begin revision (the
+        // crossing's fresh admission — one additional canonical
+        // revision between the audit and the marker).
+        assert_eq!(summary.records, 20);
     }
 }
 
@@ -2842,6 +2878,38 @@ fn multiple_deferred_historical_markers_partial_resolution_fails_closed() {
         let (audit_a2, _) =
             engine_persist::reclaim::publish_reclamation_ledger(&mut medium, &ledger, tick)
                 .unwrap();
+        // (OC-C3 CP-2) The begin-bound migration: on the eligible
+        // tier the REAL admission; on ProcessCrashOnly the typed
+        // execution refusal (nothing deleted — the marker substance
+        // covered on POSIX and the SQLite suites).
+        if medium.durability_tier() != engine_persist::SyncTier::FullPosixSequence {
+            let error = medium
+                .reclaim(&engine_persist::reclaim::ReclaimDirective {
+                    audit_record: audit_a2,
+                    units: ledger.units.clone(),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    engine_persist::MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir.store());
+            return;
+        }
+        let begin_outcome = medium.begin_reclamation(&audit_a2, &a2_mk, 230).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                engine_persist::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | engine_persist::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         medium
             .reclaim(&engine_persist::reclaim::ReclaimDirective {
                 audit_record: audit_a2,
@@ -3023,6 +3091,38 @@ fn the_post_publication_failure_restarts_idempotently() {
         let (audit_a, _) =
             engine_persist::reclaim::publish_reclamation_ledger(&mut medium, &ledger, tick)
                 .unwrap();
+        // (OC-C3 CP-2) The begin-bound migration: on the eligible
+        // tier the REAL admission; on ProcessCrashOnly the typed
+        // execution refusal (nothing deleted — the marker substance
+        // covered on POSIX and the SQLite suites).
+        if medium.durability_tier() != engine_persist::SyncTier::FullPosixSequence {
+            let error = medium
+                .reclaim(&engine_persist::reclaim::ReclaimDirective {
+                    audit_record: audit_a,
+                    units: ledger.units.clone(),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    engine_persist::MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir.store());
+            return;
+        }
+        let begin_outcome = medium.begin_reclamation(&audit_a, &a_mk, 230).unwrap();
+        assert!(
+            matches!(
+                begin_outcome,
+                engine_persist::reclaim::BeginPublicationOutcome::Accepted { .. }
+                    | engine_persist::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the fixture's begin admits: {begin_outcome:?}"
+        );
         medium
             .reclaim(&engine_persist::reclaim::ReclaimDirective {
                 audit_record: audit_a,
