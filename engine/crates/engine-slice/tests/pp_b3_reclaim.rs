@@ -269,7 +269,7 @@ fn the_two_phase_reclamation_retires_the_oldest_range_under_the_window() {
     // THE RECLAMATION (generations = 1: the newest checkpoint
     // remains — the recovery anchor).
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     let reclamation = crossing
@@ -445,7 +445,7 @@ fn the_full_stack_rotates_then_reclaims_the_range_and_the_old_journal() {
     // THE RECLAMATION: MK1's range plus the old journal file. C1:
     // the first far boundary's covering joins S1 in the range.
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     let reclamation = crossing
@@ -578,7 +578,7 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
     // THE RECLAMATION of MK1's range (generations = 1: SK2 — the
     // newest snapshot — remains the recovery anchor).
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     let reclamation = crossing
@@ -682,7 +682,8 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
 /// spawned child rebuilds the campaign at environment-provided
 /// paths — never through this process's TestDir — and dies at an
 /// armed seam inside the real Phase B.
-
+const RECLAIM_CHILD_STORE_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_STORE";
+const RECLAIM_CHILD_JOURNAL_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_JOURNAL";
 /// (OC-C3 CP-2, Windows) The platform-policy guard for the
 /// LocalFileMedium-backed reclamation tests: the LocalFileMedium
 /// tier is platform-determined (Windows = ProcessCrashOnly per
@@ -723,9 +724,6 @@ fn windows_refuses_destruction(
     let _ = std::fs::remove_dir_all(store);
     true
 }
-
-const RECLAIM_CHILD_STORE_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_STORE";
-const RECLAIM_CHILD_JOURNAL_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_JOURNAL";
 
 /// The recursive store size (the F3 non-accumulation measurement).
 fn dir_size(path: &Path) -> u64 {
@@ -870,7 +868,7 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
     // COV2 over S2) join the publications.
     let size_before = dir_size(&dir.store());
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 2) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 2) {
         return;
     }
     let r1 = crossing
@@ -1050,7 +1048,7 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
             two_checkpoint_campaign(&wdir, "death-after-audit-windows");
         drop(spine);
         drop(director);
-        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), wdir.store(), 1) {
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
             return;
         }
     }
@@ -1166,7 +1164,7 @@ fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
             two_checkpoint_campaign(&wdir, "death-mid-unit-windows");
         drop(spine);
         drop(director);
-        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), wdir.store(), 1) {
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
             return;
         }
     }
@@ -1443,7 +1441,7 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
             two_checkpoint_campaign(&wdir, "death-last-unit-windows");
         drop(spine);
         drop(director);
-        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), wdir.store(), 1) {
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
             return;
         }
     }
@@ -1651,7 +1649,7 @@ fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
             two_checkpoint_campaign(&wdir, "death-before-journals-windows");
         drop(spine);
         drop(director);
-        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), wdir.store(), 1) {
+        if windows_refuses_destruction(&mut wcrossing, &wdir.journal(), &wdir.store(), 1) {
             return;
         }
     }
@@ -1817,11 +1815,11 @@ fn checkpoints_continue_across_reclamations_and_recover() {
     // (3) RECLAIM checkpoint 1's eligible history — the audit lands
     // on the chain between MK2 and everything after.
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     let r1 = crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
@@ -2109,7 +2107,7 @@ fn a_missing_retained_audit_object_fails_the_checkpoint_closed() {
         .publish_checkpoint(&mut spine, &mut director, 10)
         .unwrap();
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     crossing.reclaim_checkpoint(&dir.journal(), 1).unwrap();
@@ -2429,7 +2427,7 @@ fn the_old_journals_retire_only_after_the_durability_is_recovered() {
     // range AND the old root journal retire — the proper
     // old-journal eligibility after the recovered failure.
     #[cfg(windows)]
-    if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+    if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
         return;
     }
     let reclamation = crossing
@@ -2613,14 +2611,14 @@ fn the_mid_flight_historical_marker_converges_through_the_real_crossing() {
             SessionCrossing::recover(&twin.store(), &twin.journal(), "child-mid-flight")
                 .expect("the twin's recovery works");
         #[cfg(windows)]
-        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), twin.store(), 1) {
+        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), &twin.store(), 1) {
             return;
         }
         twin_crossing
             .reclaim_checkpoint(&twin.journal(), 1)
             .expect("the twin's retirement A completes");
         #[cfg(windows)]
-        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), twin.store(), 1) {
+        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), &twin.store(), 1) {
             return;
         }
         twin_crossing
@@ -2916,7 +2914,7 @@ fn multiple_deferred_historical_markers_all_resolve_through_maintenance() {
             SessionCrossing::recover(&twin.store(), &twin.journal(), "child-multi-deferred")
                 .expect("the twin's recovery works");
         #[cfg(windows)]
-        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), twin.store(), 1) {
+        if windows_refuses_destruction(&mut twin_crossing, &twin.journal(), &twin.store(), 1) {
             return;
         }
         twin_crossing
@@ -2997,7 +2995,7 @@ fn multiple_deferred_historical_markers_partial_resolution_fails_closed() {
             SessionCrossing::recover(&dir.store(), &dir.journal(), "multi-deferred-partial")
                 .expect("A1's recovery works");
         #[cfg(windows)]
-        if windows_refuses_destruction(&mut crossing, &dir.journal(), dir.store(), 1) {
+        if windows_refuses_destruction(&mut crossing, &dir.journal(), &dir.store(), 1) {
             return;
         }
         crossing
