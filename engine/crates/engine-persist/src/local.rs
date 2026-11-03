@@ -3720,6 +3720,24 @@ mod exclusion_tests {
             // AUTHORIZED — the admission's own evidence core refuses
             // it (the property one boundary earlier); the execution
             // gate refuses the definite begin absence.
+            // (OC-C3 CP-2) On ProcessCrashOnly the admission refuses
+            // the platform tier before the evidence core — the gate
+            // refuses the destructive grade; the fabricated-state
+            // property is covered on POSIX and the SQLite suites.
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let error = medium.reclaim(&directive).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "execution/begin-tier-insufficient"
+                        }
+                    ),
+                    "ProcessCrashOnly refuses the destructive grade: {error:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
             let admit = medium.begin_reclamation(&audit, &mk, 213).unwrap_err();
             let error = medium.reclaim(&directive).unwrap_err();
             assert!(
@@ -4919,6 +4937,24 @@ mod exclusion_tests {
         // still refuses the malformed marker.
         let (root, mut medium, audit_a, mk1, mk2, _x, _fobj, directive_a, ledger_b) =
             two_retirement_store("r2-later-audit");
+        // (OC-C3 CP-2) The Windows platform policy: ProcessCrashOnly
+        // refuses the destructive authorization — the typed
+        // execution refusal with nothing deleted (the substance
+        // covered on POSIX and the SQLite suites).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.reclaim(&directive_a).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         medium.reclaim(&directive_a).unwrap();
         // The adversarial wrong-count marker for A, installed through
         // the in-crate admitted append.
@@ -5139,6 +5175,24 @@ mod exclusion_tests {
         // wrong-content and the wrong-key variants refuse.
         let (root, mut medium, audit_a, mk1, _mk2, x, _fobj, directive_a, ledger_b) =
             two_retirement_store("r2h1-fabricated-later");
+        // (OC-C3 CP-2) The Windows platform policy: ProcessCrashOnly
+        // refuses the destructive authorization — the typed
+        // execution refusal with nothing deleted (the substance
+        // covered on POSIX and the SQLite suites).
+        if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let error = medium.reclaim(&directive_a).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "ProcessCrashOnly refuses the destructive grade: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         medium.reclaim(&directive_a).unwrap();
         let (marker_a, _marker) =
             crate::reclaim::complete_reclamation(&mut medium, &audit_a, &mk1).unwrap();
