@@ -6070,14 +6070,18 @@ mod exclusion_tests {
         // parent; and the recovery-safe verification after the
         // original retirement records are gone (the authenticated
         // gap crossing included).
-        // (OC-P2) The tier gate: on a ProcessCrashOnly platform the
-        // real admission refuses, so the valid-case fixture is
-        // POSIX-only (the adversarial hand-installed fixtures are
-        // platform-neutral; the SQLite twin covers Windows for the
-        // verifier's provider path).
+        // (R3) The platform split: the REAL-ADMISSION valid case is
+        // POSIX-only (on a ProcessCrashOnly platform the admission
+        // refuses typed — asserted); the shared verifier's own
+        // adversarial matrix below is PLATFORM-NEUTRAL and runs in
+        // full on every platform (the hand-installed fixtures never
+        // claim trusted-admission success — the valid-LOOKING case
+        // proves the recognition, and the authority's tier refusal
+        // is separately proven in the authority test).
         {
             let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
-            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            let posix = medium.durability_tier() == crate::medium::SyncTier::FullPosixSequence;
+            if !posix {
                 let error = medium.begin_reclamation(&audit, &mk, 120).unwrap_err();
                 assert!(matches!(
                     error,
@@ -6085,25 +6089,25 @@ mod exclusion_tests {
                         rule: "begin-admission/tier-insufficient"
                     }
                 ));
-                let _ = std::fs::remove_dir_all(&root);
-                return;
+            } else {
+                // (a) The valid case: the real admission, then the
+                // verifier through the generic adapter.
+                medium.begin_reclamation(&audit, &mk, 120).unwrap();
+                let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+                let head = medium.read_head_file().unwrap().unwrap();
+                let mut reads =
+                    crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+                let found =
+                    crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                        .unwrap();
+                let (id, begin) = found.expect("the admitted begin verifies");
+                assert_eq!(begin.mk, mk);
+                assert_eq!(begin.source, audit);
+                assert_eq!(begin.range_digest, ledger.range_digest);
+                assert_eq!(begin.seed, ledger.seed);
+                let _ = id;
             }
-            // (a) The valid case: the real admission, then the
-            // verifier through the generic adapter.
-            medium.begin_reclamation(&audit, &mk, 120).unwrap();
-            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
-            let head = medium.read_head_file().unwrap().unwrap();
-            let mut reads =
-                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
-            let found =
-                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
-                    .unwrap();
-            let (id, begin) = found.expect("the admitted begin verifies");
-            assert_eq!(begin.mk, mk);
-            assert_eq!(begin.source, audit);
-            assert_eq!(begin.range_digest, ledger.range_digest);
-            assert_eq!(begin.seed, ledger.seed);
-            let _ = id;
+            let _ = std::fs::remove_dir_all(&root);
         }
         // The hand-installed adversarial fixtures (the corruption-
         // shaped install — the R4-established pattern).
@@ -6137,6 +6141,37 @@ mod exclusion_tests {
             std::fs::write(medium.root().join(HEAD_FILE), head_bytes).unwrap();
             record_id
         };
+        // (a2, R3) The platform-neutral valid-LOOKING case: a
+        // hand-installed begin with the CORRECT bindings — the
+        // shared verifier RECOGNIZES it on EVERY platform (its
+        // checks are storage logic, tier-independent), including
+        // Windows where the destructive grade remains refused by
+        // the authority's platform tier gate (proven in the
+        // authority test). The fixture is explicitly adversarial —
+        // never a trusted-admission success.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            hand_install(&mut medium, fixture, key, None);
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let found =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap();
+            assert!(
+                found.is_some(),
+                "the verifier's recognition is platform-neutral (the grade policy is not)"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
         // (b) Each payload field individually mismatched.
         for label in ["wrong mk", "wrong source", "wrong digest", "wrong seed"] {
             let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
@@ -6264,18 +6299,21 @@ mod exclusion_tests {
             assert!(found.is_none(), "the orphan never verifies");
             let _ = std::fs::remove_dir_all(&root);
         }
-        // (f) The missing and corrupt parent: the begin's parent
-        // record deleted (uncovered) or corrupted — the typed
-        // refusals.
+        // (f, R3) The corrupt parent — platform-neutral: the
+        // hand-installed begin with CORRECT bindings, its parent
+        // (the prior head — the audit) corrupted — the typed
+        // integrity refusal at the hash-verifying read.
         {
             let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
-            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
-                let _ = std::fs::remove_dir_all(&root);
-                return;
-            }
-            medium.begin_reclamation(&audit, &mk, 132).unwrap();
-            let begin_head = medium.read_head_file().unwrap().unwrap();
             let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let begin_head = hand_install(&mut medium, fixture, key, None);
             // The corrupt parent: overwrite the begin's PARENT (the
             // prior head — the audit) with wrong bytes at the same
             // path.
@@ -6473,6 +6511,128 @@ mod exclusion_tests {
             );
             let _ = std::fs::remove_dir_all(&root);
             let _ = std::fs::remove_dir_all(&root2);
+        }
+    }
+    #[test]
+    fn the_same_retirement_begin_recovery_after_deletion() {
+        // (OC-C3 CP-1 corrective R3) The SAME-retirement recovery:
+        // the begin remains discoverable — and its authority
+        // recoverable — after the VERY retirement records it
+        // authorized are deleted (the authenticated skip crossing
+        // over the retirement's own gap). Two variants: the FULL
+        // deletion (the legacy pre-CP-2 reclamation executes the
+        // whole retirement) and the PARTIAL PREFIX (the interrupted
+        // PASS 1 shape — the first unit deleted, the second
+        // present). The medium is REOPENED for the recovery (no
+        // in-memory authorization state); no replacement begin is
+        // published; the HEAD is not advanced by the authority
+        // verification. The POSIX-only scenario (the real admission
+        // and the FullPosixSequence reaffirmation).
+        // (a) The full deletion.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            // (OC-P2) The tier gate: the admission (and the
+            // reaffirmation grade) is POSIX-only.
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let error = medium.begin_reclamation(&audit, &mk, 180).unwrap_err();
+                assert!(matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-admission/tier-insufficient"
+                    }
+                ));
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            // The real begin through the accepted admission, then
+            // the pre-deletion authority.
+            let outcome = medium.begin_reclamation(&audit, &mk, 180).unwrap();
+            let installed = match outcome {
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+                other => panic!("the admission accepts: {other:?}"),
+            };
+            let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.id(), installed);
+            assert_eq!(authority.tier(), crate::medium::SyncTier::FullPosixSequence);
+            // The legacy (pre-CP-2) reclamation executes the
+            // retirement — deleting the very records the begin
+            // authorized (permitted for constructing the isolated
+            // test state: CP-1 does not yet enforce Option C; the
+            // implementation is unmodified).
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            medium
+                .reclaim(&crate::reclaim::ReclaimDirective {
+                    audit_record: audit,
+                    units: ledger.units.clone(),
+                })
+                .unwrap();
+            // The original retirement records are absent.
+            for unit in &ledger.units {
+                assert!(
+                    !medium.object_path_pub(&unit.record).is_file(),
+                    "the retirement record {} is deleted",
+                    unit.record
+                );
+            }
+            // REOPEN the medium — the recovery without any
+            // in-memory authorization state.
+            drop(medium);
+            let mut reopened = LocalFileMedium::open(&root).unwrap();
+            let authority = reopened.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(
+                authority.id(),
+                installed,
+                "the ORIGINAL installed begin identity is recovered"
+            );
+            assert_eq!(
+                authority.tier(),
+                crate::medium::SyncTier::FullPosixSequence,
+                "the grade re-established only after the completed reaffirmation"
+            );
+            // No replacement begin was published and the HEAD was
+            // not advanced by the authority verification (the begin
+            // remains the HEAD — the reclamation deletes only).
+            assert_eq!(
+                reopened.read_head_file().unwrap().unwrap(),
+                installed,
+                "the begin remains the HEAD; the authority advanced nothing"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) The partial deletion prefix (the interrupted PASS 1
+        // shape: the FIRST — newest — unit's record deleted, the
+        // second still present).
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            let outcome = medium.begin_reclamation(&audit, &mk, 181).unwrap();
+            let installed = match outcome {
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+                other => panic!("the admission accepts: {other:?}"),
+            };
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            // The genuine prefix shape: only the FIRST unit's record
+            // removed (the newest-first order — the interrupted
+            // deletion after one step), the second unit intact.
+            std::fs::remove_file(medium.object_path_pub(&ledger.units[0].record)).unwrap();
+            assert!(
+                medium.object_path_pub(&ledger.units[1].record).is_file(),
+                "the second unit remains — the prefix shape"
+            );
+            drop(medium);
+            let mut reopened = LocalFileMedium::open(&root).unwrap();
+            let authority = reopened.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.id(), installed);
+            assert_eq!(authority.tier(), crate::medium::SyncTier::FullPosixSequence);
+            assert_eq!(
+                reopened.read_head_file().unwrap().unwrap(),
+                installed,
+                "the begin remains the HEAD"
+            );
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

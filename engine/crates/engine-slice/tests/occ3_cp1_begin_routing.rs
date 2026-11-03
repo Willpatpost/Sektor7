@@ -136,8 +136,8 @@ fn the_direct_session_store_begin_routing() {
     );
     // The authority: the verified identity and the truthful grade.
     let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
-    assert_eq!(authority.id, installed);
-    assert_eq!(authority.tier, SyncTier::TransactionalWalFull);
+    assert_eq!(authority.id(), installed);
+    assert_eq!(authority.tier(), SyncTier::TransactionalWalFull);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -164,8 +164,8 @@ fn the_worker_begin_routing_and_uncertainty() {
         other => panic!("the queued admission accepts: {other:?}"),
     };
     let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
-    assert_eq!(authority.id, installed);
-    assert_eq!(authority.tier, SyncTier::TransactionalWalFull);
+    assert_eq!(authority.id(), installed);
+    assert_eq!(authority.tier(), SyncTier::TransactionalWalFull);
     // (b) The deduplication through the queue.
     let outcome = medium.begin_reclamation(&audit, &mk, 163).unwrap();
     assert!(
@@ -202,7 +202,7 @@ fn the_worker_begin_routing_and_uncertainty() {
     );
     // The authority still verifies after the uncertain window.
     let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
-    assert_eq!(authority.id, installed);
+    assert_eq!(authority.id(), installed);
     // (d) The pre-admission poison refusal: a DEFINITE non-event.
     worker.poison();
     let error = medium.begin_reclamation(&audit, &mk, 166).unwrap_err();
@@ -216,6 +216,92 @@ fn the_worker_begin_routing_and_uncertainty() {
         "the poisoned worker refuses the authority request too: {error:?}"
     );
     drop(medium);
+    drop(source);
+    worker.stop();
+    let _ = worker.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_first_publication_lost_reply_window() {
+    // (OC-C3 CP-1 corrective R2) The FIRST-publication lost-reply
+    // window: a fresh retirement with NO begin; the worker PUBLISHES
+    // it and the reply is suppressed — the caller receives the typed
+    // uncertain result (never Accepted, never a definite absence);
+    // the installation is independently discoverable through the
+    // provider (a second connection over the same database); the
+    // identical re-submission resolves the verified duplicate with
+    // the exact installed identity, publishing nothing further and
+    // advancing nothing; the truthful grade survives the window.
+    let (root, _fixture, audit, mk) = begin_ready_sqlite("first-lost");
+    drop(_fixture);
+    let mut worker = IoWorker::spawn(&StoreLocation::Database(root.join("db.sqlite"))).unwrap();
+    let source = worker.source().unwrap();
+    let mut medium = source.open_medium().unwrap();
+    // The initial authoritative HEAD — no begin exists.
+    let head_before = medium.head().unwrap().unwrap();
+    // The one-shot reply suppression (the established seam
+    // semantics: the fault is consumed by the firing arm).
+    worker.fault_control().set(WorkerFault::LoseBeginReply);
+    // The FIRST trusted admission — the worker EXECUTES it (the
+    // begin is published); the reply is never sent.
+    let error = match medium.begin_reclamation(&audit, &mk, 170) {
+        Err(error) => error,
+        Ok(outcome) => panic!("the suppressed first publication never acknowledges: {outcome:?}"),
+    };
+    assert!(
+        matches!(
+            error,
+            engine_persist::MediumError::Chain {
+                rule: "begin-admission/worker-reply-uncertain"
+            }
+        ),
+        "the first-publication lost reply is the typed uncertain class: {error:?}"
+    );
+    // The independent verification through the provider: a second
+    // connection discovers the installation with the canonical
+    // binding and the truthful grade.
+    let mut direct = SessionStore::open(&StoreLocation::Database(root.join("db.sqlite"))).unwrap();
+    let authority = direct.verify_begin_authority(&audit, &mk).unwrap();
+    assert_eq!(authority.tier(), SyncTier::TransactionalWalFull);
+    let installed = authority.id();
+    // The canonical ancestry and the MK-bound key: the installed
+    // begin's parent is the pre-publication HEAD, its record carries
+    // the deterministic key, and it is the new HEAD.
+    let record = direct.read_record(&installed).unwrap();
+    assert_eq!(record.parent, Some(head_before), "the begin's parent");
+    assert_eq!(
+        record.idempotency_key,
+        Some(engine_persist::reclaim::reclamation_begin_idempotency_key(
+            &mk
+        )),
+        "the MK-bound deterministic key"
+    );
+    assert_eq!(direct.head().unwrap().unwrap(), installed);
+    // The identical re-submission: the verified duplicate — the
+    // exact installed identity.
+    let outcome = medium.begin_reclamation(&audit, &mk, 171).unwrap();
+    assert!(
+        matches!(
+            outcome,
+            engine_persist::reclaim::BeginPublicationOutcome::DuplicateVerified { id } if id == installed
+        ),
+        "the re-submission resolves the verified duplicate: {outcome:?}"
+    );
+    // No additional begin; nothing advanced by the duplicate or the
+    // authority verification.
+    assert_eq!(
+        direct.head().unwrap().unwrap(),
+        installed,
+        "neither the duplicate nor the authority advanced HEAD"
+    );
+    let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+    assert_eq!(authority.id(), installed);
+    assert_eq!(authority.tier(), SyncTier::TransactionalWalFull);
+    // The worker remains usable and terminates cleanly once every
+    // proxy/source sender is released.
+    drop(medium);
+    drop(direct);
     drop(source);
     worker.stop();
     let _ = worker.join();

@@ -541,19 +541,44 @@ pub enum BeginPublicationOutcome {
 /// [`CanonicalMedium::verify_begin_authority`](crate::medium::
 /// CanonicalMedium::verify_begin_authority) — a caller names
 /// identities and can never supply begin bytes, fabricate a
-/// receipt, or upgrade the grade. The destructive-authorization
-/// consumer (the separately authorized CP-2 execution gate) treats
-/// this as evidence, never as a deletion instruction.
+/// receipt, or upgrade the grade. The fields are `pub(crate)`: an
+/// external crate can hold, transport, and inspect a
+/// provider-issued value (the read-only accessors) but can never
+/// construct or modify one — the type is not a caller-accepted
+/// authorization token. The destructive-authorization consumer
+/// (the separately authorized CP-2 execution gate) treats this as
+/// evidence, never as a deletion instruction.
+///
+/// ```compile_fail
+/// // An external crate cannot fabricate an authority by
+/// // constructing the type (the fields are crate-private):
+/// let forged = engine_persist::reclaim::BeginAuthority {
+///     id: engine_persist::Hash::ZERO,
+///     tier: engine_persist::SyncTier::FullPosixSequence,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeginAuthority {
     /// The verified canonical begin revision.
-    pub id: Hash,
+    pub(crate) id: Hash,
     /// The truthfully established durability grade at verification
     /// time (the POSIX local provider: `FullPosixSequence` ONLY
     /// after the completed reaffirmation sequence; SQLite:
     /// `TransactionalWalFull` from the read-transaction visibility
     /// proof under the verified WAL/FULL configuration).
-    pub tier: crate::medium::SyncTier,
+    pub(crate) tier: crate::medium::SyncTier,
+}
+
+impl BeginAuthority {
+    /// The verified canonical begin revision identity.
+    pub fn id(&self) -> Hash {
+        self.id
+    }
+
+    /// The truthfully established durability grade.
+    pub fn tier(&self) -> crate::medium::SyncTier {
+        self.tier
+    }
 }
 
 /// (OC-C3 CP-1) The reader abstraction for the shared installed-
