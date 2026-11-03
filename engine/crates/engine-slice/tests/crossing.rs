@@ -1843,6 +1843,25 @@ impl CanonicalMedium for CoveringRaceMedium {
     fn checkpoint(&mut self) -> Result<(), MediumError> {
         self.inner.checkpoint()
     }
+
+    fn begin_reclamation(
+        &mut self,
+        audit: &engine_persist::Hash,
+        mk: &engine_persist::Hash,
+        tick: u64,
+    ) -> Result<engine_persist::reclaim::BeginPublicationOutcome, MediumError> {
+        // (OC-C3 CP-1) The race double's plain delegation.
+        self.inner.begin_reclamation(audit, mk, tick)
+    }
+
+    fn verify_begin_authority(
+        &mut self,
+        audit: &engine_persist::Hash,
+        mk: &engine_persist::Hash,
+    ) -> Result<engine_persist::reclaim::BeginAuthority, MediumError> {
+        // (OC-C3 CP-1) The race double's plain delegation.
+        self.inner.verify_begin_authority(audit, mk)
+    }
 }
 
 /// §6 case 1 + the uncertain refusal: the covering's append lost its

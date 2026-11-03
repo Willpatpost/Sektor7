@@ -1009,6 +1009,91 @@ impl CanonicalMedium for SqliteMedium {
         // connection — the same logical authority contract).
         reclaim_pending_authorized(&self.conn, directive)
     }
+
+    fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        // (OC-C3 CP-1) The routing delegation to the accepted OC-C2
+        // admission — UNCHANGED semantics, no rewiring of any
+        // destructive or completion boundary.
+        SqliteMedium::begin_reclamation(self, audit, mk, tick)
+    }
+
+    fn verify_begin_authority(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+        // (OC-C3 CP-1) One consistent read snapshot for the whole
+        // verification; the truthful tier captured before the
+        // transaction borrows the connection.
+        let tier = self.durability_tier();
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| sqlite_err("begin-authority transaction", e))?;
+        let result = verify_begin_authority_tx(&tx, audit, mk, tier);
+        drop(tx);
+        result
+    }
+}
+
+/// (OC-C3 CP-1) The transaction-scoped installed-begin authority
+/// verification: the recovery-safe audit authentication (no deleted
+/// original retirement record required), the founding-derived seed,
+/// the shared canonical begin verifier over ONE transaction-scoped
+/// reader, and the SQLite durability grade — the read-snapshot
+/// visibility proof under the verified WAL/FULL configuration (a
+/// begin observed inside a fresh transaction was committed — the
+/// exposure follows the synchronized WAL commit — preserving the
+/// distinction between canonical membership and a previous
+/// publication's acknowledged outcome).
+fn verify_begin_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    audit: &Hash,
+    mk: &Hash,
+    tier: SyncTier,
+) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+    let (ledger, metadata, head) = authenticate_audit_tx(tx, audit)?;
+    if ledger.mk != *mk {
+        return Err(MediumError::Chain {
+            rule: "begin-authority/mk-mismatch",
+        });
+    }
+    // The founding-derived seed (the E1 discipline — the
+    // recovery-safe gap-aware descent).
+    let founding = crate::reclaim::founding_identity(
+        head,
+        |identity| load_record_verified(tx, identity),
+        |identity| load_object_verified(tx, identity),
+        |identity| record_exists(tx, identity),
+    )?;
+    crate::reclaim::verify_founding_seed(&metadata, &founding)?;
+    // The shared canonical begin verifier over ONE
+    // transaction-scoped reader.
+    struct SqliteBeginReads<'a, 'b> {
+        tx: &'b rusqlite::Transaction<'a>,
+    }
+    impl crate::reclaim::BeginReads for SqliteBeginReads<'_, '_> {
+        fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+            load_record_verified(self.tx, id)
+        }
+        fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            load_object_verified(self.tx, hash)
+        }
+    }
+    let mut reads = SqliteBeginReads { tx };
+    let Some((id, _begin)) =
+        crate::reclaim::verify_installed_begin(&mut reads, head, audit, mk, &ledger)?
+    else {
+        return Err(MediumError::Chain {
+            rule: "begin-authority/absent",
+        });
+    };
+    Ok(crate::reclaim::BeginAuthority { id, tier })
 }
 
 /// The trusted reclamation internals (K2-C2B P2) — the transaction-
@@ -5865,6 +5950,181 @@ mod exclusion_tests {
         );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_sqlite_begin_authority_verification() {
+        // (OC-C3 CP-1) The installed-begin durability authority on
+        // the transactional provider: the canonical verification and
+        // the truthful TransactionalWalFull grade; the grade
+        // following an UNCERTAIN publication (the AfterCommit
+        // acknowledgment-loss window — the read-snapshot visibility
+        // proof); the corrupt and orphaned refusals; the typed
+        // absence; and the verified WAL/FULL configuration's tier.
+        // (a) The canonical case + the grade.
+        {
+            let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+                sqlite_begin_store("authority-canonical");
+            let outcome = medium.begin_reclamation(&audit, &mk, 150).unwrap();
+            let installed = match outcome {
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, tier } => {
+                    assert_eq!(
+                        tier,
+                        SyncTier::TransactionalWalFull,
+                        "the sqlite admission carries the transactional tier"
+                    );
+                    id
+                }
+                other => panic!("the sqlite admission accepts: {other:?}"),
+            };
+            let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.id, installed);
+            assert_eq!(
+                authority.tier,
+                SyncTier::TransactionalWalFull,
+                "the verified WAL/FULL configuration's truthful grade"
+            );
+            // The absent case on a fresh store: the typed absence.
+            let (root2, mut medium2, audit2, mk2, _l2, _s2, _p2, _q2) =
+                sqlite_begin_store("authority-absent");
+            let error = medium2.verify_begin_authority(&audit2, &mk2).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority/absent"
+                    }
+                ),
+                "the missing begin is the typed absence: {error:?}"
+            );
+            drop(medium);
+            drop(medium2);
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&root2);
+        }
+        // (b) The grade following an uncertain publication: the
+        // AfterCommit acknowledgment-loss window — the begin IS
+        // committed; the authority's read snapshot observes it and
+        // establishes the grade (canonical membership DISTINCT from
+        // the lost acknowledgment — the visibility is the proof).
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("authority-after-commit");
+            medium.fault = Some(SqliteFaultControl::new().arm(
+                SqliteFaultPoint::AfterCommit,
+                SqliteFaultAction::InjectError,
+            ));
+            let outcome = medium.begin_reclamation(&audit, &mk, 151).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { .. }
+                ),
+                "the lost acknowledgment reconciles to the proven installation: {outcome:?}"
+            );
+            medium.fault = None;
+            let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.tier, SyncTier::TransactionalWalFull);
+            // The exact-candidate identity: the authority's begin is
+            // the record the uncertain publication installed.
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let head = read_meta_head(&medium.conn).unwrap().unwrap();
+            let _ = (ledger, key, head);
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) The corrupt and orphaned refusals: a corrupted begin
+        // object row (the typed integrity refusal) and an orphaned
+        // same-key record row (never authority — the definite
+        // absence through the walk).
+        {
+            let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+                sqlite_begin_store("authority-corrupt");
+            let outcome = medium.begin_reclamation(&audit, &mk, 152).unwrap();
+            let installed = match outcome {
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+                other => panic!("the admission accepts: {other:?}"),
+            };
+            // The begin's content object row corrupted.
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object_hash = StoredObject::new(begin.canonical_bytes()).unwrap().hash();
+            medium
+                .conn
+                .execute(
+                    "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                    params![b"corrupted-begin-payload".to_vec(), object_hash.as_bytes()],
+                )
+                .unwrap();
+            let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+            assert!(
+                matches!(error, MediumError::HashMismatch { .. }),
+                "the corrupted begin payload refuses at the hash-verifying read: {error:?}"
+            );
+            let _ = installed;
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+                sqlite_begin_store("authority-orphan");
+            // The orphaned same-key record row (never on the
+            // ancestry): the authority is the typed absence.
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let orphan_object = StoredObject::new(
+                crate::reclaim::ReclamationBegin {
+                    mk,
+                    source: audit,
+                    range_digest: [0u8; 32],
+                    seed: [0u8; 32],
+                }
+                .canonical_bytes(),
+            )
+            .unwrap();
+            let orphan_record = RevisionRecord::regular(Hash::ZERO, 0, 153)
+                .with_idempotency_key(key.clone())
+                .with_content_refs(vec![orphan_object.hash()]);
+            medium
+                .conn
+                .execute(
+                    "INSERT INTO objects (hash, domain, bytes) VALUES (?1, ?2, ?3)",
+                    params![
+                        orphan_object.hash().as_bytes().to_vec(),
+                        orphan_object.domain(),
+                        orphan_object.bytes().to_vec()
+                    ],
+                )
+                .unwrap();
+            medium
+                .conn
+                .execute(
+                    "INSERT INTO records (hash, bytes, epoch, parent, idem, kind, tick) \
+                     VALUES (?1, ?2, 0, NULL, ?3, 1, 153)",
+                    params![
+                        crate::hash::hash_object(&orphan_record.canonical_bytes())
+                            .as_bytes()
+                            .to_vec(),
+                        orphan_record.canonical_bytes(),
+                        key
+                    ],
+                )
+                .unwrap();
+            let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority/absent"
+                    }
+                ),
+                "the orphaned same-key row never grants authority: {error:?}"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
 

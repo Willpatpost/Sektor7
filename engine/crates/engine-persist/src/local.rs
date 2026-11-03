@@ -1636,6 +1636,32 @@ impl CanonicalMedium for LocalFileMedium {
         outcome
     }
 
+    fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        // (OC-C3 CP-1) The routing delegation to the accepted OC-C2
+        // admission — UNCHANGED semantics, no rewiring of any
+        // destructive or completion boundary.
+        LocalFileMedium::begin_reclamation(self, audit, mk, tick)
+    }
+
+    fn verify_begin_authority(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+        // (OC-C3 CP-1) The installed-begin durability authority
+        // under the exclusive HEAD.lock (the C2-R7
+        // outcome-preservation discipline on unlock).
+        self.lock()?;
+        let result = self.verify_begin_authority_locked(audit, mk);
+        let _ = self.unlock();
+        result
+    }
+
     fn reclaim_pending(
         &mut self,
         directive: &crate::reclaim::ReclaimDirective,
@@ -1998,6 +2024,198 @@ impl LocalFileMedium {
                 }
             }
         }
+    }
+
+    /// (OC-C3 CP-1) The lock-held installed-begin authority
+    /// verification: the recovery-safe audit authentication (no
+    /// deleted original retirement record required), the
+    /// founding-derived seed, the shared canonical begin verifier
+    /// over the internal lock-held reads, the platform tier gate,
+    /// and — only on the eligible tier — the complete reaffirmation
+    /// synchronization sequence. The grade is ESTABLISHED, never
+    /// assumed; every failure is typed and fail-closed.
+    fn verify_begin_authority_locked(
+        &self,
+        audit: &Hash,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+        let (ledger, metadata, _head) = self.authenticate_audit_locked(audit)?;
+        if ledger.mk != *mk {
+            return Err(MediumError::Chain {
+                rule: "begin-authority/mk-mismatch",
+            });
+        }
+        let head = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        // The founding-derived seed (the E1 discipline — the
+        // recovery-safe gap-aware descent; the founding is
+        // permanent, never a deleted range member).
+        let founding = crate::reclaim::founding_identity(
+            head,
+            |identity| self.load_object(identity),
+            |identity| self.load_object(identity),
+            |identity| {
+                // (C2-R2) The typed presence: a genuine NotFound is
+                // the absence; every other filesystem error refuses.
+                match fs::metadata(self.object_path(identity)) {
+                    Ok(_) => Ok(true),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(io_err(
+                        "founding presence probe",
+                        &self.object_path(identity),
+                        e,
+                    )),
+                }
+            },
+        )?;
+        crate::reclaim::verify_founding_seed(&metadata, &founding)?;
+        // The shared canonical begin verifier over ONE lock-held
+        // reader (the internal non-locking hash-verified reads).
+        struct LockedBeginReads<'a> {
+            medium: &'a LocalFileMedium,
+        }
+        impl crate::reclaim::BeginReads for LockedBeginReads<'_> {
+            fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+                self.medium.load_object(id)
+            }
+            fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+                self.medium.load_object(hash)
+            }
+        }
+        let mut reads = LockedBeginReads { medium: self };
+        let Some((id, _begin)) =
+            crate::reclaim::verify_installed_begin(&mut reads, head, audit, mk, &ledger)?
+        else {
+            return Err(MediumError::Chain {
+                rule: "begin-authority/absent",
+            });
+        };
+        // (OC-P2) The platform tier gate: ProcessCrashOnly never
+        // grants the destructive-authorization grade — an
+        // installed, restored, or otherwise discoverable begin
+        // cannot override the platform limitation.
+        if self.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+            return Err(MediumError::Chain {
+                rule: "begin-authority/tier-insufficient",
+            });
+        }
+        // The complete reaffirmation sequence — FullPosixSequence
+        // only after every required operation succeeds.
+        self.reaffirm_begin_authority_locked(head, id)?;
+        Ok(crate::reclaim::BeginAuthority {
+            id,
+            tier: crate::medium::SyncTier::FullPosixSequence,
+        })
+    }
+
+    /// (OC-C3 CP-1) The reaffirmation synchronization sequence under
+    /// the held lock: the complete recovery-relevant
+    /// authorization-evidence closure — every record on the
+    /// gap-aware HEAD-to-founding ancestry and each record's first
+    /// content-reference object (the checkpoint/skip metadata),
+    /// which includes the begin's own record and payload object —
+    /// fsynced; then the covering objects directory; then the HEAD
+    /// file; then the root directory. The sequence aborts on the
+    /// first failure (the typed I/O refusal — never success): an
+    /// interrupted or failed reaffirmation can never return the
+    /// authority grade, and (the CP-2 invariant) no deletion ever
+    /// precedes a completed sequence.
+    fn reaffirm_begin_authority_locked(&self, head: Hash, begin: Hash) -> Result<(), MediumError> {
+        const MAX_DESCENT: u64 = 1 << 20;
+        // The collecting walk: HEAD to the founding, gap-aware
+        // (the same authenticated skip-table discipline), gathering
+        // every walked record file and its first content-reference
+        // object — exactly the future re-verification set.
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut current = head;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut seen_begin = false;
+        let mut skip_table: Option<CheckpointMetadata> = None;
+        for _ in 0..MAX_DESCENT {
+            if !seen.insert(current) {
+                return Err(MediumError::Chain { rule: "cycle" });
+            }
+            let bytes = self.load_object(&current)?;
+            let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+            if current == begin {
+                seen_begin = true;
+            }
+            if let Some(object) = record.content_refs.first().copied() {
+                let object_bytes = self.load_object(&object)?;
+                if StoredObject::new(object_bytes.clone())?.domain()
+                    == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+                {
+                    skip_table = Some(
+                        CheckpointMetadata::decode(&object_bytes).map_err(MediumError::Format)?,
+                    );
+                }
+                files.push(self.object_path(&object));
+            }
+            files.push(self.object_path(&current));
+            let Some(parent) = record.parent else {
+                break;
+            };
+            if !self.object_path(&parent).is_file() {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            } else {
+                current = parent;
+            }
+        }
+        if !seen_begin {
+            // Defensive: the shared verifier already proved the
+            // begin's membership; a walk that fails to reproduce it
+            // is an internal inconsistency — refuse.
+            return Err(MediumError::Chain {
+                rule: "begin-authority/begin-not-on-ancestry",
+            });
+        }
+        // (1) Every collected file — the records and their
+        // first-reference objects.
+        for path in &files {
+            let file = File::open(path).map_err(|e| io_err("reaffirm open", path, e))?;
+            file.sync_all()
+                .map_err(|e| io_err("reaffirm sync", path, e))?;
+        }
+        // (OC-C3 CP-1, test-only seam) The interruption window:
+        // after the file syncs, before the directory/HEAD/root
+        // anchoring — an injected failure must never return
+        // success.
+        self.fault_pre(FaultPoint::ReaffirmFilesSynced)?;
+        // (2) The covering objects directory.
+        let objects_dir = self.root.join(OBJECTS_DIR);
+        let dir = File::open(&objects_dir)
+            .map_err(|e| io_err("reaffirm open objects dir", &objects_dir, e))?;
+        dir.sync_all()
+            .map_err(|e| io_err("reaffirm sync objects dir", &objects_dir, e))?;
+        // (3) The HEAD file.
+        let head_path = self.root.join(HEAD_FILE);
+        let head_file =
+            File::open(&head_path).map_err(|e| io_err("reaffirm open HEAD", &head_path, e))?;
+        head_file
+            .sync_all()
+            .map_err(|e| io_err("reaffirm sync HEAD", &head_path, e))?;
+        // (4) The root directory.
+        let root =
+            File::open(&self.root).map_err(|e| io_err("reaffirm open root", &self.root, e))?;
+        root.sync_all()
+            .map_err(|e| io_err("reaffirm sync root", &self.root, e))?;
+        Ok(())
     }
 
     /// The begin discovery under the held lock: the descent for the
@@ -4633,6 +4851,24 @@ mod exclusion_tests {
             ) -> Result<bool, MediumError> {
                 self.inner.reclaim_pending(directive)
             }
+            fn begin_reclamation(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+                tick: u64,
+            ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+                // (OC-C3 CP-1) The double's plain delegation.
+                self.inner.begin_reclamation(audit, mk, tick)
+            }
+
+            fn verify_begin_authority(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+            ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+                // (OC-C3 CP-1) The double's plain delegation.
+                self.inner.verify_begin_authority(audit, mk)
+            }
         }
         let mut interleaved = InterleavingMedium {
             inner: &mut medium,
@@ -4869,6 +5105,24 @@ mod exclusion_tests {
                 directive: &crate::reclaim::ReclaimDirective,
             ) -> Result<bool, MediumError> {
                 self.inner.reclaim_pending(directive)
+            }
+            fn begin_reclamation(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+                tick: u64,
+            ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+                // (OC-C3 CP-1) The double's plain delegation.
+                self.inner.begin_reclamation(audit, mk, tick)
+            }
+
+            fn verify_begin_authority(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+            ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+                // (OC-C3 CP-1) The double's plain delegation.
+                self.inner.verify_begin_authority(audit, mk)
             }
         }
         let marker_domain_records = |medium: &mut LocalFileMedium| -> usize {
@@ -5803,5 +6057,422 @@ mod exclusion_tests {
             "the epoch overflow refuses the linkage (u64::MAX has no coherent successor): {error:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_shared_begin_verifier_matrix() {
+        // (OC-C3 CP-1) The shared installed-begin verifier's
+        // adversarial matrix through the GENERIC adapter (the
+        // completion-path borrowing model) over a local store: the
+        // valid discovery and bindings; each payload field
+        // individually mismatched; the wrong idempotency key; the
+        // orphaned (off-chain) begin; the below-audit position; the
+        // broken parent/epoch linkage; the missing and corrupt
+        // parent; and the recovery-safe verification after the
+        // original retirement records are gone (the authenticated
+        // gap crossing included).
+        // (OC-P2) The tier gate: on a ProcessCrashOnly platform the
+        // real admission refuses, so the valid-case fixture is
+        // POSIX-only (the adversarial hand-installed fixtures are
+        // platform-neutral; the SQLite twin covers Windows for the
+        // verifier's provider path).
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let error = medium.begin_reclamation(&audit, &mk, 120).unwrap_err();
+                assert!(matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-admission/tier-insufficient"
+                    }
+                ));
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            // (a) The valid case: the real admission, then the
+            // verifier through the generic adapter.
+            medium.begin_reclamation(&audit, &mk, 120).unwrap();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let found =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap();
+            let (id, begin) = found.expect("the admitted begin verifies");
+            assert_eq!(begin.mk, mk);
+            assert_eq!(begin.source, audit);
+            assert_eq!(begin.range_digest, ledger.range_digest);
+            assert_eq!(begin.seed, ledger.seed);
+            let _ = id;
+        }
+        // The hand-installed adversarial fixtures (the corruption-
+        // shaped install — the R4-established pattern).
+        let hand_install = |medium: &mut LocalFileMedium,
+                            begin: crate::reclaim::ReclamationBegin,
+                            key: Vec<u8>,
+                            epoch_override: Option<u64>|
+         -> Hash {
+            let head = medium.read_head_file().unwrap().unwrap();
+            let head_epoch = medium.read_record(&head).unwrap().epoch;
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let record = RevisionRecord {
+                kind: crate::record::RecordKind::Regular,
+                epoch: epoch_override.unwrap_or(head_epoch + 1),
+                parent: Some(head),
+                idempotency_key: Some(key),
+                tick: 130,
+                content_refs: vec![object.hash()],
+                depends_on: Vec::new(),
+            };
+            let record_id = crate::hash::hash_object(&record.canonical_bytes());
+            std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+            std::fs::write(medium.object_path_pub(&record_id), record.canonical_bytes()).unwrap();
+            let head_bytes = {
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str(HEAD_DOMAIN);
+                enc.write_u32(HEAD_VERSION);
+                enc.write_bytes(record_id.as_bytes());
+                enc.into_bytes()
+            };
+            std::fs::write(medium.root().join(HEAD_FILE), head_bytes).unwrap();
+            record_id
+        };
+        // (b) Each payload field individually mismatched.
+        for label in ["wrong mk", "wrong source", "wrong digest", "wrong seed"] {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            // The fixture differs from the AUTHENTIC ledger in
+            // exactly one field per case.
+            let mut fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            match label {
+                // A REAL non-zero identity (the strict decode refuses
+                // a zero mk before the binding check could fire).
+                "wrong mk" => fixture.mk = ledger.sk,
+                "wrong source" => fixture.source = ledger.sk,
+                "wrong digest" => fixture.range_digest = [1u8; 32],
+                _ => fixture.seed = [2u8; 32],
+            }
+            hand_install(&mut medium, fixture, key, None);
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let error =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority/binding-mismatch"
+                    }
+                ),
+                "{label} refuses at the binding: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) The wrong idempotency key (a keyed record that is not
+        // the MK-bound begin key — the walk passes it, finding no
+        // begin: the DEFINITE absence).
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            hand_install(&mut medium, fixture, b"not-the-begin-key".to_vec(), None);
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let found =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap();
+            assert!(
+                found.is_none(),
+                "a non-begin-keyed record is a definite canonical absence"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (d) The broken parent/epoch linkage (the hand-installed
+        // begin at an incoherent epoch — the C2-R7 checked
+        // arithmetic refuses).
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            hand_install(&mut medium, fixture, key, Some(u64::MAX));
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let error =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority/installed-linkage-mismatch"
+                    }
+                ),
+                "the incoherent linkage refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (e) The orphaned (off-chain) begin: hand-written into the
+        // object namespace, never on the ancestry — a definite
+        // absence (never authority).
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+            let fixture = crate::reclaim::ReclamationBegin {
+                mk,
+                source: audit,
+                range_digest: ledger.range_digest,
+                seed: ledger.seed,
+            };
+            let object = StoredObject::new(fixture.canonical_bytes()).unwrap();
+            let orphan = RevisionRecord::regular(Hash::ZERO, 0, 131)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+            std::fs::write(
+                medium.object_path_pub(&orphan.id()),
+                orphan.canonical_bytes(),
+            )
+            .unwrap();
+            let head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let found =
+                crate::reclaim::verify_installed_begin(&mut reads, head, &audit, &mk, &ledger)
+                    .unwrap();
+            assert!(found.is_none(), "the orphan never verifies");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (f) The missing and corrupt parent: the begin's parent
+        // record deleted (uncovered) or corrupted — the typed
+        // refusals.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            medium.begin_reclamation(&audit, &mk, 132).unwrap();
+            let begin_head = medium.read_head_file().unwrap().unwrap();
+            let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+            // The corrupt parent: overwrite the begin's PARENT (the
+            // prior head — the audit) with wrong bytes at the same
+            // path.
+            let parent = medium
+                .read_record(&begin_head)
+                .unwrap()
+                .parent
+                .expect("the begin has a parent");
+            std::fs::write(medium.object_path_pub(&parent), b"corrupted-parent-record").unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let error = crate::reclaim::verify_installed_begin(
+                &mut reads, begin_head, &audit, &mk, &ledger,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, MediumError::HashMismatch { .. }),
+                "the corrupt parent refuses at the hash-verifying read: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (g) The recovery-safe case with the original retirement
+        // records deleted and an authenticated gap crossed: the
+        // two-retirement fixture, A's retirement executed, B's
+        // begin installed — the verifier needs none of A's deleted
+        // range.
+        {
+            let (root, mut medium, audit_a, mk1, _mk2, _x1, _x2, directive_a, _ledger_b) =
+                two_retirement_store("cp1-verifier-recovery");
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            medium.reclaim(&directive_a).unwrap();
+            // B's audit published above A's retired range, then B's
+            // begin.
+            let (_audit_b, outcome) =
+                publish_reclamation_ledger(&mut medium, &_ledger_b, 9).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            let ledger_b = _ledger_b;
+            let _head = medium.read_head_file().unwrap().unwrap();
+            // B's begin admission over the compacted history.
+            let begin_outcome = medium
+                .begin_reclamation(&_audit_b, &ledger_b.mk, 133)
+                .unwrap();
+            assert!(
+                matches!(
+                    begin_outcome,
+                    crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                ),
+                "the compacted-history admission accepts: {begin_outcome:?}"
+            );
+            let begin_head = medium.read_head_file().unwrap().unwrap();
+            let mut reads =
+                crate::reclaim::MediumReads::new(&mut medium as &mut dyn CanonicalMedium);
+            let found = crate::reclaim::verify_installed_begin(
+                &mut reads,
+                begin_head,
+                &_audit_b,
+                &ledger_b.mk,
+                &ledger_b,
+            )
+            .unwrap();
+            assert!(
+                found.is_some(),
+                "the recovery-safe verifier crosses the gap and needs no deleted record"
+            );
+            let _ = (audit_a, mk1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_local_begin_authority_reaffirmation() {
+        // (OC-C3 CP-1) The installed-begin durability authority on
+        // the local provider: the tier-gated platform refusal (a
+        // hand-installed begin must NOT override ProcessCrashOnly);
+        // the POSIX grade established only through the completed
+        // reaffirmation (the accepted begin, the begin below HEAD
+        // with intervening revisions, the previously-installed
+        // begin); the interrupted synchronization (the fault seam —
+        // never success); and the unreadable authorization
+        // dependency.
+        {
+            let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            // (OC-P2) The platform tier gate: on ProcessCrashOnly,
+            // even a fully valid hand-installed begin cannot obtain
+            // the authority — the restored/discoverable begin must
+            // not override the platform limitation.
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                let (ledger, _metadata, _head) = medium.authenticate_audit_locked(&audit).unwrap();
+                let key = crate::reclaim::reclamation_begin_idempotency_key(&mk);
+                let fixture = crate::reclaim::ReclamationBegin {
+                    mk,
+                    source: audit,
+                    range_digest: ledger.range_digest,
+                    seed: ledger.seed,
+                };
+                let object = StoredObject::new(fixture.canonical_bytes()).unwrap();
+                let head = medium.read_head_file().unwrap().unwrap();
+                let head_epoch = medium.read_record(&head).unwrap().epoch;
+                let record = RevisionRecord::regular(head, head_epoch, 140)
+                    .with_idempotency_key(key)
+                    .with_content_refs(vec![object.hash()]);
+                let record_id = crate::hash::hash_object(&record.canonical_bytes());
+                std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+                std::fs::write(medium.object_path_pub(&record_id), record.canonical_bytes())
+                    .unwrap();
+                let head_bytes = {
+                    let mut enc = engine_core::Encoder::new();
+                    enc.write_str(HEAD_DOMAIN);
+                    enc.write_u32(HEAD_VERSION);
+                    enc.write_bytes(record_id.as_bytes());
+                    enc.into_bytes()
+                };
+                std::fs::write(medium.root().join(HEAD_FILE), head_bytes).unwrap();
+                let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "begin-authority/tier-insufficient"
+                        }
+                    ),
+                    "the discoverable begin never overrides the platform tier: {error:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            // (a) The accepted begin: the authority established at
+            // FullPosixSequence through the completed reaffirmation.
+            let outcome = medium.begin_reclamation(&audit, &mk, 141).unwrap();
+            let installed = match outcome {
+                crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+                other => panic!("the admission accepts: {other:?}"),
+            };
+            let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.id, installed);
+            assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            // (b) The begin below HEAD with intervening canonical
+            // revisions: append records above the begin, then the
+            // authority still verifies (the walked path covers the
+            // intervening records).
+            for tick in 142..=144u64 {
+                let head = medium.head().unwrap().unwrap();
+                let head_epoch = medium.read_record(&head).unwrap().epoch;
+                let payload = StoredObject::new({
+                    let mut enc = engine_core::Encoder::new();
+                    enc.write_str("sektor7/save/1");
+                    enc.write_bytes(b"intervening-revision");
+                    enc.into_bytes()
+                })
+                .unwrap();
+                let record = RevisionRecord::regular(head, head_epoch, tick)
+                    .with_content_refs(vec![payload.hash()]);
+                medium
+                    .append(&record, std::slice::from_ref(&payload), Some(head))
+                    .unwrap();
+            }
+            let authority = medium.verify_begin_authority(&audit, &mk).unwrap();
+            assert_eq!(authority.id, installed);
+            assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            // (c) The interrupted synchronization: the fault seam
+            // fires after the file syncs, before the directory
+            // anchoring — the typed I/O refusal, NEVER success.
+            medium.fault = Some(FaultControl::new().arm(
+                FaultPoint::ReaffirmFilesSynced,
+                crate::fault::FaultAction::InjectError,
+            ));
+            let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+            assert!(
+                matches!(error, MediumError::Io { .. }),
+                "the interrupted reaffirmation never returns success: {error:?}"
+            );
+            // The armed seam persists (non-consuming): a repeat call
+            // refuses identically — never success.
+            let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+            assert!(
+                matches!(error, MediumError::Io { .. }),
+                "the armed seam refuses every attempt: {error:?}"
+            );
+            medium.fault = None;
+            // (d) The absent begin (a fresh store) — the typed
+            // absence.
+            let (root2, mut medium2, audit2, mk2, _s2, _p2) = trusted_execution_store();
+            let error = medium2.verify_begin_authority(&audit2, &mk2).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority/absent"
+                    }
+                ),
+                "the missing begin is the typed absence: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&root2);
+        }
     }
 }

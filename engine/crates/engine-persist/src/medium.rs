@@ -659,4 +659,57 @@ pub trait CanonicalMedium {
     fn checkpoint(&mut self) -> Result<(), MediumError> {
         Ok(())
     }
+
+    /// (OC-C3 CP-1) The trusted begin admission — the accepted
+    /// OC-C2 publication, now routable through the medium
+    /// abstraction. The provider implementations delegate to their
+    /// established admissions UNCHANGED (the full first-execution
+    /// evidence verification, the tier gate, the canonical-chain
+    /// validation, the insert-once discipline, the uncertain-commit
+    /// reconciliation). The inputs are IDENTITY REFERENCES ONLY —
+    /// a caller names the audit and the MK; the begin payload is
+    /// always derived inside the provider from hash-verified
+    /// canonical state, never supplied. The generic publication
+    /// gate on [`Self::append`] still refuses the begin family —
+    /// this method (and the provider admissions it delegates to)
+    /// remains the ONLY installation route. CP-1 does NOT connect
+    /// this to any destructive execution or completion boundary.
+    fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError>;
+
+    /// (OC-C3 CP-1) The installed-begin durability authority: the
+    /// recovery-safe verification and the truthfully established
+    /// grade for a PREVIOUSLY INSTALLED canonical begin — the
+    /// operation the future (separately authorized) CP-2 execution
+    /// and completion gates consume. Under the provider's own
+    /// coordination: the retained source audit and MK are
+    /// authenticated (the recovery-safe form — no deleted original
+    /// retirement record is required), the begin's canonical
+    /// membership, exact bindings (MK, source audit, range digest,
+    /// founding seed), checked linkage, and canonical position are
+    /// verified through the shared
+    /// [`crate::reclaim::verify_installed_begin`] discipline, and
+    /// the durability grade is ESTABLISHED, never assumed: the
+    /// POSIX local provider returns `FullPosixSequence` only after
+    /// the completed reaffirmation synchronization sequence (a
+    /// failed or interrupted sequence never returns success);
+    /// Windows local storage refuses typed (ProcessCrashOnly never
+    /// grants the destructive-authorization grade — an installed,
+    /// restored, or otherwise discoverable begin cannot override
+    /// the platform limitation); SQLite returns
+    /// `TransactionalWalFull` from the read-transaction visibility
+    /// proof under the verified WAL/FULL configuration, preserving
+    /// the distinction between canonical membership and a previous
+    /// publication's acknowledged outcome. No caller-supplied
+    /// proof is trusted; every failure is typed and fail-closed.
+    /// CP-1 does NOT connect this to any destructive boundary.
+    fn verify_begin_authority(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError>;
 }

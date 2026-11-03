@@ -532,6 +532,230 @@ pub enum BeginPublicationOutcome {
     DuplicateVerified { id: Hash },
 }
 
+// ------------------------------------------------- the OC-C3 CP-1 facilities
+
+/// (OC-C3 CP-1) The verified installed-begin authority: the
+/// canonical revision identity and the truthfully established
+/// durability grade. Constructible only inside the provider
+/// implementations of
+/// [`CanonicalMedium::verify_begin_authority`](crate::medium::
+/// CanonicalMedium::verify_begin_authority) — a caller names
+/// identities and can never supply begin bytes, fabricate a
+/// receipt, or upgrade the grade. The destructive-authorization
+/// consumer (the separately authorized CP-2 execution gate) treats
+/// this as evidence, never as a deletion instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeginAuthority {
+    /// The verified canonical begin revision.
+    pub id: Hash,
+    /// The truthfully established durability grade at verification
+    /// time (the POSIX local provider: `FullPosixSequence` ONLY
+    /// after the completed reaffirmation sequence; SQLite:
+    /// `TransactionalWalFull` from the read-transaction visibility
+    /// proof under the verified WAL/FULL configuration).
+    pub tier: crate::medium::SyncTier,
+}
+
+/// (OC-C3 CP-1) The reader abstraction for the shared installed-
+/// begin verifier: ONE mutable reader object serving both the
+/// record and the object reads, so a single coordination-scoped
+/// borrow — a provider transaction, a lock-held medium, or a
+/// generic trait object — backs the whole walk without conflicting
+/// Rust borrows. Every implementation MUST hash-verify: the bytes
+/// returned for an identity are the stored bytes AT that identity.
+pub trait BeginReads {
+    /// Reads and hash-verifies a revision record's canonical bytes.
+    fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError>;
+    /// Reads and hash-verifies a content object's bytes.
+    fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError>;
+}
+
+/// (OC-C3 CP-1) The generic-medium adapter: ONE
+/// `&mut dyn CanonicalMedium` backing both read kinds through the
+/// trait's hash-verifying reads — the completion-admission path's
+/// borrowing model (no double capture; the adapter's `&mut self`
+/// methods reborrow the single mutable reference per call).
+pub struct MediumReads<'a> {
+    medium: &'a mut dyn crate::medium::CanonicalMedium,
+}
+
+impl<'a> MediumReads<'a> {
+    /// The single-mutable-borrow constructor.
+    pub fn new(medium: &'a mut dyn crate::medium::CanonicalMedium) -> Self {
+        MediumReads { medium }
+    }
+}
+
+impl BeginReads for MediumReads<'_> {
+    fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+        Ok(self.medium.read_record(id)?.canonical_bytes())
+    }
+    fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+        self.medium.read_object(hash)
+    }
+}
+
+/// (OC-C3 CP-1) The shared, recovery-safe canonical installed-begin
+/// verifier — ONE implementation of the discovery discipline,
+/// callable under provider coordination (the provider adapters over
+/// a transaction or a held lock) or through the generic medium
+/// abstraction. The walk proves, from the supplied HEAD down the
+/// canonical ancestry (crossing legitimate reclaimed gaps ONLY
+/// under authenticated checkpoint skip tables):
+///
+/// - the deterministic MK-bound begin key at the discovered record
+///   (key-index occupancy alone is never authority — the record is
+///   found BY the ancestry walk, never the reverse);
+/// - the regular-revision shape (exactly one content reference, a
+///   parent);
+/// - the CHECKED parent/epoch linkage (a present parent carries
+///   epoch+1 — `u64::MAX` has no coherent successor; an absent
+///   parent only under authenticated skip coverage);
+/// - the strict 206-byte begin decode of the single content object;
+/// - the four payload bindings against the independently
+///   authenticated retained evidence — the exact MK, the exact
+///   source-audit identity, the ledger's range digest, and the
+///   ledger's founding seed;
+/// - the canonical position: the source audit appears on the walked
+///   ancestry BELOW the begin (the admission appends above the
+///   audit; a begin below its claimed audit, or a walk reaching the
+///   founding without it, is noncanonical and refuses).
+///
+/// Every missing, corrupt, orphaned, mismatched, or unverifiable
+/// input fails closed with a typed error. Recovery-safe: no deleted
+/// original retirement record is ever required (the binding inputs
+/// are the retained audit, checkpoint metadata, and the begin's own
+/// payload). Returns `Ok(None)` when the walk reaches the founding
+/// without any same-key begin — a DEFINITE canonical absence,
+/// distinct from every failure.
+pub fn verify_installed_begin<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    audit: &Hash,
+    mk: &Hash,
+    ledger: &ReclamationLedger,
+) -> Result<Option<(Hash, ReclamationBegin)>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let key = reclamation_begin_idempotency_key(mk);
+    let mut current = head;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut begin_found: Option<(Hash, ReclamationBegin)> = None;
+    for _ in 0..MAX_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let bytes = reads.read_record_bytes(&current)?;
+        let record = RevisionRecord::decode(&bytes).map_err(MediumError::Format)?;
+        if let Some(object) = record.content_refs.first().copied() {
+            let object_bytes = reads.read_object_bytes(&object)?;
+            if StoredObject::new(object_bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&object_bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        if begin_found.is_none() && record.idempotency_key.as_deref() == Some(key.as_slice()) {
+            let Some(parent) = record.parent else {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority/installed-shape-mismatch",
+                });
+            };
+            if !matches!(record.kind, crate::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority/installed-shape-mismatch",
+                });
+            }
+            // The checked parent/epoch linkage (the C2-R7
+            // arithmetic): a present parent carries epoch+1; an
+            // absent parent only under authenticated skip coverage.
+            match reads.read_record_bytes(&parent) {
+                Ok(parent_bytes) => {
+                    let parent_record =
+                        RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
+                    if parent_record.epoch.checked_add(1) != Some(record.epoch) {
+                        return Err(MediumError::Chain {
+                            rule: "begin-authority/installed-linkage-mismatch",
+                        });
+                    }
+                }
+                Err(MediumError::MissingObject { hash: parent }) => {
+                    let Some(table) = skip_table.as_ref() else {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    };
+                    let covered = if table.sk == parent {
+                        table.self_skip().is_some()
+                    } else {
+                        table.skip_for(&current).is_some()
+                    };
+                    if !covered {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+            let object = record.content_refs[0];
+            let object_bytes = reads.read_object_bytes(&object)?;
+            let begin = ReclamationBegin::decode(&object_bytes).map_err(MediumError::Format)?;
+            if begin.mk != *mk
+                || begin.source != *audit
+                || begin.range_digest != ledger.range_digest
+                || begin.seed != ledger.seed
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority/binding-mismatch",
+                });
+            }
+            begin_found = Some((current, begin));
+        }
+        if begin_found.is_some() && current == *audit {
+            // The source audit is on the walked ancestry below the
+            // begin — the canonical position holds.
+            return Ok(begin_found);
+        }
+        let Some(parent) = record.parent else {
+            if begin_found.is_some() {
+                // The begin exists but its claimed source audit is
+                // NOT below it on the canonical ancestry.
+                return Err(MediumError::Chain {
+                    rule: "begin-authority/audit-not-below-begin",
+                });
+            }
+            return Ok(None);
+        };
+        match reads.read_record_bytes(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { hash: parent }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "begin-authority/descent-bound",
+    })
+}
+
 /// The gap-aware founding descent (the OC-C2-F4 corrective): the
 /// walk from the authoritative HEAD to the ACTUAL founding revision,
 /// crossing legitimate reclaimed gaps ONLY under authenticated

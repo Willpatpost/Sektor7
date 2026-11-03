@@ -3064,6 +3064,25 @@ mod tests {
         ) -> Result<bool, MediumError> {
             self.inner.reclaim_pending(directive)
         }
+        fn begin_reclamation(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            // (OC-C3 CP-1) The counting wrapper's plain delegation
+            // (no read-accounting on the begin path).
+            self.inner.begin_reclamation(audit, mk, tick)
+        }
+
+        fn verify_begin_authority(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            // (OC-C3 CP-1) The counting wrapper's plain delegation.
+            self.inner.verify_begin_authority(audit, mk)
+        }
     }
 
     /// One publication revision's content object: a well-formed

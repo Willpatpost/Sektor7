@@ -89,6 +89,22 @@ pub enum MediumOp {
     ReclaimPending {
         directive: engine_persist::ReclaimDirective,
     },
+    /// (OC-C3 CP-1) The trusted begin admission through the queue —
+    /// identity references only; the provider derives and verifies
+    /// everything (no raw or unrestricted begin-installation route
+    /// ever exists on this transport).
+    BeginReclamation {
+        audit: Hash,
+        mk: Hash,
+        tick: u64,
+    },
+    /// (OC-C3 CP-1) The installed-begin durability authority through
+    /// the queue — the provider's own verification and grade
+    /// establishment.
+    VerifyBeginAuthority {
+        audit: Hash,
+        mk: Hash,
+    },
     Checkpoint,
     /// The maintenance FIFO barrier (PP-B4 checkpoint 4): a no-op
     /// job whose reply, by FIFO position, proves every previously
@@ -109,6 +125,8 @@ pub enum WorkerReply {
     Reconcile(Reconciliation),
     Reclaim(engine_persist::ReclaimOutcome),
     ReclaimPending(bool),
+    BeginReclamation(engine_persist::reclaim::BeginPublicationOutcome),
+    VerifyBeginAuthority(engine_persist::reclaim::BeginAuthority),
     Checkpoint,
     /// A queued job was canceled before it started (the optional-
     /// publication token, PP-B4 checkpoint 3) — a definite non-event:
@@ -226,6 +244,12 @@ pub enum WorkerFault {
     /// seam (the C4-R2 walk's content-object reads invalidated the
     /// earlier ReadObject-timing construction).
     PanicBeforeCheckpoint,
+    /// (OC-C3 CP-1) The next BeginReclamation job EXECUTES against
+    /// the store (it may publish) but its reply is never sent — the
+    /// proxy must surface the begin-admission uncertain class (the
+    /// mirror of LoseAppendReply for the trusted begin transport;
+    /// test-only, one-shot, the worker healthy).
+    LoseBeginReply,
 }
 
 /// The shared per-instance fault setter/getter, plus the one-shot park
@@ -360,7 +384,8 @@ fn worker_loop(
             | WorkerFault::DropAppendWithoutExecution
             | WorkerFault::DropNextAppends { .. }
             | WorkerFault::UnverifiableNextReconcile
-            | WorkerFault::ExitAfterAppendPreReply => {}
+            | WorkerFault::ExitAfterAppendPreReply
+            | WorkerFault::LoseBeginReply => {}
             WorkerFault::PanicNext => {
                 panic!("canonical-io-worker: injected fault (PanicNext)")
             }
@@ -398,6 +423,18 @@ fn worker_loop(
             && cancel.load(Ordering::Relaxed)
         {
             let _ = job.reply.send(Ok(WorkerReply::Canceled));
+            continue;
+        }
+        if let MediumOp::BeginReclamation { .. } = job.op
+            && fault.current() == WorkerFault::LoseBeginReply
+        {
+            // (OC-C3 CP-1) The begin admission EXECUTES (it may
+            // publish); the reply is never sent — the caller's
+            // uncertain class (resolved only by the idempotent
+            // re-submission).
+            fault.clear();
+            let _ = execute(&mut store, job.op);
+            drop(job.reply);
             continue;
         }
         if let MediumOp::Append { .. } | MediumOp::AdmittedAppend { .. } = job.op {
@@ -513,6 +550,12 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
         MediumOp::ReclaimPending { directive } => store
             .reclaim_pending(&directive)
             .map(WorkerReply::ReclaimPending),
+        MediumOp::BeginReclamation { audit, mk, tick } => store
+            .begin_reclamation(&audit, &mk, tick)
+            .map(WorkerReply::BeginReclamation),
+        MediumOp::VerifyBeginAuthority { audit, mk } => store
+            .verify_begin_authority(&audit, &mk)
+            .map(WorkerReply::VerifyBeginAuthority),
         MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
         MediumOp::Barrier => Ok(WorkerReply::Barrier),
     }
@@ -635,6 +678,106 @@ impl CanonicalMedium for WorkerMedium {
             // upstream by the pipeline's retained pending attempt.
             Err(_) => Ok(AppendOutcome::Unknown {
                 reason: UnknownReason::WorkerReplyLost,
+            }),
+        }
+    }
+
+    fn begin_reclamation(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<engine_persist::reclaim::BeginPublicationOutcome, MediumError> {
+        // (OC-C3 CP-1) The queue-backed trusted begin admission —
+        // the same admission gate and reply-loss discipline as the
+        // admitted append: a refusal BEFORE admission is a definite
+        // non-event; a reply lost AFTER admission is NEVER a
+        // definite failure (the begin MAY have been published) —
+        // the typed uncertain class, resolved only by the caller's
+        // re-submission (the deterministic MK-bound key makes the
+        // admission idempotent: never-executed resolves Accepted,
+        // executed resolves DuplicateVerified — no second
+        // independent publication, no guessed outcome).
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
+        let op = MediumOp::BeginReclamation {
+            audit: *audit,
+            mk: *mk,
+            tick,
+        };
+        let (reply, slot) = completion_slot();
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::BeginReclamation(outcome)) => Ok(outcome),
+                Ok(other) => unreachable!("the begin request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err(MediumError::Chain {
+                rule: "begin-admission/worker-reply-uncertain",
+            }),
+        }
+    }
+
+    fn verify_begin_authority(
+        &mut self,
+        audit: &Hash,
+        mk: &Hash,
+    ) -> Result<engine_persist::reclaim::BeginAuthority, MediumError> {
+        // (OC-C3 CP-1) The queue-backed installed-begin authority —
+        // the same discipline: a possibly-executed verification
+        // whose reply was lost is NEVER reported as an acknowledged
+        // result (the uncertain class; the caller re-submits and
+        // the provider re-establishes the grade under its own
+        // coordination — never a guessed acknowledgment).
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
+        let op = MediumOp::VerifyBeginAuthority {
+            audit: *audit,
+            mk: *mk,
+        };
+        let (reply, slot) = completion_slot();
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::VerifyBeginAuthority(authority)) => Ok(authority),
+                Ok(other) => unreachable!("the authority request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err(MediumError::Chain {
+                rule: "begin-authority/worker-reply-uncertain",
             }),
         }
     }

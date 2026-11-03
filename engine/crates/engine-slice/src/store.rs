@@ -214,4 +214,32 @@ impl CanonicalMedium for SessionStore {
     fn checkpoint(&mut self) -> Result<(), MediumError> {
         SessionStore::checkpoint(self)
     }
+
+    fn begin_reclamation(
+        &mut self,
+        audit: &engine_persist::Hash,
+        mk: &engine_persist::Hash,
+        tick: u64,
+    ) -> Result<engine_persist::reclaim::BeginPublicationOutcome, MediumError> {
+        // (OC-C3 CP-1) The direct-source routing of the trusted
+        // begin admission — the provider's own accepted
+        // implementation, unchanged.
+        match self {
+            SessionStore::Local(medium) => medium.begin_reclamation(audit, mk, tick),
+            SessionStore::Sqlite(medium) => medium.begin_reclamation(audit, mk, tick),
+        }
+    }
+
+    fn verify_begin_authority(
+        &mut self,
+        audit: &engine_persist::Hash,
+        mk: &engine_persist::Hash,
+    ) -> Result<engine_persist::reclaim::BeginAuthority, MediumError> {
+        // (OC-C3 CP-1) The direct-source routing of the
+        // installed-begin durability authority.
+        match self {
+            SessionStore::Local(medium) => medium.verify_begin_authority(audit, mk),
+            SessionStore::Sqlite(medium) => medium.verify_begin_authority(audit, mk),
+        }
+    }
 }

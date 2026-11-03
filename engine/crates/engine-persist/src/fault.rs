@@ -53,6 +53,11 @@ pub enum FaultPoint {
     /// Inside reconciliation, after reading HEAD, before classifying
     /// (step 9).
     ReconcileHeadRead,
+    /// (OC-C3 CP-1) Inside the begin-authority reaffirmation, after
+    /// the authorization-evidence file syncs, before the covering
+    /// directory and HEAD/root syncs — the interruption window
+    /// proof (an injected failure must never return success).
+    ReaffirmFilesSynced,
 }
 
 impl FaultPoint {
@@ -73,6 +78,7 @@ impl FaultPoint {
             FaultPoint::AfterRootDirSync => "after-root-dir-sync",
             FaultPoint::ReconcileLocked => "reconcile-locked",
             FaultPoint::ReconcileHeadRead => "reconcile-head-read",
+            FaultPoint::ReaffirmFilesSynced => "reaffirm-files-synced",
         }
     }
 
@@ -93,6 +99,7 @@ impl FaultPoint {
             FaultPoint::AfterRootDirSync,
             FaultPoint::ReconcileLocked,
             FaultPoint::ReconcileHeadRead,
+            FaultPoint::ReaffirmFilesSynced,
         ];
         POINTS.iter().copied().find(|point| point.name() == name)
     }
