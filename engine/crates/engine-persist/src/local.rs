@@ -6299,13 +6299,22 @@ mod exclusion_tests {
         // THE CONFLICTING BINDING (the competing root ID + location —
         // a REAL non-zero identity derived from a different
         // location: the strict decoder refuses zero-identity fields
-        // before the conflict check would run).
-        let competing_root_id = crate::reclaim::journal_root_id(&founding, "/competing/root");
+        // before the conflict check would run). The competing
+        // location is the CANONICAL normalized form of a genuinely
+        // different absolute path (platform-portable: a bare
+        // "/competing/root" is not an absolute descriptor on
+        // Windows, and the F4-R13 canonical check would refuse it
+        // before the conflict discipline — the competition must
+        // reach the CONFLICT, not the descriptor admission).
+        let competing_location = crate::reclaim::JournalRootBinding::normalize_location(
+            std::path::Path::new("/competing/root"),
+        );
+        let competing_root_id = crate::reclaim::journal_root_id(&founding, &competing_location);
         let error = crate::reclaim::publish_journal_root_binding(
             &mut medium,
             &founding,
             &competing_root_id,
-            "/competing/root",
+            &competing_location,
             97,
         )
         .unwrap_err();

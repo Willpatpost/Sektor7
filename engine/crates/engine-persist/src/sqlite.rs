@@ -2858,8 +2858,16 @@ fn verify_authority_row(
 /// statement returns the resulting mode), FULL (set as a pure setter
 /// — the statement returns no row — then **verified by reading the
 /// actual configuration back**, the numeric form 2), and the busy
-/// timeout. A request is never assumed granted.
+/// timeout. A request is never assumed granted. THE TIMEOUT FIRST:
+/// the busy timeout is installed BEFORE the journal-mode transition
+/// — the transition may have to recover a killed writer's hot WAL
+/// (taking locks momentarily), and without the timeout any transient
+/// contention is an immediate `SQLITE_BUSY` (the CI flake of the
+/// interrupted-run relaunch at be6ffe9's first dispatch); with it,
+/// the recovery waits within the established bound.
 fn configure_writable(conn: &Connection, config: &SqliteMediumConfig) -> Result<(), MediumError> {
+    conn.busy_timeout(config.busy_timeout)
+        .map_err(|e| sqlite_err("set busy_timeout", e))?;
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .map_err(|e| sqlite_err("set journal_mode", e))?;
@@ -2880,8 +2888,6 @@ fn configure_writable(conn: &Connection, config: &SqliteMediumConfig) -> Result<
             detail: format!("expected 2 (FULL), observed {sync}"),
         });
     }
-    conn.busy_timeout(config.busy_timeout)
-        .map_err(|e| sqlite_err("set busy_timeout", e))?;
     Ok(())
 }
 
