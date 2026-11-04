@@ -524,6 +524,10 @@ pub trait CanonicalMedium {
         // enforce the W2 bidirectional v1/v2 exclusion.
         crate::reclaim::enforce_reclamation_ledger_family_gate(objects)?;
         crate::reclaim::enforce_reclamation_plan_gate(objects)?;
+        // (V2-W F4) The journal-root binding gate: the campaign's
+        // authoritative journal-root binding is installable only
+        // through the trusted in-crate admission.
+        crate::reclaim::enforce_journal_root_binding_gate(objects)?;
         let admitted = AdmittedAppend::generic(record, objects);
         self.append_admitted(admitted, expected_parent)
     }

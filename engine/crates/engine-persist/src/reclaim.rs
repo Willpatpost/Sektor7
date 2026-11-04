@@ -1568,6 +1568,293 @@ pub fn reclamation_plan_idempotency_key(mk: &Hash) -> Vec<u8> {
     format!("{RECLAMATION_PLAN_KEY_DOMAIN}:{}", mk.hex()).into_bytes()
 }
 
+// ------------------------- the V2-W F4 canonical journal-root binding
+//
+// The owner-ratified Option A contract: exactly ONE authoritative
+// journal-root binding per newly bound campaign — a strictly
+// versioned, deterministic, WRITE-ONCE canonical record binding the
+// campaign's immutable founding identity to a stable journal-root ID
+// and the authoritative root-location descriptor. The chain's
+// duplicate-idempotency-key rule enforces the one-per-campaign
+// uniqueness (a competing second root refuses at the chain
+// validation); the binding is installable ONLY through the trusted
+// in-crate admission after the founding authentication (a caller's
+// possession of the founding hash is never authority for a second
+// root); the generic append refuses the domain. The root ID is a
+// STABLE NONZERO identity distinct from the filesystem path —
+// carried unchanged across every rotation generation — while the
+// location descriptor names the authoritative local root with the
+// canonical-path normalization as its comparison rule (absolute
+// binding: a relocated root is a CONTRADICTORY binding, never a
+// silent rebind).
+
+/// The canonical journal-root binding object's versioned domain.
+pub const JOURNAL_ROOT_BINDING_DOMAIN: &str = "engine-persist/journal-root/1";
+pub const JOURNAL_ROOT_BINDING_VERSION: u32 = 1;
+
+/// The binding revision's deterministic idempotency-key domain
+/// (one binding per founding, ever).
+pub const JOURNAL_ROOT_BINDING_KEY_DOMAIN: &str = "engine-persist/journal-root-key/1";
+
+/// The canonical journal-root binding: the immutable founding
+/// record's hash, the stable journal-root identity (nonzero, never
+/// the filesystem path, unchanged across rotations), and the
+/// authoritative root-location descriptor (the normalized absolute
+/// path — explicit comparison rule: a different location under the
+/// same key is a CONTRADICTORY binding, refused, never rebound).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalRootBinding {
+    pub founding: Hash,
+    pub root_id: Hash,
+    pub location: String,
+}
+
+impl JournalRootBinding {
+    /// Canonical bytes (the binding revision's single content
+    /// object) — deterministic.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut enc = Encoder::new();
+        enc.write_str(JOURNAL_ROOT_BINDING_DOMAIN);
+        enc.write_u32(JOURNAL_ROOT_BINDING_VERSION);
+        enc.write_bytes(self.founding.as_bytes());
+        enc.write_bytes(self.root_id.as_bytes());
+        enc.write_str(&self.location);
+        enc.into_bytes()
+    }
+
+    /// Strict decode: the domain and version gates, the exact hash
+    /// widths, the nonzero-identity refusals, the nonempty location,
+    /// and the trailing-data refusal.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
+        let mut dec = Decoder::new(bytes);
+        dec.read_domain(JOURNAL_ROOT_BINDING_DOMAIN)?;
+        let version = dec.read_u32()?;
+        if version != JOURNAL_ROOT_BINDING_VERSION {
+            return Err(SaveError::Version {
+                observed: version,
+                supported: JOURNAL_ROOT_BINDING_VERSION,
+            });
+        }
+        let founding = read_binding_hash(&mut dec)?;
+        let root_id = read_binding_hash(&mut dec)?;
+        if founding == Hash::ZERO || root_id == Hash::ZERO {
+            return Err(SaveError::Integrity("journal-root/zero-identity"));
+        }
+        let location = dec.read_str(1024, "journal-root")?;
+        if location.is_empty() {
+            return Err(SaveError::Integrity("journal-root/empty-location"));
+        }
+        dec.finish()?;
+        Ok(Self {
+            founding,
+            root_id,
+            location: location.to_owned(),
+        })
+    }
+
+    /// The location descriptor's normalization + comparison rule:
+    /// the canonical absolute form (no trailing separator).
+    pub fn normalize_location(path: &std::path::Path) -> String {
+        let mut text = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        while text.len() > 1 && text.ends_with('/') {
+            text.pop();
+        }
+        text
+    }
+}
+
+fn read_binding_hash(dec: &mut Decoder<'_>) -> Result<Hash, SaveError> {
+    let bytes = dec.read_bytes(Hash::WIDTH, "journal-root")?;
+    Hash::from_bytes(bytes).ok_or(SaveError::Integrity("journal-root/hash-width"))
+}
+
+/// The binding revision's deterministic idempotency key (the founding
+/// hash — one binding per campaign, ever).
+pub fn journal_root_binding_idempotency_key(founding: &Hash) -> Vec<u8> {
+    format!("{JOURNAL_ROOT_BINDING_KEY_DOMAIN}:{}", founding.hex()).into_bytes()
+}
+
+/// (V2-W F4) The stable journal-root identity's deterministic
+/// derivation: the hash over the canonical encoding of the founding
+/// identity and the authoritative location — stable across
+/// rotations, reproducible at every recovery, and independent of
+/// the filesystem's inode or path spelling beyond the location's
+/// own normalized form.
+pub fn journal_root_id(founding: &Hash, location: &str) -> Hash {
+    let mut enc = Encoder::new();
+    enc.write_str("engine-persist/journal-root-id/1");
+    enc.write_bytes(founding.as_bytes());
+    enc.write_str(location);
+    let bytes = enc.into_bytes();
+    crate::hash::hash_object(&bytes)
+}
+
+/// (V2-W F4) The installed binding discovery: the record carrying
+/// THIS founding's deterministic key, with its strictly decoded
+/// binding.
+pub fn find_installed_journal_root_binding(
+    medium: &mut dyn CanonicalMedium,
+    founding: &Hash,
+) -> Result<Option<(Hash, JournalRootBinding)>, MediumError> {
+    match find_on_chain(
+        medium,
+        Some(&journal_root_binding_idempotency_key(founding)),
+        None,
+    )? {
+        None => Ok(None),
+        Some((id, bytes)) => Ok(Some((
+            id,
+            JournalRootBinding::decode(&bytes).map_err(MediumError::Format)?,
+        ))),
+    }
+}
+
+/// (V2-W F4) The binding-family publication gate: no journal-root
+/// binding object (any version) may enter the chain through the
+/// unrestricted generic append — the binding is trusted campaign
+/// authority, installable only through the in-crate admission below.
+pub fn enforce_journal_root_binding_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if object.domain().starts_with("engine-persist/journal-root/") {
+            return Err(MediumError::Chain {
+                rule: "journal-root/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// (V2-W F4) The typed binding-publication outcome — the same
+/// truthful classification discipline as the plan's.
+#[derive(Debug)]
+pub enum JournalRootBindingOutcome {
+    Accepted { id: Hash },
+    ReconciledInstalled { id: Hash },
+    ReconciledNotInstalled,
+    DuplicateVerified { id: Hash },
+}
+
+/// (V2-W F4) The trusted journal-root binding admission: publishes
+/// the canonical binding for a freshly bootstrapped campaign. The
+/// founding record is AUTHENTICATED first (the canonical chain
+/// membership — it IS the parentless root — never a caller-asserted
+/// identity); the deterministic key makes the record write-once per
+/// campaign (the chain's duplicate-idempotency-key rule); an
+/// already-bound campaign REFUSES any differing root ID or location
+/// (never a rebind); an identical installed binding verifies as the
+/// exact duplicate; the publication rides the exact-parent CAS with
+/// fresh re-validation on the stale retry and the Unknown outcome
+/// reconciled against the verified identity, key, and exact
+/// canonical content.
+pub fn publish_journal_root_binding(
+    medium: &mut dyn CanonicalMedium,
+    founding: &Hash,
+    root_id: &Hash,
+    location: &str,
+    tick: u64,
+) -> Result<(Hash, JournalRootBindingOutcome), MediumError> {
+    if *founding == Hash::ZERO || *root_id == Hash::ZERO || location.is_empty() {
+        return Err(MediumError::Chain {
+            rule: "journal-root/binding-invalid",
+        });
+    }
+    // The founding authentication: the canonical chain membership —
+    // the parentless root record itself (a caller-supplied founding
+    // hash that is not the chain's root refuses).
+    let founding_record = medium.read_record(founding)?;
+    if founding_record.parent.is_some() {
+        return Err(MediumError::Chain {
+            rule: "journal-root/founding-not-root",
+        });
+    }
+    let Some((_id, _bytes)) = find_on_chain(medium, None, Some(founding))? else {
+        return Err(MediumError::Chain {
+            rule: "journal-root/founding-not-installed",
+        });
+    };
+    let binding = JournalRootBinding {
+        founding: *founding,
+        root_id: *root_id,
+        location: location.to_owned(),
+    };
+    let object = StoredObject::new(binding.canonical_bytes())?;
+    let key = journal_root_binding_idempotency_key(founding);
+    for attempt in 0..2 {
+        let head = medium
+            .head()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        // The already-bound check (fresh at THIS head): an identical
+        // installed binding verifies as the exact duplicate; ANY
+        // differing root ID or location refuses — never a rebind.
+        if let Some((installed_id, installed_bytes)) = find_on_chain(medium, Some(&key), None)? {
+            if installed_bytes == object.bytes() {
+                return Ok((
+                    installed_id,
+                    JournalRootBindingOutcome::DuplicateVerified { id: installed_id },
+                ));
+            }
+            return Err(MediumError::Chain {
+                rule: "journal-root/binding-conflict",
+            });
+        }
+        let parent_epoch = medium.read_record(&head)?.epoch;
+        let record = RevisionRecord::regular(head, parent_epoch, tick)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![object.hash()]);
+        let candidate = record.id();
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        match medium.append_admitted(admitted, Some(head))? {
+            AppendOutcome::Accepted { id, .. } => {
+                return Ok((id, JournalRootBindingOutcome::Accepted { id }));
+            }
+            AppendOutcome::RejectedStaleParent { .. } => {
+                if attempt == 1 {
+                    return Err(MediumError::Chain {
+                        rule: "journal-root/stale-unresolved",
+                    });
+                }
+                continue;
+            }
+            AppendOutcome::Unknown { .. } => match medium.reconcile_unknown(&candidate)? {
+                crate::medium::Reconciliation::Installed { id } => {
+                    let installed = medium.read_record(&id)?;
+                    if installed.idempotency_key.as_deref() != Some(key.as_slice()) {
+                        return Err(MediumError::Chain {
+                            rule: "journal-root/unknown-key-mismatch",
+                        });
+                    }
+                    let installed_object = medium.read_object(&installed.content_refs[0])?;
+                    if installed_object != object.bytes() {
+                        return Err(MediumError::Chain {
+                            rule: "journal-root/unknown-content-mismatch",
+                        });
+                    }
+                    return Ok((id, JournalRootBindingOutcome::ReconciledInstalled { id }));
+                }
+                crate::medium::Reconciliation::NotInstalled { .. } => {
+                    if attempt == 1 {
+                        return Err(MediumError::Chain {
+                            rule: "journal-root/unknown-unresolved",
+                        });
+                    }
+                    continue;
+                }
+                crate::medium::Reconciliation::Unverifiable { .. } => {
+                    return Err(MediumError::Chain {
+                        rule: "journal-root/unknown-unverifiable",
+                    });
+                }
+            },
+        }
+    }
+    unreachable!("the retry loop returns on every path")
+}
+
 // ------------------------------------------ the V2-W trusted publications
 //
 // The provider-neutral, NON-DESTRUCTIVE publication of the v2
@@ -1625,6 +1912,59 @@ pub fn collect_reclaimable_journal_files(
     for name in names {
         if active_name.as_deref() == Some(name.as_str()) {
             continue;
+        }
+        stale.push(name);
+    }
+    stale.sort();
+    Ok(stale)
+}
+
+/// (V2-W F4) The bound journal-obligation collection: the SAME
+/// trusted rotation-lineage discipline as the legacy collector,
+/// with EVERY identity verified — the active journal scanned
+/// through the bound form (the founding hash and root ID checked
+/// against the installed canonical binding; a legacy, foreign, or
+/// corrupt header refuses), and EVERY stale generation named by the
+/// ownership record verified present with the SAME bound identities
+/// (a missing generation is un-verifiable retirement evidence —
+/// fail closed; a mismatched generation refuses). The caller holds
+/// the root's exclusive sidecar lock across this collection and the
+/// canonical publication (the serialization boundary).
+pub fn collect_bound_reclaimable_journal_files(
+    journal_root: &std::path::Path,
+    founding: &Hash,
+    root_id: &Hash,
+) -> Result<Vec<String>, MediumError> {
+    let refused = |rule: &'static str| MediumError::Chain { rule };
+    let active = crate::rotation::active_journal_path(journal_root)
+        .map_err(|_error| refused("journal-root/journal-evidence"))?;
+    if active == journal_root {
+        // The unrotated root IS the active journal: the bound scan
+        // verifies its identity (an absent file is MISSING evidence
+        // once the binding exists — never the empty fallback).
+        crate::journal::scan_bound_file(journal_root, founding, root_id)
+            .map_err(|_error| refused("journal-root/active-identity"))?;
+        return Ok(Vec::new());
+    }
+    let active_name = active
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    crate::journal::scan_bound_file(&active, founding, root_id)
+        .map_err(|_error| refused("journal-root/active-identity"))?;
+    let names = crate::rotation::read_journal_generations(journal_root)
+        .map_err(|_error| refused("journal-root/journal-evidence"))?;
+    let mut stale = Vec::new();
+    for name in names {
+        if active_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let path = journal_root.with_file_name(&name);
+        let bytes =
+            std::fs::read(&path).map_err(|_error| refused("journal-root/generation-missing"))?;
+        match crate::journal::read_bound_header(&bytes, founding, root_id) {
+            Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
+            _ => return Err(refused("journal-root/generation-identity-mismatch")),
         }
         stale.push(name);
     }
@@ -1715,7 +2055,7 @@ fn find_on_chain(
 /// — the same discipline the accepted `founding_identity` helper
 /// enforces under the providers' own coordination, shaped here for
 /// the provider-neutral writer boundary.
-fn founding_identity_medium(medium: &mut dyn CanonicalMedium) -> Result<Hash, MediumError> {
+pub fn founding_identity_medium(medium: &mut dyn CanonicalMedium) -> Result<Hash, MediumError> {
     const MAX_DESCENT: u64 = 1 << 20;
     let head = medium
         .head()?
@@ -1911,6 +2251,37 @@ pub fn publish_reclamation_plan(
     journal_root: &std::path::Path,
     tick: u64,
 ) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
+    // (V2-W F4) THE CAMPAIGN-BOUND JOURNAL AUTHORITY — the required
+    // security property: this publication derives its journal
+    // obligations ONLY from the authenticated canonical campaign.
+    // The chain's founding is discovered; the INSTALLED root
+    // binding must exist (an unbound or legacy campaign refuses —
+    // v2 trusted publication requires the bound lifecycle); the
+    // supplied root's normalized location MUST equal the binding's
+    // authoritative location (a foreign root, a competing second
+    // root, or a relocated root refuses — the root uniqueness and
+    // the bypass prevention); and the root's exclusive sidecar lock
+    // is held across the obligation collection and the canonical
+    // plan append (the serialization boundary against a concurrent
+    // rotation — the rotation holds the same lock across its flip).
+    let founding = founding_identity_medium(medium)?;
+    let Some((_binding_id, binding)) = find_installed_journal_root_binding(medium, &founding)?
+    else {
+        return Err(MediumError::Chain {
+            rule: "journal-root/not-bound",
+        });
+    };
+    if binding.location != JournalRootBinding::normalize_location(journal_root) {
+        return Err(MediumError::Chain {
+            rule: "journal-root/location-mismatch",
+        });
+    }
+    let _root_lock =
+        crate::journal::open_lock_file(journal_root).map_err(|_error| MediumError::Chain {
+            rule: "journal-root/lock",
+        })?;
+    let journal_files =
+        collect_bound_reclaimable_journal_files(journal_root, &founding, &binding.root_id)?;
     // (a) The admitted byte limit: the caller-supplied operational
     // packing bound, validated against the unchanged canonical
     // ceiling (512 MiB) and the honest nonzero minimum.
@@ -2093,33 +2464,11 @@ pub fn publish_reclamation_plan(
     if !current.records.is_empty() {
         batches.push(current);
     }
-    // (e) The journal obligations (W2-B): the collector over the
-    // journal root — the SAME trusted discipline the crossing uses;
-    // never a silent empty default, never an arbitrary
-    // caller-supplied list.
-    let journal_files =
-        collect_reclaimable_journal_files(journal_root).map_err(|_error| MediumError::Chain {
-            rule: "reclamation-plan/journal-evidence",
-        })?;
-    // (V2W-F4, THE INTERIM FAIL-CLOSED BOUNDARY) The collected
-    // lineage is rotation-valid but NOT yet campaign-bound: the
-    // persisted journal format carries no campaign identity, so a
-    // provider-neutral writer cannot authenticate that this root
-    // belongs to the requested MK's campaign — a valid lineage from
-    // campaign B must never become retirement authority for
-    // campaign A. Until the owner ratifies a binding contract (the
-    // smallest safe design presented in the delivery report: the
-    // crossing-scoped publication, which holds both the store and
-    // the journal under one campaign identity, or a persisted
-    // cross-reference), any NONEMPTY obligation set REFUSES typed —
-    // never an unauthenticated approximation. The genuinely empty
-    // set (no rotation — the active IS the root) remains supported:
-    // nothing retires, nothing to mis-bind.
-    if !journal_files.is_empty() {
-        return Err(MediumError::Chain {
-            rule: "reclamation-plan/journal-campaign-unbound",
-        });
-    }
+    // (e) The journal obligations: collected ABOVE under the root's
+    // exclusive lock, with every identity verified against the
+    // installed canonical binding (the active and every stale
+    // generation) — the complete authoritative obligation set,
+    // immutable in the plan.
     // (f) The plan, constructed from the verified values only.
     let plan = ReclaimPlan {
         mk: *mk,

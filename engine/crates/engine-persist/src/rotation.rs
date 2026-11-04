@@ -379,6 +379,23 @@ pub fn rotate_journal(
     retained_cancellations: &[RecordedCancellation],
     retired: &[TransactionId],
 ) -> Result<JournalRotation, JournalError> {
+    rotate_journal_with(legacy_path, retained, retained_cancellations, retired, None)
+}
+
+/// (V2-W F4) The rotation with the optional bound identity: when
+/// present, the fresh generation carries the SAME canonical founding
+/// hash and stable journal-root ID (the identities inherit across
+/// every generation; the verification scans the bound form, refusing
+/// mixed, corrupt, or missing identity evidence). The pointer, the
+/// ownership record, and the durability semantics are the accepted
+/// ones — the identical flip sequence.
+pub fn rotate_journal_with(
+    legacy_path: &Path,
+    retained: &[CommittedTransaction],
+    retained_cancellations: &[RecordedCancellation],
+    retired: &[TransactionId],
+    bound: Option<(&crate::hash::Hash, &crate::hash::Hash)>,
+) -> Result<JournalRotation, JournalError> {
     // (1) The fresh path (unique by construction; the legacy
     // journal's directory).
     let nanos = SystemTime::now()
@@ -393,7 +410,10 @@ pub fn rotate_journal(
     // same identity and payload — the dedup semantics of the active
     // set survive the re-encoding.
     {
-        let mut journal = T1Journal::open(&new_path)?;
+        let mut journal = match bound {
+            Some((founding, root_id)) => T1Journal::open_bound(&new_path, founding, root_id)?,
+            None => T1Journal::open(&new_path)?,
+        };
         for transaction in retained {
             let input = TransactionInput {
                 envelopes: transaction.envelopes.clone(),
@@ -420,7 +440,10 @@ pub fn rotate_journal(
     // their payloads, exactly the retained cancellations, a clean
     // tail. Anything else fails closed — the pointer never names an
     // unverified journal.
-    let scan = T1Journal::scan_file(&new_path)?;
+    let scan = match bound {
+        Some((founding, root_id)) => crate::journal::scan_bound_file(&new_path, founding, root_id)?,
+        None => T1Journal::scan_file(&new_path)?,
+    };
     let rejected = || JournalError::Format(SaveError::Integrity("journal-rotation/verification"));
     if scan.committed.len() != retained.len() {
         return Err(rejected());
@@ -441,6 +464,28 @@ pub fn rotate_journal(
     if scan.tail != TailState::Clean {
         return Err(rejected());
     }
+    // (V2-W F4, §6) THE ROOT-SIDECAR EXCLUSIVE LOCK — the
+    // serialization boundary against the bound plan publication
+    // (which holds the SAME root lock across its journal-obligation
+    // collection and the canonical plan append). The lock is taken
+    // ONLY when the active journal is a ROTATED generation: in the
+    // unrotated case the active IS the root, and the caller (the
+    // crossing) already holds the root's own sidecar lock through
+    // its pipeline journal handle for the ENTIRE rotation — the
+    // publication's root lock is thereby blocked for the whole
+    // interval (the same serialization, no same-process flock
+    // self-deadlock). In the rotated case the caller holds only the
+    // active generation's lock, so THIS function takes the root
+    // lock across the ownership-record write and the pointer flip.
+    // The rotation never takes the medium's HEAD lock and the
+    // publication never takes the active generation's lock — no
+    // cycle.
+    let prior_active = active_journal_path(legacy_path)?;
+    let _root_lock = if prior_active != legacy_path {
+        Some(crate::journal::open_lock_file(legacy_path)?)
+    } else {
+        None
+    };
     // (4) THE OWNERSHIP RECORD — BEFORE THE FLIP (the review
     // corrective R4): the campaign's generation lineage — the
     // pre-flip active and the new generation, deduplicated — is
@@ -460,7 +505,6 @@ pub fn rotate_journal(
         .ok_or(JournalError::Format(SaveError::Integrity(
             "journal-rotation/name",
         )))?;
-    let prior_active = active_journal_path(legacy_path)?;
     let mut owned = read_journal_generations(legacy_path)?;
     if let Some(prior_name) = prior_active.file_name().and_then(|prior| prior.to_str())
         && !owned.iter().any(|recorded| recorded == prior_name)

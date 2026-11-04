@@ -981,6 +981,134 @@ fn read_header(bytes: &[u8]) -> Result<HeaderState, JournalError> {
     })
 }
 
+// ------------------------- the V2-W F4 bound journal header
+//
+// The owner-ratified Option A contract's journal side: a NEW
+// versioned header shape carrying the canonical founding hash and
+// the stable journal-root ID, beside the unchanged legacy format.
+// The framing chain anchors over the COMPLETE bound header (its
+// hash is the first frame's expected prev); the strict decode gates
+// the domain, the schema, the exact hash widths, and the
+// nonzero-identity refusals; a torn bound-creation prefix is the
+// same crashed-creation evidence as the legacy's (nothing could
+// ever have been journaled). The legacy format, its readers, and
+// its writers are UNTOUCHED — no migration, no reinterpretation.
+
+/// The bound journal header's versioned domain.
+pub const BOUND_JOURNAL_DOMAIN: &str = "sektor7/engine-persist/journal-bound/1";
+pub const BOUND_JOURNAL_SCHEMA: u8 = 1;
+
+/// The bound header's canonical bytes (deterministic in the founding
+/// and root ID).
+pub fn bound_header_bytes(founding: &crate::hash::Hash, root_id: &crate::hash::Hash) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.write_str(BOUND_JOURNAL_DOMAIN);
+    enc.write_u8(BOUND_JOURNAL_SCHEMA);
+    enc.write_bytes(founding.as_bytes());
+    enc.write_bytes(root_id.as_bytes());
+    enc.into_bytes()
+}
+
+/// The bound header's parsed state.
+pub enum BoundHeaderState {
+    Fresh,
+    /// A prefix of the canonical bound header — a crashed creation;
+    /// nothing could ever have been journaled.
+    TornCreation {
+        byte_len: u64,
+    },
+    /// The exact expected identities.
+    Matching {
+        header_hash: crate::hash::Hash,
+    },
+}
+
+/// The strict bound-header read: the expected identities are
+/// PARAMETERS (the caller verified them against the canonical
+/// binding); a well-formed bound header with DIFFERENT identities,
+/// a legacy header, a corrupt header, or an unknown version
+/// refuses typed — never silently treated as the expected journal.
+pub fn read_bound_header(
+    bytes: &[u8],
+    founding: &crate::hash::Hash,
+    root_id: &crate::hash::Hash,
+) -> Result<BoundHeaderState, JournalError> {
+    let header = bound_header_bytes(founding, root_id);
+    if bytes.is_empty() {
+        return Ok(BoundHeaderState::Fresh);
+    }
+    if bytes.len() < header.len() {
+        if bytes == &header[..bytes.len()] {
+            return Ok(BoundHeaderState::TornCreation {
+                byte_len: bytes.len() as u64,
+            });
+        }
+        // Not a prefix of the expected bound header: a legacy or
+        // foreign header at this path — refuse (the strict rule:
+        // never reinterpret).
+        return Err(JournalError::CorruptHeader {
+            detail: "not the expected bound header".into(),
+        });
+    }
+    if &bytes[..header.len()] != header.as_slice() {
+        return Err(JournalError::CorruptHeader {
+            detail: "bound header identity mismatch".into(),
+        });
+    }
+    Ok(BoundHeaderState::Matching {
+        header_hash: crate::hash::hash_object(&header),
+    })
+}
+
+/// (V2-W F4) The bound-journal scan: the identity-verifying
+/// read-only classification. An ABSENT file is a typed missing-
+/// evidence refusal — never the empty-journal fallback (once the
+/// canonical binding exists, a missing journal is missing
+/// authoritative evidence).
+pub fn scan_bound_file(
+    path: impl AsRef<Path>,
+    founding: &crate::hash::Hash,
+    root_id: &crate::hash::Hash,
+) -> Result<JournalScan, JournalError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|e| io_err("read bound journal", path, e))?;
+    if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
+        return Err(JournalError::Format(SaveError::Limit {
+            section: "journal",
+            kind: "file-length",
+            value: bytes.len() as u64,
+            max: MAX_JOURNAL_FILE_BYTES,
+        }));
+    }
+    match read_bound_header(&bytes, founding, root_id)? {
+        BoundHeaderState::Fresh => Err(JournalError::Io {
+            op: "read bound journal",
+            path: path.display().to_string(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        }),
+        BoundHeaderState::TornCreation { byte_len } => Ok(JournalScan {
+            committed: Vec::new(),
+            cancellations: Vec::new(),
+            tail: TailState::Inert {
+                byte_len,
+                kind: TailKind::TornCreation,
+            },
+        }),
+        BoundHeaderState::Matching { header_hash } => {
+            let state = classify_bound(
+                &bytes,
+                header_hash,
+                bound_header_bytes(founding, root_id).len(),
+            )?;
+            Ok(JournalScan {
+                committed: state.committed,
+                cancellations: state.cancellations,
+                tail: state.observed_tail,
+            })
+        }
+    }
+}
+
 /// The classified in-memory state derived from one scan.
 struct JournalState {
     committed: Vec<CommittedTransaction>,
@@ -1019,6 +1147,23 @@ impl JournalState {
             chain_prev: header_hash,
         }
     }
+
+    /// (V2-W F4) The bound-journal form: identical discipline, the
+    /// bound header's own length as the frame offset base.
+    fn empty_bound(header_hash: Hash, header_len: u64) -> Self {
+        JournalState {
+            committed: Vec::new(),
+            cancellations: Vec::new(),
+            committed_ids: BTreeSet::new(),
+            canceled_ids: BTreeSet::new(),
+            inert_ids: BTreeSet::new(),
+            observed_tail: TailState::Clean,
+            append_offset: header_len,
+            tail_resolved: true,
+            next_sequence: 1,
+            chain_prev: header_hash,
+        }
+    }
 }
 
 /// One damage site detected during the walk (the first one stands).
@@ -1030,8 +1175,31 @@ struct Damage {
 /// The classification walk — the documented rules of the module
 /// docs, applied in one sequential pass.
 fn classify(bytes: &[u8], header_hash: Hash) -> Result<JournalState, JournalError> {
-    let mut state = JournalState::empty(header_hash);
-    let mut offset = header_bytes().len();
+    let state = JournalState::empty(header_hash);
+    classify_from(state, bytes, header_hash, header_bytes().len())
+}
+
+/// (V2-W F4) The bound-journal classification walk — the identical
+/// documented rules over the bound header's anchor and length.
+fn classify_bound(
+    bytes: &[u8],
+    header_hash: Hash,
+    header_len: usize,
+) -> Result<JournalState, JournalError> {
+    let state = JournalState::empty_bound(header_hash, header_len as u64);
+    classify_from(state, bytes, header_hash, header_len)
+}
+
+/// The shared sequential walk (both header shapes): the state's
+/// append_offset carries the header length; the chain anchors at the
+/// header's hash.
+fn classify_from(
+    mut state: JournalState,
+    bytes: &[u8],
+    header_hash: Hash,
+    header_len: usize,
+) -> Result<JournalState, JournalError> {
+    let mut offset = header_len;
     let mut expected_prev = header_hash;
     let mut chain_ok = true;
     let mut damage: Option<Damage> = None;
@@ -1422,6 +1590,86 @@ impl T1Journal {
             }
             HeaderState::Valid { header_hash } => {
                 journal.state = classify(&bytes, header_hash)?;
+                journal.resolve_tail()?;
+            }
+        }
+        Ok(journal)
+    }
+
+    /// (V2-W F4) The bound-journal open: the trusted bootstrap's
+    /// creation/reuse path. A FRESH or torn-bound-creation file is
+    /// (re-)initialized with the bound header (one write + one
+    /// fsync + the parent-directory sync — a crash can only leave a
+    /// prefix, nothing could ever have been journaled); a file
+    /// carrying the EXACT expected identities is classified and
+    /// resumed; anything else — a legacy header, a foreign or
+    /// mismatched bound header, corrupt bytes — refuses typed
+    /// (never reinterpreted, never silently converted). The
+    /// single-writer sidecar lock discipline is identical.
+    pub fn open_bound(
+        path: impl Into<PathBuf>,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
+        Self::open_bound_with(path, None, founding, root_id)
+    }
+
+    /// The bound form of the fault-seamed constructor (the crash-
+    /// window tests use it exactly as the legacy's).
+    pub fn open_bound_with(
+        path: impl Into<PathBuf>,
+        fault: Option<JournalFaultControl>,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err("create journal dir", &path, e))?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| io_err("open journal", &path, e))?;
+        let lock = open_lock_file(&path)?;
+        let bytes = fs::read(&path).map_err(|e| io_err("read journal", &path, e))?;
+        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
+            return Err(JournalError::Format(SaveError::Limit {
+                section: "journal",
+                kind: "file-length",
+                value: bytes.len() as u64,
+                max: MAX_JOURNAL_FILE_BYTES,
+            }));
+        }
+        let mut journal = T1Journal {
+            path: path.clone(),
+            file,
+            _lock: lock,
+            state: JournalState::empty_bound(Hash::ZERO, 0),
+            acknowledged: BTreeSet::new(),
+            fault,
+            sync_count: 0,
+            platform_tier: platform_tier(),
+        };
+        let header = bound_header_bytes(founding, root_id);
+        match read_bound_header(&bytes, founding, root_id)? {
+            BoundHeaderState::Fresh | BoundHeaderState::TornCreation { .. } => {
+                journal
+                    .file
+                    .set_len(0)
+                    .map_err(|e| io_err("truncate journal", &path, e))?;
+                journal
+                    .append_bytes(&header)
+                    .map_err(|e| io_err("write bound journal header", &path, e))?;
+                journal.sync()?;
+                sync_parent_dir(&path).map_err(|e| io_err("sync journal dir", &path, e))?;
+                journal.state =
+                    JournalState::empty_bound(hash_object(&header), header.len() as u64);
+            }
+            BoundHeaderState::Matching { header_hash } => {
+                journal.state = classify_bound(&bytes, header_hash, header.len())?;
                 journal.resolve_tail()?;
             }
         }
@@ -1932,7 +2180,7 @@ impl T1Journal {
 /// lock lifecycle to corrupt. A same-process second open blocks here
 /// until the first instance drops. The lock deliberately does NOT
 /// cover the data file's bytes (see [`T1Journal::open_with`]).
-fn open_lock_file(path: &Path) -> Result<File, JournalError> {
+pub fn open_lock_file(path: &Path) -> Result<File, JournalError> {
     let mut name = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
