@@ -1759,7 +1759,20 @@ pub enum JournalRootBindingOutcome {
 /// exact duplicate; the publication rides the exact-parent CAS with
 /// fresh re-validation on the stale retry and the Unknown outcome
 /// reconciled against the verified identity, key, and exact
-/// canonical content.
+/// canonical content. (F4-R6) THE TRUSTED-BOOTSTRAP RESTRICTION: a
+/// FIRST binding is publishable only in the fresh-bootstrap shape —
+/// the chain's head is the founding itself (the bootstrap's own
+/// intermediate state: a truly fresh campaign, or the crash between
+/// the founding append and the binding publication, converging on
+/// re-entry). An existing campaign with history — a legacy lineage,
+/// or any chain that progressed past the founding — refuses typed:
+/// an ordinary external caller cannot directly establish an
+/// arbitrary first binding over an established campaign's fate; the
+/// identity and location derive from the verified bootstrap
+/// authority (the crossing's `open_bound_bootstrap`). A call on an
+/// already-bound campaign is never a first binding (the occupied
+/// key routes it into the duplicate/conflict discipline below, and
+/// no second binding with the same key can ever append).
 pub fn publish_journal_root_binding(
     medium: &mut dyn CanonicalMedium,
     founding: &Hash,
@@ -1774,18 +1787,23 @@ pub fn publish_journal_root_binding(
     }
     // The founding authentication: the canonical chain membership —
     // the parentless root record itself (a caller-supplied founding
-    // hash that is not the chain's root refuses).
+    // hash that is not the chain's root refuses). The membership
+    // proof is the ROOT-IDENTITY comparison (the gap-aware descent
+    // to the chain's parentless record): the production founding —
+    // the crossing's fresh append — carries NO content objects, so
+    // an object-based lookup cannot distinguish the found
+    // contentless founding from an absent one.
     let founding_record = medium.read_record(founding)?;
     if founding_record.parent.is_some() {
         return Err(MediumError::Chain {
             rule: "journal-root/founding-not-root",
         });
     }
-    let Some((_id, _bytes)) = find_on_chain(medium, None, Some(founding))? else {
+    if founding_identity_medium(medium)? != *founding {
         return Err(MediumError::Chain {
             rule: "journal-root/founding-not-installed",
         });
-    };
+    }
     let binding = JournalRootBinding {
         founding: *founding,
         root_id: *root_id,
@@ -1809,6 +1827,23 @@ pub fn publish_journal_root_binding(
             }
             return Err(MediumError::Chain {
                 rule: "journal-root/binding-conflict",
+            });
+        }
+        // (F4-R6) THE FIRST-BINDING FRESH-SHAPE GATE: execution
+        // reaches this point only when NO binding occupies the key —
+        // this append would be the campaign's FIRST binding, and it
+        // is admissible only in the fresh-bootstrap shape: the
+        // chain's head is the founding itself (a truly fresh
+        // campaign, or the crash-between founding-and-binding state
+        // converging on re-entry — the two are indistinguishable and
+        // both are the bootstrap's own intermediate state). A chain
+        // that progressed past the founding — a legacy lineage with
+        // real history — refuses: the direct first-binding
+        // publication over an established campaign is exactly what
+        // the trusted bootstrap exists to prevent.
+        if head != *founding {
+            return Err(MediumError::Chain {
+                rule: "journal-root/not-fresh-bootstrap",
             });
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
@@ -2261,19 +2296,54 @@ pub fn publish_reclamation_plan(
     journal_root: &std::path::Path,
     tick: u64,
 ) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
-    // (V2-W F4) THE CAMPAIGN-BOUND JOURNAL AUTHORITY — the required
-    // security property: this publication derives its journal
-    // obligations ONLY from the authenticated canonical campaign.
-    // The chain's founding is discovered; the INSTALLED root
-    // binding must exist (an unbound or legacy campaign refuses —
-    // v2 trusted publication requires the bound lifecycle); the
-    // supplied root's normalized location MUST equal the binding's
-    // authoritative location (a foreign root, a competing second
-    // root, or a relocated root refuses — the root uniqueness and
-    // the bypass prevention); and the root's exclusive sidecar lock
-    // is held across the obligation collection and the canonical
-    // plan append (the serialization boundary against a concurrent
-    // rotation — the rotation holds the same lock across its flip).
+    // (V2-W F4) THE STANDALONE ROUTE: the full campaign-bound
+    // verification, then the root's exclusive sidecar lock (held
+    // across the collection and the canonical append — the
+    // serialization against a concurrent rotation), then the
+    // authorized core. A LIVE crossing holding the root's own lock
+    // (its active journal) blocks here by design — the production
+    // route through the crossing does not reacquire.
+    let authority = verify_bound_journal_authority(medium, journal_root)?;
+    let _root_lock =
+        crate::journal::open_lock_file(journal_root).map_err(|_error| MediumError::Chain {
+            rule: "journal-root/lock",
+        })?;
+    publish_reclamation_plan_authorized(
+        medium,
+        mk,
+        ledger_byte_limit,
+        &authority,
+        journal_root,
+        tick,
+    )
+}
+
+/// (F4-R3) The nonforgeable bound-journal authority capability:
+/// issued ONLY by [`verify_bound_journal_authority`] after the full
+/// campaign-bound verification (the chain's founding discovered,
+/// the installed root binding present, the supplied root's
+/// normalized location equal to the binding's authoritative
+/// location). The private fields carry the verified identities the
+/// authorized publication and collection use — a caller cannot
+/// construct one from a path or a founding hash alone.
+#[derive(Debug, Clone)]
+pub struct BoundJournalAuthority {
+    founding: Hash,
+    root_id: Hash,
+}
+
+/// (F4-R3) The capability issuance: the founding discovery, the
+/// installed-binding requirement (an unbound or legacy campaign
+/// refuses — v2 trusted publication requires the bound lifecycle),
+/// and the location check (a foreign root, a competing second
+/// root, or a relocated root refuses — the root uniqueness and the
+/// bypass prevention). NO lock and NO collection here — the
+/// issuance is the authentication, the publication route owns the
+/// serialization boundary.
+pub fn verify_bound_journal_authority(
+    medium: &mut dyn CanonicalMedium,
+    journal_root: &std::path::Path,
+) -> Result<BoundJournalAuthority, MediumError> {
     let founding = founding_identity_medium(medium)?;
     let Some((_binding_id, binding)) = find_installed_journal_root_binding(medium, &founding)?
     else {
@@ -2286,12 +2356,36 @@ pub fn publish_reclamation_plan(
             rule: "journal-root/location-mismatch",
         });
     }
-    let _root_lock =
-        crate::journal::open_lock_file(journal_root).map_err(|_error| MediumError::Chain {
-            rule: "journal-root/lock",
-        })?;
-    let journal_files =
-        collect_bound_reclaimable_journal_files(journal_root, &founding, &binding.root_id)?;
+    Ok(BoundJournalAuthority {
+        founding,
+        root_id: binding.root_id,
+    })
+}
+
+/// (F4-R2/R3) THE AUTHORIZED CORE — the crossing-scoped
+/// publication route: the identity-verified obligation collection
+/// and the canonical plan publication UNDER THE CALLER'S
+/// serialization boundary. The caller (the production crossing)
+/// holds the root's exclusive sidecar lock across this call — via
+/// its own active-journal handle when the active IS the root (no
+/// reacquisition, no same-process deadlock), or via an explicitly
+/// acquired root lock when the active is a rotated generation. The
+/// standalone route wraps this under its own lock. All the F1-F5,
+/// W2, and W3A gates, the duplicate-content verification, and the
+/// installed-plan immutability are inside.
+pub fn publish_reclamation_plan_authorized(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+    ledger_byte_limit: u64,
+    authority: &BoundJournalAuthority,
+    journal_root: &std::path::Path,
+    tick: u64,
+) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
+    let journal_files = collect_bound_reclaimable_journal_files(
+        journal_root,
+        &authority.founding,
+        &authority.root_id,
+    )?;
     // (a) The admitted byte limit: the caller-supplied operational
     // packing bound, validated against the unchanged canonical
     // ceiling (512 MiB) and the honest nonzero minimum.

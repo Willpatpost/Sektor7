@@ -5164,6 +5164,33 @@ mod exclusion_tests {
         medium
             .append(&founding, std::slice::from_ref(&shared), None)
             .unwrap();
+        // (V2-W F4, the F4-R6 fresh shape) The bound bootstrap AT THE
+        // FOUNDING — the production ordering (the crossing's
+        // open_bound_bootstrap): the durable bound journal at the
+        // root, then the canonical root binding published while the
+        // founding is the chain's head (the first binding's
+        // fresh-bootstrap admission — the campaign's journal
+        // authority, the plan publication's prerequisite), and only
+        // then the campaign's revisions on top of the binding.
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                binding_outcome,
+                crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+            ),
+            "the fixture's binding publishes: {binding_outcome:?}"
+        );
         let head = medium.head().unwrap().unwrap();
         let epoch = medium.read_record(&head).unwrap().epoch;
         let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
@@ -5215,9 +5242,93 @@ mod exclusion_tests {
         medium
             .append(&mk, std::slice::from_ref(&meta_object), Some(head))
             .unwrap();
-        // (V2-W F4) The bound bootstrap: the durable bound journal at
-        // the root + the canonical root binding (the campaign's
-        // journal authority — the plan publication's prerequisite).
+        (
+            root,
+            journal_root,
+            medium,
+            mk.id(),
+            r1.id(),
+            r2.id(),
+            shared.hash(),
+            private.hash(),
+        )
+    }
+
+    /// (V2-W, restored by F4-R4) The parameterized plan-campaign
+    /// variant — the same bound-bootstrapped shape as
+    /// [`v2_plan_campaign`] with the adversarial controls the
+    /// restored F1/F2/F3/F5B tests need: the range digest (the
+    /// fabricated [9; 32] or the genuine recomputation), the seed
+    /// (the genuine founding-derived or the fabricated), the index
+    /// epoch order (the genuine or the swapped mis-order), and R2's
+    /// extra direct references (the unit-size control). The bound
+    /// bootstrap runs AT THE FOUNDING (the F4-R6 fresh shape — the
+    /// production ordering). Returns (root, journal_root, medium,
+    /// mk, r1, r2, shared, private).
+    #[allow(clippy::type_complexity)]
+    fn v2_plan_campaign_variant(
+        label: &str,
+        fabricate_digest: bool,
+        wrong_seed: bool,
+        swap_index_epochs: bool,
+        r2_extra_objects: usize,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        LocalFileMedium,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+    ) {
+        let root = temp_store(label);
+        let journal_root = std::env::temp_dir().join(format!(
+            "s7-v2wfv-journal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2wfv-shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2wfv-private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let mut extra_objects = Vec::new();
+        for index in 0..r2_extra_objects {
+            extra_objects.push(
+                StoredObject::new({
+                    let mut enc = engine_core::Encoder::new();
+                    enc.write_str("sektor7/save/1");
+                    enc.write_bytes(format!("v2wfv-extra-{index}").as_bytes());
+                    enc.into_bytes()
+                })
+                .unwrap(),
+            );
+        }
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        // (V2-W F4, the F4-R6 fresh shape) The bound bootstrap AT THE
+        // FOUNDING — the production ordering (the crossing's
+        // open_bound_bootstrap): the durable bound journal at the
+        // root, then the canonical root binding published while the
+        // founding is the chain's head, then the campaign's
+        // revisions on top of the binding.
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
@@ -5227,7 +5338,7 @@ mod exclusion_tests {
             &founding_id,
             &root_id,
             &location,
-            6,
+            1,
         )
         .unwrap();
         assert!(
@@ -5237,6 +5348,81 @@ mod exclusion_tests {
             ),
             "the fixture's binding publishes: {binding_outcome:?}"
         );
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&p1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&r1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mut r2_refs = vec![shared.hash(), private.hash()];
+        let mut r2_objects = vec![shared.clone(), private.clone()];
+        for object in &extra_objects {
+            r2_refs.push(object.hash());
+            r2_objects.push(object.clone());
+        }
+        let r2 = RevisionRecord::regular(head, epoch, 3).with_content_refs(r2_refs);
+        medium.append(&r2, &r2_objects, Some(head)).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 4).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let real_seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let member_bytes: Vec<Vec<u8>> = [r1.id(), r2.id()]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let real_digest = crate::checkpoint::chain_range_digest(&real_seed, &member_bytes);
+        let digest = if fabricate_digest {
+            [9u8; 32]
+        } else {
+            real_digest
+        };
+        let seed = if wrong_seed {
+            crate::checkpoint::compute_digest_seed(&Hash::ZERO)
+        } else {
+            real_seed
+        };
+        let mut entries = vec![
+            ReclaimedIndexEntry::new(None, r1.id(), 2),
+            ReclaimedIndexEntry::new(None, r2.id(), 3),
+            ReclaimedIndexEntry::new(None, sk.id(), 4),
+        ];
+        if swap_index_epochs {
+            // The adversarial incoherence: the CLAIMED epochs swapped
+            // between the members (r1 claims 3, r2 claims 2) — the
+            // metadata's ordering claim contradicts the original
+            // records' actual positions, surfacing at the independent
+            // digest recomputation (the claimed order reorders the
+            // digest members).
+            entries[0] = ReclaimedIndexEntry::new(None, r1.id(), 3);
+            entries[1] = ReclaimedIndexEntry::new(None, r2.id(), 2);
+        }
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r1.id(),
+            vec![SkipEntry::new(Hash::ZERO, p1.id())],
+            entries,
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk =
+            RevisionRecord::regular(head, epoch, 5).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
         (
             root,
             journal_root,
@@ -6197,6 +6383,362 @@ mod exclusion_tests {
             let _ = std::fs::remove_dir_all(&root_l);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_f1_oversized_unit_after_split_refuses_before_publication() {
+        // (V2W-F1, restored by F4-R4) The singleton check on BOTH
+        // sides of the split: the small-then-oversized fixture —
+        // the first unit fits, the combined proposal overflows, the
+        // second unit alone overflows — refuses BEFORE publication.
+        // The positive control: the multi-batch partition with
+        // consecutive indices and the complete range exactly once.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf1r-oversized", false, false, false, 100);
+            let (_id, outcome) = crate::reclaim::publish_reclamation_plan(
+                &mut medium,
+                &mk,
+                crate::reclaim::MAX_RECLAMATION_LEDGER_BYTES,
+                &journal_root,
+                50,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                ),
+                "the generous limit admits: {outcome:?}"
+            );
+            let (root2, journal_root2, mut medium2, mk2, _a, _b, _c, _d) =
+                v2_plan_campaign_variant("v2wf1r-oversized-2", false, false, false, 100);
+            let error = crate::reclaim::publish_reclamation_plan(
+                &mut medium2,
+                &mk2,
+                1024,
+                &journal_root2,
+                51,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-plan/unit-exceeds-limit"
+                    }
+                ),
+                "the oversized unit after the split refuses: {error:?}"
+            );
+            assert!(
+                crate::reclaim::find_installed_plan(&mut medium2, &mk2)
+                    .unwrap()
+                    .is_none()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&root2);
+        }
+        {
+            let (root, journal_root, mut medium, mk, r1, r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf1r-multibatch", false, false, false, 0);
+            let (_id, outcome) =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 400, &journal_root, 52)
+                    .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                ),
+                "the multi-batch plan publishes: {outcome:?}"
+            );
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            assert!(plan.batches.len() >= 2);
+            for (position, batch) in plan.batches.iter().enumerate() {
+                assert_eq!(batch.index, position as u64);
+                assert!(!batch.records.is_empty());
+            }
+            let mut covered: Vec<Hash> = plan
+                .batches
+                .iter()
+                .flat_map(|batch| batch.records.iter().copied())
+                .collect();
+            covered.sort();
+            let mut expected = vec![r1, r2];
+            let mk_record = medium.read_record(&mk).unwrap();
+            let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+            let metadata = CheckpointMetadata::decode(&meta_bytes).unwrap();
+            expected.push(metadata.sk);
+            expected.sort();
+            assert_eq!(covered, expected, "the complete range exactly once");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_f2_fabricated_checkpoint_evidence_refuses_plan_publication() {
+        // (V2W-F2, restored by F4-R4) The plan admission's complete
+        // first-execution evidence: the fabricated digest, the wrong
+        // founding seed, and the incoherent epoch claims each refuse
+        // BEFORE any plan installs; the genuine evidence produces
+        // the plan with the original accepted bindings.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf2r-digest", true, false, false, 0);
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 60)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-admission/range-digest-mismatch"
+                    }
+                ),
+                "the fabricated digest refuses: {error:?}"
+            );
+            assert!(
+                crate::reclaim::find_installed_plan(&mut medium, &mk)
+                    .unwrap()
+                    .is_none()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf2r-seed", false, true, false, 0);
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 61)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclaim/seed-not-founding-derived"
+                    }
+                ),
+                "the wrong founding seed refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf2r-order", false, false, true, 0);
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 62)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-admission/range-digest-mismatch"
+                    }
+                ),
+                "the incoherent epoch claims refuse: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let (root, journal_root, mut medium, mk, r1, r2, _s, _p) =
+                v2_plan_campaign_variant("v2wf2r-genuine", false, false, false, 0);
+            let (_id, outcome) =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 63)
+                    .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                ),
+                "the genuine evidence publishes: {outcome:?}"
+            );
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            let members: Vec<Hash> = plan
+                .batches
+                .iter()
+                .flat_map(|b| b.records.iter().copied())
+                .collect();
+            assert!(members.contains(&r1) && members.contains(&r2));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_f3_second_reference_integrity_refuses_both_admissions() {
+        // (V2W-F3, restored by F4-R4) Every direct content reference
+        // verified at both writer boundaries: the corrupt or removed
+        // SECOND reference refuses the plan admission (the evidence
+        // core) and the batch-audit admission (the collector).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, private) =
+                v2_plan_campaign_variant("v2wf3r-plan-corrupt", false, false, false, 0);
+            std::fs::write(medium.object_path(&private), b"corrupted-second-ref").unwrap();
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 70)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::HashMismatch { .. } | MediumError::MissingObject { .. }
+                ),
+                "the corrupt second reference refuses the plan admission: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, private) =
+                v2_plan_campaign_variant("v2wf3r-audit-corrupt", false, false, false, 0);
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 72)
+                .unwrap();
+            std::fs::write(medium.object_path(&private), b"corrupted-second-ref").unwrap();
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            for batch in plan.batches.iter().map(|b| b.index) {
+                let error =
+                    crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 73)
+                        .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::HashMismatch { .. } | MediumError::MissingObject { .. }
+                    ),
+                    "the corrupt second reference refuses the audit admission: {error:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_f5b_key_mismatched_installed_plan_never_authorizes_audits() {
+        // (V2W-F5B, restored by F4-R4) The installed-plan identity
+        // binding: a record with the expected deterministic key but
+        // decoded content naming a different MK never authorizes
+        // batch publication.
+        let (root, _journal_root, mut medium, mk, r1, r2, _s, _p) =
+            v2_plan_campaign_variant("v2wf5br", false, false, false, 0);
+        let foreign = crate::reclaim::ReclaimPlan {
+            mk: r1,
+            sk: r2,
+            range_digest: [9u8; 32],
+            seed: [9u8; 32],
+            ledger_byte_limit: 1024,
+            batches: vec![crate::reclaim::PlanBatch {
+                index: 0,
+                records: vec![r1],
+            }],
+            journal_files: Vec::new(),
+        };
+        let object = StoredObject::new(foreign.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, 80)
+            .with_idempotency_key(crate::reclaim::reclamation_plan_idempotency_key(&mk))
+            .with_content_refs(vec![object.hash()]);
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        medium.append_admitted(admitted, Some(head)).unwrap();
+        let error =
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 81).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-ledger-v2/plan-key-mismatch"
+                }
+            ),
+            "the key-mismatched installed plan never authorizes: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_f4_direct_first_binding_requires_the_fresh_bootstrap_shape() {
+        // (F4-R6) The trusted-bootstrap restriction on the FIRST
+        // binding: an existing campaign with real history (a legacy
+        // lineage, no binding installed) refuses the direct
+        // first-binding publication typed — an ordinary external
+        // caller cannot establish an arbitrary binding over an
+        // established campaign's fate — while the fresh-bootstrap
+        // shape (the campaign carrying exactly its founding) still
+        // publishes through the trusted admission, and a bound
+        // campaign's later duplicate verification is unaffected
+        // (the occupied key routes it away from this gate).
+        {
+            // THE HISTORY CASE: the p2r1 campaign (a full checkpoint
+            // lineage, unbound) — the head is far past the founding.
+            let (root, mut medium, _audit, _mk, _directive, _sk, _r3, _r2, _r1, _shared, _private) =
+                p2r1_prefix_campaign("v2w-f4-r6-history", false);
+            let founding = crate::reclaim::founding_identity_medium(&mut medium).unwrap();
+            let journal_root = std::env::temp_dir().join("s7-v2w-f4-r6-history-root");
+            let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+            let root_id = crate::reclaim::journal_root_id(&founding, &location);
+            let error = crate::reclaim::publish_journal_root_binding(
+                &mut medium,
+                &founding,
+                &root_id,
+                &location,
+                90,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "journal-root/not-fresh-bootstrap"
+                    }
+                ),
+                "the direct first binding over existing history refuses: {error:?}"
+            );
+            assert!(
+                crate::reclaim::find_installed_journal_root_binding(&mut medium, &founding)
+                    .unwrap()
+                    .is_none(),
+                "no binding was installed"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            // THE FRESH SHAPE: the campaign carrying exactly its
+            // founding (the bootstrap's own intermediate state) —
+            // the direct publication admits (the crossing's
+            // open_bound_bootstrap republishes through exactly this
+            // gate on the crash-between re-entry).
+            let root = temp_store("v2w-f4-r6-fresh");
+            let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+            let founding =
+                RevisionRecord::founding(AuthorityMode::Standalone, "v2w-f4-r6-fresh", 0);
+            medium.append(&founding, &[], None).unwrap();
+            let journal_root = std::env::temp_dir()
+                .join(format!("s7-v2w-f4-r6-fresh-journal-{}", std::process::id()));
+            let founding_id = founding.id();
+            let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+            let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+            drop(
+                crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id)
+                    .unwrap(),
+            );
+            let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
+                &mut medium,
+                &founding_id,
+                &root_id,
+                &location,
+                1,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+                ),
+                "the fresh-shape first binding publishes: {outcome:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_file(&journal_root);
+        }
     }
 
     fn two_retirement_store(

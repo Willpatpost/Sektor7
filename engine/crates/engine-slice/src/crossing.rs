@@ -31,7 +31,7 @@ use engine_persist::{
     RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
     SourcePosition, StoredObject, T1Journal, TailState, TransactionId, active_journal_path,
     chain_range_digest, compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
-    read_journal_generations, reconcile, retire_journal_generations, rotate_journal,
+    read_journal_generations, reconcile, retire_journal_generations, rotate_journal_with,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -788,17 +788,23 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// must EXIST and carry the bound identities (a missing journal
     /// after an established binding is MISSING authoritative
     /// evidence, fail closed — never recreated, never treated as
-    /// empty); a re-entry with no binding resumes the creation and
-    /// republishes (the orphan journal reused only through the
-    /// strict bound-identity verification). Legacy campaigns are
-    /// untouched (the no-migration rule).
+    /// empty); a re-entry with no binding and the founding as the
+    /// head (the crash between the founding append and the binding
+    /// publication) resumes the creation and republishes (the
+    /// orphan journal reused only through the strict bound-identity
+    /// verification). (F4-R5) A LEGACY CAMPAIGN — an existing
+    /// unbound chain with history beyond the founding, or a chain
+    /// whose founding identity disagrees with the supplied campaign
+    /// name — refuses typed; its historical journal is preserved
+    /// and untouched (the no-automatic-migration rule).
     pub fn open_bound_bootstrap(
         source: &S,
         journal_path: &Path,
         campaign: &str,
     ) -> Result<Self, TransitionError> {
         let mut medium = source.open_medium().map_err(PipelineError::Medium)?;
-        if medium.head()?.is_none() {
+        let fresh_campaign = medium.head()?.is_none();
+        if fresh_campaign {
             let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
             match medium.append(&founding, &[], None)? {
                 AppendOutcome::Accepted { .. } => {}
@@ -807,6 +813,51 @@ impl<S: MediumSource> SessionCrossing<S> {
         }
         let founding = engine_persist::reclaim::founding_identity_medium(&mut medium)
             .map_err(PipelineError::Medium)?;
+        // (F4-R5) THE CAMPAIGN-IDENTITY AGREEMENT: the supplied
+        // campaign name must agree with the canonical founding's
+        // persisted campaign identity — a mismatched name never
+        // opens another campaign's bound session.
+        let founding_record = medium
+            .read_record(&founding)
+            .map_err(PipelineError::Medium)?;
+        let founding_campaign = match &founding_record.kind {
+            engine_persist::record::RecordKind::Founding { campaign_id, .. } => campaign_id.clone(),
+            _ => {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "journal-root/founding-not-root",
+                });
+            }
+        };
+        if founding_campaign != campaign {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "journal-root/campaign-mismatch",
+            });
+        }
+        // (F4-R5) THE LEGACY-UNBOUND REFUSAL: only the bootstrap's
+        // own fresh shape — the campaign carrying EXACTLY its
+        // founding as the head (a truly fresh medium's founding
+        // append, or the crash between the founding append and the
+        // binding publication: the two are indistinguishable, and
+        // both are the bootstrap's resumable intermediate state) —
+        // or an ALREADY-BOUND campaign may proceed. An existing
+        // campaign with history beyond the founding (a legacy
+        // lineage, its historical journal real) never acquires a
+        // new bound journal through this path (the
+        // no-automatic-migration rule; the historical journal is
+        // preserved and untouched).
+        let founding_is_head = medium.head()? == Some(founding);
+        if !founding_is_head
+            && engine_persist::reclaim::find_installed_journal_root_binding(&mut medium, &founding)
+                .map_err(PipelineError::Medium)?
+                .is_none()
+        {
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "journal-root/legacy-unbound",
+            });
+        }
         let location =
             engine_persist::reclaim::JournalRootBinding::normalize_location(journal_path);
         let root_id = engine_persist::reclaim::journal_root_id(&founding, &location);
@@ -886,6 +937,59 @@ impl<S: MediumSource> SessionCrossing<S> {
         }
         // (6) Only now the authoritative pipeline.
         Self::finish_bound_open(source, medium, journal, journal_path)
+    }
+
+    /// (F4-R2/R3) THE TRUSTED CROSSING-SCOPED V2 PLAN PUBLICATION —
+    /// the production route. Requires the healthy journal and
+    /// worker authority; verifies the exact installed canonical
+    /// campaign/root binding (the capability issuance); and holds
+    /// the correct serialization boundary across the obligation
+    /// collection and the canonical plan append — the crossing's
+    /// OWN active-journal handle already holds the root's exclusive
+    /// sidecar lock when the active IS the root (no reacquisition,
+    /// no same-process deadlock), and an explicitly acquired root
+    /// lock when the active is a rotated generation (the rotation
+    /// holds the same lock across its flip). All the F1-F5, W2,
+    /// and W3A gates, the duplicate-content verification, and the
+    /// installed-plan immutability are inside the authorized core.
+    /// NON-DESTRUCTIVE.
+    pub fn publish_reclamation_plan_bound(
+        &mut self,
+        mk: &engine_persist::Hash,
+        ledger_byte_limit: u64,
+        tick: u64,
+    ) -> Result<
+        (
+            engine_persist::Hash,
+            engine_persist::reclaim::PlanPublicationOutcome,
+        ),
+        TransitionError,
+    > {
+        self.assert_journal_authority()?;
+        let mut medium = self.source.open_medium().map_err(PipelineError::Medium)?;
+        let authority = engine_persist::reclaim::verify_bound_journal_authority(
+            &mut medium,
+            &self.journal_root,
+        )
+        .map_err(PipelineError::Medium)?;
+        let active = active_journal_path(&self.journal_root).map_err(PipelineError::Journal)?;
+        let _root_lock = if active != self.journal_root {
+            Some(
+                engine_persist::journal::open_lock_file(&self.journal_root)
+                    .map_err(PipelineError::Journal)?,
+            )
+        } else {
+            None
+        };
+        engine_persist::reclaim::publish_reclamation_plan_authorized(
+            &mut medium,
+            mk,
+            ledger_byte_limit,
+            &authority,
+            &self.journal_root,
+            tick,
+        )
+        .map_err(|error| TransitionError::JournalFailed(PipelineError::Medium(error)))
     }
 
     /// The bound opening's shared tail: the pipeline over the bound
@@ -1967,8 +2071,27 @@ impl<S: MediumSource> SessionCrossing<S> {
         // the root's single pointer, never from a pointer published
         // beside a rotated generation).
         let root = self.journal_root.clone();
-        let mut rotation = rotate_journal(&root, &retained, &retained_cancellations, &retired)
-            .map_err(PipelineError::Journal)?;
+        // (F4-R1) THE BOUND ROTATION: a bound campaign's successor
+        // generation carries the SAME canonical founding hash and
+        // root ID (the identity-preserving mechanism; the successor
+        // verified through the bound scanner inside the mechanism);
+        // a legacy campaign keeps the accepted legacy path.
+        let bound_identities = {
+            let mut probe = self.source.open_medium().map_err(PipelineError::Medium)?;
+            let founding = engine_persist::reclaim::founding_identity_medium(&mut probe)
+                .map_err(PipelineError::Medium)?;
+            engine_persist::reclaim::find_installed_journal_root_binding(&mut probe, &founding)
+                .map_err(PipelineError::Medium)?
+                .map(|(_id, binding)| (binding.founding, binding.root_id))
+        };
+        let mut rotation = rotate_journal_with(
+            &root,
+            &retained,
+            &retained_cancellations,
+            &retired,
+            bound_identities.as_ref().map(|(f, r)| (f, r)),
+        )
+        .map_err(PipelineError::Journal)?;
         // The classified retirement evidence (the driver-populated
         // report fields — the mechanism cannot classify).
         rotation.retired_canceled = retired_canceled;
@@ -2007,7 +2130,10 @@ impl<S: MediumSource> SessionCrossing<S> {
         // explicitly unusable for further authoritative progression
         // (every mutation refuses) until a fresh recovery re-derives
         // it from the pointer.
-        match self.rebuild_pipeline_after_rotation(&rotation.new_path) {
+        match self.rebuild_pipeline_after_rotation(
+            &rotation.new_path,
+            bound_identities.as_ref().map(|(f, r)| (f, r)),
+        ) {
             Ok(()) => Ok(rotation),
             Err(error) => {
                 self.journal_authority = JournalAuthority::Lost;
@@ -2039,7 +2165,23 @@ impl<S: MediumSource> SessionCrossing<S> {
         engine_persist::reestablish_pointer_durability(&self.journal_root)
             .map_err(PipelineError::Journal)?;
         let active = active_journal_path(&self.journal_root).map_err(PipelineError::Journal)?;
-        if let Err(error) = self.rebuild_pipeline_after_rotation(&active) {
+        let repair_bound = {
+            let mut probe = self.source.open_medium().map_err(PipelineError::Medium)?;
+            engine_persist::reclaim::founding_identity_medium(&mut probe)
+                .map_err(PipelineError::Medium)
+                .ok()
+                .and_then(|founding| {
+                    engine_persist::reclaim::find_installed_journal_root_binding(
+                        &mut probe, &founding,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|(_id, binding)| (binding.founding, binding.root_id))
+                })
+        };
+        if let Err(error) = self
+            .rebuild_pipeline_after_rotation(&active, repair_bound.as_ref().map(|(f, r)| (f, r)))
+        {
             self.journal_authority = JournalAuthority::Lost;
             return Err(error);
         }
@@ -2051,7 +2193,11 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// crossing's pipeline over the rotation's new journal — called
     /// only after the authoritative pointer names it. A failure
     /// poisons the crossing (see [`SessionCrossing::rotate_journal`]).
-    fn rebuild_pipeline_after_rotation(&mut self, new_path: &Path) -> Result<(), TransitionError> {
+    fn rebuild_pipeline_after_rotation(
+        &mut self,
+        new_path: &Path,
+        bound: Option<(&engine_persist::Hash, &engine_persist::Hash)>,
+    ) -> Result<(), TransitionError> {
         if ROTATION_SWAP_FAULT.load(Ordering::Relaxed) {
             return Err(TransitionError::JournalFailed(PipelineError::Medium(
                 MediumError::Io {
@@ -2061,7 +2207,11 @@ impl<S: MediumSource> SessionCrossing<S> {
                 },
             )));
         }
-        let journal = T1Journal::open(new_path).map_err(PipelineError::Journal)?;
+        let journal = match bound {
+            Some((founding, root_id)) => T1Journal::open_bound(new_path, founding, root_id)
+                .map_err(PipelineError::Journal)?,
+            None => T1Journal::open(new_path).map_err(PipelineError::Journal)?,
+        };
         let medium = self.source.open_medium().map_err(PipelineError::Medium)?;
         self.pipeline = CommitPipeline::open(medium, journal)?;
         Ok(())
@@ -2781,41 +2931,21 @@ impl<S: MediumSource> SessionCrossing<S> {
         // B3 coherence semantics: an empty scan, the chain and the
         // snapshot carrying the truth.
         let pointer_present = active_journal != journal_path;
-        let scan = match T1Journal::scan_file(&active_journal) {
-            Ok(scan) => scan,
-            Err(engine_persist::JournalError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound && !pointer_present =>
-            {
-                JournalScan {
-                    committed: Vec::new(),
-                    cancellations: Vec::new(),
-                    tail: TailState::Clean,
-                }
-            }
-            Err(error) => return Err(PipelineError::Journal(error).into()),
-        };
-        let canceled: HashSet<engine_persist::TransactionId> =
-            scan.cancellations.iter().map(|c| c.target).collect();
-        // 3. The interleaved crossing restore + plan install — the
-        //    actionable, post-snapshot deactivations in
-        //    journal-sequence order, over the re-opened crossing.
-        //    `restored` tracks each NPC's first post-snapshot claim:
-        //    the first subtracts the snapshot's scratch (the
-        //    crossings the snapshot already materialized are NEVER
-        //    re-applied), every later one claims against zero — the
-        //    prior install's capture zeroed the scratch exactly as
-        //    the live sequence did.
-        // (V2-W F4) THE BOUND RECOVERY: a campaign with an installed
-        // journal-root binding recovers ONLY through the bound
-        // identities — the binding's location must equal the
-        // supplied root's normalized location (a foreign or
-        // relocated root refuses), the active journal must carry
-        // the EXACT founding hash and root ID (a legacy, foreign,
-        // or corrupt header refuses; a missing active is MISSING
-        // authoritative evidence, fail closed — never the empty
-        // fallback), and the pipeline opens through the bound form.
-        // A campaign with NO binding keeps the accepted legacy
-        // recovery unchanged (the no-migration rule).
+        // (V2-W F4) THE BOUND RECOVERY'S PROBE — BEFORE THE SCAN: a
+        // campaign with an installed journal-root binding recovers
+        // ONLY through the bound identities — the binding's location
+        // must equal the supplied root's normalized location (a
+        // foreign or relocated root refuses), and the binding
+        // SELECTS THE SCANNER: a bound campaign's active journal
+        // carries the versioned bound header, which the legacy
+        // scanner refuses (the domain-tag mismatch) — the bound
+        // identity-verified scan replaces it (the active journal
+        // must carry the EXACT founding hash and root ID; a legacy,
+        // foreign, or corrupt header refuses; a missing active is
+        // MISSING authoritative evidence, fail closed — never the
+        // empty fallback). A campaign with NO binding keeps the
+        // accepted legacy recovery unchanged (the no-migration
+        // rule).
         let mut probe = source.open_medium().map_err(PipelineError::Medium)?;
         let founding = engine_persist::reclaim::founding_identity_medium(&mut probe)
             .map_err(PipelineError::Medium)?;
@@ -2833,20 +2963,44 @@ impl<S: MediumSource> SessionCrossing<S> {
                         detail: "journal-root/location-mismatch",
                     });
                 }
-                engine_persist::journal::scan_bound_file(
-                    &active_journal,
-                    &binding.founding,
-                    &binding.root_id,
-                )
-                .map_err(|_error| TransitionError::InstallIncompatible {
-                    region: 0,
-                    detail: "journal-root/active-identity",
-                })?;
                 Some((binding.founding, binding.root_id))
             }
             None => None,
         };
         drop(probe);
+        let scan = match &bound_identities {
+            Some((founding, root_id)) => {
+                engine_persist::journal::scan_bound_file(&active_journal, founding, root_id)
+                    .map_err(|_error| TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-root/active-identity",
+                    })?
+            }
+            None => match T1Journal::scan_file(&active_journal) {
+                Ok(scan) => scan,
+                Err(engine_persist::JournalError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound && !pointer_present =>
+                {
+                    JournalScan {
+                        committed: Vec::new(),
+                        cancellations: Vec::new(),
+                        tail: TailState::Clean,
+                    }
+                }
+                Err(error) => return Err(PipelineError::Journal(error).into()),
+            },
+        };
+        let canceled: HashSet<engine_persist::TransactionId> =
+            scan.cancellations.iter().map(|c| c.target).collect();
+        // 3. The interleaved crossing restore + plan install — the
+        //    actionable, post-snapshot deactivations in
+        //    journal-sequence order, over the re-opened crossing.
+        //    `restored` tracks each NPC's first post-snapshot claim:
+        //    the first subtracts the snapshot's scratch (the
+        //    crossings the snapshot already materialized are NEVER
+        //    re-applied), every later one claims against zero — the
+        //    prior install's capture zeroed the scratch exactly as
+        //    the live sequence did.
         let journal = match bound_identities {
             Some((founding, root_id)) => {
                 T1Journal::open_bound(&active_journal, &founding, &root_id)
@@ -3773,6 +3927,47 @@ fn walk_checkpoint_range(
                 });
             }
             engine_persist::reclaim::ReclamationBegin::decode(&bytes)
+                .map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == engine_persist::reclaim::JOURNAL_ROOT_BINDING_DOMAIN {
+            // (V2-W F4) The campaign's journal-root binding —
+            // PERMANENT CAMPAIGN METADATA (the bound lifecycle's
+            // authority record, published at the founding by the
+            // trusted bootstrap): RETAINED EVIDENCE, strict-decoded
+            // (an invalid binding object refuses the checkpoint —
+            // never merely skipped), its retained position
+            // participating in the ancestry and the skip tables
+            // exactly like the audit, marker, and begin arms. The
+            // binding is never a reclaimable snapshot publication.
+            engine_persist::reclaim::JournalRootBinding::decode(&bytes)
+                .map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == engine_persist::reclaim::RECLAMATION_PLAN_DOMAIN {
+            // (V2-W) The trusted reclamation PLAN — the complete
+            // membership partition published BEFORE any destructive
+            // work (the all-audits-first protocol's authority
+            // record): RETAINED EVIDENCE, strict-decoded (an
+            // invalid plan object refuses the checkpoint — never
+            // merely skipped). The plan is permanent intent
+            // metadata, never a reclaimable snapshot publication.
+            engine_persist::reclaim::ReclaimPlan::decode(&bytes).map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == engine_persist::reclaim::RECLAMATION_LEDGER_V2_DOMAIN {
+            // (V2-W) The v2 batch audit — one per plan-defined
+            // batch, the batch's provenance-preserving evidence:
+            // RETAINED EVIDENCE, strict-decoded (an invalid audit
+            // object refuses the checkpoint — never merely skipped),
+            // exactly like the v1 audit arm above.
+            engine_persist::reclaim::ReclamationLedgerV2::decode(&bytes)
                 .map_err(PipelineError::Format)?;
             walked.push(WalkedRecord {
                 record,

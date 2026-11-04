@@ -6650,6 +6650,32 @@ mod exclusion_tests {
         medium
             .append(&founding, std::slice::from_ref(&shared), None)
             .unwrap();
+        // (V2-W F4, the F4-R6 fresh shape) The bound bootstrap AT THE
+        // FOUNDING — the production ordering: the durable bound
+        // journal at the root, then the canonical root binding
+        // published while the founding is the chain's head (the
+        // first binding's fresh-bootstrap admission), then the
+        // campaign's revisions on top.
+        let journal_root = root.join("journal-root");
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                binding_outcome,
+                crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+            ),
+            "the fixture's binding publishes: {binding_outcome:?}"
+        );
         let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
             let head = medium.head().unwrap().unwrap();
             let epoch = medium.read_record(&head).unwrap().epoch;
@@ -6682,29 +6708,6 @@ mod exclusion_tests {
         );
         let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
         let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
-        let journal_root = root.join("journal-root");
-        // (V2-W F4) The bound bootstrap: the durable bound journal at
-        // the root + the canonical root binding (the campaign's
-        // journal authority — the plan publication's prerequisite).
-        let founding_id = founding.id();
-        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
-        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
-        let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
-            &mut medium,
-            &founding_id,
-            &root_id,
-            &location,
-            6,
-        )
-        .unwrap();
-        assert!(
-            matches!(
-                binding_outcome,
-                crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
-            ),
-            "the fixture's binding publishes: {binding_outcome:?}"
-        );
         // THE POSITIVE: the plan and every batch audit publish.
         let (plan_id, plan_outcome) =
             crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 90)
@@ -6823,6 +6826,26 @@ mod exclusion_tests {
             medium
                 .append(&founding, std::slice::from_ref(&shared), None)
                 .unwrap();
+            // (V2-W F4, the F4-R6 fresh shape) The bound bootstrap AT
+            // THE FOUNDING — the production ordering (the first
+            // binding's fresh-bootstrap admission at the founding
+            // head).
+            let journal_root = root.join(format!("journal-{label_postfix}"));
+            let founding_id = founding.id();
+            let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+            let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+            drop(
+                crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id)
+                    .unwrap(),
+            );
+            crate::reclaim::publish_journal_root_binding(
+                &mut medium,
+                &founding_id,
+                &root_id,
+                &location,
+                1,
+            )
+            .unwrap();
             let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
                 let head = medium.head().unwrap().unwrap();
                 let epoch = medium.read_record(&head).unwrap().epoch;
@@ -6855,22 +6878,6 @@ mod exclusion_tests {
             );
             let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
             let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
-            let journal_root = root.join(format!("journal-{label_postfix}"));
-            let founding_id = founding.id();
-            let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
-            let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-            drop(
-                crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                    .unwrap(),
-            );
-            crate::reclaim::publish_journal_root_binding(
-                &mut medium,
-                &founding_id,
-                &root_id,
-                &location,
-                6,
-            )
-            .unwrap();
             (medium, mk, private.hash(), journal_root)
         };
         // THE PLAN ADMISSION (the corruption precedes the plan).
