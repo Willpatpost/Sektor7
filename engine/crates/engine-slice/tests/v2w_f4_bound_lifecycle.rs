@@ -812,18 +812,19 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         );
         assert!(installed_binding(&store).0 == founding_id);
     }
-    // (e) THE PRE-BINDING TORN CREATION (F4-R9's positive): a torn
-    // bound-header prefix — the crashed creation, nothing could ever
-    // have been journaled, and no binding exists yet to make it
-    // damaged evidence — resolves through the bootstrap's creation
-    // path.
+    // (e) THE PRE-BINDING TORN CREATION — the owner's Option B: the
+    // conservative ambiguous-recovery policy. A torn bound-header
+    // prefix (the crashed creation's residue) is PRESERVED and
+    // refused: the automatic repair is prohibited, the damaged
+    // bytes stand untouched, and NO canonical progress is installed
+    // (no founding appended, no binding published — the chain stays
+    // empty). A separately authorized recovery operation applies;
+    // it is deliberately not implemented in this checkpoint.
     {
         let dir = TestDir::new("crash-torn-prebinding");
         let store = dir.store();
         let journal_root = dir.bound_journal();
         let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
-        let location = JournalRootBinding::normalize_location(&journal_root);
-        let root_id = journal_root_id(&founding_id, &location);
         {
             let mut medium = LocalFileMedium::open(&store).unwrap();
             drop(
@@ -839,18 +840,61 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         // header (the crashed creation's residue).
         let complete = std::fs::read(&journal_root).unwrap();
         std::fs::write(&journal_root, &complete[..10]).unwrap();
-        let crossing = SessionCrossing::open_bound_bootstrap(
+        let torn_bytes = std::fs::read(&journal_root).unwrap();
+        // THE CONSERVATIVE REFUSAL through the real entry point.
+        let error = match SessionCrossing::open_bound_bootstrap(
             &StoreLocation::Directory(store.clone()),
             &journal_root,
             campaign,
-        )
-        .expect("the pre-binding torn creation resolves through the creation path");
-        drop(crossing);
-        let (installed_founding, installed_root) = installed_binding(&store);
-        assert_eq!(installed_founding, founding_id);
-        assert_eq!(installed_root, root_id);
-        engine_persist::journal::scan_bound_file(&journal_root, &founding_id, &root_id)
-            .expect("the resolved journal carries the complete bound header");
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the torn pre-binding creation is never auto-repaired"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/residue-torn"
+            ),
+            "the conservative policy refuses the torn creation prefix: {error:?}"
+        );
+        // THE EVIDENCE PRESERVED byte-exact; NO canonical progress.
+        assert_eq!(
+            std::fs::read(&journal_root).unwrap(),
+            torn_bytes,
+            "the damaged creation evidence is preserved byte-exact"
+        );
+        {
+            // The empty chain is itself the proof: no founding was
+            // appended (and with no chain, no binding can exist).
+            let mut medium = LocalFileMedium::open(&store).unwrap();
+            assert!(
+                medium.head().unwrap().is_none(),
+                "no founding was appended — the chain stands empty, so no                  journal-root binding can exist"
+            );
+        }
+        // The single creation operation refuses the same state
+        // through its own typed admission.
+        {
+            let mut medium = LocalFileMedium::open(&store).unwrap();
+            let error = match engine_persist::reclaim::create_campaign_bound_journal(
+                &mut medium,
+                &journal_root,
+                &founding_id,
+            ) {
+                Err(engine_persist::reclaim::BoundCreationError::Journal(error)) => error,
+                Err(other) => panic!("the torn admission refuses typed: {other:?}"),
+                Ok(_journal) => panic!("the torn creation is never auto-repaired"),
+            };
+            assert!(
+                matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("conservative recovery policy")),
+                "the operation's own admission refuses the torn prefix: {error:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&journal_root).unwrap(),
+            torn_bytes,
+            "the damaged evidence still stands"
+        );
     }
 }
 
@@ -1725,4 +1769,297 @@ fn the_rotation_entry_is_session_bound() {
         engine_persist::TailState::Clean,
         "the legacy successor is a clean legacy journal"
     );
+}
+
+#[test]
+fn the_unrelated_medium_cannot_repair_a_truncated_journal() {
+    // (R11-A, Option B) The canonical-source ownership gap CLOSED:
+    // a genuine bound campaign with committed journal history, its
+    // journal truncated to a valid bound-header prefix, and an
+    // UNRELATED EMPTY canonical medium armed with the genuine
+    // founding identity — the single creation operation REFUSES
+    // (the conservative policy: the torn prefix is preserved, never
+    // repaired, regardless of the medium), the damaged bytes remain
+    // identical, and no binding or journal authority was
+    // manufactured on either medium.
+    let dir = TestDir::new("r11a-optionb");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11a-optionb-campaign",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (founding, _root_id) = installed_binding(&store);
+    let intact = std::fs::read(&journal_root).unwrap();
+    std::fs::write(&journal_root, &intact[..10]).unwrap();
+    let damaged = std::fs::read(&journal_root).unwrap();
+    // THE UNRELATED EMPTY MEDIUM with the genuine founding and the
+    // damaged journal path: the typed refusal.
+    let unrelated_store = dir.bound_journal().with_extension("store-unrelated");
+    std::fs::create_dir_all(&unrelated_store).unwrap();
+    let mut unrelated = LocalFileMedium::open(&unrelated_store).unwrap();
+    assert!(
+        unrelated.head().unwrap().is_none(),
+        "the unrelated medium is genuinely empty"
+    );
+    let error = match engine_persist::reclaim::create_campaign_bound_journal(
+        &mut unrelated,
+        &journal_root,
+        &founding,
+    ) {
+        Err(engine_persist::reclaim::BoundCreationError::Journal(error)) => error,
+        Err(other) => panic!("the torn admission refuses typed: {other:?}"),
+        Ok(_journal) => panic!("an unrelated medium never repairs another campaign's journal"),
+    };
+    assert!(
+        matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("conservative recovery policy")),
+        "the truncated journal is preserved under the conservative policy: {error:?}"
+    );
+    // THE DAMAGED BYTES identical; NO authority manufactured.
+    assert_eq!(
+        std::fs::read(&journal_root).unwrap(),
+        damaged,
+        "the damaged evidence is preserved byte-exact"
+    );
+    assert!(
+        unrelated.head().unwrap().is_none(),
+        "the unrelated medium's chain stands empty — no founding, no binding"
+    );
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let (_id, binding) = find_installed_journal_root_binding(&mut medium, &founding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.founding, founding,
+            "the genuine campaign's binding stands unchanged"
+        );
+    }
+}
+
+#[test]
+fn the_concurrent_creation_is_race_safe() {
+    // (Option B §3) THE CREATION RACES: two concurrent creation
+    // attempts at the same new root — exactly ONE initialization
+    // obtains the creation ownership (the atomic create-new); the
+    // competing attempt NEVER truncates or replaces the first
+    // journal (it adopts the winner's COMPLETE empty journal through
+    // the existing-file admission, the sidecar lock serializing its
+    // read against the winner's initialization); and the binding
+    // publication's CAS and duplicate/conflict discipline is
+    // unchanged (one Accepted, the second the exact-duplicate
+    // convergence).
+    let dir = TestDir::new("race-creation");
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let campaign = "race-campaign";
+    let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
+    let founding_id = founding.id();
+    let location = JournalRootBinding::normalize_location(&journal_root);
+    let root_id = journal_root_id(&founding_id, &location);
+    // The founding-only chain (the racers create and adopt on top of
+    // it — the fresh shape holds; no binding is published until both
+    // attempts have completed, so both lifecycle verifications see
+    // the authenticated absence).
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        match medium.append(&founding, &[], None).unwrap() {
+            AppendOutcome::Accepted { .. } => {}
+            _ => panic!("the founding append accepts"),
+        }
+    }
+    let root_for_a = journal_root.clone();
+    let store_for_a = store.clone();
+    let root_for_b = journal_root.clone();
+    let store_for_b = store.clone();
+    let handle_a = std::thread::spawn(move || {
+        let mut medium = LocalFileMedium::open(&store_for_a).unwrap();
+        let journal = engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &root_for_a,
+            &founding_id,
+        )
+        .expect("the first attempt creates or adopts");
+        // The handle drops at the thread's end — releasing the root
+        // lock for the competing attempt's serialized read.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(journal);
+    });
+    let handle_b = std::thread::spawn(move || {
+        // A small stagger: the typical interleaving has the first
+        // attempt holding the creation ownership while this one
+        // competes; the asserts hold for every interleaving.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut medium = LocalFileMedium::open(&store_for_b).unwrap();
+        let journal = engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &root_for_b,
+            &founding_id,
+        )
+        .expect("the competing attempt adopts the winner's complete journal");
+        drop(journal);
+    });
+    handle_a.join().unwrap();
+    handle_b.join().unwrap();
+    // EXACTLY ONE INITIALIZATION: the file carries precisely one
+    // bound header and nothing else (never truncated, never
+    // doubled) — verified against the deterministic identities.
+    let scan = engine_persist::journal::scan_bound_file(&journal_root, &founding_id, &root_id)
+        .expect("the raced root carries exactly one valid bound journal");
+    assert!(scan.committed.is_empty(), "the journal is empty");
+    assert_eq!(scan.tail, engine_persist::TailState::Clean, "a clean tail");
+    assert_eq!(
+        std::fs::read(&journal_root).unwrap().len(),
+        engine_persist::journal::bound_header_bytes(&founding_id, &root_id).len(),
+        "exactly one header — never doubled, never truncated"
+    );
+    // THE CAS/DUPLICATE DISCIPLINE (unchanged): the first
+    // publication Accepts; the identical second converges as the
+    // exact duplicate.
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let (_id, outcome) = engine_persist::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                engine_persist::reclaim::JournalRootBindingOutcome::Accepted { .. }
+            ),
+            "the first publication accepts: {outcome:?}"
+        );
+        let (_id, outcome) = engine_persist::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            2,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                engine_persist::reclaim::JournalRootBindingOutcome::DuplicateVerified { .. }
+            ),
+            "the identical publication converges as the exact duplicate: {outcome:?}"
+        );
+    }
+    // The installed binding confirms the raced campaign's authority.
+    let (founding, root) = installed_binding(&store);
+    assert_eq!(founding, founding_id);
+    assert_eq!(root, root_id);
+}
+
+#[test]
+fn the_rotation_entry_verifies_the_root_agreement() {
+    // (R11-B) The journal/root agreement: the pipeline's journal
+    // must BE the pointer-resolved active at the requested root —
+    // an arbitrary pipeline constructed with a journal from ANOTHER
+    // root refuses before any successor is created, and a STALE
+    // journal (the pre-rotation root after a rotation) equally
+    // refuses; the bound agreements (the binding's location vs the
+    // root, the active's bound identities vs the installed binding)
+    // hold for the genuine rotation.
+    let dir = TestDir::new("r11b-agreement");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // TWO bound campaigns at different roots.
+    let make_campaign = |label: &str| {
+        let store = dir.bound_journal().with_extension(format!("store-{label}"));
+        std::fs::create_dir_all(&store).unwrap();
+        let root = dir.bound_journal().with_extension(format!("root-{label}"));
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &root,
+            label,
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        run_ticks_near(&mut spine, &mut director, &near, 5);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        (store, root)
+    };
+    let (store_a, root_a) = make_campaign("a");
+    let (store_b, root_b) = make_campaign("b");
+    let (founding_b, root_id_b) = installed_binding(&store_b);
+    // THE ARBITRARY PIPELINE from another root: a pipeline over
+    // campaign B's journal aimed at campaign A's root refuses before
+    // any successor is created.
+    {
+        let active_b = active_journal_path(&root_b).unwrap();
+        let journal_b =
+            T1Journal::open_bound(&active_b, &founding_b, &root_id_b).expect("B's active");
+        let medium_b = LocalFileMedium::open(&store_b).unwrap();
+        let mut pipeline_b = engine_persist::CommitPipeline::open(medium_b, journal_b).unwrap();
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_b, &root_a, None) {
+            Err(engine_persist::SessionRotationError::Journal(error)) => error,
+            Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
+            Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
+        };
+        assert!(
+            matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("not the pointer-resolved active")),
+            "the journal/root agreement refuses the cross-root pipeline: {error:?}"
+        );
+        assert!(
+            active_journal_path(&root_a).unwrap() == root_a,
+            "no successor was created at A's root — the pointer stands at the root"
+        );
+    }
+    // THE STALE JOURNAL: campaign A rotated once (the successor is
+    // the active); a pipeline over the STALE root journal aimed at
+    // A's root refuses.
+    {
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store_a.clone()),
+            &root_a,
+            "a",
+        )
+        .unwrap();
+        // The chain's existing anchor (make_campaign's covering
+        // publication) suffices — no new snapshot needed.
+        let rotation = crossing.rotate_journal().expect("A rotates genuinely");
+        drop(crossing);
+        let (founding_a, root_id_a) = installed_binding(&store_a);
+        let journal_stale =
+            T1Journal::open_bound(&root_a, &founding_a, &root_id_a).expect("the stale root");
+        let medium_a = LocalFileMedium::open(&store_a).unwrap();
+        let mut pipeline_stale =
+            engine_persist::CommitPipeline::open(medium_a, journal_stale).unwrap();
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_stale, &root_a, None)
+        {
+            Err(engine_persist::SessionRotationError::Journal(error)) => error,
+            Err(other) => panic!("the stale-journal aim refuses typed: {other:?}"),
+            Ok(_rotation) => panic!("a stale journal never rotates"),
+        };
+        assert!(
+            matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("not the pointer-resolved active")),
+            "the journal/root agreement refuses the stale journal: {error:?}"
+        );
+        assert_eq!(
+            active_journal_path(&root_a).unwrap(),
+            rotation.new_path,
+            "the pointer still names the genuine successor — no unauthorized flip"
+        );
+    }
 }

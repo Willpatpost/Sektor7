@@ -399,6 +399,43 @@ pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
         crate::reclaim::find_installed_journal_root_binding(medium, &founding)?
             .map(|(_id, binding)| (binding.founding, binding.root_id))
     };
+    // (R11-B) THE JOURNAL/ROOT AGREEMENT — before any successor is
+    // created: the pipeline's journal must BE the authoritative
+    // pointer-resolved ACTIVE journal at the requested root (an
+    // arbitrary pipeline constructed with a journal from another
+    // root, or a stale journal whose path differs from the resolved
+    // active, refuses). The pipeline's live journal handle carries
+    // the active's sidecar lock — the lock ownership covers the
+    // transition — and the mechanism's conditioned root lock
+    // establishes the root-side serialization boundary for the
+    // ownership record and the pointer flip.
+    let active = crate::rotation::active_journal_path(root)?;
+    if pipeline.journal().path() != active {
+        return Err(SessionRotationError::Journal(JournalError::CorruptHeader {
+            detail: "the pipeline's journal is not the pointer-resolved active \
+                     at the requested root — the rotation refuses"
+                .into(),
+        }));
+    }
+    if let Some((founding, root_id)) = bound_identities.as_ref() {
+        // (R11-B) THE BOUND AGREEMENTS: the canonical binding's
+        // location agrees with the requested root, and the pipeline's
+        // journal carries the EXACT installed bound identities (the
+        // active is the bound journal this binding names).
+        let location = crate::reclaim::JournalRootBinding::normalize_location(root);
+        let medium = pipeline.medium_mut();
+        let installed = crate::reclaim::find_installed_journal_root_binding(medium, founding)?
+            .expect("the probe above found the binding");
+        if installed.1.location != location {
+            return Err(SessionRotationError::Medium(
+                crate::medium::MediumError::Chain {
+                    rule: "journal-root/location-mismatch",
+                },
+            ));
+        }
+        crate::journal::scan_bound_file(&active, founding, root_id)
+            .map_err(SessionRotationError::Journal)?;
+    }
     // THE CLASSIFICATION (§4.4) — derived from the pipeline's own
     // journal (the live active handle) and confirmed set; the anchor
     // boundary is the session's claim.

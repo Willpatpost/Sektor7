@@ -1742,7 +1742,7 @@ impl T1Journal {
                 return Err(io_err("create bound generation", &path, error));
             }
         };
-        Self::initialize_bound_at(&path, file, founding, root_id)
+        Self::initialize_bound_at(&path, file, founding, root_id, true)
     }
 
     /// (F4-R11/R11-A) THE TRUSTED BOOTSTRAP'S CREATION — CRATE-
@@ -1751,16 +1751,23 @@ impl T1Journal {
     /// narrowly controlled operation that verifies the campaign's
     /// CURRENT canonical lifecycle (the authenticated binding
     /// absence, at the moment of creation, against the campaign's
-    /// own medium) and creates or repairs in one indivisible call —
-    /// no detachable authority exists. A MISSING journal file is
-    /// created only at a root showing NO prior journal life (the
-    /// sidecar lock's absence: a root whose lock exists had a
-    /// journal opened or created at it — never a fresh bootstrap's
-    /// target); a torn PRE-BINDING creation resolves (nothing could
-    /// ever have been journaled); an existing COMPLETE residue is
-    /// adopted only when EMPTY (F4-R12); anything else — a legacy,
-    /// foreign, or corrupt header, or a residue carrying history —
-    /// refuses typed.
+    /// own medium) and creates or adopts in one indivisible call —
+    /// no detachable authority exists. THE CONSERVATIVE
+    /// AMBIGUOUS-RECOVERY POLICY (the owner's Option B selection):
+    /// a MISSING journal file is created only at a root showing NO
+    /// prior journal life (the sidecar lock's absence), through the
+    /// RACE-SAFE new-file operation (exactly one concurrent
+    /// initializer obtains creation ownership — a competing attempt
+    /// adopts the winner's complete empty journal or refuses, never
+    /// truncating or replacing); an EXISTING file is NEVER
+    /// (re)initialized or repaired — an empty (zero-byte) file, a
+    /// torn creation prefix, a legacy, foreign, or corrupt header,
+    /// or a populated journal is PRESERVED and refused (the
+    /// original history cannot be authenticated; a crash during
+    /// the initial header creation now requires a separately
+    /// authorized recovery operation, deliberately NOT implemented
+    /// in this checkpoint); only a COMPLETE matching header with
+    /// clean empty history is adopted (F4-R12).
     pub(crate) fn open_bound_creating_at(
         path: &Path,
         founding: &crate::hash::Hash,
@@ -1774,9 +1781,7 @@ impl T1Journal {
         // journal life. The sidecar lock file is created once, never
         // unlinked, and outlives any journal data at the path — its
         // presence with NO data file means a journal was removed
-        // (never a fresh target); the legitimate interrupted
-        // creation always leaves the DATA file (created before the
-        // lock), so the crash-retry paths are unaffected.
+        // (never a fresh target).
         let data_preexists = path.exists();
         if !data_preexists && sidecar_lock_exists(path) {
             return Err(JournalError::CorruptHeader {
@@ -1785,28 +1790,74 @@ impl T1Journal {
                     .into(),
             });
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| io_err("open journal", path, e))?;
-        Self::initialize_bound_at(path, file, founding, root_id)
+        // (Option B) THE RACE-SAFE NEW-FILE CREATION: for a genuinely
+        // nonexistent root, create-new — the nonexistence proof and
+        // the creation are one step, and exactly ONE concurrent
+        // initializer obtains creation ownership. A competing attempt
+        // (EEXIST) falls through to the existing-file admission
+        // below (adopting the winner's COMPLETE empty journal, or
+        // refusing on whatever partial state it observes). A file
+        // that already existed is NEVER opened for creation here —
+        // an existing data file is never conflated with one this
+        // operation created itself.
+        let (file, created_here) = if data_preexists {
+            (
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .truncate(false)
+                    .open(path)
+                    .map_err(|e| io_err("open journal", path, e))?,
+                false,
+            )
+        } else {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // A concurrent creation obtained the ownership:
+                    // adopt-or-refuse through the existing-file
+                    // admission (the sidecar lock serializes the
+                    // read against the winner's initialization).
+                    (
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(false)
+                            .truncate(false)
+                            .open(path)
+                            .map_err(|e| io_err("open journal", path, e))?,
+                        false,
+                    )
+                }
+                Err(error) => return Err(io_err("create journal", path, error)),
+            }
+        };
+        Self::initialize_bound_at(path, file, founding, root_id, created_here)
     }
 
-    /// The shared durable initialization over an already-open data
-    /// file: the lock is taken, the bytes classified, a fresh or
-    /// torn-creation file (re-)initialized with the bound header,
-    /// and a complete matching header adopted ONLY when empty
-    /// (F4-R12 — the trusted ordering journals nothing before the
-    /// binding, so any history is foreign to the residue, refused
-    /// with the bytes preserved).
+    /// The shared durable admission over an already-open data file:
+    /// the lock is taken, the bytes classified, and ONLY this
+    /// operation's own just-created empty file is initialized with
+    /// the bound header (the race-safe winner); an existing
+    /// zero-byte file, a torn creation prefix, a legacy, foreign,
+    /// or corrupt header, or a populated journal is preserved and
+    /// refused (Option B's conservative policy); a complete
+    /// matching header is adopted ONLY when empty (F4-R12 — the
+    /// trusted ordering journals nothing before the binding, so any
+    /// history is foreign to the residue, refused with the bytes
+    /// preserved).
     fn initialize_bound_at(
         path: &Path,
         file: File,
         founding: &crate::hash::Hash,
         root_id: &crate::hash::Hash,
+        created_here: bool,
     ) -> Result<Self, JournalError> {
         let lock = open_lock_file(path)?;
         let bytes = fs::read(path).map_err(|e| io_err("read journal", path, e))?;
@@ -1830,11 +1881,22 @@ impl T1Journal {
         };
         let header = bound_header_bytes(founding, root_id);
         match read_bound_header(&bytes, founding, root_id)? {
-            BoundHeaderState::Fresh | BoundHeaderState::TornCreation { .. } => {
-                journal
-                    .file
-                    .set_len(0)
-                    .map_err(|e| io_err("truncate journal", path, e))?;
+            BoundHeaderState::Fresh => {
+                if !created_here {
+                    // (Option B) An EXISTING zero-byte file is
+                    // preserved evidence of an unintelligible prior
+                    // state — never treated as a fresh creation (a
+                    // data file opened successfully is not a file
+                    // this operation created itself).
+                    return Err(JournalError::CorruptHeader {
+                        detail: "an existing empty bound-journal file is preserved — \
+                                 never treated as a fresh creation"
+                            .into(),
+                    });
+                }
+                // THE RACE-SAFE WINNER: this operation's own
+                // just-created file — the durable initialization (one
+                // write + one fsync + the parent-directory sync).
                 journal
                     .append_bytes(&header)
                     .map_err(|e| io_err("write bound journal header", path, e))?;
@@ -1842,6 +1904,24 @@ impl T1Journal {
                 sync_parent_dir(path).map_err(|e| io_err("sync journal dir", path, e))?;
                 journal.state =
                     JournalState::empty_bound(hash_object(&header), header.len() as u64);
+            }
+            BoundHeaderState::TornCreation { byte_len } => {
+                // (Option B) THE CONSERVATIVE AMBIGUOUS-RECOVERY
+                // POLICY (the owner's selection): the automatic
+                // repair of a torn bound-header prefix is PROHIBITED
+                // — the original journal history cannot be
+                // authenticated, so the evidence is preserved and
+                // the admission refuses (a separately authorized
+                // recovery operation applies; deliberately not
+                // implemented in this checkpoint).
+                return Err(JournalError::CorruptHeader {
+                    detail: format!(
+                        "a torn bound-journal creation prefix ({} bytes) is preserved \
+                         under the conservative recovery policy — automatic repair \
+                         prohibited",
+                        byte_len
+                    ),
+                });
             }
             BoundHeaderState::Matching { header_hash } => {
                 // (F4-R12) THE EMPTY-RESIDUE ADMISSION: the trusted

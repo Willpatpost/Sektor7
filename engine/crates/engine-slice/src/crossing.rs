@@ -1001,8 +1001,10 @@ impl<S: MediumSource> SessionCrossing<S> {
         // refused with the bytes preserved (never silently adopted
         // as a fresh campaign's authoritative root, never
         // truncated). A legacy, foreign, or corrupt header refuses
-        // the same way; a torn PRE-BINDING creation proceeds to the
-        // trusted creation path's resolution.
+        // the same way; and (Option B) an existing empty file or a
+        // torn creation prefix is PRESERVED and refused (the
+        // conservative ambiguous-recovery policy — the automatic
+        // repair is prohibited).
         if journal_path.exists() {
             let residue_bytes = std::fs::read(journal_path).map_err(|_error| {
                 TransitionError::InstallIncompatible {
@@ -1034,8 +1036,27 @@ impl<S: MediumSource> SessionCrossing<S> {
                         });
                     }
                 }
-                Ok(engine_persist::journal::BoundHeaderState::Fresh)
-                | Ok(engine_persist::journal::BoundHeaderState::TornCreation { .. }) => {}
+                Ok(engine_persist::journal::BoundHeaderState::Fresh) => {
+                    // (Option B) An existing zero-byte file is
+                    // preserved — never treated as a fresh creation.
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-root/residue-empty",
+                    });
+                }
+                Ok(engine_persist::journal::BoundHeaderState::TornCreation { .. }) => {
+                    // (Option B) THE CONSERVATIVE AMBIGUOUS-RECOVERY
+                    // POLICY (the owner's selection): the automatic
+                    // repair of a torn creation prefix is prohibited —
+                    // the evidence is preserved and the bootstrap
+                    // refuses (a separately authorized recovery
+                    // operation applies; not implemented in this
+                    // checkpoint).
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-root/residue-torn",
+                    });
+                }
             }
         }
         // (F4-R11/R11-A) THE SINGLE CREATION OPERATION: the current
