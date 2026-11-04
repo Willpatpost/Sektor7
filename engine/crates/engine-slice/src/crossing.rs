@@ -1038,25 +1038,30 @@ impl<S: MediumSource> SessionCrossing<S> {
                 | Ok(engine_persist::journal::BoundHeaderState::TornCreation { .. }) => {}
             }
         }
-        // (F4-R11) THE CREATION AUTHORITY: the nonforgeable
-        // binding-absence capability — the verified lifecycle state
-        // in which no journal-root binding is installed for this
-        // founding. The creation/reuse below requires it: once a
-        // binding exists the authority is unobtainable, so no path
-        // can recreate or repair the bound journal of a bound
-        // campaign.
-        let creation_authority =
-            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding)
-                .map_err(PipelineError::Medium)?;
-        // (3) The durable bound-journal creation/reuse BEFORE the
-        // founding append and any transaction (the strict reuse:
-        // Matching resumes, a torn PRE-BINDING creation resolves —
-        // nothing could ever have been journaled, and no binding
-        // exists yet to make it damaged evidence (F4-R9) — a
-        // legacy/foreign header refuses, never reinterpreted).
-        let journal =
-            T1Journal::open_bound_creating(journal_path, &founding, &root_id, &creation_authority)
-                .map_err(PipelineError::Journal)?;
+        // (F4-R11/R11-A) THE SINGLE CREATION OPERATION: the current
+        // canonical lifecycle verification (the authenticated
+        // binding absence, at this moment, against THIS campaign's
+        // own medium — failures propagate; an installed binding
+        // refuses) and the creation/repair happen indivisibly in one
+        // call. No detachable authority exists anywhere in the API;
+        // the authorized root location and root ID are derived
+        // within the operation from this call's founding and journal
+        // root; and a missing journal is created only at a root
+        // showing no prior journal life (the unrelated-empty-medium
+        // aim at an established root refuses).
+        let journal = engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            journal_path,
+            &founding,
+        )
+        .map_err(|error| match error {
+            engine_persist::reclaim::BoundCreationError::Medium(error) => {
+                PipelineError::Medium(error)
+            }
+            engine_persist::reclaim::BoundCreationError::Journal(error) => {
+                PipelineError::Journal(error)
+            }
+        })?;
         // (1) The canonical founding append — the truly fresh
         // campaign only (an existing chain already carries it).
         if fresh_campaign {

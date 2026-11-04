@@ -2385,43 +2385,33 @@ pub struct BoundJournalAuthority {
     root_id: Hash,
 }
 
-/// (F4-R11) The nonforgeable bound-journal CREATION authority:
-/// issued ONLY by [`verify_bound_creation_authority`] after the
-/// verified lifecycle state in which NO journal-root binding is
-/// installed for the founding — the authenticated absence (an empty
-/// chain, or a completed lookup that found nothing; a FAILED
-/// verification propagates, never downgrades to absence). Once a
-/// binding is installed the authority is unobtainable, so no public
-/// path can create or repair the bound journal of a bound campaign:
-/// [`crate::journal::T1Journal::open_bound_creating`] requires it,
-/// and it is the only constructor that creates a missing journal or
-/// resolves a torn pre-binding creation.
-#[derive(Debug, Clone)]
-pub struct BoundCreationAuthority {
-    founding: Hash,
-}
-
-impl BoundCreationAuthority {
-    /// The founding identity the absence was verified for (the
-    /// creating constructor's identity agreement).
-    pub fn founding(&self) -> &Hash {
-        &self.founding
-    }
-}
-
-/// (F4-R11) The creation authority's issuance: the authenticated
-/// binding-absence verification. An EMPTY chain (the fresh
-/// bootstrap, before the founding append) is the trivial absence; a
-/// chain that exists must carry the supplied founding as its root
-/// and resolve the binding lookup to Ok(None) — an installed
-/// binding refuses (the bound lifecycle's journal is never
-/// recreated), and a failed founding discovery or binding
-/// read/verification PROPAGATES (the authenticated absence is never
-/// confused with a failed verification).
-pub fn verify_bound_creation_authority(
+/// (F4-R11/R11-A) The single narrowly controlled bound-journal
+/// creation operation: the CURRENT canonical lifecycle verification
+/// and the creation/repair happen INDIVISIBLY in one call — no
+/// detachable, reusable, or stale authority value exists anywhere in
+/// the API (the authority IS the call's own verified control flow).
+/// The lifecycle is verified against the supplied campaign's OWN
+/// medium AT THE MOMENT of creation: an empty chain (the fresh
+/// bootstrap's pre-founding medium) or a chain whose root IS the
+/// supplied founding with the binding lookup resolving to the
+/// AUTHENTICATED absence (a failed founding discovery or binding
+/// read/verification PROPAGATES — never confused with absence; an
+/// installed binding REFUSES — the bound lifecycle's journal is
+/// never recreated or repaired). The authorized root location and
+/// root ID are derived from THIS call's founding and journal root —
+/// bound to the operation, never caller-supplied. The missing-file
+/// creation applies only at a root showing no prior journal life;
+/// the torn pre-binding creation resolves; the existing complete
+/// residue is adopted only when empty (F4-R12). The binding-
+/// publication race cannot invalidate the creation proof: the
+/// journal's durable initialization precedes the caller's binding
+/// publication, and a concurrent publication converges through the
+/// admission's own CAS/duplicate/conflict discipline.
+pub fn create_campaign_bound_journal(
     medium: &mut dyn CanonicalMedium,
+    journal_root: &std::path::Path,
     founding: &Hash,
-) -> Result<BoundCreationAuthority, MediumError> {
+) -> Result<crate::journal::T1Journal, BoundCreationError> {
     match medium.head()? {
         None => {}
         Some(_) => {
@@ -2429,18 +2419,36 @@ pub fn verify_bound_creation_authority(
             if chain_root != *founding {
                 return Err(MediumError::Chain {
                     rule: "journal-root/creation-authority-founding",
-                });
+                }
+                .into());
             }
             if find_installed_journal_root_binding(medium, founding)?.is_some() {
                 return Err(MediumError::Chain {
                     rule: "journal-root/creation-authority-bound",
-                });
+                }
+                .into());
             }
         }
     }
-    Ok(BoundCreationAuthority {
-        founding: *founding,
-    })
+    let location = JournalRootBinding::normalize_location(journal_root);
+    let root_id = journal_root_id(founding, &location);
+    crate::journal::T1Journal::open_bound_creating_at(journal_root, founding, &root_id)
+        .map_err(BoundCreationError::Journal)
+}
+
+/// (F4-R11/R11-A) The creation operation's typed error: the medium
+/// lifecycle verification's refusals and the journal constructor's
+/// typed refusals, never conflated.
+#[derive(Debug)]
+pub enum BoundCreationError {
+    Medium(MediumError),
+    Journal(crate::journal::JournalError),
+}
+
+impl From<MediumError> for BoundCreationError {
+    fn from(error: MediumError) -> Self {
+        BoundCreationError::Medium(error)
+    }
 }
 
 /// (F4-R3) The capability issuance: the founding discovery, the

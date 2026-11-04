@@ -675,12 +675,13 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let root_id = journal_root_id(&founding_id, &location);
         {
             let mut medium = LocalFileMedium::open(&store).unwrap();
-            let creation =
-                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
-                    .expect("the empty chain grants the creation authority");
             drop(
-                T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
-                    .expect("the interrupted bootstrap's journal is created"),
+                engine_persist::reclaim::create_campaign_bound_journal(
+                    &mut medium,
+                    &journal_root,
+                    &founding_id,
+                )
+                .expect("the interrupted bootstrap's journal is created"),
             );
         }
         let crossing = SessionCrossing::open_bound_bootstrap(
@@ -706,12 +707,13 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let location = JournalRootBinding::normalize_location(&journal_root);
         let root_id = journal_root_id(&founding_id, &location);
         let mut medium = LocalFileMedium::open(&store).unwrap();
-        let creation =
-            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
-                .expect("the empty chain grants the creation authority");
         drop(
-            T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
-                .expect("the interrupted bootstrap's journal is created"),
+            engine_persist::reclaim::create_campaign_bound_journal(
+                &mut medium,
+                &journal_root,
+                &founding_id,
+            )
+            .expect("the interrupted bootstrap's journal is created"),
         );
         match medium.append(&founding, &[], None).unwrap() {
             AppendOutcome::Accepted { .. } => {}
@@ -824,12 +826,13 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let root_id = journal_root_id(&founding_id, &location);
         {
             let mut medium = LocalFileMedium::open(&store).unwrap();
-            let creation =
-                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
-                    .expect("the empty chain grants the creation authority");
             drop(
-                T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
-                    .expect("the journal is created"),
+                engine_persist::reclaim::create_campaign_bound_journal(
+                    &mut medium,
+                    &journal_root,
+                    &founding_id,
+                )
+                .expect("the journal is created"),
             );
         }
         // The torn prefix: a strict prefix of the canonical bound
@@ -1118,14 +1121,22 @@ fn the_bound_journal_recreation_bypass_fails_closed() {
         !journal_root.exists(),
         "no journal file was manufactured by the refused re-entry"
     );
-    // The creation authority is unobtainable: the installed binding
-    // makes the binding-absence capability — and with it every
-    // public creation path — unreachable for this campaign.
+    // The single creation operation refuses: the installed binding
+    // makes the current lifecycle verification — and with it every
+    // public creation path — refuse for this campaign.
     {
         let mut medium = LocalFileMedium::open(&store).unwrap();
-        let error =
-            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding)
-                .unwrap_err();
+        let error = match engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &journal_root,
+            &founding,
+        ) {
+            Err(engine_persist::reclaim::BoundCreationError::Medium(error)) => error,
+            Err(other) => {
+                panic!("the bound campaign's creation refuses at the lifecycle: {other:?}")
+            }
+            Ok(_journal) => panic!("the bound campaign's journal is never recreated"),
+        };
         assert!(
             matches!(
                 error,
@@ -1133,7 +1144,7 @@ fn the_bound_journal_recreation_bypass_fails_closed() {
                     rule: "journal-root/creation-authority-bound"
                 }
             ),
-            "the bound campaign never grants the creation authority: {error:?}"
+            "the bound campaign never authorizes journal creation: {error:?}"
         );
     }
     // (2) THE TRUNCATED JOURNAL (a valid header prefix): the public
@@ -1343,12 +1354,13 @@ fn the_bootstrap_refuses_pre_binding_journals_with_history() {
         let root_id = journal_root_id(&founding_id, &location);
         {
             let mut medium = LocalFileMedium::open(&empty_store).unwrap();
-            let creation =
-                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
-                    .expect("the empty chain grants the creation authority");
             drop(
-                T1Journal::open_bound_creating(&empty_root, &founding_id, &root_id, &creation)
-                    .expect("the empty residue is created"),
+                engine_persist::reclaim::create_campaign_bound_journal(
+                    &mut medium,
+                    &empty_root,
+                    &founding_id,
+                )
+                .expect("the empty residue is created"),
             );
         }
         let crossing = SessionCrossing::open_bound_bootstrap(
@@ -1362,4 +1374,266 @@ fn the_bootstrap_refuses_pre_binding_journals_with_history() {
         assert_eq!(installed_founding, founding_id);
         assert_eq!(installed_root, root_id);
     }
+}
+
+#[test]
+fn the_creation_operation_is_current_and_source_bound() {
+    // (F4-R11-A) The creation authorization is the CURRENT verified
+    // lifecycle of the canonical campaign, verified and consumed
+    // indivisibly — no detachable authority exists (the token type
+    // is gone from the API; the operation IS the authority). (1) A
+    // completed binding makes the operation refuse the campaign's
+    // OWN medium for both the removed and the truncated journal
+    // (the lifecycle check fires before any file work; the damaged
+    // state is preserved, nothing manufactured); (2) an UNRELATED
+    // EMPTY medium aimed at the established campaign's root cannot
+    // restore the missing journal — the root's prior journal life
+    // (the sidecar lock, created once and never unlinked) refuses
+    // the fresh-creation branch: a root that had a journal is never
+    // a fresh bootstrap's target.
+    let dir = TestDir::new("r11a-current");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11a-campaign",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (founding, _root_id) = installed_binding(&store);
+    let intact_bytes = std::fs::read(&journal_root).unwrap();
+    // (1a) THE REMOVED JOURNAL + the campaign's OWN medium: the
+    // operation refuses at the current lifecycle (the binding IS
+    // installed) — never reaching the file work.
+    std::fs::remove_file(&journal_root).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let error = match engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &journal_root,
+            &founding,
+        ) {
+            Err(engine_persist::reclaim::BoundCreationError::Medium(error)) => error,
+            Err(other) => panic!("the bound lifecycle refuses the creation: {other:?}"),
+            Ok(_journal) => panic!("the removed journal is never recreated"),
+        };
+        assert!(
+            matches!(
+                error,
+                engine_persist::MediumError::Chain {
+                    rule: "journal-root/creation-authority-bound"
+                }
+            ),
+            "the current lifecycle refuses the bound campaign's creation: {error:?}"
+        );
+        assert!(!journal_root.exists(), "no journal file was manufactured");
+    }
+    // (1b) THE TRUNCATED JOURNAL + the campaign's OWN medium: the
+    // same lifecycle refusal, the damaged bytes preserved.
+    std::fs::write(&journal_root, &intact_bytes[..10]).unwrap();
+    let damaged_bytes = std::fs::read(&journal_root).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let error = match engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &journal_root,
+            &founding,
+        ) {
+            Err(engine_persist::reclaim::BoundCreationError::Medium(error)) => error,
+            Err(other) => panic!("the bound lifecycle refuses the repair: {other:?}"),
+            Ok(_journal) => panic!("the truncated journal is never repaired"),
+        };
+        assert!(
+            matches!(
+                error,
+                engine_persist::MediumError::Chain {
+                    rule: "journal-root/creation-authority-bound"
+                }
+            ),
+            "the current lifecycle refuses the bound campaign's repair: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&journal_root).unwrap(),
+            damaged_bytes,
+            "the damaged evidence is preserved byte-exact"
+        );
+    }
+    // (2) THE UNRELATED EMPTY MEDIUM aimed at the established root:
+    // the journal is removed again (the sidecar lock — created once,
+    // never unlinked — remains as the root's prior-journal-life
+    // evidence), and a SEPARATE fresh empty medium with the
+    // established campaign's founding cannot create there.
+    std::fs::remove_file(&journal_root).unwrap();
+    {
+        let unrelated_store = dir.bound_journal().with_extension("store-unrelated");
+        std::fs::create_dir_all(&unrelated_store).unwrap();
+        let mut unrelated = LocalFileMedium::open(&unrelated_store).unwrap();
+        assert!(
+            unrelated.head().unwrap().is_none(),
+            "the unrelated medium is genuinely empty"
+        );
+        let error = match engine_persist::reclaim::create_campaign_bound_journal(
+            &mut unrelated,
+            &journal_root,
+            &founding,
+        ) {
+            Err(engine_persist::reclaim::BoundCreationError::Journal(error)) => error,
+            Err(other) => panic!("the unrelated-medium aim refuses at the root: {other:?}"),
+            Ok(_journal) => {
+                panic!("an unrelated empty medium never restores another campaign's journal")
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("prior journal life")
+            ),
+            "the established root's prior journal life refuses the fresh creation: {error:?}"
+        );
+        assert!(
+            !journal_root.exists(),
+            "the missing journal was not restored"
+        );
+    }
+    // The genuine evidence restored re-opens (the strict path).
+    std::fs::write(&journal_root, &intact_bytes).unwrap();
+    let crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11a-campaign",
+    )
+    .expect("the restored genuine evidence re-opens");
+    drop(crossing);
+}
+
+#[test]
+fn the_generation_creation_is_rotation_only() {
+    // (F4-R11-B) The generation construction is CRATE-PRIVATE to the
+    // trusted rotation (an ordinary external caller cannot even name
+    // it — the compile-time boundary; rotation and the journal
+    // implementation both reside in engine-persist). A bound campaign
+    // that loses its active ROTATED generation cannot manufacture an
+    // empty replacement through any public API: the strict open
+    // refuses the missing generation, the creation operation refuses
+    // the bound lifecycle — while the genuine production rotation
+    // still creates a new identity-matching successor and the
+    // restart recovery follows it.
+    let dir = TestDir::new("r11b-rotation-only");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11b-campaign",
+    )
+    .unwrap();
+    // The anchor + the outstanding window for the rotation.
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let rotation = crossing.rotate_journal().expect("the rotation completes");
+    let (founding, root_id) = installed_binding(&store);
+    let active = rotation.new_path.clone();
+    let active_bytes = std::fs::read(&active).unwrap();
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    // THE ACTIVE ROTATED GENERATION REMOVED: no public path
+    // manufactures a replacement.
+    std::fs::remove_file(&active).unwrap();
+    {
+        // The strict open refuses the missing generation.
+        let error = match T1Journal::open_bound(&active, &founding, &root_id) {
+            Err(error) => error,
+            Ok(_journal) => panic!("the missing generation is never created by an open"),
+        };
+        assert!(
+            matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("absent")),
+            "the strict open refuses the missing generation: {error:?}"
+        );
+        assert!(!active.exists(), "no generation file was manufactured");
+        // The creation operation refuses the bound lifecycle.
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let error = match engine_persist::reclaim::create_campaign_bound_journal(
+            &mut medium,
+            &active,
+            &founding,
+        ) {
+            Err(engine_persist::reclaim::BoundCreationError::Medium(error)) => error,
+            Err(other) => panic!("the bound lifecycle refuses: {other:?}"),
+            Ok(_journal) => panic!("the missing generation is never manufactured"),
+        };
+        assert!(
+            matches!(
+                error,
+                engine_persist::MediumError::Chain {
+                    rule: "journal-root/creation-authority-bound"
+                }
+            ),
+            "the bound campaign never authorizes generation creation: {error:?}"
+        );
+        assert!(
+            !active.exists(),
+            "still no generation file was manufactured"
+        );
+        // The re-entry refuses the missing active (fail closed).
+        let error = match SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r11b-campaign",
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the missing active generation never re-enters"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/missing-journal"
+            ),
+            "the re-entry fails closed on the missing active: {error:?}"
+        );
+    }
+    // THE GENUINE PRODUCTION ROTATION still creates the successor:
+    // the restored active (the strict path) re-opens the campaign,
+    // the rotation creates a new identity-matching generation, and
+    // the restart recovery follows it.
+    std::fs::write(&active, &active_bytes).unwrap();
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11b-campaign",
+    )
+    .expect("the restored active re-opens the campaign");
+    // The genuine rotation over the CHAIN's existing anchor (the
+    // first session's covering publication — no new snapshot needed;
+    // the outstanding transaction re-anchors whole into the
+    // successor, preserving the frontier-coherent recovery state).
+    let rotation2 = crossing
+        .rotate_journal()
+        .expect("the second rotation completes");
+    drop(crossing);
+    engine_persist::journal::scan_bound_file(&rotation2.new_path, &founding, &root_id)
+        .expect("the genuine rotation's successor carries the bound identities");
+    let (_recovered_spine, _recovered_director, recovered) =
+        SessionCrossing::recover(&store, &journal_root, "r11b-campaign")
+            .expect("the restart recovery follows the genuine successor");
+    assert_eq!(
+        recovered.pipeline_journal_path(),
+        rotation2.new_path.as_path(),
+        "the recovery holds the rotated active"
+    );
+    drop(recovered);
 }

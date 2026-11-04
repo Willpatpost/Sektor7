@@ -5175,16 +5175,9 @@ mod exclusion_tests {
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        let creation =
-            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
         drop(
-            crate::journal::T1Journal::open_bound_creating(
-                &journal_root,
-                &founding_id,
-                &root_id,
-                &creation,
-            )
-            .unwrap(),
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
         );
         let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
@@ -5342,16 +5335,9 @@ mod exclusion_tests {
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        let creation =
-            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
         drop(
-            crate::journal::T1Journal::open_bound_creating(
-                &journal_root,
-                &founding_id,
-                &root_id,
-                &creation,
-            )
-            .unwrap(),
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
         );
         let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
@@ -6746,14 +6732,11 @@ mod exclusion_tests {
             let founding_id = founding.id();
             let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
             let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-            let creation =
-                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
             drop(
-                crate::journal::T1Journal::open_bound_creating(
+                crate::reclaim::create_campaign_bound_journal(
+                    &mut medium,
                     &journal_root,
                     &founding_id,
-                    &root_id,
-                    &creation,
                 )
                 .unwrap(),
             );
@@ -6880,16 +6863,9 @@ mod exclusion_tests {
         // (d) THE GENUINE EVIDENCE: the bound journal durably created
         // at the location with the exact expected identities (the
         // trusted bootstrap's own durable step) publishes.
-        let creation =
-            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
         drop(
-            crate::journal::T1Journal::open_bound_creating(
-                &journal_root,
-                &founding_id,
-                &root_id,
-                &creation,
-            )
-            .unwrap(),
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
         );
         let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
@@ -6934,16 +6910,9 @@ mod exclusion_tests {
         let relative_text = relative.to_str().unwrap().to_owned();
         let wrong_root_id = crate::reclaim::journal_root_id(&founding_id, &relative_text);
         {
-            let creation =
-                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
             drop(
-                crate::journal::T1Journal::open_bound_creating(
-                    relative,
-                    &founding_id,
-                    &wrong_root_id,
-                    &creation,
-                )
-                .unwrap(),
+                crate::reclaim::create_campaign_bound_journal(&mut medium, relative, &founding_id)
+                    .unwrap(),
             );
         }
         assert!(relative.exists(), "the relative-path journal is real");
@@ -6982,16 +6951,9 @@ mod exclusion_tests {
         let location = crate::reclaim::JournalRootBinding::normalize_location(&absolute);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
         {
-            let creation =
-                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
             drop(
-                crate::journal::T1Journal::open_bound_creating(
-                    &absolute,
-                    &founding_id,
-                    &root_id,
-                    &creation,
-                )
-                .unwrap(),
+                crate::reclaim::create_campaign_bound_journal(&mut medium, &absolute, &founding_id)
+                    .unwrap(),
             );
         }
         let (_id, outcome) = crate::reclaim::publish_journal_root_binding(

@@ -1701,70 +1701,89 @@ impl T1Journal {
         Ok(journal)
     }
 
-    /// (F4-R11) THE ROTATION'S SUCCESSOR CREATION — the authorized
-    /// creation of a UNIQUE bound generation: the path must NOT
-    /// exist (the rotation names a fresh nanos-unique generation;
-    /// an existing path is never overwritten — this constructor is
-    /// structurally unable to replace authoritative evidence). The
-    /// durable initialization is the bound form's (one write + one
-    /// fsync + the parent-directory sync).
-    pub fn create_bound_generation(
+    /// (F4-R11/R11-B) THE ROTATION'S SUCCESSOR CREATION — the
+    /// authorized creation of a UNIQUE bound generation, CRATE-
+    /// PRIVATE to the trusted rotation (rotation and the journal
+    /// implementation both live in engine-persist; no external
+    /// caller can manufacture a generation): the data file is
+    /// created ATOMICALLY (create-new — an existing path refuses
+    /// with no check-then-create race; the rotation names a fresh
+    /// nanos-unique generation, and an existing path is never
+    /// overwritten — this constructor is structurally unable to
+    /// replace authoritative evidence). The durable initialization
+    /// is the bound form's (one write + one fsync + the
+    /// parent-directory sync), preserving the established
+    /// identity inheritance, pointer-flip, ownership-record, and
+    /// durability ordering.
+    pub(crate) fn create_bound_generation(
         path: impl Into<PathBuf>,
         founding: &crate::hash::Hash,
         root_id: &crate::hash::Hash,
     ) -> Result<Self, JournalError> {
         let path = path.into();
-        if path.exists() {
-            return Err(JournalError::CorruptHeader {
-                detail: "the bound generation path already exists — never overwritten".into(),
-            });
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err("create journal dir", &path, e))?;
         }
-        Self::open_bound_creating_at(&path, founding, root_id)
+        // THE ATOMIC CREATE-NEW: the nonexistence proof and the
+        // creation are one step (no check-then-create race).
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(JournalError::CorruptHeader {
+                    detail: "the bound generation path already exists — never overwritten".into(),
+                });
+            }
+            Err(error) => {
+                return Err(io_err("create bound generation", &path, error));
+            }
+        };
+        Self::initialize_bound_at(&path, file, founding, root_id)
     }
 
-    /// (F4-R11/F4-R12) THE TRUSTED BOOTSTRAP'S CREATION — the one
-    /// path that may create a missing bound journal or resolve a
-    /// torn PRE-BINDING creation, and it requires the nonforgeable
-    /// [`crate::reclaim::BoundCreationAuthority`]: the verified
-    /// lifecycle state in which NO journal-root binding is installed
-    /// for this founding (the authenticated absence — an empty chain
-    /// or a completed lookup). Once a binding exists the authority
-    /// is unobtainable, so no public path can recreate or repair the
-    /// active journal of a bound campaign. The adoption of an
-    /// existing COMPLETE residue (F4-R12) accepts only an EMPTY
-    /// journal — no committed transactions, no cancellations, a
-    /// clean tail: the trusted bootstrap's ordering journals nothing
-    /// before the binding, so any history is foreign to the
-    /// interrupted-bootstrap residue and refuses with the bytes
-    /// preserved.
-    pub fn open_bound_creating(
-        path: impl Into<PathBuf>,
-        founding: &crate::hash::Hash,
-        root_id: &crate::hash::Hash,
-        authority: &crate::reclaim::BoundCreationAuthority,
-    ) -> Result<Self, JournalError> {
-        if authority.founding() != founding {
-            return Err(JournalError::CorruptHeader {
-                detail: "the creation authority was issued for a different founding".into(),
-            });
-        }
-        Self::open_bound_creating_at(&path.into(), founding, root_id)
-    }
-
-    /// The creation/reuse implementation shared by the bootstrap's
-    /// authority-gated creation and the rotation's unique successor:
-    /// a fresh or torn-creation file is (re-)initialized with the
-    /// bound header (nothing could ever have been journaled); a
-    /// complete matching header is adopted ONLY when empty (F4-R12);
-    /// anything else — a legacy, foreign, or corrupt header, or a
-    /// residue carrying history — refuses typed.
-    fn open_bound_creating_at(
+    /// (F4-R11/R11-A) THE TRUSTED BOOTSTRAP'S CREATION — CRATE-
+    /// PRIVATE, reachable ONLY through
+    /// [`crate::reclaim::create_campaign_bound_journal`]: the single
+    /// narrowly controlled operation that verifies the campaign's
+    /// CURRENT canonical lifecycle (the authenticated binding
+    /// absence, at the moment of creation, against the campaign's
+    /// own medium) and creates or repairs in one indivisible call —
+    /// no detachable authority exists. A MISSING journal file is
+    /// created only at a root showing NO prior journal life (the
+    /// sidecar lock's absence: a root whose lock exists had a
+    /// journal opened or created at it — never a fresh bootstrap's
+    /// target); a torn PRE-BINDING creation resolves (nothing could
+    /// ever have been journaled); an existing COMPLETE residue is
+    /// adopted only when EMPTY (F4-R12); anything else — a legacy,
+    /// foreign, or corrupt header, or a residue carrying history —
+    /// refuses typed.
+    pub(crate) fn open_bound_creating_at(
         path: &Path,
         founding: &crate::hash::Hash,
         root_id: &crate::hash::Hash,
     ) -> Result<Self, JournalError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err("create journal dir", path, e))?;
+        }
+        // (R11-A) THE PRIOR-LIFE CHECK for the absent-data case: the
+        // fresh bootstrap never starts at a root that already shows
+        // journal life. The sidecar lock file is created once, never
+        // unlinked, and outlives any journal data at the path — its
+        // presence with NO data file means a journal was removed
+        // (never a fresh target); the legitimate interrupted
+        // creation always leaves the DATA file (created before the
+        // lock), so the crash-retry paths are unaffected.
+        let data_preexists = path.exists();
+        if !data_preexists && sidecar_lock_exists(path) {
+            return Err(JournalError::CorruptHeader {
+                detail: "the root shows prior journal life — never a fresh bootstrap's \
+                         creation target"
+                    .into(),
+            });
         }
         let file = OpenOptions::new()
             .read(true)
@@ -1773,6 +1792,22 @@ impl T1Journal {
             .truncate(false)
             .open(path)
             .map_err(|e| io_err("open journal", path, e))?;
+        Self::initialize_bound_at(path, file, founding, root_id)
+    }
+
+    /// The shared durable initialization over an already-open data
+    /// file: the lock is taken, the bytes classified, a fresh or
+    /// torn-creation file (re-)initialized with the bound header,
+    /// and a complete matching header adopted ONLY when empty
+    /// (F4-R12 — the trusted ordering journals nothing before the
+    /// binding, so any history is foreign to the residue, refused
+    /// with the bytes preserved).
+    fn initialize_bound_at(
+        path: &Path,
+        file: File,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
         let lock = open_lock_file(path)?;
         let bytes = fs::read(path).map_err(|e| io_err("read journal", path, e))?;
         if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
@@ -2397,6 +2432,18 @@ pub fn hold_publication_lock(path: &Path) -> Result<PublicationLockGuard, Journa
 /// lock lifecycle to corrupt. A same-process second open blocks here
 /// until the first instance drops. The lock deliberately does NOT
 /// cover the data file's bytes (see [`T1Journal::open_with`]).
+/// (R11-A) Whether the sidecar lock file exists at the path (the
+/// prior-journal-life evidence: created once, never unlinked — its
+/// presence with no data file means a journal was removed).
+fn sidecar_lock_exists(path: &Path) -> bool {
+    let mut name = match path.file_name() {
+        Some(name) => name.to_os_string(),
+        None => return false,
+    };
+    name.push(".lock");
+    path.with_file_name(name).exists()
+}
+
 pub fn open_lock_file(path: &Path) -> Result<File, JournalError> {
     let mut name = path
         .file_name()
