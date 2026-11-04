@@ -752,6 +752,53 @@ fn a_real_child_reclamation_death_resumes() {
         let _ = session.reclaim_checkpoint(1);
         panic!("the child must die at the after-medium seam");
     }
+    #[cfg(windows)]
+    {
+        // (OC-C3 CP-2, Windows) The kill seam is legally unreachable
+        // (the session's destructive phase refuses the platform tier
+        // BEFORE any deletion) — no child spawn; the typed refusal
+        // asserted through the real orchestrated path with no
+        // forbidden effect. The POSIX crash/resume substance is
+        // covered on the eligible platforms.
+        let wdir = TestDir::new("reclaim-child-windows");
+        let wlocation = found_location(&wdir, false);
+        let mut wsession = orchestrated(&wdir);
+        checkpoint_prelude(&mut wsession);
+        wsession
+            .publish_checkpoint(10)
+            .expect("the first checkpoint");
+        wsession.tick(&far_presence()).unwrap();
+        assert!(matches!(
+            wsession.commit_canonical().unwrap(),
+            CommitOutcome::Confirmed(_)
+        ));
+        wsession.tick(&near_presence()).unwrap();
+        for _ in 0..100 {
+            wsession.tick(&near_presence()).unwrap();
+        }
+        let ws2 = wsession
+            .submit_publication(wsession.capture_snapshot().unwrap())
+            .unwrap();
+        assert!(matches!(
+            wsession.wait_publication(ws2).unwrap(),
+            PublicationOutcome::Accepted { .. }
+        ));
+        wsession
+            .publish_checkpoint(10)
+            .expect("the second checkpoint");
+        wsession.rotate_journal().expect("the rotation");
+        let records_before = oracle_records_at(&wlocation);
+        let error = wsession.reclaim_checkpoint(1).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("execution/begin-tier-insufficient"),
+            "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
+        );
+        assert!(
+            oracle_records_at(&wlocation) <= records_before + 1,
+            "at most the audit revision added — no begin, no marker, nothing deleted"
+        );
+        return;
+    }
     let dir = TestDir::new("reclaim-child");
     let location = found_location(&dir, false);
     let status = run_child(
@@ -1932,6 +1979,24 @@ fn an_unchanged_snapshot_behind_checkpoint_metadata_and_an_audit_still_satisfies
         .publish_checkpoint(10)
         .expect("the second checkpoint");
     // THE RECLAMATION (the audit revision at HEAD above MK2).
+    #[cfg(windows)]
+    {
+        // (OC-C3 CP-2, Windows) The destructive phase refuses the
+        // platform tier BEFORE any deletion — the close-behind-audit
+        // substance is covered on the eligible platforms; the typed
+        // refusal asserted here with no forbidden effect.
+        let before = oracle_records_at(&location);
+        let error = session.reclaim_checkpoint(1).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("execution/begin-tier-insufficient"),
+            "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
+        );
+        assert!(
+            oracle_records_at(&location) <= before + 1,
+            "at most the audit revision added — no begin, no marker, nothing deleted"
+        );
+        return;
+    }
     session.reclaim_checkpoint(1).expect("the reclamation");
     let records_before = oracle_records_at(&location);
     // THE CLOSE of the unchanged state: the audit and MK2 pass (non-
