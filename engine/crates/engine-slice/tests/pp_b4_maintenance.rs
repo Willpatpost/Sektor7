@@ -762,7 +762,7 @@ fn windows_refuses_reclamation_death() -> bool {
     // window), its units and content objects, the HEAD, the
     // complete object-identity snapshot, and the journal
     // generations.
-    let mut medium = LocalFileMedium::open(&wdir.store()).unwrap();
+    let mut medium = LocalFileMedium::open(wdir.store()).unwrap();
     let summary_before = medium.validate().unwrap();
     assert!(summary_before.checkpoints.len() > 1);
     let mut targeted: Vec<Hash> = Vec::new();
@@ -796,7 +796,7 @@ fn windows_refuses_reclamation_death() -> bool {
         "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
     );
     // The affirmative no-forbidden-effect proof.
-    let mut medium = LocalFileMedium::open(&wdir.store()).unwrap();
+    let mut medium = LocalFileMedium::open(wdir.store()).unwrap();
     let summary_after = medium.validate().unwrap();
     for identity in &targeted {
         medium
