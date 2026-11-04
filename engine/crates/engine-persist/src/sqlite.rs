@@ -6263,18 +6263,27 @@ mod exclusion_tests {
     }
     #[test]
     fn the_r1_attack_refuses_at_every_boundary() {
-        // (OC-C3 CP-2 §9) The R1 attack end-to-end: the forged
-        // self-consistent audit/checkpoint with the original
-        // retirement evidence absent and NO begin ever published —
-        // refused at the provider deletion gate, at the direct
-        // completion publication, and at the completion wrapper;
-        // the failed fresh admission (the degraded evidence) never
-        // manufactures a retroactive begin.
+        // (OC-C3 CP-2 §9; CP2-R2-D) The R1 attack end-to-end at the
+        // SQLite provider's boundaries: the GENUINE
+        // checkpoint/audit fixture (sqlite_begin_store — a real
+        // campaign, a real published audit) with the original
+        // retirement evidence DELETED after the fact — the
+        // DEGRADATION shape the attack presents — and NO begin ever
+        // published. Refused at the provider deletion gate (the
+        // definite begin absence), at the direct completion
+        // publication, and at the completion wrapper; the failed
+        // fresh admission (the degraded evidence) never manufactures
+        // a retroactive begin. (The distinct FABRICATED-evidence
+        // scenario — a self-consistent invented checkpoint/audit —
+        // is covered at the admission boundary by the local
+        // fabricated-range/digest-order regressions and at the
+        // completion boundary by this test's hand-built marker: the
+        // canonical validation is never weakened to construct it.)
         let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
             sqlite_begin_store("r1-attack");
-        // THE R1 SHAPE: the original retirement evidence deleted
-        // (the newest-first prefix — exactly what the forged attack
-        // or degradation presents), NO begin ever published.
+        // THE R1 DEGRADATION: the original retirement evidence
+        // deleted (the genuine audit's unit records — exactly what
+        // the degradation presents), NO begin ever published.
         let (ledger, _meta) =
             crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
         for unit in &ledger.units {

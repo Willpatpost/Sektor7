@@ -3558,6 +3558,133 @@ mod exclusion_tests {
     }
 
     #[test]
+    fn the_local_r1_degraded_evidence_refuses_at_every_boundary() {
+        // (OC-C3 CP-2 §9; CP2-R2-A) The R1 entry-point matrix at the
+        // LOCAL execution boundary: the GENUINE checkpoint/audit
+        // fixture (trusted_execution_store — a real campaign, a real
+        // published audit) with the original retirement evidence
+        // DELETED (the degradation shape) and NO begin ever
+        // published. The provider deletion gate refuses the DEFINITE
+        // begin absence (the distinct typed rule — the begin
+        // record's canonical absence, not the missing originals);
+        // the fresh admission cannot manufacture a retroactive begin
+        // from the missing originals (its first-execution evidence
+        // core fails closed on the absent record); no additional
+        // deletion occurs (the complete object-identity snapshot is
+        // unchanged across every refused attempt, the survivor AND
+        // the mandatory content both still present and hash-valid);
+        // and no terminal completion is published. On Windows the
+        // provider gate refuses the platform tier FIRST (the
+        // independent ProcessCrashOnly proof — never an ineligible
+        // positive destruction) with the same unchanged-store
+        // guarantee.
+        let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        // THE DEGRADATION: every unit record deleted (the units run
+        // newest-first — the deletion-prefix shape the provider's
+        // own interruption discipline leaves).
+        for unit in &ledger.units {
+            std::fs::remove_file(medium.object_path(&unit.record)).unwrap();
+        }
+        let directive = crate::reclaim::ReclaimDirective {
+            audit_record: audit,
+            units: ledger.units.clone(),
+        };
+        // The identity snapshot after the degradation (the baseline
+        // every refused attempt must preserve exactly).
+        let objects_before: std::collections::BTreeSet<String> =
+            std::fs::read_dir(root.join("objects"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        // (a) THE PROVIDER DELETION GATE.
+        let error = medium.reclaim(&directive).unwrap_err();
+        if cfg!(windows) {
+            // The platform tier refuses FIRST — the independent
+            // ProcessCrashOnly proof.
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "the Windows provider gate refuses the platform tier: {error:?}"
+            );
+            let objects_after: std::collections::BTreeSet<String> =
+                std::fs::read_dir(root.join("objects"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+            assert_eq!(objects_after, objects_before, "nothing changed");
+            assert!(
+                crate::reclaim::find_installed_completion(&mut medium, &mk)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the provider gate refuses the definite begin absence: {error:?}"
+        );
+        // (b) THE FRESH ADMISSION: the first-execution evidence core
+        // fails closed on the missing originals — no retroactive
+        // begin is manufactured from the degradation.
+        let error = medium.begin_reclamation(&audit, &mk, 240).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::MissingObject { .. }
+                    | MediumError::Chain {
+                        rule: "begin-admission/units-objects-mismatch"
+                    }
+            ),
+            "the degraded evidence cannot be authorized: {error:?}"
+        );
+        // The gate still refuses after the failed admission.
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the gate still refuses after the failed admission: {error:?}"
+        );
+        // NO ADDITIONAL DELETION: the identity snapshot is unchanged
+        // across all three refused attempts, and both the survivor
+        // content and the mandatory content remain present and
+        // hash-valid (the provider's reads verify the hash).
+        medium.read_object(&shared).unwrap();
+        medium.read_object(&private).unwrap();
+        let objects_after: std::collections::BTreeSet<String> =
+            std::fs::read_dir(root.join("objects"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(objects_after, objects_before, "no additional deletion");
+        // NO TERMINAL COMPLETION.
+        assert!(
+            crate::reclaim::find_installed_completion(&mut medium, &mk)
+                .unwrap()
+                .is_none(),
+            "no completion marker was published"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn an_interrupted_execution_resumes_from_the_persisted_audit() {
         // The interrupted recovery: the record pass partially
         // executed (one record physically deleted by hand — the

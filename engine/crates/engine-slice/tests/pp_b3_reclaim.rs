@@ -24,7 +24,9 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
+use engine_persist::checkpoint::{CheckpointMetadata, ReclaimedIndexEntry, chain_range_digest};
 use engine_persist::local::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
+use engine_persist::reclaim::{ReclaimUnit, ReclamationLedger, publish_reclamation_ledger};
 use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, LocalFileMedium, MediumError, POINTER_DIR_SYNC_FAULT,
     PipelineError, RevisionRecord, SqliteMedium, StoredObject, T1Journal, active_journal_path,
@@ -422,6 +424,259 @@ fn a_hand_deleted_range_record_without_an_audit_fails_closed() {
     }
 }
 
+/// (CP2-R2) The R1 crossing fixture: the GENUINE two-checkpoint
+/// campaign with the GENUINE audit installed through the same
+/// publication Phase A uses (publish_reclamation_ledger over the
+/// metadata-derived ledger — the digest recomputed over the
+/// still-present range bytes, the units newest-first) and NO begin
+/// ever published. Returns (audit, mk, ledger): the beginless
+/// audited retirement every R1 crossing case degrades from.
+fn r1_beginless_audited_campaign(dir: &TestDir, campaign: &str) -> (Hash, Hash, ReclamationLedger) {
+    let (spine, director, _crossing, _s1, _mk1) = two_checkpoint_campaign(dir, campaign);
+    drop(spine);
+    drop(director);
+    let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+    let summary = medium.validate().unwrap();
+    let oldest_mk = *summary.checkpoints.last().unwrap();
+    let mk_record = medium.read_record(&oldest_mk).unwrap();
+    let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+    let metadata = CheckpointMetadata::decode(&meta_bytes).unwrap();
+    // The Phase A derivation (the crossing's own construction): the
+    // index sorted by epoch, the units newest-first, the digest
+    // recomputed oldest-first over the still-present bytes.
+    let mut indexed: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
+    indexed.sort_unstable_by_key(|entry| entry.epoch);
+    let mut range_bytes = Vec::with_capacity(indexed.len());
+    let mut units: Vec<ReclaimUnit> = Vec::with_capacity(indexed.len());
+    for entry in indexed.iter().rev() {
+        let record = medium.read_record(&entry.hash).unwrap();
+        if entry.hash != metadata.sk {
+            range_bytes.push(record.canonical_bytes());
+        }
+        units.push(ReclaimUnit {
+            record: entry.hash,
+            objects: record.content_refs.clone(),
+        });
+    }
+    range_bytes.reverse();
+    assert_eq!(
+        chain_range_digest(&metadata.seed, &range_bytes),
+        metadata.range_digest,
+        "the fixture's recomputed digest matches the permanent metadata"
+    );
+    let ledger = ReclamationLedger {
+        mk: oldest_mk,
+        sk: metadata.sk,
+        range_digest: metadata.range_digest,
+        seed: metadata.seed,
+        records: metadata.range_records,
+        reclaimed_keys: metadata
+            .index
+            .iter()
+            .filter(|entry| entry.key.is_some())
+            .count() as u64,
+        journal_files: Vec::new(),
+        units,
+    };
+    let head = medium.head().unwrap().unwrap();
+    let tick = medium.read_record(&head).unwrap().tick.saturating_add(1);
+    let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, tick).unwrap();
+    assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+    (audit, oldest_mk, ledger)
+}
+
+#[test]
+fn the_r1_degraded_evidence_fails_closed_through_the_real_crossing() {
+    // (CP2-R2-B) The R1 entry-point matrix at the production
+    // crossing's NORMAL EXECUTION path: the genuine audit installed,
+    // the range's TOP unit record deleted (the mid-unit crash shape
+    // — the E1-legal deletion prefix, the manifest still pending on
+    // the remaining bytes), NO begin. The crossing's provider gate
+    // refuses the DEFINITE begin absence — the only rule that
+    // triggers the fresh admission — and the admission's
+    // first-execution evidence core fails closed on the missing
+    // original (the propagated typed outcome names the deleted
+    // identity): no retroactive begin, no new deletion, no terminal
+    // completion. On Windows the provider gate refuses the platform
+    // tier first (the independent ProcessCrashOnly proof) with the
+    // same no-forbidden-effect guarantees.
+    let dir = TestDir::new("r1-crossing-degraded");
+    let (audit, mk, ledger) = r1_beginless_audited_campaign(&dir, "r1-crossing-degraded");
+    // THE DEGRADATION: the range's TOP unit record deleted (the
+    // newest index member — the deletion-prefix shape the
+    // provider's own interruption discipline leaves; the unit's
+    // content objects remain, so the manifest stays pending).
+    let top = ledger.units[0].record;
+    std::fs::remove_file(dir.store().join("objects").join(top.hex())).unwrap();
+    // The baseline after the degradation.
+    let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+    medium.validate().unwrap();
+    drop(medium);
+    let objects_before = object_identities(&dir.store());
+    // THE CROSSING PASS — the real path.
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "r1-crossing-degraded")
+            .expect("the recovery works over the degraded chain");
+    let error = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the beginless degraded state never reclaims");
+    if cfg!(windows) {
+        // The platform tier refuses FIRST (the independent
+        // ProcessCrashOnly proof) — the same typed nesting.
+        assert!(
+            matches!(
+                &error,
+                TransitionError::JournalFailed(PipelineError::Medium(MediumError::Chain {
+                    rule: "execution/begin-tier-insufficient"
+                }))
+            ),
+            "the Windows provider gate refuses the platform tier: {error:?}"
+        );
+    } else {
+        // POSIX: the provider gate's definite begin absence triggers
+        // the crossing's fresh admission, whose first-execution
+        // evidence core fails closed on the missing original — the
+        // propagated typed outcome names the deleted identity.
+        assert!(
+            matches!(
+                &error,
+                TransitionError::JournalFailed(PipelineError::Medium(
+                    MediumError::MissingObject { hash }
+                )) if *hash == top
+            ),
+            "the fresh admission fails closed on the missing original: {error:?}"
+        );
+    }
+    drop(crossing);
+    // NO RETROACTIVE BEGIN: the begin authority for the audited
+    // retirement is definitely absent (the check precedes any tier
+    // gate — platform-independent).
+    let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+    medium.validate().unwrap();
+    let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MediumError::Chain {
+                rule: "begin-authority/absent"
+            }
+        ),
+        "the failed admission manufactured no begin: {error:?}"
+    );
+    // NO NEW DELETION: the identity snapshot is exactly the
+    // post-degradation baseline (the audit was installed by the
+    // fixture before the baseline; the refused pass appended and
+    // removed nothing).
+    let objects_after = object_identities(&dir.store());
+    assert_eq!(objects_after, objects_before, "no new deletion occurred");
+    // NO TERMINAL COMPLETION.
+    assert!(
+        engine_persist::reclaim::find_installed_completion(&mut medium, &mk)
+            .unwrap()
+            .is_none(),
+        "no completion marker was published"
+    );
+}
+
+#[test]
+fn the_r1_beginless_satisfied_state_refuses_certification_through_the_crossing() {
+    // (CP2-R2-C) The R1 entry-point matrix at the production
+    // crossing's COMPLETION path: the genuine audit installed, the
+    // retirement's medium-storage obligations ALREADY satisfied
+    // (every unit record deleted, every MANDATORY object deleted,
+    // the DEFERRED survivors preserved exactly as the real execution
+    // leaves them — the construction verified by the completion
+    // state's own oracle), NO marker, NO begin. The crossing's
+    // selection takes the already-satisfied branch — the path that
+    // would otherwise publish the terminal marker through
+    // complete_reclamation — and the completion gate refuses the
+    // beginless state: the provider begin authority is required and
+    // the state cannot be certified. Platform-independent (the
+    // begin-authority absence is checked before any tier gate at
+    // this boundary — Windows gets the same real refusal, not a
+    // tier substitute).
+    let dir = TestDir::new("r1-crossing-satisfied");
+    let (audit, mk, ledger) = r1_beginless_audited_campaign(&dir, "r1-crossing-satisfied");
+    // THE FULLY-SATISFIED CONSTRUCTION. The order matters: the
+    // partition is computed and the MANDATORY objects deleted while
+    // the unit records still REFERENCE them (an open-time sweep
+    // would otherwise quarantine the newly-unreferenced objects —
+    // a PENDING state, not a satisfied one; the quarantine family
+    // keeps the manifest pending by design). Only then are the unit
+    // records themselves deleted — the real execution's end state:
+    // every retiring record absent, every mandatory identity
+    // absent, the deferred survivors' references preserved.
+    let objects = dir.store().join("objects");
+    let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+    let exclusion: BTreeSet<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+    let survivors = engine_persist::reclaim::survivor_objects(&mut medium, &exclusion).unwrap();
+    let partition = engine_persist::reclaim::partition_reclaim(&ledger.units, &survivors).unwrap();
+    for identity in &partition.mandatory {
+        // The unit RECORDS are deleted below, after their objects
+        // (the mandatory set carries them alongside the content
+        // objects — the whole-revision units).
+        if exclusion.contains(identity) {
+            continue;
+        }
+        std::fs::remove_file(objects.join(identity.hex())).unwrap();
+    }
+    for unit in &ledger.units {
+        std::fs::remove_file(objects.join(unit.record.hex())).unwrap();
+    }
+    // The construction's own oracle: the completion state verifies —
+    // the obligations met, the residue checks pass, the deferred
+    // survivors present and hash-valid.
+    let (mandatory_count, _deferred) =
+        engine_persist::reclaim::verify_completion_state(&mut medium, &ledger).unwrap();
+    assert_eq!(mandatory_count, partition.mandatory.len() as u64);
+    drop(medium);
+    let objects_before = object_identities(&dir.store());
+    // THE CROSSING PASS — the real path (the completion branch).
+    let (_spine, _director, mut crossing) =
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "r1-crossing-satisfied")
+            .expect("the recovery works over the satisfied chain");
+    let error = crossing
+        .reclaim_checkpoint(&dir.journal(), 1)
+        .expect_err("the beginless satisfied state is never certified");
+    // THE COMPLETION GATE: the provider begin authority is required
+    // — the definite begin-authority absence refuses the
+    // certification (the marker publication never happens).
+    assert!(
+        matches!(
+            &error,
+            TransitionError::JournalFailed(PipelineError::Medium(MediumError::Chain {
+                rule: "begin-authority/absent"
+            }))
+        ),
+        "the beginless satisfied state cannot be certified: {error:?}"
+    );
+    drop(crossing);
+    // NO MARKER, NO BEGIN, NO CHANGE.
+    let mut medium = LocalFileMedium::open(dir.store()).unwrap();
+    medium.validate().unwrap();
+    assert!(
+        engine_persist::reclaim::find_installed_completion(&mut medium, &mk)
+            .unwrap()
+            .is_none(),
+        "no terminal marker was published"
+    );
+    let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MediumError::Chain {
+                rule: "begin-authority/absent"
+            }
+        ),
+        "no begin exists for the audited retirement: {error:?}"
+    );
+    let objects_after = object_identities(&dir.store());
+    assert_eq!(
+        objects_after, objects_before,
+        "the refused certification changed nothing"
+    );
+}
+
 #[test]
 fn the_full_stack_rotates_then_reclaims_the_range_and_the_old_journal() {
     // THE full stack: two checkpoints, an outstanding unconfirmed
@@ -684,15 +939,21 @@ fn the_multi_checkpoint_example_the_mandatory_retirement_chain() {
 /// armed seam inside the real Phase B.
 const RECLAIM_CHILD_STORE_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_STORE";
 const RECLAIM_CHILD_JOURNAL_ENV: &str = "S7_PP_B3_RECLAIM_CHILD_JOURNAL";
-/// (OC-C3 CP-2, Windows) The platform-policy guard for the
+/// (OC-C3 CP-2, Windows; CP2-R1) The platform-policy guard for the
 /// LocalFileMedium-backed reclamation tests: the LocalFileMedium
 /// tier is platform-determined (Windows = ProcessCrashOnly per
 /// OC-P2), so the REAL crossing's destructive phase refuses the
-/// typed platform tier BEFORE any deletion. Asserts the typed nested
-/// refusal and the absence of forbidden effects — at most the audit
-/// revision may have been committed (the protocol's stage ordering);
-/// no begin, no marker, nothing deleted — then cleans the store.
-/// Returns true when the caller should STOP (the Windows path).
+/// typed platform tier BEFORE any deletion. The no-forbidden-effect
+/// proof is AFFIRMATIVE (CP2-R1): the targeted retirement's records
+/// and content objects captured before the refusal remain present
+/// and hash-valid after it; no trusted begin was published (the
+/// definite begin-authority absence for the audited retirement); no
+/// terminal completion marker was installed; the journal
+/// generations were not retired; the store reopens valid and
+/// usable; and any HEAD advancement is EXCLUSIVELY the permitted
+/// audit revision (decoded and MK-bound, its object files the only
+/// additions). Returns true when the caller should STOP (the
+/// Windows path).
 #[cfg(windows)]
 fn windows_refuses_destruction(
     crossing: &mut SessionCrossing<StoreLocation>,
@@ -700,29 +961,152 @@ fn windows_refuses_destruction(
     store: &std::path::Path,
     generations: u64,
 ) -> bool {
-    let before = LocalFileMedium::open(store)
-        .unwrap()
-        .validate()
-        .unwrap()
-        .records;
+    // (1) The targeted retirement: every checkpoint outside the
+    // retention window, its unit records, and their content
+    // objects, captured before the refusal.
+    let mut medium = LocalFileMedium::open(store).unwrap();
+    let summary_before = medium.validate().unwrap();
+    let protected = generations as usize;
+    assert!(
+        summary_before.checkpoints.len() > protected,
+        "an eligible retirement exists for the guard"
+    );
+    let mut targeted: Vec<Hash> = Vec::new();
+    for mk in &summary_before.checkpoints[protected..] {
+        let record = medium.read_record(mk).unwrap();
+        let meta_bytes = medium.read_object(&record.content_refs[0]).unwrap();
+        let metadata = engine_persist::checkpoint::CheckpointMetadata::decode(&meta_bytes).unwrap();
+        for entry in &metadata.index {
+            targeted.push(entry.hash);
+            let unit = medium.read_record(&entry.hash).unwrap();
+            targeted.extend(unit.content_refs.iter().copied());
+        }
+    }
+    let head_before = medium.head().unwrap().unwrap();
+    let records_before = summary_before.records;
+    let objects_before = object_identities(store);
+    let journals_before = journal_identities(journal);
+    drop(medium);
+    // (2) The refusal — the exact nested typed structure (the
+    // platform tier, not a substring match).
     let error = crossing
         .reclaim_checkpoint(journal, generations)
         .unwrap_err();
     assert!(
-        format!("{error:?}").contains("execution/begin-tier-insufficient"),
+        matches!(
+            &error,
+            TransitionError::JournalFailed(PipelineError::Medium(MediumError::Chain {
+                rule: "execution/begin-tier-insufficient"
+            }))
+        ),
         "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
     );
-    let after = LocalFileMedium::open(store)
-        .unwrap()
-        .validate()
-        .unwrap()
-        .records;
+    // (3)–(8): the affirmative no-forbidden-effect proof.
+    let mut medium = LocalFileMedium::open(store).unwrap();
+    let summary_after = medium.validate().unwrap();
+    // (3)+(4): every targeted record and content object still
+    // present and hash-valid (the provider's read verifies the
+    // hash) — the mandatory content was not destructively retired.
+    for identity in &targeted {
+        medium
+            .read_object(identity)
+            .expect("the targeted retirement evidence survives the refusal");
+    }
+    // The audit accounting: any HEAD advancement is exclusively the
+    // permitted audit revision for the targeted retirement.
+    let head_after = medium.head().unwrap().unwrap();
+    let mut expected_added: BTreeSet<String> = BTreeSet::new();
+    if head_after != head_before {
+        assert_eq!(
+            summary_after.records,
+            records_before + 1,
+            "exactly the audit revision was appended"
+        );
+        let audit_record = medium.read_record(&head_after).unwrap();
+        let audit_bytes = medium.read_object(&audit_record.content_refs[0]).unwrap();
+        let ledger = engine_persist::reclaim::ReclamationLedger::decode(&audit_bytes).unwrap();
+        assert!(
+            summary_before.checkpoints.contains(&ledger.mk),
+            "the appended revision is the targeted retirement's audit"
+        );
+        expected_added.insert(head_after.hex());
+        expected_added.insert(audit_record.content_refs[0].hex());
+        // (5): no trusted begin — the definite begin-authority
+        // absence for the audited retirement.
+        let error = medium
+            .verify_begin_authority(&head_after, &ledger.mk)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "no begin was published by the refused pass: {error:?}"
+        );
+    } else {
+        assert_eq!(
+            summary_after.records, records_before,
+            "nothing was appended by the refused pass"
+        );
+    }
+    let objects_after = object_identities(store);
+    let added: BTreeSet<String> = objects_after.difference(&objects_before).cloned().collect();
+    let removed: BTreeSet<String> = objects_before.difference(&objects_after).cloned().collect();
     assert!(
-        after <= before + 1,
-        "at most the audit revision added — no begin, no marker, nothing deleted"
+        removed.is_empty(),
+        "nothing was deleted by the refused pass"
     );
+    assert_eq!(
+        added, expected_added,
+        "the only additions are the permitted audit revision's objects"
+    );
+    // (6): no terminal completion marker for any targeted
+    // checkpoint.
+    for mk in &summary_before.checkpoints[protected..] {
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, mk)
+                .unwrap()
+                .is_none(),
+            "no completion marker was published by the refused pass"
+        );
+    }
+    // (7): the audited journal generations and their retirement
+    // evidence were not removed.
+    assert_eq!(
+        journal_identities(journal),
+        journals_before,
+        "the journal generations survive the refusal"
+    );
+    drop(medium);
     let _ = std::fs::remove_dir_all(store);
     true
+}
+
+/// (CP2-R1) The complete object-identity snapshot: every file name
+/// in the store's content-addressed object namespace (the Windows
+/// no-forbidden-effect guards and the R1 crossing cases share it).
+fn object_identities(store: &std::path::Path) -> BTreeSet<String> {
+    std::fs::read_dir(store.join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// (CP2-R1, Windows) The journal-generation snapshot: every file
+/// name in the journal root's directory (the active journal, the
+/// stale generations, and their sidecar locks — the reclamation's
+/// journal-retirement targets).
+#[cfg(windows)]
+fn journal_identities(journal: &std::path::Path) -> BTreeSet<String> {
+    let dir = journal
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The recursive store size (the F3 non-accumulation measurement).

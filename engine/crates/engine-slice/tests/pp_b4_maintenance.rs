@@ -17,6 +17,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 
 use engine_core::{EventClass, EventSpec, LodLevel, PresenceSample, Schedule, Spine, Tick};
+#[cfg(windows)]
+use engine_persist::checkpoint::CheckpointMetadata;
 use engine_persist::{
     AuthorityMode, AwardCheckpoint, CancellationReason, CanonicalMedium, ClassifiedSpan,
     CommitOutcome, ConsequenceEnvelope, ConsequenceId, CounterValues, Coverage, DurabilityClass,
@@ -24,6 +26,8 @@ use engine_persist::{
     SourceBaseline, SourcePosition, StoredObject, SyncTier, T1Journal, TransactionInput,
     active_journal_path,
 };
+#[cfg(windows)]
+use engine_persist::{Hash, LocalFileMedium, MediumError, PipelineError};
 use engine_slice::crossing::{ARM_AFTER_SK_EXIT, ARM_RECLAIM_AFTER_MEDIUM, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::orchestration::{
@@ -709,11 +713,19 @@ fn the_rotation_retirement_evidence_distinguishes_canceled_from_subsumed() {
     assert!(rotation.retired.contains(&t1));
 }
 
-/// (OC-C3 CP-2, Windows) The platform-policy guard for the
+/// (OC-C3 CP-2, Windows; CP2-R1) The platform-policy guard for the
 /// reclamation-death test: the kill seam is legally unreachable (the
 /// session's destructive phase refuses the platform tier BEFORE any
-/// deletion) — no child spawn; the typed refusal asserted through the
-/// real orchestrated path with no forbidden effect. The POSIX
+/// deletion) — no child spawn. The no-forbidden-effect proof is
+/// AFFIRMATIVE (CP2-R1): the targeted retirement's records and
+/// content objects captured before the refusal remain present and
+/// hash-valid after it; no trusted begin was published (the
+/// definite begin-authority absence for the audited retirement); no
+/// terminal completion marker was installed; the journal
+/// generations (including the rotation's stale ones) were not
+/// retired; the store reopens valid and usable; and any HEAD
+/// advancement is EXCLUSIVELY the permitted audit revision (decoded
+/// and MK-bound, its object files the only additions). The POSIX
 /// crash/resume substance is covered on the eligible platforms.
 /// Returns true when the caller should STOP (the Windows path).
 #[cfg(windows)]
@@ -745,17 +757,142 @@ fn windows_refuses_reclamation_death() -> bool {
         .publish_checkpoint(10)
         .expect("the second checkpoint");
     wsession.rotate_journal().expect("the rotation");
-    let records_before = oracle_records_at(&wlocation);
+    // (CP2-R1) The affirmative no-forbidden-effect capture: the
+    // targeted retirement (the oldest checkpoint outside the
+    // window), its units and content objects, the HEAD, the
+    // complete object-identity snapshot, and the journal
+    // generations.
+    let mut medium = LocalFileMedium::open(&wdir.store()).unwrap();
+    let summary_before = medium.validate().unwrap();
+    assert!(summary_before.checkpoints.len() > 1);
+    let mut targeted: Vec<Hash> = Vec::new();
+    for mk in &summary_before.checkpoints[1..] {
+        let record = medium.read_record(mk).unwrap();
+        let meta_bytes = medium.read_object(&record.content_refs[0]).unwrap();
+        let metadata = CheckpointMetadata::decode(&meta_bytes).unwrap();
+        for entry in &metadata.index {
+            targeted.push(entry.hash);
+            let unit = medium.read_record(&entry.hash).unwrap();
+            targeted.extend(unit.content_refs.iter().copied());
+        }
+    }
+    let head_before = medium.head().unwrap().unwrap();
+    let records_before = summary_before.records;
+    let objects_before = windows_object_identities(&wdir.store());
+    let journals_before = windows_journal_identities(&wdir.journal());
+    drop(medium);
+    // The refusal — the exact nested typed structure (the platform
+    // tier, not a substring match).
     let error = wsession.reclaim_checkpoint(1).unwrap_err();
     assert!(
-        format!("{error:?}").contains("execution/begin-tier-insufficient"),
+        matches!(
+            &error,
+            MaintenanceError::Compound(TransitionError::JournalFailed(PipelineError::Medium(
+                MediumError::Chain {
+                    rule: "execution/begin-tier-insufficient"
+                }
+            )))
+        ),
         "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
     );
+    // The affirmative no-forbidden-effect proof.
+    let mut medium = LocalFileMedium::open(&wdir.store()).unwrap();
+    let summary_after = medium.validate().unwrap();
+    for identity in &targeted {
+        medium
+            .read_object(identity)
+            .expect("the targeted retirement evidence survives the refusal");
+    }
+    let head_after = medium.head().unwrap().unwrap();
+    let mut expected_added: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if head_after != head_before {
+        assert_eq!(
+            summary_after.records,
+            records_before + 1,
+            "exactly the audit revision was appended"
+        );
+        let audit_record = medium.read_record(&head_after).unwrap();
+        let audit_bytes = medium.read_object(&audit_record.content_refs[0]).unwrap();
+        let ledger = engine_persist::reclaim::ReclamationLedger::decode(&audit_bytes).unwrap();
+        assert!(
+            summary_before.checkpoints.contains(&ledger.mk),
+            "the appended revision is the targeted retirement's audit"
+        );
+        expected_added.insert(head_after.hex());
+        expected_added.insert(audit_record.content_refs[0].hex());
+        let error = medium
+            .verify_begin_authority(&head_after, &ledger.mk)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "no begin was published by the refused pass: {error:?}"
+        );
+    } else {
+        assert_eq!(
+            summary_after.records, records_before,
+            "nothing was appended by the refused pass"
+        );
+    }
+    let objects_after = windows_object_identities(&wdir.store());
+    let added: std::collections::BTreeSet<String> =
+        objects_after.difference(&objects_before).cloned().collect();
+    let removed: std::collections::BTreeSet<String> =
+        objects_before.difference(&objects_after).cloned().collect();
     assert!(
-        oracle_records_at(&wlocation) <= records_before + 1,
-        "at most the audit revision added — no begin, no marker, nothing deleted"
+        removed.is_empty(),
+        "nothing was deleted by the refused pass"
     );
+    assert_eq!(
+        added, expected_added,
+        "the only additions are the permitted audit revision's objects"
+    );
+    for mk in &summary_before.checkpoints[1..] {
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, mk)
+                .unwrap()
+                .is_none(),
+            "no completion marker was published by the refused pass"
+        );
+    }
+    assert_eq!(
+        windows_journal_identities(&wdir.journal()),
+        journals_before,
+        "the journal generations survive the refusal"
+    );
+    drop(medium);
+    drop(wsession);
+    drop(wlocation);
     true
+}
+
+/// (CP2-R1, Windows) The complete object-identity snapshot: every
+/// file name in the store's content-addressed object namespace.
+#[cfg(windows)]
+fn windows_object_identities(store: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(store.join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// (CP2-R1, Windows) The journal-generation snapshot: every file
+/// name in the journal root's directory (the active journal, the
+/// rotation's stale generations, and their sidecar locks — the
+/// reclamation's journal-retirement targets).
+#[cfg(windows)]
+fn windows_journal_identities(journal: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let dir = journal
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// I (+P's reclamation boundary) — the REAL-CHILD reclamation death
@@ -1950,24 +2087,130 @@ fn a_future_version_snapshot_supersedes_and_recovery_fails_closed() {
     }
 }
 
-/// (OC-C3 CP-2, Windows) The platform-policy guard for the
+/// (OC-C3 CP-2, Windows; CP2-R1) The platform-policy guard for the
 /// close-matrix test's destructive reclaim: the destructive phase
-/// refuses the platform tier BEFORE any deletion — the typed refusal
-/// asserted with no forbidden effect. The close-behind-audit
-/// substance is covered on the eligible platforms. Returns true when
-/// the caller should STOP (the Windows path).
+/// refuses the platform tier BEFORE any deletion. The
+/// no-forbidden-effect proof is AFFIRMATIVE (CP2-R1): the targeted
+/// retirement's records and content objects captured before the
+/// refusal remain present and hash-valid after it; no trusted begin
+/// was published; no terminal completion marker was installed; the
+/// journal generations were not retired; the store reopens valid;
+/// and any HEAD advancement is EXCLUSIVELY the permitted audit
+/// revision. The close-behind-audit substance is covered on the
+/// eligible platforms. Returns true when the caller should STOP
+/// (the Windows path).
 #[cfg(windows)]
-fn windows_refuses_reclaim(session: &mut OrchestratedSession, location: &StoreLocation) -> bool {
-    let before = oracle_records_at(location);
+fn windows_refuses_reclaim(
+    session: &mut OrchestratedSession,
+    location: &StoreLocation,
+    journal: &std::path::Path,
+) -> bool {
+    let StoreLocation::Directory(store) = location else {
+        panic!("the close-matrix guard is the LocalFileMedium path");
+    };
+    // (CP2-R1) The affirmative no-forbidden-effect capture.
+    let mut medium = LocalFileMedium::open(store).unwrap();
+    let summary_before = medium.validate().unwrap();
+    assert!(summary_before.checkpoints.len() > 1);
+    let mut targeted: Vec<Hash> = Vec::new();
+    for mk in &summary_before.checkpoints[1..] {
+        let record = medium.read_record(mk).unwrap();
+        let meta_bytes = medium.read_object(&record.content_refs[0]).unwrap();
+        let metadata = CheckpointMetadata::decode(&meta_bytes).unwrap();
+        for entry in &metadata.index {
+            targeted.push(entry.hash);
+            let unit = medium.read_record(&entry.hash).unwrap();
+            targeted.extend(unit.content_refs.iter().copied());
+        }
+    }
+    let head_before = medium.head().unwrap().unwrap();
+    let records_before = summary_before.records;
+    let objects_before = windows_object_identities(store);
+    let journals_before = windows_journal_identities(journal);
+    drop(medium);
+    // The refusal — the exact nested typed structure.
     let error = session.reclaim_checkpoint(1).unwrap_err();
     assert!(
-        format!("{error:?}").contains("execution/begin-tier-insufficient"),
+        matches!(
+            &error,
+            MaintenanceError::Compound(TransitionError::JournalFailed(PipelineError::Medium(
+                MediumError::Chain {
+                    rule: "execution/begin-tier-insufficient"
+                }
+            )))
+        ),
         "the Windows destructive refusal is the typed platform tier (OC-P2): {error:?}"
     );
+    // The affirmative no-forbidden-effect proof.
+    let mut medium = LocalFileMedium::open(store).unwrap();
+    let summary_after = medium.validate().unwrap();
+    for identity in &targeted {
+        medium
+            .read_object(identity)
+            .expect("the targeted retirement evidence survives the refusal");
+    }
+    let head_after = medium.head().unwrap().unwrap();
+    let mut expected_added: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if head_after != head_before {
+        assert_eq!(
+            summary_after.records,
+            records_before + 1,
+            "exactly the audit revision was appended"
+        );
+        let audit_record = medium.read_record(&head_after).unwrap();
+        let audit_bytes = medium.read_object(&audit_record.content_refs[0]).unwrap();
+        let ledger = engine_persist::reclaim::ReclamationLedger::decode(&audit_bytes).unwrap();
+        assert!(
+            summary_before.checkpoints.contains(&ledger.mk),
+            "the appended revision is the targeted retirement's audit"
+        );
+        expected_added.insert(head_after.hex());
+        expected_added.insert(audit_record.content_refs[0].hex());
+        let error = medium
+            .verify_begin_authority(&head_after, &ledger.mk)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "no begin was published by the refused pass: {error:?}"
+        );
+    } else {
+        assert_eq!(
+            summary_after.records, records_before,
+            "nothing was appended by the refused pass"
+        );
+    }
+    let objects_after = windows_object_identities(store);
+    let added: std::collections::BTreeSet<String> =
+        objects_after.difference(&objects_before).cloned().collect();
+    let removed: std::collections::BTreeSet<String> =
+        objects_before.difference(&objects_after).cloned().collect();
     assert!(
-        oracle_records_at(location) <= before + 1,
-        "at most the audit revision added — no begin, no marker, nothing deleted"
+        removed.is_empty(),
+        "nothing was deleted by the refused pass"
     );
+    assert_eq!(
+        added, expected_added,
+        "the only additions are the permitted audit revision's objects"
+    );
+    for mk in &summary_before.checkpoints[1..] {
+        assert!(
+            engine_persist::reclaim::find_installed_completion(&mut medium, mk)
+                .unwrap()
+                .is_none(),
+            "no completion marker was published by the refused pass"
+        );
+    }
+    assert_eq!(
+        windows_journal_identities(journal),
+        journals_before,
+        "the journal generations survive the refusal"
+    );
+    drop(medium);
     true
 }
 
@@ -2007,7 +2250,7 @@ fn an_unchanged_snapshot_behind_checkpoint_metadata_and_an_audit_still_satisfies
         .expect("the second checkpoint");
     // THE RECLAMATION (the audit revision at HEAD above MK2).
     #[cfg(windows)]
-    if windows_refuses_reclaim(&mut session, &location) {
+    if windows_refuses_reclaim(&mut session, &location, &dir.journal()) {
         return;
     }
     session.reclaim_checkpoint(1).expect("the reclamation");
