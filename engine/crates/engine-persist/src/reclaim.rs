@@ -2447,6 +2447,35 @@ pub fn complete_reclamation(
     unreachable!("the retry loop returns on every path")
 }
 
+/// (OC-C4) The completion-reader begin authority: a completed marker
+/// never becomes authoritative without an authenticated, correctly
+/// bound, provider-durable ReclamationBegin. The verification is
+/// provider-issued (never a caller-supplied value — the provider
+/// internally re-derives the ledger and discovers the begin under
+/// its own coordination), and the eligible durability grade is
+/// required on the returned authority. This strengthens the
+/// verification side deliberately left at the marker-only strength
+/// during OC-C3 (the R2-F6 dissolution superseded by the owner's
+/// OC-C4 policy): no grandfathering — a legacy beginless marker
+/// refuses trusted certification while remaining discoverable for
+/// non-authoritative reporting through the discovery arm (which
+/// carries no completion authority).
+fn verify_completion_begin_authority(
+    medium: &mut dyn CanonicalMedium,
+    source: &Hash,
+    mk: &Hash,
+) -> Result<(), MediumError> {
+    let authority = medium.verify_begin_authority(source, mk)?;
+    if authority.tier != crate::medium::SyncTier::FullPosixSequence
+        && authority.tier != crate::medium::SyncTier::TransactionalWalFull
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-complete/begin-tier-insufficient",
+        });
+    }
+    Ok(())
+}
+
 /// The keyed completion-marker discovery: the gap-aware descent
 /// from the authoritative HEAD, returning the first record carrying
 /// THIS mk's deterministic completion key with its strictly decoded
@@ -2655,6 +2684,15 @@ pub fn verify_reclamation_complete(
     // (3) The source audit's authority in the recovery-safe form:
     // the completed retirement's records are absent by construction.
     let (ledger, _metadata) = verify_installed_v1_audit(medium, &marker.source, &marker.mk)?;
+    // (OC-C4) THE REQUESTED MARKER'S BEGIN AUTHORITY: the provider-
+    // issued, MK/source-bound, durably-acknowledged ReclamationBegin
+    // is required before any obligation accounting — a beginless,
+    // corrupt, mismatched, or insufficient-grade begin refuses the
+    // trusted certification (the provider's own typed rules
+    // propagate: begin-authority/absent, binding-mismatch,
+    // mk-mismatch, tier-insufficient). All existing semantic
+    // postcondition checks below are preserved unchanged.
+    verify_completion_begin_authority(medium, &marker.source, &marker.mk)?;
     // (4) The semantic recheck. The retiring records absent (the
     // records-table read — the cross-provider interface) is the
     // stable live claim; the full obligation equality applies when
@@ -2706,6 +2744,14 @@ pub fn verify_reclamation_complete(
         }
         let (later_ledger, _later_metadata) =
             verify_installed_v1_audit(medium, &later_marker.source, &later_marker.mk)?;
+        // (OC-C4) THE LATER MARKER'S OWN BEGIN AUTHORITY: a beginless
+        // later marker never relaxes an earlier certification — its
+        // canonical membership, valid encoding, authenticated audit,
+        // or apparent completion state never substitute for trusted
+        // begin provenance. The provider-issued verification with the
+        // eligible durability grade, before its manifest may
+        // contribute any historical-attribution coverage.
+        verify_completion_begin_authority(medium, &later_marker.source, &later_marker.mk)?;
         for unit in &later_ledger.units {
             match medium.read_record(&unit.record) {
                 Err(MediumError::MissingObject { .. }) => {}

@@ -4243,18 +4243,19 @@ mod exclusion_tests {
         };
         let (audit_a, _) =
             crate::reclaim::publish_reclamation_ledger(&mut medium, &ledger_a, 4).unwrap();
-        // (OC-C3 CP-2) A's begin — the real admission.
+        // (OC-C3 CP-2) A's begin — the real admission. (OC-C4) The
+        // begin record is B1's TRUE nearest retained ancestor: the
+        // later range's skip entry names it, never audit_a — a
+        // gap-crossing walk from MK2 lands on the begin, never
+        // bypasses it.
         let begin_a = medium
             .begin_reclamation(&audit_a, &ledger_a.mk, 224)
             .unwrap();
-        assert!(
-            matches!(
-                begin_a,
-                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
-                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
-            ),
-            "A's begin admits: {begin_a:?}"
-        );
+        let begin_a_id = match begin_a {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. }
+            | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => id,
+            other => panic!("A's begin admits: {other:?}"),
+        };
         // B's range: B1(X) → SK2(fobj) → MK2 → auditB.
         let b1 = step(&mut medium, std::slice::from_ref(&x), 5);
         let sk2 = step(&mut medium, std::slice::from_ref(&fobj), 6);
@@ -4263,7 +4264,7 @@ mod exclusion_tests {
         let meta2 = CheckpointMetadata::new(
             sk2,
             b1,
-            vec![SkipEntry::new(Hash::ZERO, audit_a)],
+            vec![SkipEntry::new(Hash::ZERO, begin_a_id)],
             vec![
                 ReclaimedIndexEntry::new(None, b1, 5),
                 ReclaimedIndexEntry::new(None, sk2, 6),
@@ -5413,17 +5414,18 @@ mod exclusion_tests {
         ));
         // (OC-C3 CP-2) A's begin — the real admission (the A
         // execution below requires it under the begin-bound gate).
+        // (OC-C4) The begin record is B1's TRUE nearest retained
+        // ancestor: the later range's skip entry names it, never
+        // audit_a — a gap-crossing walk from MK2 lands on the begin,
+        // never bypasses it.
         let begin_a = medium
             .begin_reclamation(&audit_a, &ledger_a.mk, 223)
             .unwrap();
-        assert!(
-            matches!(
-                begin_a,
-                crate::reclaim::BeginPublicationOutcome::Accepted { .. }
-                    | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
-            ),
-            "A's begin admits: {begin_a:?}"
-        );
+        let begin_a_id = match begin_a {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. }
+            | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => id,
+            other => panic!("A's begin admits: {other:?}"),
+        };
         // The later range: B1(X) → SK2(fobj) → MK2(meta2) — B1/SK2
         // are survivors of A (X deferred: B1 references it).
         let head = medium.head().unwrap().unwrap();
@@ -5443,7 +5445,7 @@ mod exclusion_tests {
         let meta2 = CheckpointMetadata::new(
             sk2.id(),
             b1.id(),
-            vec![SkipEntry::new(Hash::ZERO, audit_a)],
+            vec![SkipEntry::new(Hash::ZERO, begin_a_id)],
             vec![
                 ReclaimedIndexEntry::new(None, b1.id(), 5),
                 ReclaimedIndexEntry::new(None, sk2.id(), 6),
@@ -6374,6 +6376,169 @@ mod exclusion_tests {
                 }
             ),
             "the completion wrapper refuses the beginless state: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(feature = "composite-test-fixture")]
+    fn the_oc4_beginless_marker_refuses_trusted_certification_and_stays_discoverable() {
+        // (OC-C4) The completion-reader authority at the REQUESTED
+        // level: a completed marker never becomes authoritative
+        // without an authenticated, correctly bound, provider-durable
+        // ReclamationBegin — no grandfathering. The LEGACY shape: the
+        // genuine audit, the hand-installed keyed marker (exactly
+        // what a pre-Option-C record or a corrupted in-crate path
+        // presents), and NO begin ever published. The trusted
+        // verification refuses at the begin authority; the marker
+        // remains DISCOVERABLE for non-authoritative reporting (the
+        // discovery arm carries no completion authority); the failed
+        // verification publishes no begin, deletes nothing, and
+        // installs no new completion.
+        let (root, mut medium, audit, mk, _ledger, _shared, _private, _p1) =
+            sqlite_begin_store("oc4-beginless-marker");
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: audit,
+            mandatory_count: 2,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let marker_id =
+            crate::reclaim::test_only_install_completion_marker(&mut medium, &marker, 240).unwrap();
+        // The baseline AFTER the install (the failed verification
+        // must change nothing beyond it).
+        let records_before = medium.validate().unwrap().records;
+        // THE TRUSTED VERIFICATION refuses the beginless marker.
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "the beginless marker never certifies: {error:?}"
+        );
+        // The legacy marker remains DISCOVERABLE (the reporting
+        // distinction: readable, never authoritative).
+        let (found_id, _found) = crate::reclaim::find_installed_completion(&mut medium, &mk)
+            .unwrap()
+            .expect("the historical record stays discoverable");
+        assert_eq!(
+            found_id, marker_id,
+            "the historical record stays readable for non-authoritative reporting"
+        );
+        // No begin was published as a side effect of the failed
+        // verification.
+        let error = medium.verify_begin_authority(&audit, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/absent"
+                }
+            ),
+            "the verification manufactured no begin: {error:?}"
+        );
+        // No deletion, no new completion publication: the record
+        // count is unchanged (the marker install preceded the
+        // baseline).
+        let records_after = medium.validate().unwrap().records;
+        assert_eq!(
+            records_after, records_before,
+            "the failed verification changed nothing"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(feature = "composite-test-fixture")]
+    fn the_oc4_wrong_bound_begin_refuses_through_the_completion_reader() {
+        // (OC-C4) The CP-1 verifier matrix's typed refusals
+        // propagate through the completion reader — the reader never
+        // broadens the accepted classifications: a begin record
+        // discovered at the right deterministic key but carrying the
+        // WRONG source-audit binding refuses with
+        // begin-authority/binding-mismatch; the wrong range digest
+        // refuses the same way. The marker itself is structurally
+        // valid and on-chain — only the begin provenance is wrong.
+        let (root, mut medium, audit, mk, ledger, _shared, _private, p1) =
+            sqlite_begin_store("oc4-wrong-bound");
+        // The wrong-SOURCE begin at the right key (a REAL non-zero
+        // identity — the strict decoder refuses zero-identity
+        // fields before the binding check would run).
+        let wrong_source = crate::reclaim::ReclamationBegin {
+            mk,
+            source: p1,
+            range_digest: ledger.range_digest,
+            seed: ledger.seed,
+        };
+        let _begin_id =
+            crate::reclaim::test_only_install_begin_record(&mut medium, &wrong_source, 240)
+                .unwrap();
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: audit,
+            mandatory_count: 2,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let marker_id =
+            crate::reclaim::test_only_install_completion_marker(&mut medium, &marker, 241).unwrap();
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/binding-mismatch"
+                }
+            ),
+            "the wrong-source begin refuses the certification: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // The wrong-DIGEST begin at the right key.
+        let (root, mut medium, audit, mk, ledger, _shared, _private, _p1) =
+            sqlite_begin_store("oc4-wrong-digest");
+        let wrong_digest = crate::reclaim::ReclamationBegin {
+            mk,
+            source: audit,
+            range_digest: [0u8; 32],
+            seed: ledger.seed,
+        };
+        let _begin_id =
+            crate::reclaim::test_only_install_begin_record(&mut medium, &wrong_digest, 240)
+                .unwrap();
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: audit,
+            mandatory_count: 2,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let marker_id =
+            crate::reclaim::test_only_install_completion_marker(&mut medium, &marker, 241).unwrap();
+        let error =
+            crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-authority/binding-mismatch"
+                }
+            ),
+            "the wrong-digest begin refuses the certification: {error:?}"
         );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);

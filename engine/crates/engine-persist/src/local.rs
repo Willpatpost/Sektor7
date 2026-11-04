@@ -4397,6 +4397,23 @@ mod exclusion_tests {
         // record-still-present refusal.
         {
             let (root, mut medium, audit, mk, _shared, _private) = trusted_execution_store();
+            let (ledger, _meta) =
+                crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+            let directive = crate::reclaim::ReclaimDirective {
+                audit_record: audit,
+                units: ledger.units.clone(),
+            };
+            // (OC-C4) The begin-bound migration: the retirement's
+            // begin is ADMITTED but never executed — the marker's
+            // verification passes the begin authority on POSIX and
+            // refuses at the unexecuted retirement's still-present
+            // records (the original deeper boundary preserved); on
+            // Windows the admission's tier refusal is the platform
+            // proof (no destructive authorization exists to
+            // certify).
+            if !authorize_or_refuse(&mut medium, &audit, &mk, &directive, 213, &root) {
+                return;
+            }
             let marker = crate::reclaim::ReclamationComplete {
                 kind: crate::reclaim::CompletionKind::Batch,
                 mk,
@@ -4971,7 +4988,13 @@ mod exclusion_tests {
         // fixture's executions require it under the begin-bound
         // gate; on a ProcessCrashOnly platform the admission refuses
         // and the dependent tests assert the typed execution refusal
-        // instead — the platform policy is unchanged).
+        // instead — the platform policy is unchanged). (OC-C4) The
+        // begin record is B1's TRUE nearest retained ancestor: the
+        // later range's skip entry must name it, never audit_a — a
+        // gap-crossing walk from MK2 lands on the begin, never
+        // bypasses it (the real crossing-built tables name the true
+        // nearest retained record the same way).
+        let mut begin_a_id = audit_a;
         if medium.durability_tier() == crate::medium::SyncTier::FullPosixSequence {
             let begin_outcome = medium.begin_reclamation(&audit_a, &mk1.id(), 45).unwrap();
             assert!(
@@ -4981,6 +5004,9 @@ mod exclusion_tests {
                 ),
                 "the fixture's A begin admits: {begin_outcome:?}"
             );
+            if let crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } = begin_outcome {
+                begin_a_id = id;
+            }
         }
         let directive_a = crate::reclaim::ReclaimDirective {
             audit_record: audit_a,
@@ -5004,7 +5030,7 @@ mod exclusion_tests {
         let meta2 = CheckpointMetadata::new(
             sk2.id(),
             b1.id(),
-            vec![SkipEntry::new(Hash::ZERO, audit_a)],
+            vec![SkipEntry::new(Hash::ZERO, begin_a_id)],
             vec![
                 ReclaimedIndexEntry::new(None, b1.id(), 5),
                 ReclaimedIndexEntry::new(None, sk2.id(), 6),
@@ -5411,6 +5437,222 @@ mod exclusion_tests {
             ),
             "the wrong-key later marker refuses at collection: {error:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_oc4_beginless_later_marker_never_relaxes_an_earlier_certification() {
+        // (OC-C4) The completion-reader authority at the CASCADE
+        // level: a later marker without begin authority never relaxes
+        // an earlier certification — its canonical membership, valid
+        // encoding, authenticated audit, and internally consistent
+        // obligations never substitute for trusted begin provenance.
+        // PHASE 1 (the mid-flight shape): A genuinely completed (the
+        // fixture's real begin, the execution, and the real marker —
+        // the shared X deferred); B's retirement HAND-satisfied with
+        // the CORRECT marker content but NO B begin — A's trusted
+        // verification refuses at B's begin absence. PHASE 2 (the
+        // positive control): the same shape with B's REAL begin
+        // admitted before the hand satisfaction — A's verification
+        // passes (the legitimate historical attribution through
+        // B's authenticated completion). On Windows the fixture's A
+        // execution refuses the platform tier (the independent
+        // ProcessCrashOnly proof — no destructive authorization
+        // exists to certify or relax).
+        let install =
+            |medium: &mut LocalFileMedium, marker: &crate::reclaim::ReclamationComplete| -> Hash {
+                let head = medium.head().unwrap().unwrap();
+                let parent_epoch = medium.read_record(&head).unwrap().epoch;
+                let key = crate::reclaim::reclamation_complete_idempotency_key(
+                    &marker.mk,
+                    Some(marker.batch),
+                );
+                let object = StoredObject::new(marker.canonical_bytes()).unwrap();
+                let record = RevisionRecord::regular(head, parent_epoch, 98)
+                    .with_idempotency_key(key)
+                    .with_content_refs(vec![object.hash()]);
+                let admitted =
+                    crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+                medium.append_admitted(admitted, Some(head)).unwrap();
+                record.id()
+            };
+        for admit_b_begin in [false, true] {
+            let label = if admit_b_begin {
+                "oc4-later-positive"
+            } else {
+                "oc4-later-beginless"
+            };
+            let (root, mut medium, audit_a, mk1, _mk2, x, fobj, directive_a, ledger_b) =
+                two_retirement_store(label);
+            if medium.durability_tier() != crate::medium::SyncTier::FullPosixSequence {
+                // Windows: the A execution refuses the platform tier.
+                let error = medium.reclaim(&directive_a).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "execution/begin-tier-insufficient"
+                        }
+                    ),
+                    "ProcessCrashOnly refuses the destructive grade: {error:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+                continue;
+            }
+            // A: the genuine completion (the fixture's begin, the
+            // execution, the real marker through the wrapper).
+            medium.reclaim(&directive_a).unwrap();
+            let (marker_a, marker_a_content) =
+                crate::reclaim::complete_reclamation(&mut medium, &audit_a, &mk1).unwrap();
+            assert!(
+                marker_a_content.deferred.contains(&x),
+                "A defers the shared X (B1, a survivor above A, references it)"
+            );
+            // B's audit.
+            let (audit_b, _) = publish_reclamation_ledger(&mut medium, &ledger_b, 8).unwrap();
+            // (OC-C4 phase 2) B's REAL begin — admitted BEFORE the
+            // hand satisfaction (the first-execution evidence still
+            // present); phase 1 publishes none.
+            if admit_b_begin {
+                let begin_b = medium
+                    .begin_reclamation(&audit_b, &ledger_b.mk, 48)
+                    .unwrap();
+                assert!(
+                    matches!(
+                        begin_b,
+                        crate::reclaim::BeginPublicationOutcome::Accepted { .. }
+                            | crate::reclaim::BeginPublicationOutcome::DuplicateVerified { .. }
+                    ),
+                    "B's begin admits: {begin_b:?}"
+                );
+            }
+            // B's retirement HAND-SATISFIED: the mandatory object
+            // deleted while the records still reference it, then the
+            // unit records (the real execution's end state).
+            std::fs::remove_file(medium.object_path(&x)).unwrap();
+            for unit in &ledger_b.units {
+                std::fs::remove_file(medium.object_path(&unit.record)).unwrap();
+            }
+            // B's CORRECT marker content (the completion state's own
+            // oracle — the obligations genuinely met).
+            let (mandatory_count, deferred) =
+                crate::reclaim::verify_completion_state(&mut medium, &ledger_b).unwrap();
+            let marker_b_content = crate::reclaim::ReclamationComplete {
+                kind: crate::reclaim::CompletionKind::Batch,
+                mk: ledger_b.mk,
+                batch: 0,
+                source: audit_b,
+                mandatory_count,
+                deferred: deferred.into_iter().collect(),
+                journal_files: Vec::new(),
+            };
+            let _marker_b_id = install(&mut medium, &marker_b_content);
+            // A's trusted verification.
+            if admit_b_begin {
+                // THE POSITIVE CONTROL: B's authenticated completion
+                // resolves A's deferred accounting — the legitimate
+                // historical attribution.
+                crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1).unwrap();
+            } else {
+                // THE REFUSAL: B's beginless marker never relaxes A's
+                // certification (A's own begin IS present — the
+                // refusal is the later marker's by elimination).
+                medium
+                    .verify_begin_authority(&audit_a, &mk1)
+                    .expect("A's own begin authority holds");
+                let error =
+                    crate::reclaim::verify_reclamation_complete(&mut medium, &marker_a, &mk1)
+                        .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "begin-authority/absent"
+                        }
+                    ),
+                    "the beginless later marker never relaxes an earlier certification: {error:?}"
+                );
+            }
+            let _ = fobj;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "composite-test-fixture")]
+    fn the_oc4_local_completion_reader_tier_gate() {
+        // (OC-C4) The insufficient-tier refusal through the
+        // completion reader: on Windows (ProcessCrashOnly) even a
+        // correctly shaped, correctly bound, ON-CHAIN begin record
+        // cannot authorize trusted certification — the platform tier
+        // gate inside verify_begin_authority refuses and propagates
+        // through the reader (the OC-P2 rule: an installed, restored,
+        // or otherwise discoverable begin never overrides the
+        // platform limitation). On POSIX the same hand-installed
+        // valid begin passes the discovery, binding, reaffirmation,
+        // and tier — and the correctly satisfied retirement's marker
+        // CERTIFIES (the local positive through the reader).
+        let (root, mut medium, audit, mk, shared, private) = trusted_execution_store();
+        let (ledger, _meta) =
+            crate::reclaim::verify_canonical_v1_audit(&mut medium, &audit, &mk).unwrap();
+        // The hand-installed begin (the right deterministic key, the
+        // correct four-field binding — bypassing the admission,
+        // exactly the restored/legacy record the tier gate must
+        // refuse on Windows).
+        let begin = crate::reclaim::ReclamationBegin {
+            mk,
+            source: audit,
+            range_digest: ledger.range_digest,
+            seed: ledger.seed,
+        };
+        let _begin_id =
+            crate::reclaim::test_only_install_begin_record(&mut medium, &begin, 240).unwrap();
+        // The satisfied retirement (the hand construction: the
+        // mandatory object deleted while the records still reference
+        // it, then the unit records).
+        std::fs::remove_file(medium.object_path(&private)).unwrap();
+        for unit in &ledger.units {
+            std::fs::remove_file(medium.object_path(&unit.record)).unwrap();
+        }
+        // The correct marker content (the completion state's own
+        // oracle).
+        let (mandatory_count, deferred) =
+            crate::reclaim::verify_completion_state(&mut medium, &ledger).unwrap();
+        let marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk,
+            batch: 0,
+            source: audit,
+            mandatory_count,
+            deferred: deferred.into_iter().collect(),
+            journal_files: Vec::new(),
+        };
+        let marker_id =
+            crate::reclaim::test_only_install_completion_marker(&mut medium, &marker, 241).unwrap();
+        let records_before = medium.validate().unwrap().records;
+        // THE READER'S VERDICT.
+        let result = crate::reclaim::verify_reclamation_complete(&mut medium, &marker_id, &mk);
+        if cfg!(windows) {
+            match result {
+                Err(MediumError::Chain {
+                    rule: "begin-authority/tier-insufficient",
+                }) => {}
+                other => panic!(
+                    "the Windows platform tier refuses the reader's certification: {other:?}"
+                ),
+            }
+        } else {
+            result.expect("the correctly authorized and satisfied retirement certifies");
+        }
+        // No forbidden effect either way: the verification published
+        // nothing (the record count unchanged) and the survivor
+        // content remains present and hash-valid.
+        let records_after = medium.validate().unwrap().records;
+        assert_eq!(
+            records_after, records_before,
+            "the verification published nothing"
+        );
+        medium.read_object(&shared).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
