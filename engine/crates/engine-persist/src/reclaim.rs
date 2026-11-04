@@ -1846,6 +1846,39 @@ pub fn publish_journal_root_binding(
                 rule: "journal-root/not-fresh-bootstrap",
             });
         }
+        // (F4-R8) THE FIRST-BINDING BOOTSTRAP-EVIDENCE VERIFICATION:
+        // an arbitrary caller holding a founding hash, a root ID,
+        // and a path can never establish the first binding — the
+        // append demands (a) the root ID's INDEPENDENT derivation
+        // from the founding and the normalized location (a
+        // caller-supplied root ID refuses), and (b) the DURABLE
+        // JOURNAL-BOOTSTRAP EVIDENCE: the bound journal file
+        // existing at the claimed location and carrying the EXACT
+        // expected identities (a complete, matching bound header —
+        // the trusted bootstrap's journal-first ordering always
+        // leaves this residue; a missing, torn, legacy, or foreign
+        // journal at the location refuses). Bound campaigns never
+        // reach this point (the occupied key returned into the
+        // duplicate/conflict discipline above), so the
+        // duplicate/conflict refusals keep their delivered shape.
+        if *root_id != journal_root_id(founding, location) {
+            return Err(MediumError::Chain {
+                rule: "journal-root/root-id-derivation",
+            });
+        }
+        let bootstrap_journal = std::path::Path::new(location);
+        let bootstrap_bytes =
+            std::fs::read(bootstrap_journal).map_err(|_error| MediumError::Chain {
+                rule: "journal-root/bootstrap-evidence-missing",
+            })?;
+        match crate::journal::read_bound_header(&bootstrap_bytes, founding, root_id) {
+            Ok(crate::journal::BoundHeaderState::Matching { .. }) => {}
+            _ => {
+                return Err(MediumError::Chain {
+                    rule: "journal-root/bootstrap-evidence-invalid",
+                });
+            }
+        }
         let parent_epoch = medium.read_record(&head)?.epoch;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
@@ -2296,23 +2329,27 @@ pub fn publish_reclamation_plan(
     journal_root: &std::path::Path,
     tick: u64,
 ) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
-    // (V2-W F4) THE STANDALONE ROUTE: the full campaign-bound
-    // verification, then the root's exclusive sidecar lock (held
-    // across the collection and the canonical append — the
-    // serialization against a concurrent rotation), then the
-    // authorized core. A LIVE crossing holding the root's own lock
-    // (its active journal) blocks here by design — the production
-    // route through the crossing does not reacquire.
+    // (V2-W F4, F4-R7) THE STANDALONE ROUTE — the offline/standalone
+    // publication policy: the full campaign-bound verification, then
+    // the root's exclusive sidecar lock EXPLICITLY HELD (the
+    // publication permit issued from it — the serialization against
+    // a concurrent rotation; possessing a bound root's path is never
+    // itself authorization), then the authorized core. A LIVE
+    // crossing holding the root's own lock (its active journal)
+    // blocks here by design — the production route through the
+    // crossing does not reacquire.
     let authority = verify_bound_journal_authority(medium, journal_root)?;
-    let _root_lock =
-        crate::journal::open_lock_file(journal_root).map_err(|_error| MediumError::Chain {
+    let guard = crate::journal::hold_publication_lock(journal_root).map_err(|_error| {
+        MediumError::Chain {
             rule: "journal-root/lock",
-        })?;
+        }
+    })?;
     publish_reclamation_plan_authorized(
         medium,
         mk,
         ledger_byte_limit,
         &authority,
+        &guard.permit(),
         journal_root,
         tick,
     )
@@ -2362,25 +2399,44 @@ pub fn verify_bound_journal_authority(
     })
 }
 
-/// (F4-R2/R3) THE AUTHORIZED CORE — the crossing-scoped
+/// (F4-R2/R3/R7) THE AUTHORIZED CORE — the crossing-scoped
 /// publication route: the identity-verified obligation collection
-/// and the canonical plan publication UNDER THE CALLER'S
-/// serialization boundary. The caller (the production crossing)
-/// holds the root's exclusive sidecar lock across this call — via
-/// its own active-journal handle when the active IS the root (no
-/// reacquisition, no same-process deadlock), or via an explicitly
-/// acquired root lock when the active is a rotated generation. The
-/// standalone route wraps this under its own lock. All the F1-F5,
-/// W2, and W3A gates, the duplicate-content verification, and the
-/// installed-plan immutability are inside.
+/// and the canonical plan publication UNDER THE CALLER'S PROVEN
+/// serialization boundary. The caller presents the NONFORGEABLE,
+/// lifetime-bound [`crate::journal::PublicationPermit`] — proof the
+/// journal root's exclusive sidecar lock is held for the call (via a
+/// live journal handle that IS the root — the unrotated crossing's
+/// no-reacquisition path — or via the explicitly held publication
+/// lock — the rotated crossing and the standalone route). The
+/// permit's locked root must agree with this publication's journal
+/// root: a permit for any other lock never authorizes it. All the
+/// F1-F5, W2, and W3A gates, the duplicate-content verification,
+/// and the installed-plan immutability are inside.
 pub fn publish_reclamation_plan_authorized(
     medium: &mut dyn CanonicalMedium,
     mk: &Hash,
     ledger_byte_limit: u64,
     authority: &BoundJournalAuthority,
+    permit: &crate::journal::PublicationPermit<'_>,
     journal_root: &std::path::Path,
     tick: u64,
 ) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
+    // (F4-R7) THE SERIALIZATION-POSSESSION PROOF: the permit's held
+    // lock must be THIS publication's root's lock — the normalized
+    // path agreement. Without a permit the core is unreachable
+    // (the type is nonconstructible outside this crate); with a
+    // permit for a different root the publication refuses before
+    // any journal evidence is read. This is the boundary the
+    // production rotation honors (the same root lock across its
+    // flip), so a correctly permitted publication cannot race the
+    // rotation interval.
+    if JournalRootBinding::normalize_location(permit.locked_root())
+        != JournalRootBinding::normalize_location(journal_root)
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/permit-root-mismatch",
+        });
+    }
     let journal_files = collect_bound_reclaimable_journal_files(
         journal_root,
         &authority.founding,

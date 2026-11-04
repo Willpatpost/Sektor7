@@ -627,7 +627,7 @@ fn the_crossing_composes_over_the_worker_source_and_poisons_closed() {
     let source = worker.source().unwrap();
     let (mut spine, mut director) = scenario_pair(150, &near);
     let journal = T1Journal::open(dir.journal()).unwrap();
-    let mut crossing = SessionCrossing::open_at(&source, journal, "pp-b4-crossing").unwrap();
+    let mut crossing = SessionCrossing::open_at(&source, journal, "pp-b4-worker").unwrap();
     // The full composition: a snapshot publication, a durable
     // deactivation (T1 evidence — the FAR presence drives region 4's
     // live-to-dormant boundary over the accrued crossings), and a
@@ -660,7 +660,7 @@ fn the_crossing_composes_over_the_worker_source_and_poisons_closed() {
     let (_spine, _director, recovered) = SessionCrossing::recover_at(
         &found_location(&dir.store(), false),
         &dir.journal(),
-        "pp-b4-crossing",
+        "pp-b4-worker",
     )
     .unwrap();
     drop(recovered);

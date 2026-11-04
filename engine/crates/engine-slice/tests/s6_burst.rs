@@ -1201,7 +1201,7 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
     let (spine, director) = demo_scenario(&timing, &[DEMO_PRESENCE]).expect("the scenario builds");
     let journal_path = cleaner.root.join("journal.t1");
     let journal = T1Journal::open(&journal_path).unwrap();
-    let mut session = OrchestratedSession::open(spine, director, &location, journal, "s6c2-b8")
+    let mut session = OrchestratedSession::open(spine, director, &location, journal, "s6c2-burst")
         .expect("the session opens");
 
     // The burst cohort (the load) and the independent registry (the
@@ -1438,7 +1438,7 @@ fn b8_persistence_under_burst_load_closes_and_recovers_exactly() {
     // (region 0's applied credits survive the close/recovery cycle),
     // and a continued tick.
     let mut recovered =
-        OrchestratedSession::recover(&location, &journal_path, "s6c2-b8").expect("the recovery");
+        OrchestratedSession::recover(&location, &journal_path, "s6c2-burst").expect("the recovery");
     assert_eq!(
         recovered.spine().clock().as_u64(),
         closing_clock,
@@ -1481,9 +1481,8 @@ fn b8_companion_empty_capture_reports_nothing_pending_truthfully() {
     let location = found_store(&cleaner.root);
     let (spine, director) = demo_scenario(&timing, &[DEMO_PRESENCE]).expect("the scenario builds");
     let journal = T1Journal::open(cleaner.root.join("journal.t1")).unwrap();
-    let mut session =
-        OrchestratedSession::open(spine, director, &location, journal, "s6c2-b8-empty")
-            .expect("the session opens");
+    let mut session = OrchestratedSession::open(spine, director, &location, journal, "s6c2-burst")
+        .expect("the session opens");
     // A young campaign: no NPC has reached a milestone, so region 0
     // holds no pending consequential signal.
     session.tick(&[DEMO_PRESENCE]).expect("the tick runs");

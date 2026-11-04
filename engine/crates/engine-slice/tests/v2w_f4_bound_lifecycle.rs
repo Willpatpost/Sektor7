@@ -23,8 +23,8 @@ use engine_persist::reclaim::{
     journal_root_id,
 };
 use engine_persist::{
-    AppendOutcome, AuthorityMode, CanonicalMedium, Hash, LocalFileMedium, RevisionRecord,
-    T1Journal, active_journal_path,
+    AppendOutcome, AuthorityMode, CanonicalMedium, Hash, LocalFileMedium, MediumError,
+    PipelineError, RevisionRecord, T1Journal, active_journal_path,
 };
 use engine_slice::crossing::{SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
@@ -646,101 +646,148 @@ fn the_bound_bootstrap_refuses_legacy_and_mismatched_campaigns() {
         "the bound journal path was never created"
     );
 }
-
 #[test]
 fn the_crash_states_of_the_bound_bootstrap_resume() {
-    // (§8, F4-R5/R6) The bootstrap's crash matrix through the real
-    // entry point: the crash between the founding append and the
-    // binding publication (the founding-only chain — the state
-    // indistinguishable from fresh) RESUMES and converges; the crash
-    // between the bound-journal creation and the binding (the orphan
-    // journal) resumes through the strict bound-identity reuse; and
-    // the crash-after-binding with the journal REMOVED is missing
-    // authoritative evidence — fail closed, never recreated.
-    // (a) THE FOUNDING-ONLY CRASH STATE.
+    // (§8, F4-R8/§7 — the JOURNAL-FIRST ordering's crash matrix)
+    // through the real entry point: the crash after the journal
+    // creation but before the founding append (the truly fresh
+    // medium + the durable journal) reuses the journal and proceeds;
+    // the crash after the founding append but before the binding
+    // publication reuses the journal and publishes; the crash
+    // between the founding-only chain and NO journal at the root is
+    // REFUSED — the state indistinguishable from a legacy campaign
+    // whose historical journal lives elsewhere (the §7 closure: no
+    // automatic migration, no history discarded); the crash-after-
+    // binding with the journal REMOVED is missing authoritative
+    // evidence — fail closed, never recreated; and the PRE-BINDING
+    // torn creation resolves (nothing could have been journaled —
+    // F4-R9's positive).
+    let campaign = "crash-campaign";
+    // (a) THE JOURNAL-ONLY CRASH STATE: the durable bound journal
+    // exists (the bootstrap's step 2 crashed after the creation),
+    // the chain is EMPTY (the founding append never ran).
     {
-        let dir = TestDir::new("crash-founding");
+        let dir = TestDir::new("crash-journal-only");
         let store = dir.store();
         let journal_root = dir.bound_journal();
-        let mut medium = LocalFileMedium::open(&store).unwrap();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "crash-campaign", 0);
-        match medium.append(&founding, &[], None).unwrap() {
-            AppendOutcome::Accepted { .. } => {}
-            _ => panic!("the founding append accepts"),
-        }
-        drop(medium);
-        // No binding, no journal — the crash between the founding
-        // append and the binding publication.
-        let crossing = SessionCrossing::open_bound_bootstrap(
-            &StoreLocation::Directory(store.clone()),
-            &journal_root,
-            "crash-campaign",
-        )
-        .expect("the founding-only crash state resumes the bootstrap");
-        drop(crossing);
-        let (founding_id, root_id) = installed_binding(&store);
-        assert_eq!(founding_id, founding.id());
-        engine_persist::journal::scan_bound_file(&journal_root, &founding_id, &root_id)
-            .expect("the resumed bootstrap created the bound journal");
-    }
-    // (b) THE ORPHAN-JOURNAL CRASH STATE (the durable bound journal
-    // exists, the binding was never published).
-    {
-        let dir = TestDir::new("crash-orphan");
-        let store = dir.store();
-        let journal_root = dir.bound_journal();
-        let mut medium = LocalFileMedium::open(&store).unwrap();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "crash-campaign", 0);
-        match medium.append(&founding, &[], None).unwrap() {
-            AppendOutcome::Accepted { .. } => {}
-            _ => panic!("the founding append accepts"),
-        }
-        drop(medium);
-        let founding_id = founding.id();
+        let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
         let location = JournalRootBinding::normalize_location(&journal_root);
         let root_id = journal_root_id(&founding_id, &location);
         drop(
             T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                .expect("the orphan bound journal is created"),
+                .expect("the interrupted bootstrap's journal exists"),
         );
         let crossing = SessionCrossing::open_bound_bootstrap(
             &StoreLocation::Directory(store.clone()),
             &journal_root,
-            "crash-campaign",
+            campaign,
         )
-        .expect("the orphan-journal crash state resumes through the strict identity reuse");
+        .expect("the journal-only crash state resumes (the truly fresh medium reuses the journal)");
         drop(crossing);
         let (installed_founding, installed_root) = installed_binding(&store);
         assert_eq!(installed_founding, founding_id);
         assert_eq!(installed_root, root_id);
     }
-    // (c) THE MISSING-JOURNAL CRASH STATE (the binding installed,
-    // the journal removed — missing authoritative evidence).
+    // (b) THE JOURNAL + FOUNDING CRASH STATE: the crash after the
+    // founding append but before the binding publication (the
+    // not-fresh re-entry onto the pre-existing durable residue).
     {
-        let dir = TestDir::new("crash-missing");
+        let dir = TestDir::new("crash-journal-founding");
         let store = dir.store();
         let journal_root = dir.bound_journal();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
+        let founding_id = founding.id();
+        let location = JournalRootBinding::normalize_location(&journal_root);
+        let root_id = journal_root_id(&founding_id, &location);
+        drop(
+            T1Journal::open_bound(&journal_root, &founding_id, &root_id)
+                .expect("the interrupted bootstrap's journal exists"),
+        );
         let mut medium = LocalFileMedium::open(&store).unwrap();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "crash-campaign", 0);
         match medium.append(&founding, &[], None).unwrap() {
             AppendOutcome::Accepted { .. } => {}
             _ => panic!("the founding append accepts"),
         }
         drop(medium);
+        let crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            campaign,
+        )
+        .expect("the journal+founding crash state resumes onto the pre-existing journal");
+        drop(crossing);
+        let (installed_founding, installed_root) = installed_binding(&store);
+        assert_eq!(installed_founding, founding_id);
+        assert_eq!(installed_root, root_id);
+    }
+    // (c) THE FOUNDING-ONLY, NO-JOURNAL STATE — the §7 closure: the
+    // chain carries only its founding (a legacy campaign's exact
+    // shape — its historical journal, with real unconfirmed work,
+    // lives at a caller-supplied path this entry cannot see), and no
+    // bound journal exists at the root. The bootstrap REFUSES the
+    // fresh creation: no automatic migration, no history discarded.
+    {
+        let dir = TestDir::new("crash-founding-only");
+        let store = dir.store();
+        let journal_root = dir.bound_journal();
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
+        match medium.append(&founding, &[], None).unwrap() {
+            AppendOutcome::Accepted { .. } => {}
+            _ => panic!("the founding append accepts"),
+        }
+        let head_before = medium.head().unwrap();
+        drop(medium);
+        let error = match SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            campaign,
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the founding-only chain with no journal never bootstraps"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/missing-bootstrap-evidence"
+            ),
+            "the missing durable bootstrap evidence refuses: {error:?}"
+        );
+        // THE STATE UNCHANGED: no journal created, no binding, the
+        // chain stands at its founding.
+        assert!(!journal_root.exists(), "no bound journal was created");
         {
+            let mut probe = LocalFileMedium::open(&store).unwrap();
+            assert_eq!(probe.head().unwrap(), head_before);
+            assert!(
+                find_installed_journal_root_binding(&mut probe, &founding.id())
+                    .unwrap()
+                    .is_none(),
+                "no binding was installed"
+            );
+        }
+    }
+    // (d) THE MISSING-JOURNAL-AFTER-BINDING CRASH STATE (fail
+    // closed, never recreated).
+    {
+        let dir = TestDir::new("crash-missing");
+        let store = dir.store();
+        let journal_root = dir.bound_journal();
+        let founding_id = {
             let crossing = SessionCrossing::open_bound_bootstrap(
                 &StoreLocation::Directory(store.clone()),
                 &journal_root,
-                "crash-campaign",
+                campaign,
             )
             .expect("the bootstrap completes");
             drop(crossing);
-        }
+            installed_binding(&store).0
+        };
         std::fs::remove_file(&journal_root).unwrap();
         let error = match SessionCrossing::open_bound_bootstrap(
             &StoreLocation::Directory(store.clone()),
             &journal_root,
-            "crash-campaign",
+            campaign,
         ) {
             Err(error) => error,
             Ok(_crossing) => panic!("the missing journal never opens"),
@@ -752,8 +799,236 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
             ),
             "the missing journal after an established binding fails closed: {error:?}"
         );
-        // The binding itself is untouched (the fail-closed state —
-        // never a silent rebinding elsewhere).
-        assert!(installed_binding(&store).0 == founding.id());
+        assert!(installed_binding(&store).0 == founding_id);
+    }
+    // (e) THE PRE-BINDING TORN CREATION (F4-R9's positive): a torn
+    // bound-header prefix — the crashed creation, nothing could ever
+    // have been journaled, and no binding exists yet to make it
+    // damaged evidence — resolves through the bootstrap's creation
+    // path.
+    {
+        let dir = TestDir::new("crash-torn-prebinding");
+        let store = dir.store();
+        let journal_root = dir.bound_journal();
+        let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
+        let location = JournalRootBinding::normalize_location(&journal_root);
+        let root_id = journal_root_id(&founding_id, &location);
+        drop(
+            T1Journal::open_bound(&journal_root, &founding_id, &root_id)
+                .expect("the journal is created"),
+        );
+        // The torn prefix: a strict prefix of the canonical bound
+        // header (the crashed creation's residue).
+        let complete = std::fs::read(&journal_root).unwrap();
+        std::fs::write(&journal_root, &complete[..10]).unwrap();
+        let crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            campaign,
+        )
+        .expect("the pre-binding torn creation resolves through the creation path");
+        drop(crossing);
+        let (installed_founding, installed_root) = installed_binding(&store);
+        assert_eq!(installed_founding, founding_id);
+        assert_eq!(installed_root, root_id);
+        engine_persist::journal::scan_bound_file(&journal_root, &founding_id, &root_id)
+            .expect("the resolved journal carries the complete bound header");
+    }
+}
+
+#[test]
+fn the_bound_journal_corruption_after_binding_fails_closed() {
+    // (F4-R9) The post-binding corruption separation: a valid bound
+    // campaign, closed, its active journal's header TRUNCATED to a
+    // torn prefix — the bootstrap re-entry, the restart recovery,
+    // and the plan publication ALL refuse (the torn header is
+    // DAMAGED EVIDENCE, never an inert empty scan, never repaired,
+    // never replaced with an empty valid journal), the journal's
+    // bytes are preserved untouched for diagnosis, and no
+    // retirement authority installs.
+    let dir = TestDir::new("r9-corrupt");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r9-campaign",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    let report = crossing
+        .publish_checkpoint(&mut spine, &mut director, 10)
+        .expect("the checkpoint publishes");
+    let mk = report.mk;
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    // THE TORN HEADER: a strict prefix of the canonical bound header
+    // (the damaged-evidence shape — indistinguishable from a crashed
+    // creation by bytes alone, which is exactly why the installed
+    // binding's presence decides the interpretation).
+    let complete = std::fs::read(&journal_root).unwrap();
+    std::fs::write(&journal_root, &complete[..10]).unwrap();
+    let damaged_bytes = std::fs::read(&journal_root).unwrap();
+    // (1) THE BOOTSTRAP RE-ENTRY refuses (the damaged evidence is
+    // never repaired into an empty valid journal).
+    let error = match SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r9-campaign",
+    ) {
+        Err(error) => error,
+        Ok(_crossing) => panic!("the corrupted journal never re-enters"),
+    };
+    assert!(
+        matches!(
+            &error,
+            TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/active-corrupt"
+        ),
+        "the torn active journal refuses the re-entry: {error:?}"
+    );
+    // (2) THE RESTART RECOVERY refuses.
+    let error = match SessionCrossing::recover(&store, &journal_root, "r9-campaign") {
+        Err(error) => error,
+        Ok(_recovered) => panic!("the corrupted journal never recovers"),
+    };
+    assert!(
+        matches!(
+            &error,
+            TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/active-corrupt"
+        ),
+        "the torn active journal refuses the recovery: {error:?}"
+    );
+    // (3) THE PLAN PUBLICATION refuses (the collection's
+    // identity-verified scan of the active).
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let error = engine_persist::reclaim::publish_reclamation_plan(
+            &mut medium,
+            &mk,
+            1024,
+            &journal_root,
+            400,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                engine_persist::MediumError::Chain {
+                    rule: "journal-root/active-identity"
+                }
+            ),
+            "the torn active journal refuses the plan publication: {error:?}"
+        );
+        assert!(
+            find_installed_plan(&mut medium, &mk).unwrap().is_none(),
+            "no retirement authority installed"
+        );
+    }
+    // THE DAMAGED EVIDENCE PRESERVED (nothing repaired, nothing
+    // replaced — the bytes stand for diagnosis).
+    assert_eq!(std::fs::read(&journal_root).unwrap(), damaged_bytes);
+}
+
+#[test]
+fn the_open_at_entry_point_joins_bound_campaigns_only_through_their_journal() {
+    // (F4 §6) The entry-point closure: an already-bound canonical
+    // campaign joins ONLY through its bound journal — a foreign
+    // legacy journal refuses before any authoritative progression or
+    // rotation; a mismatched campaign name refuses at the founding's
+    // persisted identity; the authorized bound journal continues
+    // through the correct bound path with the crossing's journal
+    // root at the BINDING's authoritative location.
+    let dir = TestDir::new("entry-closure");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "entry-campaign",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (founding, root_id) = installed_binding(&store);
+    // THE FOREIGN LEGACY JOURNAL refuses: a legacy journal at another
+    // path never joins a bound campaign.
+    {
+        let foreign = dir.bound_journal();
+        let journal = T1Journal::open(&foreign).unwrap();
+        let error = match SessionCrossing::open_at(
+            &StoreLocation::Directory(store.clone()),
+            journal,
+            "entry-campaign",
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the foreign legacy journal never joins a bound campaign"),
+        };
+        assert!(
+            matches!(
+                &error,
+                PipelineError::Medium(MediumError::Chain {
+                    rule: "journal-root/foreign-journal"
+                })
+            ),
+            "the foreign journal refuses the bound join: {error:?}"
+        );
+    }
+    // THE MISMATCHED CAMPAIGN NAME refuses (the founding's persisted
+    // identity).
+    {
+        let journal =
+            T1Journal::open_bound(&journal_root, &founding, &root_id).expect("the bound journal");
+        let error = match SessionCrossing::open_at(
+            &StoreLocation::Directory(store.clone()),
+            journal,
+            "wrong-name",
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the mismatched campaign name never opens"),
+        };
+        assert!(
+            matches!(
+                &error,
+                PipelineError::Medium(MediumError::Chain {
+                    rule: "journal-root/campaign-mismatch"
+                })
+            ),
+            "the mismatched name refuses: {error:?}"
+        );
+    }
+    // THE AUTHORIZED BOUND JOURNAL continues through the correct
+    // bound path (the crossing's journal root at the binding's
+    // authoritative location).
+    {
+        let journal =
+            T1Journal::open_bound(&journal_root, &founding, &root_id).expect("the bound journal");
+        let crossing = SessionCrossing::open_at(
+            &StoreLocation::Directory(store.clone()),
+            journal,
+            "entry-campaign",
+        )
+        .expect("the authorized bound journal joins");
+        assert_eq!(
+            crossing.pipeline_journal_path(),
+            journal_root.as_path(),
+            "the bound join holds the bound journal"
+        );
+        assert_eq!(
+            crossing.journal_root_path(),
+            journal_root.as_path(),
+            "the crossing's journal root is the BINDING's authoritative root"
+        );
+        drop(crossing);
     }
 }

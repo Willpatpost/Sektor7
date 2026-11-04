@@ -1064,7 +1064,16 @@ pub fn read_bound_header(
 /// read-only classification. An ABSENT file is a typed missing-
 /// evidence refusal — never the empty-journal fallback (once the
 /// canonical binding exists, a missing journal is missing
-/// authoritative evidence).
+/// authoritative evidence). (F4-R9) A TORN bound header is DAMAGED
+/// EVIDENCE, never an inert empty scan: after the binding is
+/// installed the active journal must carry a COMPLETE matching
+/// header — an empty file, a torn-creation prefix, or a corrupt
+/// header refuses typed, and nothing downstream (the bootstrap
+/// re-entry, the recovery, the plan publication's collection) may
+/// repair or replace it with an empty valid journal. The torn-
+/// creation resolution remains the exclusive province of the
+/// PRE-BINDING creation path (`T1Journal::open_bound`'s
+/// initialization of a journal whose binding was never published).
 pub fn scan_bound_file(
     path: impl AsRef<Path>,
     founding: &crate::hash::Hash,
@@ -1086,13 +1095,11 @@ pub fn scan_bound_file(
             path: path.display().to_string(),
             source: io::Error::from(io::ErrorKind::NotFound),
         }),
-        BoundHeaderState::TornCreation { byte_len } => Ok(JournalScan {
-            committed: Vec::new(),
-            cancellations: Vec::new(),
-            tail: TailState::Inert {
-                byte_len,
-                kind: TailKind::TornCreation,
-            },
+        BoundHeaderState::TornCreation { byte_len } => Err(JournalError::CorruptHeader {
+            detail: format!(
+                "torn bound header — damaged evidence, never an inert scan \
+                 (prefix of {byte_len} bytes)"
+            ),
         }),
         BoundHeaderState::Matching { header_hash } => {
             let state = classify_bound(
@@ -1612,6 +1619,20 @@ impl T1Journal {
         root_id: &crate::hash::Hash,
     ) -> Result<Self, JournalError> {
         Self::open_bound_with(path, None, founding, root_id)
+    }
+
+    /// (F4-R7) The publication permit borrowing THIS journal's own
+    /// held sidecar lock — proof the lock is held for the permit's
+    /// lifetime. The publication core checks the permit's locked
+    /// root against its own journal root, so a journal at any other
+    /// path never authorizes a root's publication (the unrotated
+    /// crossing's no-reacquisition path: its active journal IS the
+    /// root, and this permit is exactly that held root lock).
+    pub fn publication_permit(&self) -> PublicationPermit<'_> {
+        PublicationPermit {
+            locked_root: self.path.clone(),
+            _root_lock: &self._lock,
+        }
     }
 
     /// The bound form of the fault-seamed constructor (the crash-
@@ -2171,6 +2192,63 @@ impl T1Journal {
             None => Ok(()),
         }
     }
+}
+
+/// (V2-W F4, F4-R7) The nonforgeable, lifetime-bound publication
+/// permit: proof that a journal root's EXCLUSIVE SIDECAR LOCK is
+/// held for the permit's lifetime. Constructible ONLY inside this
+/// crate — from a live journal handle's own held sidecar lock (the
+/// unrotated crossing's no-reacquisition path: its active journal
+/// IS the root), or from the explicitly held publication lock (the
+/// rotated crossing and the standalone route). The reclamation plan
+/// publication core requires it: no caller can reach the plan append
+/// without proving the serialization boundary the production
+/// rotation honors (the same root lock across its flip).
+pub struct PublicationPermit<'a> {
+    locked_root: PathBuf,
+    _root_lock: &'a File,
+}
+
+impl<'a> PublicationPermit<'a> {
+    /// The location of the locked root (the publication core's
+    /// agreement check against its own journal root — a permit for a
+    /// different root never authorizes this publication).
+    pub fn locked_root(&self) -> &Path {
+        &self.locked_root
+    }
+}
+
+/// (V2-W F4, F4-R7) The explicitly held root publication lock — the
+/// serialization boundary acquired by
+/// [`hold_publication_lock`]. The guard owns the lock file (the
+/// release is the drop); the lifetime-bound permit borrows it.
+pub struct PublicationLockGuard {
+    lock: File,
+    root: PathBuf,
+}
+
+impl PublicationLockGuard {
+    /// The lifetime-bound permit borrowing THIS held lock.
+    pub fn permit(&self) -> PublicationPermit<'_> {
+        PublicationPermit {
+            locked_root: self.root.clone(),
+            _root_lock: &self.lock,
+        }
+    }
+}
+
+/// (V2-W F4, F4-R7) Acquires the journal root's exclusive sidecar
+/// lock — the publication serialization boundary (the same lock a
+/// concurrent rotation honors; a live unrotated crossing holds it
+/// through its own active-journal handle, blocking this acquire by
+/// design). The offline/standalone publication policy: the
+/// provider-neutral plan publication is legal ONLY under this held
+/// lock — never merely from possessing a bound root's path.
+pub fn hold_publication_lock(path: &Path) -> Result<PublicationLockGuard, JournalError> {
+    Ok(PublicationLockGuard {
+        lock: open_lock_file(path)?,
+        root: path.to_path_buf(),
+    })
 }
 
 /// Opens and exclusively locks the journal's sidecar lock file (the

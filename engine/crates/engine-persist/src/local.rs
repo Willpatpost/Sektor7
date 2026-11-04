@@ -6741,6 +6741,130 @@ mod exclusion_tests {
         }
     }
 
+    #[test]
+    fn the_v2_f4_first_binding_requires_durable_bootstrap_evidence() {
+        // (F4-R8) The first-binding admission's bootstrap-evidence
+        // verification: an arbitrary external caller holding a
+        // founding hash, a root ID, and a location can NEVER
+        // establish the first binding — the append demands the root
+        // ID's independent derivation from the founding and the
+        // normalized location, and the DURABLE journal-bootstrap
+        // evidence (the bound journal file existing at the claimed
+        // location with the exact expected identities). A missing
+        // journal refuses; a wrong derived root ID refuses; a
+        // legacy journal at the location refuses; the genuine
+        // bootstrap evidence publishes (the crossing's
+        // journal-first ordering always leaves the residue).
+        let root = temp_store("v2w-f4-r8");
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "v2w-f4-r8", 0);
+        medium.append(&founding, &[], None).unwrap();
+        let founding_id = founding.id();
+        let journal_root =
+            std::env::temp_dir().join(format!("s7-v2w-f4-r8-journal-{}", std::process::id()));
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        // (a) THE MISSING JOURNAL: the values alone (the founding
+        // hash, the correctly derived root ID, the location) are
+        // never authorization — no durable bootstrap evidence
+        // exists at the location.
+        let error = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            90,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "journal-root/bootstrap-evidence-missing"
+                }
+            ),
+            "the missing durable bootstrap evidence refuses: {error:?}"
+        );
+        assert!(
+            crate::reclaim::find_installed_journal_root_binding(&mut medium, &founding_id)
+                .unwrap()
+                .is_none(),
+            "no binding was installed"
+        );
+        // (b) THE WRONG DERIVED ROOT ID: a caller-supplied root ID
+        // that is not the deterministic derivation from the founding
+        // and the normalized location refuses.
+        let wrong_root_id = crate::reclaim::journal_root_id(&founding_id, "/wrong/location");
+        let error = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &wrong_root_id,
+            &location,
+            91,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "journal-root/root-id-derivation"
+                }
+            ),
+            "the wrong derived root ID refuses: {error:?}"
+        );
+        // (c) THE LEGACY JOURNAL AT THE LOCATION: a file carrying a
+        // legacy header is not the expected bound journal — never
+        // reinterpreted as bootstrap evidence.
+        drop(crate::journal::T1Journal::open(&journal_root).unwrap());
+        let error = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            92,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "journal-root/bootstrap-evidence-invalid"
+                }
+            ),
+            "the legacy journal at the location refuses: {error:?}"
+        );
+        assert!(
+            crate::reclaim::find_installed_journal_root_binding(&mut medium, &founding_id)
+                .unwrap()
+                .is_none(),
+            "still no binding was installed"
+        );
+        let _ = std::fs::remove_file(&journal_root);
+        let _ = std::fs::remove_file(journal_root.with_extension("lock"));
+        // (d) THE GENUINE EVIDENCE: the bound journal durably created
+        // at the location with the exact expected identities (the
+        // trusted bootstrap's own durable step) publishes.
+        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            93,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+            ),
+            "the genuine durable bootstrap evidence publishes: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&journal_root);
+        let _ = std::fs::remove_file(journal_root.with_extension("lock"));
+    }
+
     fn two_retirement_store(
         label: &str,
     ) -> (

@@ -815,7 +815,7 @@ fn legacy_synchronous_paths_remain_operational() {
     let location = found_location(&dir, false);
     let (mut spine, mut director) = scenario_pair(150, &near_region_4());
     let journal = T1Journal::open(dir.journal()).unwrap();
-    let mut crossing = SessionCrossing::open(&dir.store(), journal, "legacy").unwrap();
+    let mut crossing = SessionCrossing::open(&dir.store(), journal, "pp-b4-orch").unwrap();
     crossing.publish_snapshot(&spine, &director).unwrap();
     let now = spine.clock();
     crossing
@@ -828,7 +828,7 @@ fn legacy_synchronous_paths_remain_operational() {
     ));
     drop(crossing);
     let (_spine, _director, recovered) =
-        SessionCrossing::recover(&dir.store(), &dir.journal(), "legacy").unwrap();
+        SessionCrossing::recover(&dir.store(), &dir.journal(), "pp-b4-orch").unwrap();
     drop(recovered);
     assert!(oracle_records_at(&location) >= 3);
 }
@@ -851,7 +851,7 @@ fn the_journal_flip_count_generation() {
     let worker = IoWorker::spawn(&location).unwrap();
     let source = worker.source().unwrap();
     let journal = T1Journal::open(dir.journal()).unwrap();
-    let mut crossing = SessionCrossing::open_at(&source, journal, "pp-b4-flip").unwrap();
+    let mut crossing = SessionCrossing::open_at(&source, journal, "pp-b4-orch").unwrap();
     assert_eq!(crossing.journal_flip_count(), 0);
     // The rotation requires a verified anchor: publish one first.
     crossing.publish_snapshot(&spine, &director).unwrap();
