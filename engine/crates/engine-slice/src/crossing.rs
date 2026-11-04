@@ -838,23 +838,31 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// derived from the founding and the normalized location; (2)
     /// the durable bound-journal creation (or strict reuse) at the
     /// selected root BEFORE the founding append and any transaction
-    /// (a torn pre-binding creation resolves — nothing could have
-    /// been journaled, and no binding exists yet to make it damaged
-    /// evidence, F4-R9; a matching bound header resumes; a legacy,
-    /// foreign, or conflicting header refuses); (3) the canonical
-    /// founding append (the truly fresh campaign only); (4) the
-    /// canonical binding publication through the trusted in-crate
-    /// admission (the CAS, the exact-duplicate recognition, the
+    /// — under the F4-R11 creation authority (the verified
+    /// binding-absence capability; once a binding is installed no
+    /// public path can create or repair the journal), adopting an
+    /// existing complete residue only when it is EMPTY (F4-R12: the
+    /// trusted ordering journals nothing before the binding, so
+    /// committed transactions, cancellations, or an unresolved
+    /// non-creation tail are foreign history, refused with the
+    /// bytes preserved), a torn pre-binding creation resolving
+    /// (nothing could have been journaled, and no binding exists yet
+    /// to make it damaged evidence, F4-R9), a legacy, foreign, or
+    /// conflicting header refusing; (3) the canonical founding
+    /// append (the truly fresh campaign only); (4) the canonical
+    /// binding publication through the trusted in-crate admission
+    /// (the CAS, the exact-duplicate recognition, the
     /// conflicting-root refusal, the Unknown reconciliation — never
     /// a false completion; the first-binding fresh-shape gate, the
-    /// root-ID derivation check, and the durable journal-bootstrap
-    /// evidence verification, F4-R8); (5) the installed agreement
-    /// verified; (6) only then the authoritative pipeline. THE
-    /// CRASH STATES: a re-entry with the binding ALREADY installed
-    /// is the completed-bootstrap resume — the journal must EXIST
-    /// and carry a COMPLETE matching bound header (a missing journal
-    /// is MISSING authoritative evidence, a torn or corrupt header
-    /// is DAMAGED evidence — both fail closed, never repaired, never
+    /// root-ID derivation check, the durable journal-bootstrap
+    /// evidence verification, and the canonical location descriptor
+    /// check, F4-R8/R13); (5) the installed agreement verified; (6)
+    /// only then the authoritative pipeline. THE CRASH STATES: a
+    /// re-entry with the binding ALREADY installed is the
+    /// completed-bootstrap resume — the journal must EXIST and carry
+    /// a COMPLETE matching bound header (a missing journal is
+    /// MISSING authoritative evidence, a torn or corrupt header is
+    /// DAMAGED evidence — both fail closed, never repaired, never
     /// recreated); a re-entry after the journal creation but before
     /// the founding append (the truly fresh medium) reuses the
     /// journal and proceeds; a re-entry after the founding append
@@ -982,14 +990,73 @@ impl<S: MediumSource> SessionCrossing<S> {
                 detail: "journal-root/missing-bootstrap-evidence",
             });
         }
+        // (F4-R12) THE RESIDUE CLASSIFICATION — read-only, BEFORE the
+        // founding append and the journal-root binding publication:
+        // an existing journal at the root is adoptable as
+        // interrupted-bootstrap residue ONLY when it matches the
+        // expected identities and carries NO authoritative history —
+        // the trusted bootstrap's ordering journals nothing before
+        // the binding, so committed transactions, cancellations, or
+        // an unresolved non-creation tail are FOREIGN history,
+        // refused with the bytes preserved (never silently adopted
+        // as a fresh campaign's authoritative root, never
+        // truncated). A legacy, foreign, or corrupt header refuses
+        // the same way; a torn PRE-BINDING creation proceeds to the
+        // trusted creation path's resolution.
+        if journal_path.exists() {
+            let residue_bytes = std::fs::read(journal_path).map_err(|_error| {
+                TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "journal-root/residue-unreadable",
+                }
+            })?;
+            match engine_persist::journal::read_bound_header(&residue_bytes, &founding, &root_id) {
+                Err(_error) => {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-root/residue-invalid",
+                    });
+                }
+                Ok(engine_persist::journal::BoundHeaderState::Matching { .. }) => {
+                    let scan =
+                        engine_persist::journal::scan_bound_file(journal_path, &founding, &root_id)
+                            .map_err(|_error| TransitionError::InstallIncompatible {
+                                region: 0,
+                                detail: "journal-root/residue-invalid",
+                            })?;
+                    if !scan.committed.is_empty()
+                        || !scan.cancellations.is_empty()
+                        || scan.tail != TailState::Clean
+                    {
+                        return Err(TransitionError::InstallIncompatible {
+                            region: 0,
+                            detail: "journal-root/residue-history",
+                        });
+                    }
+                }
+                Ok(engine_persist::journal::BoundHeaderState::Fresh)
+                | Ok(engine_persist::journal::BoundHeaderState::TornCreation { .. }) => {}
+            }
+        }
+        // (F4-R11) THE CREATION AUTHORITY: the nonforgeable
+        // binding-absence capability — the verified lifecycle state
+        // in which no journal-root binding is installed for this
+        // founding. The creation/reuse below requires it: once a
+        // binding exists the authority is unobtainable, so no path
+        // can recreate or repair the bound journal of a bound
+        // campaign.
+        let creation_authority =
+            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding)
+                .map_err(PipelineError::Medium)?;
         // (3) The durable bound-journal creation/reuse BEFORE the
         // founding append and any transaction (the strict reuse:
         // Matching resumes, a torn PRE-BINDING creation resolves —
         // nothing could ever have been journaled, and no binding
         // exists yet to make it damaged evidence (F4-R9) — a
         // legacy/foreign header refuses, never reinterpreted).
-        let journal = T1Journal::open_bound(journal_path, &founding, &root_id)
-            .map_err(PipelineError::Journal)?;
+        let journal =
+            T1Journal::open_bound_creating(journal_path, &founding, &root_id, &creation_authority)
+                .map_err(PipelineError::Journal)?;
         // (1) The canonical founding append — the truly fresh
         // campaign only (an existing chain already carries it).
         if fresh_campaign {

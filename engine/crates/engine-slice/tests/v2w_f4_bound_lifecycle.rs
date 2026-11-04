@@ -673,10 +673,16 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
         let location = JournalRootBinding::normalize_location(&journal_root);
         let root_id = journal_root_id(&founding_id, &location);
-        drop(
-            T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                .expect("the interrupted bootstrap's journal exists"),
-        );
+        {
+            let mut medium = LocalFileMedium::open(&store).unwrap();
+            let creation =
+                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
+                    .expect("the empty chain grants the creation authority");
+            drop(
+                T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
+                    .expect("the interrupted bootstrap's journal is created"),
+            );
+        }
         let crossing = SessionCrossing::open_bound_bootstrap(
             &StoreLocation::Directory(store.clone()),
             &journal_root,
@@ -699,11 +705,14 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let founding_id = founding.id();
         let location = JournalRootBinding::normalize_location(&journal_root);
         let root_id = journal_root_id(&founding_id, &location);
-        drop(
-            T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                .expect("the interrupted bootstrap's journal exists"),
-        );
         let mut medium = LocalFileMedium::open(&store).unwrap();
+        let creation =
+            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
+                .expect("the empty chain grants the creation authority");
+        drop(
+            T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
+                .expect("the interrupted bootstrap's journal is created"),
+        );
         match medium.append(&founding, &[], None).unwrap() {
             AppendOutcome::Accepted { .. } => {}
             _ => panic!("the founding append accepts"),
@@ -813,10 +822,16 @@ fn the_crash_states_of_the_bound_bootstrap_resume() {
         let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
         let location = JournalRootBinding::normalize_location(&journal_root);
         let root_id = journal_root_id(&founding_id, &location);
-        drop(
-            T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                .expect("the journal is created"),
-        );
+        {
+            let mut medium = LocalFileMedium::open(&store).unwrap();
+            let creation =
+                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
+                    .expect("the empty chain grants the creation authority");
+            drop(
+                T1Journal::open_bound_creating(&journal_root, &founding_id, &root_id, &creation)
+                    .expect("the journal is created"),
+            );
+        }
         // The torn prefix: a strict prefix of the canonical bound
         // header (the crashed creation's residue).
         let complete = std::fs::read(&journal_root).unwrap();
@@ -1030,5 +1045,321 @@ fn the_open_at_entry_point_joins_bound_campaigns_only_through_their_journal() {
             "the crossing's journal root is the BINDING's authoritative root"
         );
         drop(crossing);
+    }
+}
+
+#[test]
+fn the_bound_journal_recreation_bypass_fails_closed() {
+    // (F4-R11) The low-level recreation bypass closed: a bound
+    // campaign with REAL COMMITTED journal history, closed, its
+    // active journal REMOVED, then separately TRUNCATED to a valid
+    // header prefix — the PUBLIC low-level bound opening (the
+    // ordinary open) refuses BOTH (never creating the missing file,
+    // never repairing the torn header — no manufactured empty
+    // authoritative history), and the crossing re-entry refuses the
+    // same states; restoring the genuine evidence re-opens. The
+    // legitimate creation paths — the fresh bootstrap, the
+    // pre-binding torn resolution, the rotation's unique successor —
+    // are proven by the adjacent suite members (the crash matrix,
+    // the end-to-end rotations).
+    let dir = TestDir::new("r11-bypass");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11-campaign",
+    )
+    .unwrap();
+    // The real committed journal history: a snapshot publication and
+    // a journaled deactivation (a complete committed transaction).
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (founding, root_id) = installed_binding(&store);
+    let intact_bytes = std::fs::read(&journal_root).unwrap();
+    // (1) THE REMOVED JOURNAL: the public low-level bound open
+    // refuses and NEVER CREATES the missing file.
+    std::fs::remove_file(&journal_root).unwrap();
+    let error = match T1Journal::open_bound(&journal_root, &founding, &root_id) {
+        Err(error) => error,
+        Ok(_journal) => panic!("the ordinary open never creates the missing bound journal"),
+    };
+    assert!(
+        matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("absent")),
+        "the ordinary open never creates the missing bound journal: {error:?}"
+    );
+    assert!(
+        !journal_root.exists(),
+        "no journal file was manufactured by the refused open"
+    );
+    // The crossing re-entry refuses (missing authoritative evidence).
+    let error = match SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11-campaign",
+    ) {
+        Err(error) => error,
+        Ok(_crossing) => panic!("the removed journal never re-enters"),
+    };
+    assert!(
+        matches!(
+            &error,
+            TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/missing-journal"
+        ),
+        "the re-entry fails closed on the removed journal: {error:?}"
+    );
+    assert!(
+        !journal_root.exists(),
+        "no journal file was manufactured by the refused re-entry"
+    );
+    // The creation authority is unobtainable: the installed binding
+    // makes the binding-absence capability — and with it every
+    // public creation path — unreachable for this campaign.
+    {
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let error =
+            engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                engine_persist::MediumError::Chain {
+                    rule: "journal-root/creation-authority-bound"
+                }
+            ),
+            "the bound campaign never grants the creation authority: {error:?}"
+        );
+    }
+    // (2) THE TRUNCATED JOURNAL (a valid header prefix): the public
+    // low-level open refuses without repairing (the damaged
+    // evidence preserved).
+    std::fs::write(&journal_root, &intact_bytes[..10]).unwrap();
+    let damaged_bytes = std::fs::read(&journal_root).unwrap();
+    let error = match T1Journal::open_bound(&journal_root, &founding, &root_id) {
+        Err(error) => error,
+        Ok(_journal) => panic!("the ordinary open never repairs the torn bound header"),
+    };
+    assert!(
+        matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("torn")),
+        "the ordinary open never repairs the torn bound header: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&journal_root).unwrap(),
+        damaged_bytes,
+        "the damaged evidence is preserved byte-exact by the refused open"
+    );
+    // The crossing re-entry refuses the damaged evidence.
+    let error = match SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11-campaign",
+    ) {
+        Err(error) => error,
+        Ok(_crossing) => panic!("the truncated journal never re-enters"),
+    };
+    assert!(
+        matches!(
+            &error,
+            TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/active-corrupt"
+        ),
+        "the re-entry fails closed on the damaged evidence: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&journal_root).unwrap(),
+        damaged_bytes,
+        "the damaged evidence is preserved byte-exact by the refused re-entry"
+    );
+    // (3) THE RESTORED GENUINE EVIDENCE re-opens (the strict open
+    // over the intact committed history).
+    std::fs::write(&journal_root, &intact_bytes).unwrap();
+    let crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11-campaign",
+    )
+    .expect("the restored genuine evidence re-opens the bound campaign");
+    drop(crossing);
+}
+
+#[test]
+fn the_bootstrap_refuses_pre_binding_journals_with_history() {
+    // (F4-R12) The residue's authoritative-history refusal: an
+    // existing bound journal at the root is adoptable as
+    // interrupted-bootstrap residue ONLY when EMPTY — the trusted
+    // ordering journals nothing before the binding. A matching
+    // journal ALREADY carrying a committed transaction refuses the
+    // EMPTY canonical store and the founding-only chain alike (no
+    // founding appended, no binding installed, the bytes preserved);
+    // a matching journal with an unresolved non-creation tail fails
+    // closed without truncation; the genuine EMPTY matching residue
+    // bootstraps.
+    let dir = TestDir::new("r12-residue");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    let campaign = "r12-campaign";
+    // THE HISTORY JOURNAL: a genuine bound campaign's journal with a
+    // real committed transaction (a snapshot publication + a
+    // journaled deactivation), left at the root after its crossing
+    // closes. Its identities are the deterministic function of the
+    // campaign name and the location, so a fresh store presenting
+    // the same name and root path proposes EXACTLY this journal as
+    // its residue.
+    let history_root = dir.journal();
+    {
+        let store = dir.store();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &history_root,
+            campaign,
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        drop(crossing);
+        drop(spine);
+        drop(director);
+    }
+    let history_bytes = std::fs::read(&history_root).unwrap();
+    // (1) THE EMPTY CANONICAL STORE + the history journal: the
+    // residue classification refuses (no founding, no binding).
+    {
+        let fresh_store = dir.bound_journal().with_extension("store-fresh");
+        std::fs::create_dir_all(&fresh_store).unwrap();
+        let error = match SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(fresh_store.clone()),
+            &history_root,
+            campaign,
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("a journal with committed history is never adopted"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/residue-history"
+            ),
+            "the exact authority boundary — the residue carries history: {error:?}"
+        );
+        let mut medium = LocalFileMedium::open(&fresh_store).unwrap();
+        assert!(
+            medium.head().unwrap().is_none(),
+            "no founding was appended to the fresh store"
+        );
+        assert_eq!(
+            std::fs::read(&history_root).unwrap(),
+            history_bytes,
+            "the history journal's bytes are preserved"
+        );
+    }
+    // (2) THE FOUNDING-ONLY CHAIN + the history journal: the same
+    // refusal (the founding's presence changes nothing — the
+    // residue's history is the refusal's cause).
+    {
+        let founding_store = dir.bound_journal().with_extension("store-founding");
+        std::fs::create_dir_all(&founding_store).unwrap();
+        let mut medium = LocalFileMedium::open(&founding_store).unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0);
+        match medium.append(&founding, &[], None).unwrap() {
+            AppendOutcome::Accepted { .. } => {}
+            _ => panic!("the founding append accepts"),
+        }
+        drop(medium);
+        let error = match SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(founding_store.clone()),
+            &history_root,
+            campaign,
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the founding-only chain never adopts the history journal"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/residue-history"
+            ),
+            "the founding-only chain refuses the history residue: {error:?}"
+        );
+        let mut medium = LocalFileMedium::open(&founding_store).unwrap();
+        assert_eq!(
+            medium.head().unwrap(),
+            Some(founding.id()),
+            "the founding-only chain stands unchanged"
+        );
+        assert!(
+            find_installed_journal_root_binding(&mut medium, &founding.id())
+                .unwrap()
+                .is_none(),
+            "no binding was installed"
+        );
+    }
+    // (3) THE UNRESOLVED NON-CREATION TAIL: a matching journal with
+    // trailing garbage after the committed history fails closed
+    // without truncation (the bytes preserved).
+    {
+        let mut tailed_bytes = history_bytes.clone();
+        tailed_bytes.extend_from_slice(b"unresolved trailing damage");
+        std::fs::write(&history_root, &tailed_bytes).unwrap();
+        let tail_store = dir.bound_journal().with_extension("store-tail");
+        std::fs::create_dir_all(&tail_store).unwrap();
+        let error = match SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(tail_store.clone()),
+            &history_root,
+            campaign,
+        ) {
+            Err(error) => error,
+            Ok(_crossing) => panic!("the unresolved non-creation tail never adopts"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-root/residue-history"
+            ),
+            "the unresolved non-creation tail fails closed: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&history_root).unwrap(),
+            tailed_bytes,
+            "the damaged residue is preserved byte-exact (never truncated)"
+        );
+        std::fs::write(&history_root, &history_bytes).unwrap();
+    }
+    // (4) THE GENUINE EMPTY MATCHING RESIDUE: a fresh campaign whose
+    // root carries an EMPTY bound journal with the exact expected
+    // identities bootstraps (the interrupted bootstrap's true
+    // residue).
+    {
+        let empty_root = dir.bound_journal().with_extension("empty-root");
+        let empty_store = dir.bound_journal().with_extension("store-empty");
+        std::fs::create_dir_all(&empty_store).unwrap();
+        let founding_id = RevisionRecord::founding(AuthorityMode::Standalone, campaign, 0).id();
+        let location = JournalRootBinding::normalize_location(&empty_root);
+        let root_id = journal_root_id(&founding_id, &location);
+        {
+            let mut medium = LocalFileMedium::open(&empty_store).unwrap();
+            let creation =
+                engine_persist::reclaim::verify_bound_creation_authority(&mut medium, &founding_id)
+                    .expect("the empty chain grants the creation authority");
+            drop(
+                T1Journal::open_bound_creating(&empty_root, &founding_id, &root_id, &creation)
+                    .expect("the empty residue is created"),
+            );
+        }
+        let crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(empty_store.clone()),
+            &empty_root,
+            campaign,
+        )
+        .expect("the genuine empty matching residue bootstraps");
+        drop(crossing);
+        let (installed_founding, installed_root) = installed_binding(&empty_store);
+        assert_eq!(installed_founding, founding_id);
+        assert_eq!(installed_root, root_id);
     }
 }

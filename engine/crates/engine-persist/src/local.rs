@@ -5175,7 +5175,17 @@ mod exclusion_tests {
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let creation =
+            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+        drop(
+            crate::journal::T1Journal::open_bound_creating(
+                &journal_root,
+                &founding_id,
+                &root_id,
+                &creation,
+            )
+            .unwrap(),
+        );
         let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
             &founding_id,
@@ -5332,7 +5342,17 @@ mod exclusion_tests {
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let creation =
+            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+        drop(
+            crate::journal::T1Journal::open_bound_creating(
+                &journal_root,
+                &founding_id,
+                &root_id,
+                &creation,
+            )
+            .unwrap(),
+        );
         let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
             &founding_id,
@@ -6717,9 +6737,16 @@ mod exclusion_tests {
             let founding_id = founding.id();
             let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
             let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+            let creation =
+                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
             drop(
-                crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                    .unwrap(),
+                crate::journal::T1Journal::open_bound_creating(
+                    &journal_root,
+                    &founding_id,
+                    &root_id,
+                    &creation,
+                )
+                .unwrap(),
             );
             let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
                 &mut medium,
@@ -6844,7 +6871,17 @@ mod exclusion_tests {
         // (d) THE GENUINE EVIDENCE: the bound journal durably created
         // at the location with the exact expected identities (the
         // trusted bootstrap's own durable step) publishes.
-        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let creation =
+            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+        drop(
+            crate::journal::T1Journal::open_bound_creating(
+                &journal_root,
+                &founding_id,
+                &root_id,
+                &creation,
+            )
+            .unwrap(),
+        );
         let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
             &founding_id,
@@ -6863,6 +6900,109 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&journal_root);
         let _ = std::fs::remove_file(journal_root.with_extension("lock"));
+    }
+
+    #[test]
+    fn the_v2_f4_binding_location_must_be_the_canonical_descriptor() {
+        // (F4-R13) The canonical root-location descriptor: the
+        // binding admission's supplied location must BE the exact
+        // normalized absolute form required by the accepted contract
+        // — a relative descriptor (even with a matching journal at
+        // the real relative path and a root ID derived from the
+        // unnormalized string) refuses BEFORE any publication work,
+        // so the permanent key is never installed over a descriptor
+        // the verifications could not round-trip; the properly
+        // normalized absolute equivalent publishes.
+        let root = temp_store("v2w-f4-r13");
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "v2w-f4-r13", 0);
+        medium.append(&founding, &[], None).unwrap();
+        let founding_id = founding.id();
+        // A REAL relative path (under the test's working directory)
+        // carrying a matching bound journal, with the root ID
+        // derived from the UNNORMALIZED string.
+        let relative = std::path::Path::new("s7-r13-relative/journal.t1");
+        let relative_text = relative.to_str().unwrap().to_owned();
+        let wrong_root_id = crate::reclaim::journal_root_id(&founding_id, &relative_text);
+        {
+            let creation =
+                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+            drop(
+                crate::journal::T1Journal::open_bound_creating(
+                    relative,
+                    &founding_id,
+                    &wrong_root_id,
+                    &creation,
+                )
+                .unwrap(),
+            );
+        }
+        assert!(relative.exists(), "the relative-path journal is real");
+        // THE DIRECT PUBLICATION with the relative descriptor and
+        // its unnormalized derivation refuses — the canonical check
+        // fires before any publication work.
+        let error = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &wrong_root_id,
+            &relative_text,
+            94,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "journal-root/location-not-canonical"
+                }
+            ),
+            "the relative location descriptor refuses: {error:?}"
+        );
+        assert!(
+            crate::reclaim::find_installed_journal_root_binding(&mut medium, &founding_id)
+                .unwrap()
+                .is_none(),
+            "the permanent key was never installed"
+        );
+        let _ = std::fs::remove_file(relative);
+        let _ = std::fs::remove_dir_all("s7-r13-relative");
+        // THE PROPERLY NORMALIZED ABSOLUTE EQUIVALENT publishes (the
+        // trusted bootstrap's own descriptor form).
+        let absolute =
+            std::env::temp_dir().join(format!("s7-v2w-f4-r13-journal-{}", std::process::id()));
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&absolute);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        {
+            let creation =
+                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+            drop(
+                crate::journal::T1Journal::open_bound_creating(
+                    &absolute,
+                    &founding_id,
+                    &root_id,
+                    &creation,
+                )
+                .unwrap(),
+            );
+        }
+        let (_id, outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            95,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+            ),
+            "the canonical absolute descriptor publishes: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&absolute);
+        let _ = std::fs::remove_file(absolute.with_extension("lock"));
     }
 
     fn two_retirement_store(

@@ -1072,7 +1072,7 @@ pub fn read_bound_header(
 /// re-entry, the recovery, the plan publication's collection) may
 /// repair or replace it with an empty valid journal. The torn-
 /// creation resolution remains the exclusive province of the
-/// PRE-BINDING creation path (`T1Journal::open_bound`'s
+/// PRE-BINDING creation path (`T1Journal::open_bound_creating`'s
 /// initialization of a journal whose binding was never published).
 pub fn scan_bound_file(
     path: impl AsRef<Path>,
@@ -1603,24 +1603,6 @@ impl T1Journal {
         Ok(journal)
     }
 
-    /// (V2-W F4) The bound-journal open: the trusted bootstrap's
-    /// creation/reuse path. A FRESH or torn-bound-creation file is
-    /// (re-)initialized with the bound header (one write + one
-    /// fsync + the parent-directory sync — a crash can only leave a
-    /// prefix, nothing could ever have been journaled); a file
-    /// carrying the EXACT expected identities is classified and
-    /// resumed; anything else — a legacy header, a foreign or
-    /// mismatched bound header, corrupt bytes — refuses typed
-    /// (never reinterpreted, never silently converted). The
-    /// single-writer sidecar lock discipline is identical.
-    pub fn open_bound(
-        path: impl Into<PathBuf>,
-        founding: &crate::hash::Hash,
-        root_id: &crate::hash::Hash,
-    ) -> Result<Self, JournalError> {
-        Self::open_bound_with(path, None, founding, root_id)
-    }
-
     /// (F4-R7) The publication permit borrowing THIS journal's own
     /// held sidecar lock — proof the lock is held for the permit's
     /// lifetime. The publication core checks the permit's locked
@@ -1635,11 +1617,31 @@ impl T1Journal {
         }
     }
 
-    /// The bound form of the fault-seamed constructor (the crash-
-    /// window tests use it exactly as the legacy's).
-    pub fn open_bound_with(
+    /// (F4-R11) THE STRICT BOUND OPEN — the ordinary public path for
+    /// an EXISTING bound journal, and the ONLY public open once a
+    /// journal-root binding is installed: the file must exist and
+    /// carry a COMPLETE matching bound header, which is classified
+    /// and resumed (the accepted inert-data-tail resolution
+    /// included). An absent file, an empty file, a torn-creation
+    /// prefix, or a corrupt/legacy/foreign header refuses typed —
+    /// this path NEVER creates and NEVER repairs: the authoritative
+    /// evidence is preserved exactly as found. Creation belongs to
+    /// the trusted bootstrap ([`Self::open_bound_creating`] under
+    /// the verified binding-absence authority) and to the rotation's
+    /// unique successor ([`Self::create_bound_generation`]).
+    pub fn open_bound(
         path: impl Into<PathBuf>,
-        fault: Option<JournalFaultControl>,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
+        Self::open_bound_strict(path, founding, root_id)
+    }
+
+    /// The strict open's implementation: no file creation, no header
+    /// initialization, no torn resolution — an existing complete
+    /// matching header or a typed refusal.
+    fn open_bound_strict(
+        path: impl Into<PathBuf>,
         founding: &crate::hash::Hash,
         root_id: &crate::hash::Hash,
     ) -> Result<Self, JournalError> {
@@ -1650,10 +1652,12 @@ impl T1Journal {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(false)
             .truncate(false)
             .open(&path)
-            .map_err(|e| io_err("open journal", &path, e))?;
+            .map_err(|_error| JournalError::CorruptHeader {
+                detail: "the bound journal is absent — an ordinary open never creates it".into(),
+            })?;
         let lock = open_lock_file(&path)?;
         let bytes = fs::read(&path).map_err(|e| io_err("read journal", &path, e))?;
         if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
@@ -1670,7 +1674,122 @@ impl T1Journal {
             _lock: lock,
             state: JournalState::empty_bound(Hash::ZERO, 0),
             acknowledged: BTreeSet::new(),
-            fault,
+            fault: None,
+            sync_count: 0,
+            platform_tier: platform_tier(),
+        };
+        let header = bound_header_bytes(founding, root_id);
+        match read_bound_header(&bytes, founding, root_id)? {
+            BoundHeaderState::Fresh => {
+                return Err(JournalError::CorruptHeader {
+                    detail: "the bound journal is empty — no complete header".into(),
+                });
+            }
+            BoundHeaderState::TornCreation { byte_len } => {
+                return Err(JournalError::CorruptHeader {
+                    detail: format!(
+                        "torn bound header — damaged evidence, never repaired by an \
+                         ordinary open (prefix of {byte_len} bytes)"
+                    ),
+                });
+            }
+            BoundHeaderState::Matching { header_hash } => {
+                journal.state = classify_bound(&bytes, header_hash, header.len())?;
+                journal.resolve_tail()?;
+            }
+        }
+        Ok(journal)
+    }
+
+    /// (F4-R11) THE ROTATION'S SUCCESSOR CREATION — the authorized
+    /// creation of a UNIQUE bound generation: the path must NOT
+    /// exist (the rotation names a fresh nanos-unique generation;
+    /// an existing path is never overwritten — this constructor is
+    /// structurally unable to replace authoritative evidence). The
+    /// durable initialization is the bound form's (one write + one
+    /// fsync + the parent-directory sync).
+    pub fn create_bound_generation(
+        path: impl Into<PathBuf>,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
+        let path = path.into();
+        if path.exists() {
+            return Err(JournalError::CorruptHeader {
+                detail: "the bound generation path already exists — never overwritten".into(),
+            });
+        }
+        Self::open_bound_creating_at(&path, founding, root_id)
+    }
+
+    /// (F4-R11/F4-R12) THE TRUSTED BOOTSTRAP'S CREATION — the one
+    /// path that may create a missing bound journal or resolve a
+    /// torn PRE-BINDING creation, and it requires the nonforgeable
+    /// [`crate::reclaim::BoundCreationAuthority`]: the verified
+    /// lifecycle state in which NO journal-root binding is installed
+    /// for this founding (the authenticated absence — an empty chain
+    /// or a completed lookup). Once a binding exists the authority
+    /// is unobtainable, so no public path can recreate or repair the
+    /// active journal of a bound campaign. The adoption of an
+    /// existing COMPLETE residue (F4-R12) accepts only an EMPTY
+    /// journal — no committed transactions, no cancellations, a
+    /// clean tail: the trusted bootstrap's ordering journals nothing
+    /// before the binding, so any history is foreign to the
+    /// interrupted-bootstrap residue and refuses with the bytes
+    /// preserved.
+    pub fn open_bound_creating(
+        path: impl Into<PathBuf>,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+        authority: &crate::reclaim::BoundCreationAuthority,
+    ) -> Result<Self, JournalError> {
+        if authority.founding() != founding {
+            return Err(JournalError::CorruptHeader {
+                detail: "the creation authority was issued for a different founding".into(),
+            });
+        }
+        Self::open_bound_creating_at(&path.into(), founding, root_id)
+    }
+
+    /// The creation/reuse implementation shared by the bootstrap's
+    /// authority-gated creation and the rotation's unique successor:
+    /// a fresh or torn-creation file is (re-)initialized with the
+    /// bound header (nothing could ever have been journaled); a
+    /// complete matching header is adopted ONLY when empty (F4-R12);
+    /// anything else — a legacy, foreign, or corrupt header, or a
+    /// residue carrying history — refuses typed.
+    fn open_bound_creating_at(
+        path: &Path,
+        founding: &crate::hash::Hash,
+        root_id: &crate::hash::Hash,
+    ) -> Result<Self, JournalError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err("create journal dir", path, e))?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| io_err("open journal", path, e))?;
+        let lock = open_lock_file(path)?;
+        let bytes = fs::read(path).map_err(|e| io_err("read journal", path, e))?;
+        if bytes.len() as u64 > MAX_JOURNAL_FILE_BYTES {
+            return Err(JournalError::Format(SaveError::Limit {
+                section: "journal",
+                kind: "file-length",
+                value: bytes.len() as u64,
+                max: MAX_JOURNAL_FILE_BYTES,
+            }));
+        }
+        let mut journal = T1Journal {
+            path: path.to_path_buf(),
+            file,
+            _lock: lock,
+            state: JournalState::empty_bound(Hash::ZERO, 0),
+            acknowledged: BTreeSet::new(),
+            fault: None,
             sync_count: 0,
             platform_tier: platform_tier(),
         };
@@ -1680,17 +1799,37 @@ impl T1Journal {
                 journal
                     .file
                     .set_len(0)
-                    .map_err(|e| io_err("truncate journal", &path, e))?;
+                    .map_err(|e| io_err("truncate journal", path, e))?;
                 journal
                     .append_bytes(&header)
-                    .map_err(|e| io_err("write bound journal header", &path, e))?;
+                    .map_err(|e| io_err("write bound journal header", path, e))?;
                 journal.sync()?;
-                sync_parent_dir(&path).map_err(|e| io_err("sync journal dir", &path, e))?;
+                sync_parent_dir(path).map_err(|e| io_err("sync journal dir", path, e))?;
                 journal.state =
                     JournalState::empty_bound(hash_object(&header), header.len() as u64);
             }
             BoundHeaderState::Matching { header_hash } => {
-                journal.state = classify_bound(&bytes, header_hash, header.len())?;
+                // (F4-R12) THE EMPTY-RESIDUE ADMISSION: the trusted
+                // bootstrap's ordering journals nothing before the
+                // binding publication, so a genuine interrupted-
+                // bootstrap residue is EMPTY — committed
+                // transactions, cancellations, or an unresolved
+                // non-creation tail are foreign history, refused
+                // with the bytes preserved (never silently adopted
+                // as a fresh campaign's authoritative root, never
+                // truncated).
+                let state = classify_bound(&bytes, header_hash, header.len())?;
+                if !state.committed.is_empty()
+                    || !state.cancellations.is_empty()
+                    || state.observed_tail != TailState::Clean
+                {
+                    return Err(JournalError::CorruptHeader {
+                        detail: "the existing bound journal carries history — never \
+                                 adopted as a fresh campaign's root"
+                            .into(),
+                    });
+                }
+                journal.state = state;
                 journal.resolve_tail()?;
             }
         }

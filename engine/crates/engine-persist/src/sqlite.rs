@@ -6660,7 +6660,17 @@ mod exclusion_tests {
         let founding_id = founding.id();
         let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
         let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
-        drop(crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id).unwrap());
+        let creation =
+            crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
+        drop(
+            crate::journal::T1Journal::open_bound_creating(
+                &journal_root,
+                &founding_id,
+                &root_id,
+                &creation,
+            )
+            .unwrap(),
+        );
         let (_binding_id, binding_outcome) = crate::reclaim::publish_journal_root_binding(
             &mut medium,
             &founding_id,
@@ -6834,9 +6844,16 @@ mod exclusion_tests {
             let founding_id = founding.id();
             let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
             let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+            let creation =
+                crate::reclaim::verify_bound_creation_authority(&mut medium, &founding_id).unwrap();
             drop(
-                crate::journal::T1Journal::open_bound(&journal_root, &founding_id, &root_id)
-                    .unwrap(),
+                crate::journal::T1Journal::open_bound_creating(
+                    &journal_root,
+                    &founding_id,
+                    &root_id,
+                    &creation,
+                )
+                .unwrap(),
             );
             crate::reclaim::publish_journal_root_binding(
                 &mut medium,

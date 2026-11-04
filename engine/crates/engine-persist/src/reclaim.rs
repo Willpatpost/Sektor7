@@ -1785,6 +1785,22 @@ pub fn publish_journal_root_binding(
             rule: "journal-root/binding-invalid",
         });
     }
+    // (F4-R13) THE CANONICAL LOCATION DESCRIPTOR: the supplied
+    // location must BE the exact normalized absolute form required
+    // by the accepted contract — a relative, malformed, or
+    // noncanonical descriptor (anything that is not a fixed point
+    // of the approved normalization rule) refuses BEFORE any
+    // publication work, so the permanent key is never installed
+    // over a descriptor the verifications could not round-trip. The
+    // root ID's derivation check downstream then verifies the ID
+    // against THIS canonical representation.
+    let canonical_location = JournalRootBinding::normalize_location(std::path::Path::new(location));
+    if location != canonical_location.as_str() {
+        return Err(MediumError::Chain {
+            rule: "journal-root/location-not-canonical",
+        });
+    }
+
     // The founding authentication: the canonical chain membership —
     // the parentless root record itself (a caller-supplied founding
     // hash that is not the chain's root refuses). The membership
@@ -2367,6 +2383,64 @@ pub fn publish_reclamation_plan(
 pub struct BoundJournalAuthority {
     founding: Hash,
     root_id: Hash,
+}
+
+/// (F4-R11) The nonforgeable bound-journal CREATION authority:
+/// issued ONLY by [`verify_bound_creation_authority`] after the
+/// verified lifecycle state in which NO journal-root binding is
+/// installed for the founding — the authenticated absence (an empty
+/// chain, or a completed lookup that found nothing; a FAILED
+/// verification propagates, never downgrades to absence). Once a
+/// binding is installed the authority is unobtainable, so no public
+/// path can create or repair the bound journal of a bound campaign:
+/// [`crate::journal::T1Journal::open_bound_creating`] requires it,
+/// and it is the only constructor that creates a missing journal or
+/// resolves a torn pre-binding creation.
+#[derive(Debug, Clone)]
+pub struct BoundCreationAuthority {
+    founding: Hash,
+}
+
+impl BoundCreationAuthority {
+    /// The founding identity the absence was verified for (the
+    /// creating constructor's identity agreement).
+    pub fn founding(&self) -> &Hash {
+        &self.founding
+    }
+}
+
+/// (F4-R11) The creation authority's issuance: the authenticated
+/// binding-absence verification. An EMPTY chain (the fresh
+/// bootstrap, before the founding append) is the trivial absence; a
+/// chain that exists must carry the supplied founding as its root
+/// and resolve the binding lookup to Ok(None) — an installed
+/// binding refuses (the bound lifecycle's journal is never
+/// recreated), and a failed founding discovery or binding
+/// read/verification PROPAGATES (the authenticated absence is never
+/// confused with a failed verification).
+pub fn verify_bound_creation_authority(
+    medium: &mut dyn CanonicalMedium,
+    founding: &Hash,
+) -> Result<BoundCreationAuthority, MediumError> {
+    match medium.head()? {
+        None => {}
+        Some(_) => {
+            let chain_root = founding_identity_medium(medium)?;
+            if chain_root != *founding {
+                return Err(MediumError::Chain {
+                    rule: "journal-root/creation-authority-founding",
+                });
+            }
+            if find_installed_journal_root_binding(medium, founding)?.is_some() {
+                return Err(MediumError::Chain {
+                    rule: "journal-root/creation-authority-bound",
+                });
+            }
+        }
+    }
+    Ok(BoundCreationAuthority {
+        founding: *founding,
+    })
 }
 
 /// (F4-R3) The capability issuance: the founding discovery, the

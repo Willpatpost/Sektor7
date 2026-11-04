@@ -411,7 +411,14 @@ pub fn rotate_journal_with(
     // set survive the re-encoding.
     {
         let mut journal = match bound {
-            Some((founding, root_id)) => T1Journal::open_bound(&new_path, founding, root_id)?,
+            Some((founding, root_id)) => {
+                // (F4-R11) THE AUTHORIZED SUCCESSOR CREATION: the
+                // rotation names a fresh nanos-unique generation and
+                // the creating constructor refuses an existing path —
+                // it is structurally unable to replace authoritative
+                // evidence.
+                T1Journal::create_bound_generation(&new_path, founding, root_id)?
+            }
             None => T1Journal::open(&new_path)?,
         };
         for transaction in retained {
