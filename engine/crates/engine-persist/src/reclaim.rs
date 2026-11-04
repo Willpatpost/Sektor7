@@ -1653,13 +1653,23 @@ impl JournalRootBinding {
     }
 
     /// The location descriptor's normalization + comparison rule:
-    /// the canonical absolute form (no trailing separator).
+    /// the ABSOLUTE form WITHOUT symlink resolution (stable
+    /// regardless of the target's existence — a resolution-based
+    /// rule would disagree with itself across a creation boundary
+    /// on symlinked temp roots such as macOS `/var`), the trailing
+    /// separator trimmed. RELATIVE-LOCATION LIMITATION (documented,
+    /// the owner's absolute-binding permission): the descriptor
+    /// binds the absolute path as supplied; a relocated root is a
+    /// contradictory binding, never a silent rebind.
     pub fn normalize_location(path: &std::path::Path) -> String {
-        let mut text = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                .join(path)
+        };
+        let mut text = absolute.to_string_lossy().into_owned();
         while text.len() > 1 && text.ends_with('/') {
             text.pop();
         }
