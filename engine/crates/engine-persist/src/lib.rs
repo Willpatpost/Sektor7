@@ -130,9 +130,8 @@ pub use recovery::{
 };
 pub use rotation::{
     GENERATIONS_IO_FAULT, JOURNAL_ACTIVE_SUFFIX, JournalRotation, POINTER_DIR_SYNC_FAULT,
-    PointerDurability, active_journal_path, read_journal_generations,
-    reestablish_pointer_durability, retire_journal_generations, rotate_journal,
-    rotate_journal_with,
+    PointerDurability, SessionRotationError, active_journal_path, read_journal_generations,
+    reestablish_pointer_durability, retire_journal_generations, rotate_session_journal,
 };
 pub use sqlite::{
     SqliteFaultAction, SqliteFaultControl, SqliteFaultPoint, SqliteMedium, SqliteMediumConfig,

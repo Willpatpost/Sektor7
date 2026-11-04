@@ -368,18 +368,106 @@ fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), Journa
     Ok(())
 }
 
-/// Writes the surviving set to a fresh journal, scan-verifies it,
-/// and atomically flips the active-path pointer. The legacy journal
-/// is never modified (its bytes and its sidecar lock stand). The
-/// `retired` list is report evidence only — the caller's
-/// classification, recorded honestly.
-pub fn rotate_journal(
-    legacy_path: &Path,
-    retained: &[CommittedTransaction],
-    retained_cancellations: &[RecordedCancellation],
-    retired: &[TransactionId],
-) -> Result<JournalRotation, JournalError> {
-    rotate_journal_with(legacy_path, retained, retained_cancellations, retired, None)
+/// (F4-R11-B) THE SESSION-BOUND ROTATION — the only public rotation
+/// entry: the authority derives from the verified session's own
+/// pipeline (the live active-journal handle with its sidecar lock —
+/// the lock ownership covers the transition — and the canonical
+/// medium the pipeline verified), never from caller-supplied
+/// retention evidence or bound identities. The bound arm is PROBED
+/// through the pipeline's medium (an installed binding selects the
+/// identity-inheriting successor; the authenticated absence keeps
+/// the legacy arm — a bound root can never take the legacy arm, and
+/// a legacy root never takes the bound arm); the classification is
+/// DERIVED from the pipeline's own journal and confirmed set (§4.4:
+/// retire iff canceled, or actionable with every identity confirmed
+/// AND subsumed below the anchor boundary — the anchor boundary is
+/// the trusted session's chain-verified claim, passed by the
+/// crossing from the latest published snapshot); the mechanism is
+/// the accepted crate-private sequence (write + scan-verify + the
+/// pointer flip at the campaign root + the ownership record + the
+/// durability rules, all unchanged).
+pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
+    pipeline: &mut crate::pipeline::CommitPipeline<M>,
+    root: &Path,
+    anchor_boundary: Option<&[u64]>,
+) -> Result<JournalRotation, SessionRotationError> {
+    // (F4-R1/R11-B) THE BOUND-IDENTITY PROBE — in-crate, through the
+    // pipeline's own medium (never caller-supplied).
+    let bound_identities = {
+        let medium = pipeline.medium_mut();
+        let founding = crate::reclaim::founding_identity_medium(medium)?;
+        crate::reclaim::find_installed_journal_root_binding(medium, &founding)?
+            .map(|(_id, binding)| (binding.founding, binding.root_id))
+    };
+    // THE CLASSIFICATION (§4.4) — derived from the pipeline's own
+    // journal (the live active handle) and confirmed set; the anchor
+    // boundary is the session's claim.
+    let journal = pipeline.journal();
+    let mut retained: Vec<CommittedTransaction> = Vec::new();
+    let mut retired_canceled: Vec<TransactionId> = Vec::new();
+    let mut retired_subsumed: Vec<TransactionId> = Vec::new();
+    for transaction in journal.transactions() {
+        let canceled = journal.is_canceled(transaction.id);
+        let settled = transaction.envelopes.iter().all(|envelope| {
+            pipeline.is_confirmed(envelope.id)
+                && anchor_boundary.is_some_and(|boundary| {
+                    envelope.id.episode <= boundary[envelope.id.region as usize]
+                })
+        });
+        if canceled {
+            retired_canceled.push(transaction.id);
+        } else if settled {
+            retired_subsumed.push(transaction.id);
+        } else {
+            retained.push(transaction.clone());
+        }
+    }
+    let retired: Vec<TransactionId> = retired_canceled
+        .iter()
+        .chain(retired_subsumed.iter())
+        .copied()
+        .collect();
+    let retained_ids: std::collections::BTreeSet<TransactionId> =
+        retained.iter().map(|transaction| transaction.id).collect();
+    let retained_cancellations: Vec<RecordedCancellation> = journal
+        .cancellations()
+        .iter()
+        .filter(|cancellation| retained_ids.contains(&cancellation.target))
+        .cloned()
+        .collect();
+    let mut rotation = rotate_journal_with(
+        root,
+        &retained,
+        &retained_cancellations,
+        &retired,
+        bound_identities.as_ref().map(|(f, r)| (f, r)),
+    )?;
+    // The classified retirement evidence (the driver-populated
+    // report fields — the mechanism cannot classify).
+    rotation.retired_canceled = retired_canceled;
+    rotation.retired_subsumed = retired_subsumed;
+    Ok(rotation)
+}
+
+/// (F4-R11-B) The session-bound rotation's typed error: the binding
+/// probe's medium failures and the mechanism's journal failures,
+/// never conflated.
+#[derive(Debug)]
+pub enum SessionRotationError {
+    Medium(crate::medium::MediumError),
+    Journal(JournalError),
+}
+
+impl From<crate::medium::MediumError> for SessionRotationError {
+    fn from(error: crate::medium::MediumError) -> Self {
+        SessionRotationError::Medium(error)
+    }
+}
+
+impl From<JournalError> for SessionRotationError {
+    fn from(error: JournalError) -> Self {
+        SessionRotationError::Journal(error)
+    }
 }
 
 /// (V2-W F4) The rotation with the optional bound identity: when
@@ -388,8 +476,11 @@ pub fn rotate_journal(
 /// every generation; the verification scans the bound form, refusing
 /// mixed, corrupt, or missing identity evidence). The pointer, the
 /// ownership record, and the durability semantics are the accepted
-/// ones — the identical flip sequence.
-pub fn rotate_journal_with(
+/// ones — the identical flip sequence. (F4-R11-B) CRATE-PRIVATE: the
+/// raw mechanism is reachable only through
+/// [`rotate_session_journal`] — the bound identities and the
+/// retention classification are never external inputs.
+pub(crate) fn rotate_journal_with(
     legacy_path: &Path,
     retained: &[CommittedTransaction],
     retained_cancellations: &[RecordedCancellation],
@@ -685,7 +776,7 @@ mod tests {
         let legacy_bytes = fs::read(&legacy).unwrap();
         drop(journal);
 
-        let rotation = rotate_journal(&legacy, &survivors, &[], &[second.id]).unwrap();
+        let rotation = rotate_journal_with(&legacy, &survivors, &[], &[second.id], None).unwrap();
 
         // The pointer resolves the new file; the legacy stands.
         assert_eq!(active_journal_path(&legacy).unwrap(), rotation.new_path);
@@ -722,7 +813,7 @@ mod tests {
             .cloned()
             .collect();
         drop(journal);
-        let rotation = rotate_journal(&legacy, &survivors, &[], &[]).unwrap();
+        let rotation = rotate_journal_with(&legacy, &survivors, &[], &[], None).unwrap();
 
         let mut journal = T1Journal::open(&rotation.new_path).unwrap();
         let receipt = journal.append_transaction(&tx_input(1)).unwrap();

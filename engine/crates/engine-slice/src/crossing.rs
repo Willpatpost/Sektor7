@@ -23,15 +23,15 @@ use engine_core::{
 use engine_persist::{
     AppendOutcome, AuthorityMode, AwardCheckpoint, AwardState, CHECKPOINT_METADATA_DOMAIN,
     CONSEQUENCE_BATCH_DOMAIN, CanonicalMedium, CaptureReceipt, CheckpointMetadata, ClassifiedSpan,
-    CommitOutcome, CommitPipeline, CommittedTransaction, ConfirmedEvidence, ConsequenceEnvelope,
-    ConsequenceId, CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation,
-    JournalScan, KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
+    CommitOutcome, CommitPipeline, ConfirmedEvidence, ConsequenceEnvelope, ConsequenceId,
+    CounterValues, Coverage, DurabilityClass, FrontierEntry, Hash, JournalRotation, JournalScan,
+    KeyPhase, MediumError, OccurrenceSpan, PipelineError, PointerDurability,
     RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_LEDGER_DOMAIN, ReclaimUnit, ReclaimedIndexEntry,
-    ReclamationComplete, ReclamationLedger, ReconcileOutcome, Reconciliation, RecordedCancellation,
-    RecoveryAnchor, RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline,
-    SourcePosition, StoredObject, T1Journal, TailState, TransactionId, active_journal_path,
-    chain_range_digest, compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
-    read_journal_generations, reconcile, retire_journal_generations, rotate_journal_with,
+    ReclamationComplete, ReclamationLedger, ReconcileOutcome, Reconciliation, RecoveryAnchor,
+    RecoveryError, RevisionRecord, SignalLane, SkipEntry, SourceBaseline, SourcePosition,
+    StoredObject, T1Journal, TailState, active_journal_path, chain_range_digest,
+    compute_digest_seed, publish_checkpoint_mk, publish_reclamation_ledger,
+    read_journal_generations, reconcile, retire_journal_generations, rotate_session_journal,
 };
 
 use crate::npc::{NPC_COUNT, NpcWorld, POSITION_DISCARDED, REGION_COUNT, REGION_GRID};
@@ -2227,79 +2227,28 @@ impl<S: MediumSource> SessionCrossing<S> {
             .ledger()
             .summarized()
             .map(|summary| summary.boundary);
-        let subsumed = |identity: &ConsequenceId| {
-            boundary.is_some_and(|boundary| identity.episode <= boundary[identity.region as usize])
-        };
-        // THE CLASSIFICATION (§4.4): retire iff canceled, or
-        // actionable with every identity confirmed AND subsumed
-        // below the verified anchor's boundary.
-        let journal = self.pipeline.journal();
-        let mut retained: Vec<CommittedTransaction> = Vec::new();
-        let mut retired_canceled: Vec<TransactionId> = Vec::new();
-        let mut retired_subsumed: Vec<TransactionId> = Vec::new();
-        for transaction in journal.transactions() {
-            let canceled = journal.is_canceled(transaction.id);
-            let settled = transaction
-                .envelopes
-                .iter()
-                .all(|envelope| self.pipeline.is_confirmed(envelope.id) && subsumed(&envelope.id));
-            if canceled {
-                retired_canceled.push(transaction.id);
-            } else if settled {
-                retired_subsumed.push(transaction.id);
-            } else {
-                retained.push(transaction.clone());
-            }
-        }
-        // THE RETIREMENT-EVIDENCE DISTINCTION (PP-B4 checkpoint 4's
-        // matrix H): the two classes stay distinct on the report; the
-        // flat retired set the mechanism receives is their union.
-        let retired: Vec<TransactionId> = retired_canceled
-            .iter()
-            .chain(retired_subsumed.iter())
-            .copied()
-            .collect();
-        // Cancellations survive while their target survives.
-        let retained_ids: BTreeSet<TransactionId> =
-            retained.iter().map(|transaction| transaction.id).collect();
-        let retained_cancellations: Vec<RecordedCancellation> = journal
-            .cancellations()
-            .iter()
-            .filter(|cancellation| retained_ids.contains(&cancellation.target))
-            .cloned()
-            .collect();
-        // THE MECHANISM: write + scan-verify + flip — the pointer
-        // ALWAYS lands at THE CAMPAIGN ROOT (the review corrective
-        // F1: one stable authority across repeated rotations — the
-        // recovery and the backup resolve the active journal from
-        // the root's single pointer, never from a pointer published
-        // beside a rotated generation).
-        let root = self.journal_root.clone();
-        // (F4-R1) THE BOUND ROTATION: a bound campaign's successor
-        // generation carries the SAME canonical founding hash and
-        // root ID (the identity-preserving mechanism; the successor
-        // verified through the bound scanner inside the mechanism);
-        // a legacy campaign keeps the accepted legacy path.
-        let bound_identities = {
-            let mut probe = self.source.open_medium().map_err(PipelineError::Medium)?;
-            let founding = engine_persist::reclaim::founding_identity_medium(&mut probe)
-                .map_err(PipelineError::Medium)?;
-            engine_persist::reclaim::find_installed_journal_root_binding(&mut probe, &founding)
-                .map_err(PipelineError::Medium)?
-                .map(|(_id, binding)| (binding.founding, binding.root_id))
-        };
-        let mut rotation = rotate_journal_with(
-            &root,
-            &retained,
-            &retained_cancellations,
-            &retired,
-            bound_identities.as_ref().map(|(f, r)| (f, r)),
+        // (F4-R11-B) THE SESSION-BOUND ROTATION ENTRY: the bound
+        // identities are PROBED in-crate through the pipeline's own
+        // medium (never caller-supplied — a bound root can never
+        // take the legacy arm, a legacy root never the bound arm),
+        // and the retention classification is DERIVED from the
+        // pipeline's own journal (the live active-journal handle —
+        // the lock ownership covers the transition) and confirmed
+        // set (§4.4: retire iff canceled, or actionable with every
+        // identity confirmed AND subsumed below the verified
+        // anchor's boundary — the boundary is the trusted session's
+        // chain-verified claim). No caller-invented retention
+        // evidence exists anywhere in the API; the raw wrappers are
+        // crate-private.
+        let rotation = rotate_session_journal(
+            &mut self.pipeline,
+            &self.journal_root,
+            boundary.as_ref().map(|boundary| boundary.as_slice()),
         )
-        .map_err(PipelineError::Journal)?;
-        // The classified retirement evidence (the driver-populated
-        // report fields — the mechanism cannot classify).
-        rotation.retired_canceled = retired_canceled;
-        rotation.retired_subsumed = retired_subsumed;
+        .map_err(|error| match error {
+            engine_persist::SessionRotationError::Medium(error) => PipelineError::Medium(error),
+            engine_persist::SessionRotationError::Journal(error) => PipelineError::Journal(error),
+        })?;
         // THE CAPTURE-VALIDITY GENERATION (PP-B4 checkpoint 3, the F1
         // preflight): the mechanism returned Ok — the pointer FLIPPED —
         // so every snapshot capture taken before this instant is
@@ -2325,6 +2274,19 @@ impl<S: MediumSource> SessionCrossing<S> {
                 detail: "rotation/pointer-durability",
             });
         }
+        // (F4-R1) THE REBUILD'S BOUND IDENTITIES: the crossing's own
+        // post-flip probe (the same chain-verified pair the
+        // session-bound entry used for the arm selection — the
+        // rebuild opens the successor through the bound form when
+        // the campaign is bound).
+        let bound_identities = {
+            let mut probe = self.source.open_medium().map_err(PipelineError::Medium)?;
+            let founding = engine_persist::reclaim::founding_identity_medium(&mut probe)
+                .map_err(PipelineError::Medium)?;
+            engine_persist::reclaim::find_installed_journal_root_binding(&mut probe, &founding)
+                .map_err(PipelineError::Medium)?
+                .map(|(_id, binding)| (binding.founding, binding.root_id))
+        };
         // THE SWAP: this crossing's pipeline reopens over the new
         // journal — the keys reseeded from it, the confirmed set
         // re-derived from the chain. THE POST-FLIP FAILURE RULE

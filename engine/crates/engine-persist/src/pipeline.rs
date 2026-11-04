@@ -1008,6 +1008,11 @@ fn remaining_keys(
 }
 
 impl<M: CanonicalMedium> CommitVerifier<M> {
+    /// (F4-R11-B) The verifier's canonical medium — crate-private
+    /// (the session-bound rotation's binding probe).
+    pub(crate) fn medium_mut(&mut self) -> &mut M {
+        &mut self.medium
+    }
     /// Opens the verifier: the session-open chain walk (O(chain),
     /// documented honestly — never per tick) collects every
     /// chain-confirmed key from the `consequence-batch/1` objects and
@@ -1654,6 +1659,14 @@ impl<M: CanonicalMedium> CommitPipeline<M> {
     /// state; the instance and its sidecar lock stay owned here).
     pub fn journal(&self) -> &T1Journal {
         self.authority.journal()
+    }
+
+    /// (F4-R11-B) The pipeline's canonical medium — crate-private:
+    /// the session-bound rotation entry probes the campaign's
+    /// installed binding through the pipeline's own medium (the
+    /// bound identities are never caller-supplied).
+    pub(crate) fn medium_mut(&mut self) -> &mut M {
+        self.verifier.medium_mut()
     }
 
     /// Stages one consequential envelope — the in-memory accrual

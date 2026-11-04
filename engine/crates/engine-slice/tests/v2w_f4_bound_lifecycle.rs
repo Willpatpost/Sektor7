@@ -1637,3 +1637,92 @@ fn the_generation_creation_is_rotation_only() {
     );
     drop(recovered);
 }
+
+#[test]
+fn the_rotation_entry_is_session_bound() {
+    // (F4-R11-B) The rotation wrappers' closure: the raw mechanisms
+    // (rotate_journal_with and the legacy form) are CRATE-PRIVATE —
+    // an external caller cannot even name them (the compile-time
+    // boundary; the legacy wrapper is removed outright), so no
+    // caller-invented retention evidence and no caller-selected
+    // legacy arm for a bound root exist in the public API at all.
+    // The single public entry rotate_session_journal derives the
+    // bound identities by probing the pipeline's own medium (the arm
+    // selection is never an input) and derives the classification
+    // from the pipeline's live journal and confirmed set. The
+    // regressions here: the bound campaign's rotation through the
+    // crossing produces the identity-inheriting successor (the arm
+    // probed, never chosen); the legacy campaign's rotation keeps
+    // the legacy arm (the authenticated absence); the active and the
+    // historical generations remain complete across the restart
+    // recovery; and the serialization contract is the accepted
+    // root-lock discipline (proven by the R2 and fault-arc suites).
+    let dir = TestDir::new("r11b-entry");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // THE BOUND CAMPAIGN's rotation: the successor carries the SAME
+    // founding hash and root ID (the probed bound arm).
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let mut crossing = SessionCrossing::open_bound_bootstrap(
+        &StoreLocation::Directory(store.clone()),
+        &journal_root,
+        "r11b-entry-campaign",
+    )
+    .unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let rotation = crossing
+        .rotate_journal()
+        .expect("the bound rotation succeeds");
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let (founding, root_id) = installed_binding(&store);
+    engine_persist::journal::scan_bound_file(&rotation.new_path, &founding, &root_id)
+        .expect("the probed bound arm produced the identity-inheriting successor");
+    // THE RESTART COMPLETENESS: the active and the historical
+    // generations stand across the recovery.
+    let (_spine, _director, recovered) =
+        SessionCrossing::recover(&store, &journal_root, "r11b-entry-campaign")
+            .expect("the restart recovery follows the successor");
+    assert_eq!(
+        recovered.pipeline_journal_path(),
+        rotation.new_path.as_path(),
+        "the recovery holds the rotated active"
+    );
+    engine_persist::journal::scan_bound_file(&journal_root, &founding, &root_id)
+        .expect("the historical root generation remains complete");
+    drop(recovered);
+    // THE LEGACY CAMPAIGN's rotation: the authenticated absence
+    // keeps the legacy arm (the successor carries the legacy header
+    // form — scan_file, not the bound scanner).
+    let legacy_dir = TestDir::new("r11b-entry-legacy");
+    let legacy_store = legacy_dir.store();
+    let legacy_root = legacy_dir.journal();
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&legacy_root).unwrap();
+    let mut crossing = SessionCrossing::open(&legacy_store, journal, "r11b-entry-legacy").unwrap();
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    confirm_cycle(&mut crossing, &mut spine, &mut director, &far, &near);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let legacy_rotation = crossing
+        .rotate_journal()
+        .expect("the legacy rotation succeeds through the same entry");
+    drop(crossing);
+    drop(spine);
+    drop(director);
+    let legacy_scan = T1Journal::scan_file(&legacy_rotation.new_path)
+        .expect("the authenticated absence kept the legacy arm (the legacy header form)");
+    assert_eq!(
+        legacy_scan.tail,
+        engine_persist::TailState::Clean,
+        "the legacy successor is a clean legacy journal"
+    );
+}
