@@ -4723,26 +4723,32 @@ mod exclusion_tests {
         medium.validate().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
-    #[test]
-    #[ignore = "P2-R1: the proper-prefix recovery-authority ambiguity — the owner decision PENDING (Options A/B/C, none ratified); this test demonstrates the current prefix-shaped trust; the assertion flips to refusal when the owner ratifies Option A or C"]
-    fn the_prefix_recovery_assumption_is_unresolved_and_proceeds_pending_the_owner_decision() {
-        // (P2-R1, UNRESOLVED — NO OPTION RATIFIED) The recovery
-        // policy is an open owner decision: a proper newest-first
-        // deletion-prefix absence is currently accepted as
-        // interruption evidence (the implementation's existing
-        // behavior — NOT an owner-approved policy). WHAT IS PROVEN on this path: the exact audit identity and
-        // deterministic key, the MK-bound hash-verified metadata,
-        // the units-vs-index equality, the strictly-descending
-        // order, the founding-derived seed, the prefix shape itself,
-        // and the survivor partition protecting every
-        // survivor-referenced object. WHAT IS NOT PROVEN: the range
-        // digest, for any absent digest member — the review's
-        // counterexample below proceeds on the unverified audit,
-        // exactly as the ratified assumption accepts. The units
-        // newest-first [SK, R3, R2, R1] with R1..R3 digest-covered;
-        // the storage loses the PROPER prefix {SK, R3}; the audit
-        // carries MATCHING FABRICATED digest values.
-        let root = temp_store("r1-proper-prefix");
+    /// (P2-R1 Option C) The proper-prefix campaign: F(shared) →
+    /// P1(shared) → R1(shared) → R2(shared) → R3(shared+private) →
+    /// SK(shared) → MK (the index [R1, R2, R3, SK], the range
+    /// digest over R1..R3 — the REAL recomputation, or the
+    /// fabricated [9; 32] for the adversarial variant) → the audit.
+    /// The units run newest-first [SK, R3, R2, R1]; the shared
+    /// object is the survivor (P1 references it), the private
+    /// object is R3-mandated. Returns (root, medium, audit, mk,
+    /// directive, sk, r3, r2, r1, shared, private).
+    fn p2r1_prefix_campaign(
+        label: &str,
+        fabricate_digest: bool,
+    ) -> (
+        std::path::PathBuf,
+        LocalFileMedium,
+        Hash,
+        Hash,
+        crate::reclaim::ReclaimDirective,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+    ) {
+        let root = temp_store(label);
         let mut medium = LocalFileMedium::open(root.clone()).unwrap();
         let shared = StoredObject::new({
             let mut enc = engine_core::Encoder::new();
@@ -4758,7 +4764,7 @@ mod exclusion_tests {
             enc.into_bytes()
         })
         .unwrap();
-        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "p2r1", 0)
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
             .with_content_refs(vec![shared.hash()]);
         medium
             .append(&founding, std::slice::from_ref(&shared), None)
@@ -4804,8 +4810,12 @@ mod exclusion_tests {
             .iter()
             .map(|id| medium.read_record(id).unwrap().canonical_bytes())
             .collect();
-        let _real_digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
-        let fabricated = [9; 32];
+        let real_digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let digest = if fabricate_digest {
+            [9u8; 32]
+        } else {
+            real_digest
+        };
         let meta = CheckpointMetadata::new(
             sk.id(),
             r1,
@@ -4816,7 +4826,7 @@ mod exclusion_tests {
                 ReclaimedIndexEntry::new(None, r3, 4),
                 ReclaimedIndexEntry::new(None, sk.id(), 5),
             ],
-            fabricated,
+            digest,
             seed,
         );
         let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
@@ -4831,7 +4841,7 @@ mod exclusion_tests {
         let ledger = ReclamationLedger {
             mk: mk.id(),
             sk: sk.id(),
-            range_digest: fabricated,
+            range_digest: digest,
             seed,
             records: 4,
             reclaimed_keys: 0,
@@ -4857,25 +4867,254 @@ mod exclusion_tests {
         };
         let (audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 7).unwrap();
         assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
-        // The proper-prefix loss: SK and R3 gone, R2 and R1 present.
-        std::fs::remove_file(medium.object_path(&sk.id())).unwrap();
-        std::fs::remove_file(medium.object_path(&r3)).unwrap();
         let directive = crate::reclaim::ReclaimDirective {
             audit_record: audit,
             units: ledger.units.clone(),
         };
-        // The CURRENT behavior (the unresolved policy): the deletion
-        // PROCEEDS on the unverified audit — the digest is never
-        // recomputed (R3 absent). This assertion flips to a typed
-        // refusal when the owner ratifies Option A (strict
-        // fail-closed) or Option C (new durable evidence).
-        let outcome = medium.reclaim(&directive).unwrap();
-        assert!(outcome.removed >= 2, "the deletion proceeded");
-        assert!(!medium.object_path(&r2).is_file());
-        assert!(!medium.object_path(&private.hash()).is_file());
-        assert!(medium.object_path(&shared.hash()).is_file());
+        (
+            root,
+            medium,
+            audit,
+            mk.id(),
+            directive,
+            sk.id(),
+            r3,
+            r2,
+            r1,
+            shared.hash(),
+            private.hash(),
+        )
+    }
+
+    #[test]
+    fn the_p2r1_beginless_prefix_refuses_recovery_without_a_begin() {
+        // (P2-R1, OPTION C RATIFIED — the negative case) A
+        // proper-prefix deletion absence is not, by itself,
+        // authorization to continue destructive work: the genuine
+        // audit with the proper-prefix loss {SK, R3} and NO begin
+        // ever admitted refuses at the provider's execution gate
+        // (the definite begin absence); the fresh first admission
+        // cannot manufacture a retroactive begin from the missing
+        // originals (its first-execution evidence core fails
+        // closed); the remaining evidence is unchanged; and no
+        // terminal marker appears. On Windows the platform's typed
+        // insufficient-tier refusal fires first (the independent
+        // ProcessCrashOnly proof).
+        let (root, mut medium, audit, mk, directive, sk, r3, _r2, _r1, _shared, _private) =
+            p2r1_prefix_campaign("p2r1-beginless", false);
+        // The proper-prefix loss (the genuine newest-first
+        // interruption shape).
+        std::fs::remove_file(medium.object_path(&sk)).unwrap();
+        std::fs::remove_file(medium.object_path(&r3)).unwrap();
+        // The remaining-evidence baseline.
+        let objects_before: std::collections::BTreeSet<String> =
+            std::fs::read_dir(root.join("objects"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        // THE PROVIDER REFUSAL.
+        let error = medium.reclaim(&directive).unwrap_err();
+        if cfg!(windows) {
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "the Windows platform tier refuses the recovery: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the beginless prefix never authorizes recovery: {error:?}"
+        );
+        // THE FAILED FIRST ADMISSION: the original evidence is
+        // unavailable (SK gone) — no retroactive begin is
+        // manufactured.
+        let error = medium.begin_reclamation(&audit, &mk, 240).unwrap_err();
+        assert!(
+            matches!(error, MediumError::MissingObject { .. }),
+            "the first admission fails closed on the missing originals: {error:?}"
+        );
+        // The gate still refuses after the failed admission.
+        let error = medium.reclaim(&directive).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the gate still refuses after the failed admission: {error:?}"
+        );
+        // The remaining evidence unchanged; no terminal marker.
+        let objects_after: std::collections::BTreeSet<String> =
+            std::fs::read_dir(root.join("objects"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(objects_after, objects_before, "nothing changed");
+        assert!(
+            crate::reclaim::find_installed_completion(&mut medium, &mk)
+                .unwrap()
+                .is_none(),
+            "no terminal marker was published"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_p2r1_authorized_prefix_interruption_recovers_under_the_admitted_begin() {
+        // (P2-R1, OPTION C RATIFIED — the positive case) Recovery
+        // across a proper-prefix deletion interruption is permitted
+        // under a valid, previously admitted, durably installed
+        // ReclamationBegin: the REAL trusted admission runs while
+        // every first-execution evidence member is intact; the
+        // genuine proper newest-first prefix {SK, R3} is then lost;
+        // a fresh provider handle (the restart) resumes the
+        // retirement under the independently rediscovered,
+        // authenticated begin — the correct durability grade, NO
+        // second begin, convergence to the completed state (the
+        // marker through the trusted wrapper, verified by the
+        // OC-C4 reader), the survivor protection, and the hash
+        // integrity. On Windows the admission itself refuses the
+        // platform tier (the independent proof — the recovery
+        // substance is POSIX-covered).
+        let (root, mut medium, audit, mk, directive, sk, r3, _r2, _r1, shared, _private) =
+            p2r1_prefix_campaign("p2r1-authorized", false);
+        // THE REAL ADMISSION (every first-execution evidence member
+        // intact).
+        let begin = medium.begin_reclamation(&audit, &mk, 240);
+        if cfg!(windows) {
+            match begin {
+                Err(MediumError::Chain {
+                    rule: "begin-admission/tier-insufficient",
+                }) => {}
+                other => panic!("the Windows admission refuses the platform tier: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let crate::reclaim::BeginPublicationOutcome::Accepted { id: begin_id, .. } =
+            begin.expect("the real admission accepts")
+        else {
+            unreachable!("the accepted pattern is matched above")
+        };
+        // THE GENUINE PROPER PREFIX (the newest-first deletion
+        // interruption shape).
+        std::fs::remove_file(medium.object_path(&sk)).unwrap();
+        std::fs::remove_file(medium.object_path(&r3)).unwrap();
+        // THE RECOVERY: a fresh provider handle (the restart), the
+        // resume under the installed begin.
+        drop(medium);
+        let mut recovered = LocalFileMedium::open(root.clone()).unwrap();
+        let outcome = recovered
+            .reclaim(&directive)
+            .expect("the authorized interruption resumes and completes");
+        assert!(outcome.removed >= 1, "the remaining work executed");
+        // NO SECOND BEGIN: the authority independently rediscovers
+        // the SAME record, at the correct durability grade.
+        let authority = recovered.verify_begin_authority(&audit, &mk).unwrap();
+        assert_eq!(authority.id, begin_id, "no second begin was published");
+        assert_eq!(
+            authority.tier,
+            crate::medium::SyncTier::FullPosixSequence,
+            "the durability grade"
+        );
+        // THE CONVERGENCE: the completion through the trusted
+        // wrapper (which itself requires the begin), verified by
+        // the OC-C4 completion reader.
+        let (marker_id, _marker) =
+            crate::reclaim::complete_reclamation(&mut recovered, &audit, &mk).unwrap();
+        crate::reclaim::verify_reclamation_complete(&mut recovered, &marker_id, &mk).unwrap();
+        // THE SURVIVOR PROTECTION + the hash integrity + the
+        // idempotent re-run.
+        assert!(
+            recovered.object_path(&shared).is_file(),
+            "the survivor-referenced shared object is preserved"
+        );
+        recovered.validate().unwrap();
+        let rerun = recovered
+            .reclaim(&directive)
+            .expect("the completed retirement re-runs idempotently");
+        assert_eq!(rerun.removed, 0, "nothing left to delete");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_p2r1_fabricated_digest_refuses_trusted_first_admission() {
+        // (P2-R1, OPTION C RATIFIED — the fabricated-digest case) A
+        // fabricated checkpoint/audit digest cannot obtain trusted
+        // first-execution begin admission while the intact original
+        // evidence contradicts it: the admission's independent
+        // range-digest recomputation over the actual, hash-verified
+        // canonical record bytes refuses (the original history
+        // itself must prove the commitment — a ledger whose digest
+        // merely agrees with the metadata is never enough); with no
+        // begin admitted, the execution gate refuses the definite
+        // begin absence; the intact evidence is unchanged and no
+        // terminal marker appears. On Windows the platform tier
+        // refuses first (the independent proof).
+        let (root, mut medium, audit, mk, directive, sk, r3, r2, r1, _shared, _private) =
+            p2r1_prefix_campaign("p2r1-fabricated", true);
+        // THE ADMISSION REFUSES (the intact evidence contradicts the
+        // fabricated commitment).
+        let error = medium.begin_reclamation(&audit, &mk, 240).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "begin-admission/range-digest-mismatch"
+                }
+            ),
+            "the fabricated digest cannot be authorized: {error:?}"
+        );
+        // The gate refuses (no begin was admitted).
+        let error = medium.reclaim(&directive).unwrap_err();
+        if cfg!(windows) {
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "execution/begin-tier-insufficient"
+                    }
+                ),
+                "the Windows platform tier refuses the recovery: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "execution/begin-absent"
+                }
+            ),
+            "the beginless fabricated state never authorizes recovery: {error:?}"
+        );
+        // The intact evidence unchanged; no terminal marker.
+        assert!(medium.object_path(&sk).is_file());
+        assert!(medium.object_path(&r3).is_file());
+        assert!(medium.object_path(&r2).is_file());
+        assert!(medium.object_path(&r1).is_file());
+        assert!(
+            crate::reclaim::find_installed_completion(&mut medium, &mk)
+                .unwrap()
+                .is_none(),
+            "no terminal marker was published"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn two_retirement_store(
         label: &str,
     ) -> (
