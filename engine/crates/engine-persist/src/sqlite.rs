@@ -6758,6 +6758,142 @@ mod exclusion_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_v2_f3_sqlite_second_reference_integrity() {
+        // (V2W-F3, the SQLite side) EVERY direct content reference
+        // is verified at the writer boundaries on the SQLite
+        // provider too: the genuine two-reference retiring record
+        // whose SECOND reference is corrupted at the row level
+        // refuses both the plan admission (the first-execution
+        // evidence core) and the batch-audit admission (the
+        // collector's verified read) through the typed integrity
+        // classification, before any authority installs.
+        let label = "v2wf3-sqlite";
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ2r4-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let build = |label_postfix: &str| -> (SqliteMedium, Hash, Hash) {
+            let mut medium =
+                SqliteMedium::open(root.join(format!("db-{label_postfix}.sqlite"))).unwrap();
+            let shared = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"v2wf3-sqlite-shared");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let private = StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"v2wf3-sqlite-private");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+                let head = medium.head().unwrap().unwrap();
+                let epoch = medium.read_record(&head).unwrap().epoch;
+                let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+                let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+                medium.append(&record, objects, Some(head)).unwrap();
+                record.id()
+            };
+            let p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+            let r1 = step(&mut medium, std::slice::from_ref(&shared), 2);
+            let r2 = step(&mut medium, &[shared.clone(), private.clone()], 3);
+            let sk = step(&mut medium, std::slice::from_ref(&shared), 4);
+            let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+            let member_bytes: Vec<Vec<u8>> = [r1, r2]
+                .iter()
+                .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+                .collect();
+            let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+            let meta = CheckpointMetadata::new(
+                sk,
+                r1,
+                vec![SkipEntry::new(Hash::ZERO, p1)],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1, 2),
+                    ReclaimedIndexEntry::new(None, r2, 3),
+                    ReclaimedIndexEntry::new(None, sk, 4),
+                ],
+                digest,
+                seed,
+            );
+            let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+            let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
+            (medium, mk, private.hash())
+        };
+        let journal_root = root.join("journal-root");
+        // THE PLAN ADMISSION (the corruption precedes the plan).
+        {
+            let (mut medium, mk, private_hash) = build("plan");
+            medium
+                .conn
+                .execute(
+                    "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                    params![
+                        b"corrupted-second-ref".to_vec(),
+                        private_hash.as_bytes().to_vec()
+                    ],
+                )
+                .unwrap();
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 90)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::HashMismatch { .. } | MediumError::MissingObject { .. }
+                ),
+                "the corrupt second reference refuses the sqlite plan admission: {error:?}"
+            );
+        }
+        // THE BATCH-AUDIT ADMISSION (the plan published intact, the
+        // corruption after).
+        {
+            let (mut medium, mk, private_hash) = build("audit");
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 91)
+                .unwrap();
+            medium
+                .conn
+                .execute(
+                    "UPDATE objects SET bytes = ?1 WHERE hash = ?2",
+                    params![
+                        b"corrupted-second-ref".to_vec(),
+                        private_hash.as_bytes().to_vec()
+                    ],
+                )
+                .unwrap();
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            for batch in plan.batches.iter().map(|b| b.index) {
+                let error =
+                    crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 92)
+                        .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::HashMismatch { .. } | MediumError::MissingObject { .. }
+                    ),
+                    "the corrupt second reference refuses the sqlite audit admission: {error:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The OC-C2 trusted begin admission (the transactional twin — see

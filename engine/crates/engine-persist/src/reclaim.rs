@@ -1708,6 +1708,68 @@ fn find_on_chain(
     })
 }
 
+/// (V2-W, V2W-F2) The authoritative founding identity over the
+/// generic medium: the gap-aware descent from the HEAD to the
+/// chain's root record (the parentless founding), crossing
+/// legitimate gaps only under authenticated checkpoint skip tables
+/// — the same discipline the accepted `founding_identity` helper
+/// enforces under the providers' own coordination, shaped here for
+/// the provider-neutral writer boundary.
+fn founding_identity_medium(medium: &mut dyn CanonicalMedium) -> Result<Hash, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut current = head;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let record = medium.read_record(&current)?;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+        }
+        let Some(parent) = record.parent else {
+            return Ok(current);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "reclamation/descent-bound",
+    })
+}
+
 /// (V2-W) The installed-plan discovery: the record carrying THIS
 /// MK's deterministic plan key, with its strictly decoded plan.
 pub fn find_installed_plan(
@@ -1744,14 +1806,19 @@ pub fn find_installed_v2_audit(
     }
 }
 
-/// (V2-W) The unit's closure-expanded object manifest: the record's
-/// direct content references plus the verified composite closure
-/// (the first reference's /2 root decoded, every chunk dependency
-/// envelope-verified — the same machinery the provider walks use),
-/// collected while the first-execution evidence remains intact.
-/// The ratified sharing rules apply at the ledger level (a repeated
-/// identity ACROSS units is legitimate; the intra-unit set is
-/// deduplicated here).
+/// (V2-W, V2W-F3) The unit's closure-expanded object manifest: the
+/// record's direct content references plus the verified composite
+/// closure (the first reference's /2 root decoded, every chunk
+/// dependency envelope-verified — the same machinery the provider
+/// walks use), collected while the first-execution evidence remains
+/// intact. EVERY direct content reference is explicitly read
+/// through the provider's hash-verifying read at this boundary (the
+/// proof never depends on incidental full-chain validation or a
+/// provider cursor-cache state), and a structurally invalid
+/// DUPLICATE reference within one unit REFUSES typed (the ratified
+/// representation is a set — the v2 ledger codec's own rule) rather
+/// than being silently normalized; a repeated identity ACROSS units
+/// remains legitimate sharing.
 fn collect_unit_objects(
     medium: &mut dyn CanonicalMedium,
     record_id: &Hash,
@@ -1759,29 +1826,36 @@ fn collect_unit_objects(
     let record = medium.read_record(record_id)?;
     let mut objects: Vec<Hash> = Vec::new();
     for (position, reference) in record.content_refs.iter().enumerate() {
-        if !objects.contains(reference) {
-            objects.push(*reference);
+        // (V2W-F3) The explicit hash-verified read of EVERY direct
+        // reference — a corrupt or missing second (or later)
+        // reference refuses through the typed integrity or
+        // missing-object classification here, before any authority
+        // installs.
+        let bytes = medium.read_object(reference)?;
+        if objects.contains(reference) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-ledger-v2/duplicate-unit-object",
+            });
         }
-        if position == 0 {
-            let bytes = medium.read_object(reference)?;
-            if StoredObject::new(bytes.clone())?.domain()
+        objects.push(*reference);
+        if position == 0
+            && StoredObject::new(bytes.clone())?.domain()
                 == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
-            {
-                let manifest =
-                    crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
-                for entry in &manifest.entries {
-                    let chunk_bytes = medium.read_object(&entry.identity)?;
-                    crate::composite_append::verify_chunk_dependency(
-                        &chunk_bytes,
-                        &entry.identity,
-                        &manifest,
-                    )
-                    .map_err(|_error| MediumError::Chain {
-                        rule: "reclamation-plan/composite-closure-verification",
-                    })?;
-                    if !objects.contains(&entry.identity) {
-                        objects.push(entry.identity);
-                    }
+        {
+            let manifest =
+                crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+            for entry in &manifest.entries {
+                let chunk_bytes = medium.read_object(&entry.identity)?;
+                crate::composite_append::verify_chunk_dependency(
+                    &chunk_bytes,
+                    &entry.identity,
+                    &manifest,
+                )
+                .map_err(|_error| MediumError::Chain {
+                    rule: "reclamation-plan/composite-closure-verification",
+                })?;
+                if !objects.contains(&entry.identity) {
+                    objects.push(entry.identity);
                 }
             }
         }
@@ -1876,6 +1950,66 @@ pub fn publish_reclamation_plan(
             rule: "reclamation-plan/empty-index",
         });
     }
+    // (V2W-F2) THE COMPLETE FIRST-EXECUTION EVIDENCE — the SAME
+    // accepted trusted-begin contract, not a second or weaker
+    // definition: the authoritative founding identity (the seed's
+    // authority), the v1-shaped full-membership ledger over the
+    // index, and the OC-C2 verifier (`verify_first_execution_evidence`)
+    // proving — before any plan installs — that every indexed range
+    // record exists and is hash-valid with its manifest exactly
+    // equal to its actual content references, every content object
+    // present and hash-verified (the composite closure
+    // envelope-verified), the units exactly match the index, the
+    // newest-first order holds, the founding-derived seed agrees,
+    // and the INDEPENDENT range-digest recomputation over the
+    // original canonical record bytes equals the checkpoint's
+    // stored commitment. A fabricated, incomplete, or contradictory
+    // checkpoint never becomes trusted publication authority.
+    let founding = founding_identity_medium(medium)?;
+    let mut evidence_units: Vec<ReclaimUnit> = Vec::new();
+    let mut evidence_keys = 0u64;
+    let mut indexed_members: Vec<&crate::checkpoint::ReclaimedIndexEntry> =
+        metadata.index.iter().collect();
+    indexed_members.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.epoch));
+    for entry in &indexed_members {
+        let record = medium.read_record(&entry.hash)?;
+        if record.idempotency_key.is_some() {
+            evidence_keys += 1;
+        }
+        evidence_units.push(ReclaimUnit {
+            record: entry.hash,
+            objects: record.content_refs.clone(),
+        });
+    }
+    let evidence_ledger = ReclamationLedger {
+        mk: *mk,
+        sk: metadata.sk,
+        range_digest: metadata.range_digest,
+        seed: metadata.seed,
+        records: evidence_units.len() as u64,
+        reclaimed_keys: evidence_keys,
+        journal_files: Vec::new(),
+        units: evidence_units,
+    };
+    {
+        let medium_cell = std::cell::RefCell::new(&mut *medium);
+        let read_record = |id: &Hash| -> Result<Vec<u8>, MediumError> {
+            medium_cell
+                .borrow_mut()
+                .read_record(id)
+                .map(|r| r.canonical_bytes())
+        };
+        let read_object = |hash: &Hash| -> Result<Vec<u8>, MediumError> {
+            medium_cell.borrow_mut().read_object(hash)
+        };
+        verify_first_execution_evidence(
+            &evidence_ledger,
+            &metadata,
+            &founding,
+            read_record,
+            read_object,
+        )?;
+    }
     // (d) The COMPLETE membership partition in the ratified epoch
     // order (newest-first — batch 0 carries the newest slice),
     // computed from the actual canonical v2 ledger encodings: each
@@ -1913,13 +2047,33 @@ pub fn publish_reclamation_plan(
             units: probe_units,
         };
         if probe.canonical_bytes().len() as u64 > ledger_byte_limit {
-            if current.records.is_empty() {
-                // The single unit cannot fit even an otherwise-empty
-                // batch — refuse before installing an unusable plan.
+            // (V2W-F1) The singleton check on BOTH sides of the
+            // split: a unit whose own minimal ledger cannot fit the
+            // admitted limit never enters ANY batch — before the
+            // first batch (the empty-current case) AND after a split
+            // (the newly opened batch), measured with the same
+            // canonical-encoding byte accounting the audit writer
+            // enforces. No plan installs with an unfulfillable batch.
+            let singleton = ReclamationLedgerV2 {
+                mk: *mk,
+                sk: metadata.sk,
+                batch: current.index,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                records: 1,
+                reclaimed_keys: 0,
+                units: vec![ReclaimUnit {
+                    record: entry.hash,
+                    objects: objects.clone(),
+                }],
+            };
+            if singleton.canonical_bytes().len() as u64 > ledger_byte_limit {
                 return Err(MediumError::Chain {
                     rule: "reclamation-plan/unit-exceeds-limit",
                 });
             }
+            // The singleton fits; close the current batch and open
+            // the next (the consecutive-index discipline).
             let next_index = current.index + 1;
             batches.push(std::mem::replace(
                 &mut current,
@@ -1947,6 +2101,25 @@ pub fn publish_reclamation_plan(
         collect_reclaimable_journal_files(journal_root).map_err(|_error| MediumError::Chain {
             rule: "reclamation-plan/journal-evidence",
         })?;
+    // (V2W-F4, THE INTERIM FAIL-CLOSED BOUNDARY) The collected
+    // lineage is rotation-valid but NOT yet campaign-bound: the
+    // persisted journal format carries no campaign identity, so a
+    // provider-neutral writer cannot authenticate that this root
+    // belongs to the requested MK's campaign — a valid lineage from
+    // campaign B must never become retirement authority for
+    // campaign A. Until the owner ratifies a binding contract (the
+    // smallest safe design presented in the delivery report: the
+    // crossing-scoped publication, which holds both the store and
+    // the journal under one campaign identity, or a persisted
+    // cross-reference), any NONEMPTY obligation set REFUSES typed —
+    // never an unauthenticated approximation. The genuinely empty
+    // set (no rotation — the active IS the root) remains supported:
+    // nothing retires, nothing to mis-bind.
+    if !journal_files.is_empty() {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/journal-campaign-unbound",
+        });
+    }
     // (f) The plan, constructed from the verified values only.
     let plan = ReclaimPlan {
         mk: *mk,
@@ -1958,6 +2131,16 @@ pub fn publish_reclamation_plan(
         journal_files,
     };
     let object = StoredObject::new(plan.canonical_bytes())?;
+    // (V2W-F5A) The plan object's OWN encoded size must fit the
+    // provider's effective per-object capacity (the framed stored
+    // bytes — the same byte accounting the audit writer enforces);
+    // a plan whose partitioned audits fit their limits but whose
+    // own object cannot fit the provider never installs.
+    if object.bytes().len() as u64 > effective_limit {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/provider-limit-exceeded",
+        });
+    }
     let key = reclamation_plan_idempotency_key(mk);
     let v1_key = reclamation_ledger_idempotency_key(mk);
     // (g) The publication: the duplicate resolution first (the
@@ -2071,6 +2254,17 @@ pub fn publish_reclamation_ledger_v2(
             rule: "reclamation-ledger-v2/plan-not-installed",
         });
     };
+    // (V2W-F5B) The installed plan's IDENTITY BINDING: the record
+    // was discovered by THIS MK's deterministic key, but the
+    // decoded content must independently agree — a record with the
+    // expected key but mismatched or malformed content (the
+    // in-crate adversarial shape) never authorizes batch
+    // publication.
+    if plan.mk != *mk {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/plan-key-mismatch",
+        });
+    }
     // (b) The requested batch exists in THIS exact plan.
     let Some(plan_batch) = plan.batches.iter().find(|b| b.index == batch) else {
         return Err(MediumError::Chain {
