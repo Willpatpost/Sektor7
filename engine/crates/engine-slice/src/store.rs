@@ -191,6 +191,17 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
+    /// (V2-W, W3A) The union medium delegates to the selected
+    /// provider — the SQLite-backed store reports the runtime
+    /// `SQLITE_MAX_LENGTH`, the local-backed store the compile-time
+    /// object bound.
+    fn effective_object_byte_limit(&mut self) -> Result<u64, MediumError> {
+        match self {
+            SessionStore::Local(medium) => medium.effective_object_byte_limit(),
+            SessionStore::Sqlite(medium) => medium.effective_object_byte_limit(),
+        }
+    }
+
     fn reclaim(
         &mut self,
         directive: &engine_persist::ReclaimDirective,

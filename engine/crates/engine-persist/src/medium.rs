@@ -516,6 +516,14 @@ pub trait CanonicalMedium {
         // append — the same admission-boundary discipline as the
         // completion marker.
         crate::reclaim::enforce_reclamation_begin_gate(objects)?;
+        // (V2-W, W2-A) The reclamation publication fence: no v1 or
+        // v2 reclamation audit and no reclamation plan (any version)
+        // may enter the chain through the generic append — the
+        // audits and the plan are trusted retirement authority,
+        // installable only through the in-crate publications that
+        // enforce the W2 bidirectional v1/v2 exclusion.
+        crate::reclaim::enforce_reclamation_ledger_family_gate(objects)?;
+        crate::reclaim::enforce_reclamation_plan_gate(objects)?;
         let admitted = AdmittedAppend::generic(record, objects);
         self.append_admitted(admitted, expected_parent)
     }
@@ -607,6 +615,26 @@ pub trait CanonicalMedium {
 
     /// What `Accepted` establishes on this platform.
     fn durability_tier(&self) -> SyncTier;
+
+    /// (V2-W, W3A) The provider's effective per-object byte
+    /// capacity for reclamation publication — the honest bound a
+    /// plan or batch-audit encoding must fit. The PROVIDED default
+    /// is the local file medium's compile-time object bound (the
+    /// 4 GiB ceiling); the SQLite provider overrides it with the
+    /// runtime `SQLITE_MAX_LENGTH` query (the connection's actual
+    /// limit, "queried at open" per the retained contract — this
+    /// method re-queries on each call, which is equivalent and
+    /// avoids storing a stale value). The reclamation publications
+    /// compare this against the supported floor
+    /// ([`crate::reclaim::MIN_SUPPORTED_EFFECTIVE_OBJECT_BYTES`])
+    /// and each encoded object's framed byte length. NOTE: the
+    /// v2 writers are NOT routed through the worker in this
+    /// checkpoint — the WorkerMedium inherits the default (the
+    /// batched-execution checkpoint routes the capacity query with
+    /// the destructive ops if needed).
+    fn effective_object_byte_limit(&mut self) -> Result<u64, MediumError> {
+        Ok(crate::local::MAX_OBJECT_BYTES)
+    }
 
     /// The TRUSTED reclamation execution (K2-C2B P2): remove the
     /// audited retirement under PROVIDER-AUTHENTICATED authority —

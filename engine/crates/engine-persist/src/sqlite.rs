@@ -968,6 +968,19 @@ impl CanonicalMedium for SqliteMedium {
         SyncTier::TransactionalWalFull
     }
 
+    /// (V2-W, W3A) The SQLite provider's effective per-object byte
+    /// capacity: the connection's ACTUAL `SQLITE_MAX_LENGTH` runtime
+    /// limit (the maximum length of any bound string or blob — the
+    /// honest bound a reclamation publication's stored object must
+    /// fit), queried live through the runtime limit API.
+    fn effective_object_byte_limit(&mut self) -> Result<u64, MediumError> {
+        let observed = self
+            .conn
+            .limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)
+            .map_err(|error| sqlite_err("query length limit", error))?;
+        Ok(observed.max(0) as u64)
+    }
+
     fn reclaim(
         &mut self,
         directive: &crate::reclaim::ReclaimDirective,
@@ -6589,6 +6602,159 @@ mod exclusion_tests {
             !outcome.mandatory.is_empty(),
             "the retry converges through the re-verified begin"
         );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_sqlite_publication_and_capacity_matrix() {
+        // (V2-W §9 G + the sqlite positives) The v2 publications on
+        // the SQLite provider: the plan and every batch audit
+        // publish under the deterministic keys with the truthful
+        // outcomes; the W3A capacity floor — a connection whose
+        // runtime SQLITE_MAX_LENGTH falls below the supported 4 MiB
+        // floor is an UNSUPPORTED configuration for reclamation
+        // publication (the typed refusal), while the ordinary
+        // small-object reads/writes remain unaffected; and a limit
+        // restored above the floor re-enables publication.
+        let label = "v2w-sqlite";
+        let root = std::env::temp_dir().join(format!(
+            "s7-occ2r4-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        // The plan campaign (the checkpoint WITHOUT a v1 audit):
+        // F(shared) → P1(shared) → R1(shared) → R2(shared+private)
+        // → SK(shared) → MK.
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2w-sqlite-shared");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2w-sqlite-private");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+        let r1 = step(&mut medium, std::slice::from_ref(&shared), 2);
+        let r2 = step(&mut medium, &[shared.clone(), private.clone()], 3);
+        let sk = step(&mut medium, std::slice::from_ref(&shared), 4);
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let member_bytes: Vec<Vec<u8>> = [r1, r2]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, r2, 3),
+                ReclaimedIndexEntry::new(None, sk, 4),
+            ],
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
+        let journal_root = root.join("journal-root");
+        // THE POSITIVE: the plan and every batch audit publish.
+        let (plan_id, plan_outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 90)
+                .unwrap();
+        assert!(
+            matches!(
+                plan_outcome,
+                crate::reclaim::PlanPublicationOutcome::Accepted { id } if id == plan_id
+            ),
+            "the sqlite plan publishes: {plan_outcome:?}"
+        );
+        let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            let (audit_id, audit_outcome) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 91).unwrap();
+            assert!(
+                matches!(
+                    audit_outcome,
+                    crate::reclaim::LedgerV2PublicationOutcome::Accepted { id } if id == audit_id
+                ),
+                "the sqlite batch audit publishes: {audit_outcome:?}"
+            );
+            assert!(
+                crate::reclaim::find_installed_v2_audit(&mut medium, &mk, batch)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        // THE W3A FLOOR: a connection below the supported floor is
+        // an unsupported configuration for reclamation publication —
+        // the typed refusal — while the ordinary small-object
+        // publication keeps working.
+        medium
+            .conn
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 1024)
+            .unwrap();
+        let error =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 92)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-plan/provider-limit-unsupported"
+                }
+            ),
+            "the below-floor connection refuses reclamation publication: {error:?}"
+        );
+        // The ordinary small-object publication is unaffected (the
+        // floor is a RECLAMATION classification, not a store-wide
+        // failure).
+        step(&mut medium, std::slice::from_ref(&shared), 6);
+        // THE RESTORE: a limit above the floor re-enables the
+        // publication (the idempotent duplicate of the already
+        // installed plan).
+        medium
+            .conn
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, i32::MAX)
+            .unwrap();
+        let (dup_id, dup_outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 93)
+                .unwrap();
+        assert!(
+            matches!(
+                dup_outcome,
+                crate::reclaim::PlanPublicationOutcome::DuplicateVerified { id } if id == plan_id
+            ),
+            "the restored connection re-enables the idempotent publication: {dup_outcome:?}"
+        );
+        assert_eq!(dup_id, plan_id);
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }

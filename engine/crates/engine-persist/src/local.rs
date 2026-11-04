@@ -98,7 +98,7 @@ pub(crate) const MIGRATED_MARKER: &str = "MIGRATED";
 
 /// Documented maximum for a stored object's size (matches the Batch 1
 /// byte-length maximum; enforced by stat before any read allocates).
-const MAX_OBJECT_BYTES: u64 = MAX_BYTE_LEN;
+pub(crate) const MAX_OBJECT_BYTES: u64 = MAX_BYTE_LEN;
 
 /// The ephemeral trusted cursor (§5.3.2) — session-scoped derived
 /// state rebuilt by the cold walk; never persisted to a file.
@@ -5113,6 +5113,831 @@ mod exclusion_tests {
             "no terminal marker was published"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (V2-W) The plan campaign: F(shared) → P1(shared) → R1(shared)
+    /// → R2(shared+private) → SK(shared) → MK — the index [R1, R2,
+    /// SK], the range digest over R1..R2 oldest-first, and NO v1
+    /// audit (the checkpoint is plan-eligible). The shared object
+    /// repeats across the R1/R2/SK units (the ratified cross-unit
+    /// sharing) and is the survivor (P1 references it); the private
+    /// object is R2-mandated. Returns (root, journal_root, medium,
+    /// mk, r1, r2, shared, private).
+    fn v2_plan_campaign(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        LocalFileMedium,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+        Hash,
+    ) {
+        let root = temp_store(label);
+        let journal_root = std::env::temp_dir().join(format!(
+            "s7-v2w-journal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2w-shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2w-private-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let p1 = RevisionRecord::regular(head, epoch, 1).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&p1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&r1, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r2 = RevisionRecord::regular(head, epoch, 3)
+            .with_content_refs(vec![shared.hash(), private.hash()]);
+        medium
+            .append(&r2, &[shared.clone(), private.clone()], Some(head))
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = RevisionRecord::regular(head, epoch, 4).with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding.id());
+        let member_bytes: Vec<Vec<u8>> = [r1.id(), r2.id()]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let meta = CheckpointMetadata::new(
+            sk.id(),
+            r1.id(),
+            vec![SkipEntry::new(Hash::ZERO, p1.id())],
+            vec![
+                ReclaimedIndexEntry::new(None, r1.id(), 2),
+                ReclaimedIndexEntry::new(None, r2.id(), 3),
+                ReclaimedIndexEntry::new(None, sk.id(), 4),
+            ],
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk =
+            RevisionRecord::regular(head, epoch, 5).with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        (
+            root,
+            journal_root,
+            medium,
+            mk.id(),
+            r1.id(),
+            r2.id(),
+            shared.hash(),
+            private.hash(),
+        )
+    }
+
+    #[test]
+    fn the_v2_plan_publication_admission_matrix() {
+        // (V2-W §9 A/C/H/I) The trusted plan admission: the valid
+        // publication under the deterministic MK-bound key with the
+        // COMPLETE membership partition; the invalid MK and byte
+        // limits; the exact-duplicate idempotence and the
+        // conflicting-content refusal; the restart discovery; and
+        // the non-destruction proof (only the plan's record and
+        // object added — nothing deleted, no begin, no completion
+        // marker, the survivor and mandatory content intact).
+        let (root, journal_root, mut medium, mk, r1, r2, shared, private) =
+            v2_plan_campaign("v2w-admission");
+        let records_before = medium.validate().unwrap().records;
+        // THE INVALID MK.
+        let error = crate::reclaim::publish_reclamation_plan(
+            &mut medium,
+            &Hash::ZERO,
+            1024,
+            &journal_root,
+            50,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-plan/mk-not-installed"
+                }
+            ),
+            "an unknown MK refuses: {error:?}"
+        );
+        // THE INVALID BYTE LIMITS.
+        for limit in [0, crate::reclaim::MAX_RECLAMATION_LEDGER_BYTES + 1] {
+            let error = crate::reclaim::publish_reclamation_plan(
+                &mut medium,
+                &mk,
+                limit,
+                &journal_root,
+                50,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-plan/ledger-byte-limit-invalid"
+                    }
+                ),
+                "the invalid byte limit refuses: {error:?}"
+            );
+        }
+        // THE VALID PUBLICATION (the small campaign fits one batch).
+        let (plan_id, outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 51)
+                .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::reclaim::PlanPublicationOutcome::Accepted { id } if id == plan_id
+            ),
+            "the valid plan publishes: {outcome:?}"
+        );
+        // The discovery + the complete membership partition (the
+        // index exactly once, the ratified epoch order newest-first).
+        let (found_id, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_id, plan_id);
+        assert_eq!(plan.mk, mk);
+        assert_eq!(plan.batches.len(), 1);
+        let members = &plan.batches[0].records;
+        assert_eq!(members.len(), 3, "the complete index membership");
+        assert!(members.contains(&r1) && members.contains(&r2));
+        // THE EXACT DUPLICATE (idempotent under the deterministic
+        // key).
+        let (dup_id, dup_outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 52)
+                .unwrap();
+        assert!(
+            matches!(
+                dup_outcome,
+                crate::reclaim::PlanPublicationOutcome::DuplicateVerified { id } if id == plan_id
+            ),
+            "the exact duplicate verifies: {dup_outcome:?}"
+        );
+        assert_eq!(dup_id, plan_id);
+        // THE CONFLICTING CONTENT (a different limit → a different
+        // partition → the same key, different bytes → refuse, never
+        // an equivalent duplicate).
+        let error =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 2048, &journal_root, 53)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-plan/duplicate-content-mismatch"
+                }
+            ),
+            "the conflicting content refuses: {error:?}"
+        );
+        // THE RESTART DISCOVERY (a fresh provider handle — the
+        // installed records and identities verified without
+        // re-deriving them from caller state).
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(root.clone()).unwrap();
+        let (restart_id, restart_plan) = crate::reclaim::find_installed_plan(&mut reopened, &mk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restart_id, plan_id);
+        assert_eq!(restart_plan, plan);
+        // THE NON-DESTRUCTION: exactly the plan's record added;
+        // every retirement record and object intact; no completion
+        // marker.
+        let summary = reopened.validate().unwrap();
+        assert_eq!(
+            summary.records,
+            records_before + 1,
+            "only the plan's revision was added"
+        );
+        assert!(reopened.object_path(&r1).is_file());
+        assert!(reopened.object_path(&r2).is_file());
+        assert!(reopened.object_path(&shared).is_file());
+        assert!(reopened.object_path(&private).is_file());
+        assert!(
+            crate::reclaim::find_installed_completion(&mut reopened, &mk)
+                .unwrap()
+                .is_none(),
+            "no completion marker was published"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_w2_exclusion_fence_and_competing_writers() {
+        // (V2-W §9 B/J) The W2 bidirectional v1/v2 exclusion at every
+        // reachable installation path: a v1-audited MK refuses the
+        // plan admission; a planned MK refuses the v1 publication;
+        // the unrestricted generic append refuses BOTH families; and
+        // the competing-writer races over two provider handles never
+        // leave a chain carrying conflicting trusted retirement
+        // authority (the same plan converges idempotently; a
+        // conflicting plan refuses; the cross-type publication
+        // refuses through the fresh exclusion check anchored to the
+        // CAS head).
+        let v1_ledger = |medium: &mut LocalFileMedium, mk: Hash| {
+            let mk_record = medium.read_record(&mk).unwrap();
+            let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+            let metadata = CheckpointMetadata::decode(&meta_bytes).unwrap();
+            let mut refs_of = |id: Hash| medium.read_record(&id).unwrap().content_refs.clone();
+            ReclamationLedger {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                records: metadata.index.len() as u64,
+                reclaimed_keys: 0,
+                journal_files: Vec::new(),
+                units: metadata
+                    .index
+                    .iter()
+                    .map(|entry| ReclaimUnit {
+                        record: entry.hash,
+                        objects: refs_of(entry.hash),
+                    })
+                    .collect(),
+            }
+        };
+        // DIRECTION 1: a v1-audited MK refuses the plan.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-w2-v1first");
+            let ledger = v1_ledger(&mut medium, mk);
+            let (_audit, outcome) = publish_reclamation_ledger(&mut medium, &ledger, 60).unwrap();
+            assert!(matches!(outcome, AppendOutcome::Accepted { .. }));
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 61)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-plan/v1-audit-exclusion"
+                    }
+                ),
+                "the v1-audited MK refuses the plan: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // DIRECTION 2: a planned MK refuses the v1 publication.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-w2-planfirst");
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 62)
+                .unwrap();
+            let ledger = v1_ledger(&mut medium, mk);
+            let error = publish_reclamation_ledger(&mut medium, &ledger, 63).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-ledger/v2-plan-exclusion"
+                    }
+                ),
+                "the planned MK refuses the v1 publication: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // THE GENERIC-APPEND BYPASS: hand-built ledger and plan
+        // objects refused by the unrestricted append (the family
+        // gates).
+        {
+            let (root, _journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-w2-bypass");
+            let ledger = v1_ledger(&mut medium, mk);
+            let ledger_object = StoredObject::new(ledger.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 64)
+                .with_content_refs(vec![ledger_object.hash()]);
+            let error = medium
+                .append(&record, std::slice::from_ref(&ledger_object), Some(head))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-ledger/generic-append-refused"
+                    }
+                ),
+                "the generic append refuses the ledger family: {error:?}"
+            );
+            let plan_object = StoredObject::new(
+                crate::reclaim::ReclaimPlan {
+                    mk,
+                    sk: Hash::ZERO,
+                    range_digest: [0u8; 32],
+                    seed: [0u8; 32],
+                    ledger_byte_limit: 1024,
+                    batches: Vec::new(),
+                    journal_files: Vec::new(),
+                }
+                .canonical_bytes(),
+            )
+            .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 65)
+                .with_content_refs(vec![plan_object.hash()]);
+            let error = medium
+                .append(&record, std::slice::from_ref(&plan_object), Some(head))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-plan/generic-append-refused"
+                    }
+                ),
+                "the generic append refuses the plan family: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // THE COMPETING WRITERS (two provider handles over the same
+        // root): the same plan converges idempotently; a conflicting
+        // plan refuses; the cross-type publication refuses through
+        // the fresh exclusion check.
+        {
+            let (root, journal_root, medium_a, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-w2-race");
+            drop(medium_a);
+            let mut a = LocalFileMedium::open(root.clone()).unwrap();
+            let mut b = LocalFileMedium::open(root.clone()).unwrap();
+            let (id_a, out_a) =
+                crate::reclaim::publish_reclamation_plan(&mut a, &mk, 1024, &journal_root, 66)
+                    .unwrap();
+            assert!(
+                matches!(
+                    out_a,
+                    crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                ),
+                "{out_a:?}"
+            );
+            let (id_b, out_b) =
+                crate::reclaim::publish_reclamation_plan(&mut b, &mk, 1024, &journal_root, 67)
+                    .unwrap();
+            assert!(
+                matches!(
+                    out_b,
+                    crate::reclaim::PlanPublicationOutcome::DuplicateVerified { id } if id == id_a
+                ),
+                "the competing same-plan writer converges idempotently: {out_b:?}"
+            );
+            assert_eq!(id_a, id_b);
+            let error =
+                crate::reclaim::publish_reclamation_plan(&mut b, &mk, 2048, &journal_root, 68)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-plan/duplicate-content-mismatch"
+                    }
+                ),
+                "the conflicting competing plan refuses: {error:?}"
+            );
+            let ledger = v1_ledger(&mut b, mk);
+            let error = publish_reclamation_ledger(&mut b, &ledger, 69).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "reclamation-ledger/v2-plan-exclusion"
+                    }
+                ),
+                "the competing cross-type writer refuses: {error:?}"
+            );
+            // No final chain carries conflicting trusted authority:
+            // the plan is installed, the v1 audit is not.
+            assert!(
+                crate::reclaim::find_installed_plan(&mut b, &mk)
+                    .unwrap()
+                    .is_some()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_batch_audit_publication_matrix() {
+        // (V2-W §9 D/E/H/I) The trusted v2 batch-audit publication:
+        // every plan batch publishes under its deterministic (MK,
+        // batch) key with the exact membership slice and the
+        // ratified sharing; the unknown batch index refuses; the
+        // missing evidence and corrupt objects refuse through the
+        // hash-verified reads; the Unknown publication outcomes
+        // reconcile with the verified identity, key, and exact
+        // content; the restart discovers the installed audits; and
+        // the publications are non-destructive.
+        let (root, journal_root, mut medium, mk, r1, r2, shared, _private) =
+            v2_plan_campaign("v2w-audits");
+        let records_before = medium.validate().unwrap().records;
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 70)
+                .unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        // EVERY batch (the all-audits-first discipline as a
+        // property: the complete set publishable and discoverable).
+        let mut audit_ids = Vec::new();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            let (audit_id, outcome) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 71).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::LedgerV2PublicationOutcome::Accepted { id } if id == audit_id
+                ),
+                "the batch audit publishes: {outcome:?}"
+            );
+            // The discovery + the membership exactness.
+            let (found_id, ledger) =
+                crate::reclaim::find_installed_v2_audit(&mut medium, &mk, batch)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(found_id, audit_id);
+            assert_eq!(ledger.mk, mk);
+            assert_eq!(ledger.batch, batch);
+            let slice = &plan.batches[batch as usize];
+            assert_eq!(ledger.units.len(), slice.records.len());
+            for (unit, record) in ledger.units.iter().zip(&slice.records) {
+                assert_eq!(unit.record, *record);
+            }
+            // The ratified cross-unit sharing: the shared object
+            // appears in multiple units legitimately.
+            assert!(
+                ledger
+                    .units
+                    .iter()
+                    .filter(|unit| unit.objects.contains(&shared))
+                    .count()
+                    >= 2,
+                "the cross-unit repetition is legitimate sharing"
+            );
+            // The exact duplicate.
+            let (_dup_id, dup_outcome) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 72).unwrap();
+            assert!(
+                matches!(
+                    dup_outcome,
+                    crate::reclaim::LedgerV2PublicationOutcome::DuplicateVerified { id } if id == audit_id
+                ),
+                "the exact duplicate verifies: {dup_outcome:?}"
+            );
+            audit_ids.push(audit_id);
+        }
+        // THE UNKNOWN BATCH INDEX.
+        let error =
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 99, 73).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-ledger-v2/batch-not-in-plan"
+                }
+            ),
+            "the unknown batch index refuses: {error:?}"
+        );
+        // THE NON-DESTRUCTION: only the plan + the audits added;
+        // every retirement record and object intact.
+        let summary = medium.validate().unwrap();
+        assert_eq!(
+            summary.records,
+            records_before + 1 + audit_ids.len() as u64,
+            "only the plan and audit revisions were added"
+        );
+        assert!(medium.object_path(&r1).is_file());
+        assert!(medium.object_path(&r2).is_file());
+        // THE RESTART DISCOVERY.
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(root.clone()).unwrap();
+        for (batch, audit_id) in plan.batches.iter().map(|b| b.index).zip(&audit_ids) {
+            let (found_id, _ledger) =
+                crate::reclaim::find_installed_v2_audit(&mut reopened, &mk, batch)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(found_id, *audit_id);
+        }
+        assert_eq!(
+            crate::reclaim::find_installed_plan(&mut reopened, &mk)
+                .unwrap()
+                .unwrap()
+                .0,
+            plan_id
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        // THE MISSING EVIDENCE: a digest member deleted → the
+        // hash-verified read refuses (never a fabricated manifest).
+        {
+            let (root, journal_root, mut medium, mk, r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-audits-missing");
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 74)
+                .unwrap();
+            std::fs::remove_file(medium.object_path(&r1)).unwrap();
+            let error =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 75).unwrap_err();
+            assert!(
+                matches!(error, MediumError::MissingObject { .. }),
+                "the missing evidence refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // THE CORRUPT OBJECT: a unit object's bytes corrupted → the
+        // hash-verified read refuses.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _shared, private) =
+                v2_plan_campaign("v2w-audits-corrupt");
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 76)
+                .unwrap();
+            std::fs::write(medium.object_path(&private), b"corrupted-bytes").unwrap();
+            let error =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 77).unwrap_err();
+            assert!(
+                matches!(error, MediumError::HashMismatch { .. }),
+                "the corrupt object refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_plan_publication_uncertainty_reconciliation() {
+        // (V2-W §9 C/E) The plan publication's Unknown-outcome
+        // discipline over a test-only wrapper (the established
+        // single-shot injection pattern): Unknown->Installed
+        // reconciles to ReconciledInstalled with the verified
+        // identity, key, and exact canonical content; Unknown->
+        // NotInstalled retries through the correct admission;
+        // Unknown->Unverifiable refuses typed (never a false durable
+        // confirmation).
+        #[derive(Clone, Copy)]
+        enum V2Inject {
+            Installed,
+            NotInstalled,
+            Unverifiable,
+        }
+        struct V2UnknownMedium<'a> {
+            inner: &'a mut LocalFileMedium,
+            inject: V2Inject,
+            armed: bool,
+        }
+        impl CanonicalMedium for V2UnknownMedium<'_> {
+            fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+                self.inner.head()
+            }
+            fn append_admitted(
+                &mut self,
+                admitted: crate::medium::AdmittedAppend,
+                expected_parent: Option<Hash>,
+            ) -> Result<AppendOutcome, MediumError> {
+                if !self.armed {
+                    return self.inner.append_admitted(admitted, expected_parent);
+                }
+                self.armed = false;
+                match self.inject {
+                    V2Inject::Installed => {
+                        self.inner.append_admitted(admitted, expected_parent)?;
+                        Ok(AppendOutcome::Unknown {
+                            reason: crate::medium::UnknownReason::CommitUncertain,
+                        })
+                    }
+                    V2Inject::NotInstalled => Ok(AppendOutcome::Unknown {
+                        reason: crate::medium::UnknownReason::ObjectWriteFailed,
+                    }),
+                    V2Inject::Unverifiable => Ok(AppendOutcome::Unknown {
+                        reason: crate::medium::UnknownReason::HeadPublishFailed,
+                    }),
+                }
+            }
+            fn reconcile_unknown(
+                &mut self,
+                candidate: &Hash,
+            ) -> Result<crate::medium::Reconciliation, MediumError> {
+                match self.inject {
+                    V2Inject::Installed => self.inner.reconcile_unknown(candidate),
+                    V2Inject::NotInstalled => Ok(crate::medium::Reconciliation::NotInstalled {
+                        head: self.inner.head()?,
+                    }),
+                    V2Inject::Unverifiable => Ok(crate::medium::Reconciliation::Unverifiable {
+                        reason: "the injected uncertain outcome".to_owned(),
+                    }),
+                }
+            }
+            fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+                self.inner.read_record(id)
+            }
+            fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+                self.inner.read_object(hash)
+            }
+            fn validate(&mut self) -> Result<crate::medium::ChainSummary, MediumError> {
+                self.inner.validate()
+            }
+            fn durability_tier(&self) -> crate::medium::SyncTier {
+                self.inner.durability_tier()
+            }
+            fn reclaim(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+                self.inner.reclaim(directive)
+            }
+            fn reclaim_pending(
+                &mut self,
+                directive: &crate::reclaim::ReclaimDirective,
+            ) -> Result<bool, MediumError> {
+                self.inner.reclaim_pending(directive)
+            }
+            fn begin_reclamation(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+                tick: u64,
+            ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+                self.inner.begin_reclamation(audit, mk, tick)
+            }
+            fn verify_begin_authority(
+                &mut self,
+                audit: &Hash,
+                mk: &Hash,
+            ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+                self.inner.verify_begin_authority(audit, mk)
+            }
+        }
+        for inject in [
+            V2Inject::Installed,
+            V2Inject::NotInstalled,
+            V2Inject::Unverifiable,
+        ] {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-uncertain");
+            let mut wrapper = V2UnknownMedium {
+                inner: &mut medium,
+                inject,
+                armed: true,
+            };
+            let result = crate::reclaim::publish_reclamation_plan(
+                &mut wrapper,
+                &mk,
+                1024,
+                &journal_root,
+                80,
+            );
+            match inject {
+                V2Inject::Installed => {
+                    let (id, outcome) = result.unwrap();
+                    assert!(
+                        matches!(
+                            outcome,
+                            crate::reclaim::PlanPublicationOutcome::ReconciledInstalled {
+                                id: reconciled,
+                            } if reconciled == id
+                        ),
+                        "the installed unknown reconciles: {outcome:?}"
+                    );
+                }
+                V2Inject::NotInstalled => {
+                    let (_id, outcome) = result.unwrap();
+                    assert!(
+                        matches!(
+                            outcome,
+                            crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                        ),
+                        "the not-installed unknown retries through the admission: {outcome:?}"
+                    );
+                }
+                V2Inject::Unverifiable => {
+                    let error = result.unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            MediumError::Chain {
+                                rule: "reclamation-plan/unknown-unverifiable"
+                            }
+                        ),
+                        "the unverifiable unknown refuses: {error:?}"
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_journal_obligations_bound_to_the_immutable_plan() {
+        // (V2-W §9 F) The journal obligations' provenance: a genuine
+        // rotation's stale generation names bind to the plan at
+        // admission; the retry with the SAME journal state verifies
+        // as the exact duplicate; a FURTHER rotation (the
+        // contradictory evidence) refuses — the installed plan's
+        // obligations are never silently replaced; and a journal
+        // root with no rotation legitimately binds the empty set.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2w-journal");
+        // The genuine rotation: the journal at the root, then the
+        // rotation (the fresh active, the pointer, the generations
+        // manifest — the SAME trusted discipline the crossing
+        // uses).
+        let _journal = crate::journal::T1Journal::open(&journal_root).unwrap();
+        crate::rotation::rotate_journal(&journal_root, &[], &[], &[]).unwrap();
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 90)
+                .unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !plan.journal_files.is_empty(),
+            "the rotation's stale generations bind to the plan"
+        );
+        // THE RETRY (the same journal state): the exact duplicate.
+        let (dup_id, dup_outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 91)
+                .unwrap();
+        assert!(
+            matches!(
+                dup_outcome,
+                crate::reclaim::PlanPublicationOutcome::DuplicateVerified { id } if id == plan_id
+            ),
+            "the same-state retry verifies as the exact duplicate: {dup_outcome:?}"
+        );
+        assert_eq!(dup_id, plan_id);
+        // THE CONTRADICTORY EVIDENCE (a further rotation): the
+        // different obligations under the same key refuse — never a
+        // silent replacement.
+        crate::rotation::rotate_journal(&journal_root, &[], &[], &[]).unwrap();
+        let error =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 92)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclamation-plan/duplicate-content-mismatch"
+                }
+            ),
+            "the contradictory journal evidence refuses: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&journal_root);
+        // THE EMPTY SET (a journal root with no rotation — the
+        // active IS the root: the legitimate empty obligations).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+                v2_plan_campaign("v2w-journal-empty");
+            let (_id, outcome) =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 93)
+                    .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::PlanPublicationOutcome::Accepted { .. }
+                ),
+                "the no-rotation journal root legitimately binds the empty set: {outcome:?}"
+            );
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            assert!(plan.journal_files.is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     fn two_retirement_store(

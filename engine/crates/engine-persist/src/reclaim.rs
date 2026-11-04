@@ -234,17 +234,38 @@ pub fn publish_reclamation_ledger(
             rule: "reclamation-ledger/empty",
         });
     }
-    let bytes = ledger.canonical_bytes();
-    let object = StoredObject::new(bytes)?;
+    // (V2-W, W2-A direction 2) The plan-existence precondition,
+    // checked under the append boundary against the CAS-anchored
+    // head: an MK with an installed trusted v2 plan never also
+    // carries a trusted v1 audit — one retirement authority per
+    // checkpoint, ever. The caller receives the typed exclusion;
+    // the wire format and the legitimate v1 publication behavior
+    // are otherwise unchanged (the pre-authorized narrow migration:
+    // the publication rides the in-crate admitted receipt, since
+    // the generic append now refuses the ledger family).
     let head = medium
         .head()?
         .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    if find_on_chain(
+        medium,
+        Some(&reclamation_plan_idempotency_key(&ledger.mk)),
+        None,
+    )?
+    .is_some()
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger/v2-plan-exclusion",
+        });
+    }
+    let bytes = ledger.canonical_bytes();
+    let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&head)?.epoch;
     let record = RevisionRecord::regular(head, parent_epoch, tick)
         .with_idempotency_key(reclamation_ledger_idempotency_key(&ledger.mk))
         .with_content_refs(vec![object.hash()]);
     let candidate = record.id();
-    let outcome = medium.append(&record, std::slice::from_ref(&object), Some(head))?;
+    let admitted = crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+    let outcome = medium.append_admitted(admitted, Some(head))?;
     Ok((candidate, outcome))
 }
 
@@ -281,6 +302,11 @@ pub const RECLAMATION_LEDGER_V2_KEY_DOMAIN: &str = "engine-persist/reclamation-l
 /// record).
 pub const RECLAMATION_PLAN_DOMAIN: &str = "engine-persist/reclamation-plan/1";
 pub const RECLAMATION_PLAN_VERSION: u32 = 1;
+
+/// The plan-family prefix — EVERY version in this family is refused
+/// by the generic-append publication gate (the W2-A exclusion's
+/// admission-boundary discipline).
+pub const RECLAMATION_PLAN_DOMAIN_PREFIX: &str = "engine-persist/reclamation-plan/";
 
 /// The plan revision's idempotency-key domain (deterministic in the
 /// MK — one plan per checkpoint, ever).
@@ -482,6 +508,46 @@ pub fn enforce_reclamation_begin_gate(objects: &[StoredObject]) -> Result<(), Me
         if is_reclamation_begin_family(object.domain()) {
             return Err(MediumError::Chain {
                 rule: "reclamation-begin/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The plan-family publication gate (V2-W, the W2-A exclusion): no
+/// reclamation-plan object (any version) may enter the chain through
+/// the unrestricted generic append — the plan is the all-audits-first
+/// protocol's authority record, installable only through the
+/// in-crate plan admission after the checkpoint authentication and
+/// the W2 v1-exclusion check. A valid codec alone never grants
+/// publication authority.
+pub fn enforce_reclamation_plan_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if object.domain().starts_with(RECLAMATION_PLAN_DOMAIN_PREFIX) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-plan/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The reclamation-ledger-family publication gate (V2-W, the W2-A
+/// exclusion): no v1 or v2 reclamation audit (any version in the
+/// family) may enter the chain through the unrestricted generic
+/// append — the audits are trusted retirement evidence, installable
+/// only through the in-crate publications (the v1
+/// [`publish_reclamation_ledger`] and the v2
+/// [`publish_reclamation_ledger_v2`]) that enforce the W2
+/// bidirectional exclusion. This is the pre-authorized narrow
+/// migration's enforcement side: the legitimate v1 publication path
+/// moves to the in-crate admitted receipt, its wire format and
+/// behavior unchanged.
+pub fn enforce_reclamation_ledger_family_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if is_reclamation_ledger_family(object.domain()) {
+            return Err(MediumError::Chain {
+                rule: "reclamation-ledger/generic-append-refused",
             });
         }
     }
@@ -1500,6 +1566,675 @@ pub fn reclamation_ledger_v2_idempotency_key(mk: &Hash, batch: u64) -> Vec<u8> {
 /// plan per checkpoint, ever).
 pub fn reclamation_plan_idempotency_key(mk: &Hash) -> Vec<u8> {
     format!("{RECLAMATION_PLAN_KEY_DOMAIN}:{}", mk.hex()).into_bytes()
+}
+
+// ------------------------------------------ the V2-W trusted publications
+//
+// The provider-neutral, NON-DESTRUCTIVE publication of the v2
+// reclamation authority evidence: the canonical ReclaimPlan (the
+// all-audits-first protocol's authority record) and every
+// plan-defined ReclamationLedgerV2 batch audit. This checkpoint
+// publishes durable evidence ONLY — no batch deletion, no v2
+// completion marker, no range-terminal certification, no journal
+// deletion, no crossing routing (the later batched-execution
+// checkpoint independently enforces the all-audits-first
+// prerequisite). The W2 bidirectional v1/v2 exclusion (one MK can
+// never carry both a trusted v1 audit and a trusted v2 plan) is
+// enforced at every reachable installation path: the generic-append
+// family gates (no ledger or plan object enters unrestricted), the
+// v1 publication's plan-existence precondition, and the plan
+// admission's v1-audit exclusion — each anchored to the exact
+// expected-parent CAS with fresh re-validation on every retry, and
+// the Unknown outcome reconciled against the verified record
+// identity, key, and exact canonical content (never a false
+// acknowledgment).
+
+/// (V2-W, W3A) The minimum supported effective provider per-object
+/// capacity: the retained contract's 4 MB floor, read as the binary
+/// megabyte consistent with the 512 MiB canonical ceiling's
+/// convention (4 × 1024 × 1024 bytes). A provider below this floor
+/// is an UNSUPPORTED configuration for reclamation publication —
+/// fail-closed and typed, with reads/writes otherwise unaffected (a
+/// distinct refusal class from the batch-size check).
+pub const MIN_SUPPORTED_EFFECTIVE_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// (V2-W, W2-B) The journal-evidence collector — the writer-only
+/// preparation bridge over the SAME trusted discipline the
+/// production crossing uses: the active journal must scan green
+/// before any stale generation is removable (the survival set
+/// stands), the stale names derive from the rotation's generation
+/// evidence, and the ownership stays the journal root's. The plan
+/// writer binds the collected obligations to the immutable plan at
+/// admission; a retry or recovery discovers and verifies the
+/// installed plan — never regenerates different obligations and
+/// accepts them as equivalent.
+pub fn collect_reclaimable_journal_files(
+    journal_root: &std::path::Path,
+) -> Result<Vec<String>, crate::journal::JournalError> {
+    let active = crate::rotation::active_journal_path(journal_root)?;
+    if active == journal_root {
+        return Ok(Vec::new());
+    }
+    let active_name = active
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    crate::journal::T1Journal::scan_file(&active)?;
+    let names = crate::rotation::read_journal_generations(journal_root)?;
+    let mut stale = Vec::new();
+    for name in names {
+        if active_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        stale.push(name);
+    }
+    stale.sort();
+    Ok(stale)
+}
+
+/// (V2-W) The on-chain discovery: the gap-aware descent from the
+/// authoritative HEAD, matching either an exact idempotency key or
+/// an exact record identity, returning the matched record's id and
+/// its FIRST content object's bytes. The skip-table discipline is
+/// the established one (a missing parent crosses only under an
+/// authenticated checkpoint skip table); a record bypassed by a
+/// skip jump is never falsely reported absent on production-shaped
+/// tables (the true nearest-retained-ancestor targets). Shared by
+/// the W2 exclusion checks, the writer duplicate resolutions, and
+/// the audit writer's plan discovery.
+fn find_on_chain(
+    medium: &mut dyn CanonicalMedium,
+    key: Option<&[u8]>,
+    id: Option<&Hash>,
+) -> Result<Option<(Hash, Vec<u8>)>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut current = head;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..MAX_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let record = medium.read_record(&current)?;
+        let mut first_object: Option<Vec<u8>> = None;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+            first_object = Some(bytes);
+        }
+        if (id.is_some() && id == Some(&current))
+            || (key.is_some() && record.idempotency_key.as_deref() == key)
+        {
+            return Ok(first_object.map(|bytes| (current, bytes)));
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "reclamation/descent-bound",
+    })
+}
+
+/// (V2-W) The installed-plan discovery: the record carrying THIS
+/// MK's deterministic plan key, with its strictly decoded plan.
+pub fn find_installed_plan(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+) -> Result<Option<(Hash, ReclaimPlan)>, MediumError> {
+    match find_on_chain(medium, Some(&reclamation_plan_idempotency_key(mk)), None)? {
+        None => Ok(None),
+        Some((id, bytes)) => Ok(Some((
+            id,
+            ReclaimPlan::decode(&bytes).map_err(MediumError::Format)?,
+        ))),
+    }
+}
+
+/// (V2-W) The installed v2 batch-audit discovery: the record
+/// carrying THIS (MK, batch) deterministic key, with its strictly
+/// decoded ledger.
+pub fn find_installed_v2_audit(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+    batch: u64,
+) -> Result<Option<(Hash, ReclamationLedgerV2)>, MediumError> {
+    match find_on_chain(
+        medium,
+        Some(&reclamation_ledger_v2_idempotency_key(mk, batch)),
+        None,
+    )? {
+        None => Ok(None),
+        Some((id, bytes)) => Ok(Some((
+            id,
+            ReclamationLedgerV2::decode(&bytes).map_err(MediumError::Format)?,
+        ))),
+    }
+}
+
+/// (V2-W) The unit's closure-expanded object manifest: the record's
+/// direct content references plus the verified composite closure
+/// (the first reference's /2 root decoded, every chunk dependency
+/// envelope-verified — the same machinery the provider walks use),
+/// collected while the first-execution evidence remains intact.
+/// The ratified sharing rules apply at the ledger level (a repeated
+/// identity ACROSS units is legitimate; the intra-unit set is
+/// deduplicated here).
+fn collect_unit_objects(
+    medium: &mut dyn CanonicalMedium,
+    record_id: &Hash,
+) -> Result<Vec<Hash>, MediumError> {
+    let record = medium.read_record(record_id)?;
+    let mut objects: Vec<Hash> = Vec::new();
+    for (position, reference) in record.content_refs.iter().enumerate() {
+        if !objects.contains(reference) {
+            objects.push(*reference);
+        }
+        if position == 0 {
+            let bytes = medium.read_object(reference)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::composite_manifest::SESSION_SNAPSHOT_V2_DOMAIN
+            {
+                let manifest =
+                    crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
+                for entry in &manifest.entries {
+                    let chunk_bytes = medium.read_object(&entry.identity)?;
+                    crate::composite_append::verify_chunk_dependency(
+                        &chunk_bytes,
+                        &entry.identity,
+                        &manifest,
+                    )
+                    .map_err(|_error| MediumError::Chain {
+                        rule: "reclamation-plan/composite-closure-verification",
+                    })?;
+                    if !objects.contains(&entry.identity) {
+                        objects.push(entry.identity);
+                    }
+                }
+            }
+        }
+    }
+    Ok(objects)
+}
+
+/// (V2-W) The typed plan-publication outcome: the truthful
+/// classification, never a guess. `Accepted` carries the
+/// durably-acknowledged installation's record identity;
+/// `ReconciledInstalled` a canonical-membership proof reconciled
+/// from an Unknown outcome with the exact content verified;
+/// `DuplicateVerified` an ALREADY-installed identical plan
+/// (discovered by the deterministic key and exactly content-matched
+/// — a conflicting content under the same key REFUSES, never an
+/// equivalent duplicate); `ReconciledNotInstalled` the verified
+/// absence after an Unknown outcome.
+#[derive(Debug)]
+pub enum PlanPublicationOutcome {
+    Accepted { id: Hash },
+    ReconciledInstalled { id: Hash },
+    ReconciledNotInstalled,
+    DuplicateVerified { id: Hash },
+}
+
+/// (V2-W) The typed v2 batch-audit publication outcome — the same
+/// truthful classification discipline as the plan's.
+#[derive(Debug)]
+pub enum LedgerV2PublicationOutcome {
+    Accepted { id: Hash },
+    ReconciledInstalled { id: Hash },
+    ReconciledNotInstalled,
+    DuplicateVerified { id: Hash },
+}
+
+/// (V2-W) The trusted plan publication: authenticates the MK-bound
+/// checkpoint and its permanent metadata, derives the COMPLETE
+/// membership partition from the checkpoint index in the ratified
+/// epoch order (each batch's actual canonical v2 ledger encoding
+/// respecting the admitted byte limit — a single unit that cannot
+/// fit refuses BEFORE an unusable plan installs), binds the
+/// journal obligations collected through the provenance-preserving
+/// boundary (W2-B), enforces the W2 v1-audit exclusion, and
+/// publishes through the deterministic MK-bound key with exact-
+/// parent CAS, fresh exclusion re-validation on every retry, and
+/// the Unknown outcome reconciled against the verified identity,
+/// key, and exact canonical content. NON-DESTRUCTIVE: no deletion,
+/// no begin, no completion marker, no journal retirement.
+pub fn publish_reclamation_plan(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+    ledger_byte_limit: u64,
+    journal_root: &std::path::Path,
+    tick: u64,
+) -> Result<(Hash, PlanPublicationOutcome), MediumError> {
+    // (a) The admitted byte limit: the caller-supplied operational
+    // packing bound, validated against the unchanged canonical
+    // ceiling (512 MiB) and the honest nonzero minimum.
+    if ledger_byte_limit == 0 || ledger_byte_limit > MAX_RECLAMATION_LEDGER_BYTES {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/ledger-byte-limit-invalid",
+        });
+    }
+    // (b) The W3A provider capacity: the effective per-object limit
+    // must meet the supported floor (the typed
+    // unsupported-configuration refusal — reads/writes otherwise
+    // unaffected).
+    let effective_limit = medium.effective_object_byte_limit()?;
+    if effective_limit < MIN_SUPPORTED_EFFECTIVE_OBJECT_BYTES {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/provider-limit-unsupported",
+        });
+    }
+    // (c) The checkpoint authentication: the MK's canonical chain
+    // membership (the descent match), its permanent metadata, and
+    // the SK binding.
+    let Some((_mk_id, meta_bytes)) = find_on_chain(medium, None, Some(mk))? else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/mk-not-installed",
+        });
+    };
+    let metadata =
+        crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+    let mk_record = medium.read_record(mk)?;
+    if Some(metadata.sk) != mk_record.parent {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/metadata-binding",
+        });
+    }
+    if metadata.index.is_empty() {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/empty-index",
+        });
+    }
+    // (d) The COMPLETE membership partition in the ratified epoch
+    // order (newest-first — batch 0 carries the newest slice),
+    // computed from the actual canonical v2 ledger encodings: each
+    // unit's record is read and hash-verified while present, its
+    // closure-expanded manifest collected, and the accumulating
+    // batch's encoded size checked against the admitted limit. A
+    // single unit whose minimal ledger cannot fit refuses BEFORE
+    // the plan installs.
+    let mut indexed: Vec<&crate::checkpoint::ReclaimedIndexEntry> = metadata.index.iter().collect();
+    indexed.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.epoch));
+    let mut batches: Vec<PlanBatch> = Vec::new();
+    let mut current: PlanBatch = PlanBatch {
+        index: 0,
+        records: Vec::new(),
+    };
+    let mut current_units: Vec<ReclaimUnit> = Vec::new();
+    for entry in &indexed {
+        let objects = collect_unit_objects(medium, &entry.hash)?;
+        let probe_units: Vec<ReclaimUnit> = current_units
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ReclaimUnit {
+                record: entry.hash,
+                objects: objects.clone(),
+            }))
+            .collect();
+        let probe = ReclamationLedgerV2 {
+            mk: *mk,
+            sk: metadata.sk,
+            batch: current.index,
+            range_digest: metadata.range_digest,
+            seed: metadata.seed,
+            records: probe_units.len() as u64,
+            reclaimed_keys: 0,
+            units: probe_units,
+        };
+        if probe.canonical_bytes().len() as u64 > ledger_byte_limit {
+            if current.records.is_empty() {
+                // The single unit cannot fit even an otherwise-empty
+                // batch — refuse before installing an unusable plan.
+                return Err(MediumError::Chain {
+                    rule: "reclamation-plan/unit-exceeds-limit",
+                });
+            }
+            let next_index = current.index + 1;
+            batches.push(std::mem::replace(
+                &mut current,
+                PlanBatch {
+                    index: next_index,
+                    records: Vec::new(),
+                },
+            ));
+            current_units.clear();
+        }
+        current_units.push(ReclaimUnit {
+            record: entry.hash,
+            objects,
+        });
+        current.records.push(entry.hash);
+    }
+    if !current.records.is_empty() {
+        batches.push(current);
+    }
+    // (e) The journal obligations (W2-B): the collector over the
+    // journal root — the SAME trusted discipline the crossing uses;
+    // never a silent empty default, never an arbitrary
+    // caller-supplied list.
+    let journal_files =
+        collect_reclaimable_journal_files(journal_root).map_err(|_error| MediumError::Chain {
+            rule: "reclamation-plan/journal-evidence",
+        })?;
+    // (f) The plan, constructed from the verified values only.
+    let plan = ReclaimPlan {
+        mk: *mk,
+        sk: metadata.sk,
+        range_digest: metadata.range_digest,
+        seed: metadata.seed,
+        ledger_byte_limit,
+        batches,
+        journal_files,
+    };
+    let object = StoredObject::new(plan.canonical_bytes())?;
+    let key = reclamation_plan_idempotency_key(mk);
+    let v1_key = reclamation_ledger_idempotency_key(mk);
+    // (g) The publication: the duplicate resolution first (the
+    // deterministic-key discovery with the EXACT content check — a
+    // conflicting content refuses, never an equivalent duplicate),
+    // then the W2 v1-audit exclusion anchored to the CAS head, the
+    // exact-parent append, the fresh re-validation on the stale-
+    // parent retry, and the Unknown reconciliation with the
+    // verified identity, key, and content.
+    for attempt in 0..2 {
+        let head = medium
+            .head()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        // The W2 v1-audit exclusion (fresh at THIS head — the CAS
+        // anchors to the same one; a competing publication moves the
+        // head and forces the fresh re-check on the retry).
+        if find_on_chain(medium, Some(&v1_key), None)?.is_some() {
+            return Err(MediumError::Chain {
+                rule: "reclamation-plan/v1-audit-exclusion",
+            });
+        }
+        // The duplicate resolution (an installed plan under the
+        // deterministic key): the exact canonical content matches →
+        // the idempotent DuplicateVerified; anything else refuses.
+        if let Some((installed_id, installed_bytes)) = find_on_chain(medium, Some(&key), None)? {
+            if installed_bytes == object.bytes() {
+                return Ok((
+                    installed_id,
+                    PlanPublicationOutcome::DuplicateVerified { id: installed_id },
+                ));
+            }
+            return Err(MediumError::Chain {
+                rule: "reclamation-plan/duplicate-content-mismatch",
+            });
+        }
+        let parent_epoch = medium.read_record(&head)?.epoch;
+        let record = RevisionRecord::regular(head, parent_epoch, tick)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![object.hash()]);
+        let candidate = record.id();
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        match medium.append_admitted(admitted, Some(head))? {
+            AppendOutcome::Accepted { id, .. } => {
+                return Ok((id, PlanPublicationOutcome::Accepted { id }));
+            }
+            AppendOutcome::RejectedStaleParent { .. } => {
+                if attempt == 1 {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-plan/stale-unresolved",
+                    });
+                }
+                continue;
+            }
+            AppendOutcome::Unknown { .. } => match medium.reconcile_unknown(&candidate)? {
+                crate::medium::Reconciliation::Installed { id } => {
+                    let installed = medium.read_record(&id)?;
+                    if installed.idempotency_key.as_deref() != Some(key.as_slice()) {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-plan/unknown-key-mismatch",
+                        });
+                    }
+                    let installed_object = medium.read_object(&installed.content_refs[0])?;
+                    if installed_object != object.bytes() {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-plan/unknown-content-mismatch",
+                        });
+                    }
+                    return Ok((id, PlanPublicationOutcome::ReconciledInstalled { id }));
+                }
+                crate::medium::Reconciliation::NotInstalled { .. } => {
+                    if attempt == 1 {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-plan/unknown-unresolved",
+                        });
+                    }
+                    continue;
+                }
+                crate::medium::Reconciliation::Unverifiable { .. } => {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-plan/unknown-unverifiable",
+                    });
+                }
+            },
+        }
+    }
+    unreachable!("the retry loop returns on every path")
+}
+
+/// (V2-W) The trusted v2 batch-audit publication: discovers and
+/// verifies the installed plan (the authoritative membership — the
+/// caller names the MK and the batch index, never supplies content),
+/// reads and hash-verifies every retiring record while the
+/// first-execution evidence remains intact (the closure-expanded
+/// manifests), independently recomputes the original range digest
+/// against the canonical evidence (a fabricated commitment refuses),
+/// checks the encoded audit against the plan's admitted limit and
+/// the provider's effective capacity, and publishes through the
+/// deterministic (MK, batch) key with the same duplicate, CAS,
+/// stale-retry, and Unknown-reconciliation discipline as the plan.
+/// NON-DESTRUCTIVE.
+pub fn publish_reclamation_ledger_v2(
+    medium: &mut dyn CanonicalMedium,
+    mk: &Hash,
+    batch: u64,
+    tick: u64,
+) -> Result<(Hash, LedgerV2PublicationOutcome), MediumError> {
+    // (a) The installed plan: the authoritative membership.
+    let Some((_plan_id, plan)) = find_installed_plan(medium, mk)? else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/plan-not-installed",
+        });
+    };
+    // (b) The requested batch exists in THIS exact plan.
+    let Some(plan_batch) = plan.batches.iter().find(|b| b.index == batch) else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/batch-not-in-plan",
+        });
+    };
+    // (c) The checkpoint metadata re-verification (the plan's
+    // bindings against the permanent record).
+    let Some((_mk_id, meta_bytes)) = find_on_chain(medium, None, Some(mk))? else {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/mk-not-installed",
+        });
+    };
+    let metadata =
+        crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+    if plan.sk != metadata.sk
+        || plan.range_digest != metadata.range_digest
+        || plan.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/plan-binding-mismatch",
+        });
+    }
+    // (d) The batch members equal the plan's designated slice, each
+    // retiring record read and hash-verified while present, the
+    // closure-expanded manifest collected (the sharing rules: the
+    // intra-unit identities deduplicated; cross-unit repetition is
+    // legitimate).
+    let mut units: Vec<ReclaimUnit> = Vec::new();
+    let mut reclaimed_keys = 0u64;
+    for record_id in &plan_batch.records {
+        let record = medium.read_record(record_id)?;
+        if record.idempotency_key.is_some() {
+            reclaimed_keys += 1;
+        }
+        let objects = collect_unit_objects(medium, record_id)?;
+        units.push(ReclaimUnit {
+            record: *record_id,
+            objects,
+        });
+    }
+    // (e) The original range digest independently recomputed against
+    // the canonical evidence (every digest member read and
+    // hash-verified while present — the SK is an index member but
+    // never a digest member, the established discipline).
+    let mut digest_members: Vec<(u64, Hash)> = metadata
+        .index
+        .iter()
+        .filter(|entry| entry.hash != metadata.sk)
+        .map(|entry| (entry.epoch, entry.hash))
+        .collect();
+    digest_members.sort_unstable_by_key(|(epoch, _)| *epoch);
+    let mut range_bytes = Vec::with_capacity(digest_members.len());
+    for (_, record_id) in &digest_members {
+        range_bytes.push(medium.read_record(record_id)?.canonical_bytes());
+    }
+    let recomputed = crate::checkpoint::chain_range_digest(&metadata.seed, &range_bytes);
+    if recomputed != plan.range_digest {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/range-digest-mismatch",
+        });
+    }
+    // (f) The audit construction and the capacity checks: the
+    // encoded audit must fit the plan's admitted byte limit AND the
+    // provider's effective per-object capacity (including the
+    // object framing — the stored bytes, not just the payload).
+    let ledger = ReclamationLedgerV2 {
+        mk: *mk,
+        sk: plan.sk,
+        batch,
+        range_digest: plan.range_digest,
+        seed: plan.seed,
+        records: units.len() as u64,
+        reclaimed_keys,
+        units,
+    };
+    let object = StoredObject::new(ledger.canonical_bytes())?;
+    if object.bytes().len() as u64 > plan.ledger_byte_limit {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/ledger-exceeds-limit",
+        });
+    }
+    let effective_limit = medium.effective_object_byte_limit()?;
+    if effective_limit < MIN_SUPPORTED_EFFECTIVE_OBJECT_BYTES {
+        return Err(MediumError::Chain {
+            rule: "reclamation-plan/provider-limit-unsupported",
+        });
+    }
+    if object.bytes().len() as u64 > effective_limit {
+        return Err(MediumError::Chain {
+            rule: "reclamation-ledger-v2/provider-limit-exceeded",
+        });
+    }
+    // (g) The publication (the plan writer's discipline verbatim:
+    // the duplicate resolution with the exact content check, the
+    // CAS, the fresh retry, the Unknown reconciliation).
+    let key = reclamation_ledger_v2_idempotency_key(mk, batch);
+    for attempt in 0..2 {
+        let head = medium
+            .head()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        if let Some((installed_id, installed_bytes)) = find_on_chain(medium, Some(&key), None)? {
+            if installed_bytes == object.bytes() {
+                return Ok((
+                    installed_id,
+                    LedgerV2PublicationOutcome::DuplicateVerified { id: installed_id },
+                ));
+            }
+            return Err(MediumError::Chain {
+                rule: "reclamation-ledger-v2/duplicate-content-mismatch",
+            });
+        }
+        let parent_epoch = medium.read_record(&head)?.epoch;
+        let record = RevisionRecord::regular(head, parent_epoch, tick)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![object.hash()]);
+        let candidate = record.id();
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+        match medium.append_admitted(admitted, Some(head))? {
+            AppendOutcome::Accepted { id, .. } => {
+                return Ok((id, LedgerV2PublicationOutcome::Accepted { id }));
+            }
+            AppendOutcome::RejectedStaleParent { .. } => {
+                if attempt == 1 {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-ledger-v2/stale-unresolved",
+                    });
+                }
+                continue;
+            }
+            AppendOutcome::Unknown { .. } => match medium.reconcile_unknown(&candidate)? {
+                crate::medium::Reconciliation::Installed { id } => {
+                    let installed = medium.read_record(&id)?;
+                    if installed.idempotency_key.as_deref() != Some(key.as_slice()) {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-ledger-v2/unknown-key-mismatch",
+                        });
+                    }
+                    let installed_object = medium.read_object(&installed.content_refs[0])?;
+                    if installed_object != object.bytes() {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-ledger-v2/unknown-content-mismatch",
+                        });
+                    }
+                    return Ok((id, LedgerV2PublicationOutcome::ReconciledInstalled { id }));
+                }
+                crate::medium::Reconciliation::NotInstalled { .. } => {
+                    if attempt == 1 {
+                        return Err(MediumError::Chain {
+                            rule: "reclamation-ledger-v2/unknown-unresolved",
+                        });
+                    }
+                    continue;
+                }
+                crate::medium::Reconciliation::Unverifiable { .. } => {
+                    return Err(MediumError::Chain {
+                        rule: "reclamation-ledger-v2/unknown-unverifiable",
+                    });
+                }
+            },
+        }
+    }
+    unreachable!("the retry loop returns on every path")
 }
 
 /// The completion markers' deterministic idempotency key: the batch
