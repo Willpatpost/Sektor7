@@ -15,11 +15,14 @@ use engine_core::{
     SaveError, SaveWorld, Schedule, Spine, Tick, World,
 };
 
-/// Eight logical region identifiers (Stage 3 metadata for later stages).
-pub const REGION_COUNT: usize = 8;
+/// Eight logical region identifiers (Stage 3 metadata for later
+/// stages) — authoritative in engine-core (the shared wire-format
+/// constant; V2-W F4's authenticated retention).
+pub use engine_core::REGION_COUNT;
 
-/// The Stage 4 workload: 1,000 stable NPC identities.
-pub const NPC_COUNT: usize = 1000;
+/// The Stage 4 workload: 1,000 stable NPC identities — authoritative
+/// in engine-core (the shared wire-format bound).
+pub use engine_core::NPC_COUNT;
 
 /// Real-execution milestone period: every MILESTONE_PERIOD-th actual
 /// activity is an irreversible consequence. Milestones arise ONLY from
@@ -29,8 +32,9 @@ pub const NPC_COUNT: usize = 1000;
 pub const MILESTONE_PERIOD: u64 = 16;
 
 /// Side length of the per-NPC region-local position grid (bounds and
-/// travel-reachability invariants; derived render proxies).
-pub const REGION_GRID: u8 = 16;
+/// travel-reachability invariants; derived render proxies) —
+/// authoritative in engine-core (the shared wire-format bound).
+pub use engine_core::REGION_GRID;
 
 /// How the workload handler chains activities (Stage 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +174,7 @@ pub fn routine_payload_parts(payload: u64) -> Option<(usize, u64)> {
 pub const ROUTINE_CURSOR_DISCARDED: u64 = u64::MAX;
 
 /// Sentinel for a dormant NPC's discarded grid position.
-pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
+pub use engine_core::POSITION_DISCARDED;
 
 /// Sentinel for a dormant NPC's discarded represented-through boundary
 /// (Batch 2 corrective finding D).

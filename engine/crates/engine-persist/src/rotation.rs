@@ -389,7 +389,6 @@ fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), Journa
 pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
     pipeline: &mut crate::pipeline::CommitPipeline<M>,
     root: &Path,
-    anchor_boundary: Option<&[u64]>,
 ) -> Result<JournalRotation, SessionRotationError> {
     // (F4-R1/R11-B) THE BOUND-IDENTITY PROBE — in-crate, through the
     // pipeline's own medium (never caller-supplied).
@@ -436,9 +435,31 @@ pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
         crate::journal::scan_bound_file(&active, founding, root_id)
             .map_err(SessionRotationError::Journal)?;
     }
+    // (THE AUTHENTICATED RETENTION BOUNDARY) The per-region
+    // retirement boundary derives EXCLUSIVELY from the newest
+    // canonical session snapshot — selected from the chain (the
+    // HEAD-descent, the same selection rule as the recovery),
+    // hash-verified through the medium's read, its domain exactly
+    // the supported version, its director section strictly
+    // validated (the shared session-anchor decoder — the ONE
+    // interpretation of the wire format), and the boundary derived
+    // from the decoded lane summary. NO caller-supplied boundary
+    // exists in the API; a forged boundary is unrepresentable. No
+    // snapshot on the chain refuses (no-anchor); an uncompacted
+    // ledger (no summary) retires only what is independently
+    // provable (cancellations); a malformed or
+    // newer-unsupported-version snapshot fails closed.
+    let anchor = crate::session_anchor::latest_session_anchor(pipeline.medium_mut())
+        .map_err(SessionRotationError::Anchor)
+        .and_then(|anchor| {
+            anchor.ok_or(SessionRotationError::Anchor(
+                crate::session_anchor::AnchorError::NoAnchor,
+            ))
+        })?;
+    let anchor_boundary = anchor.boundary;
     // THE CLASSIFICATION (§4.4) — derived from the pipeline's own
-    // journal (the live active handle) and confirmed set; the anchor
-    // boundary is the session's claim.
+    // journal (the live active handle) and confirmed set, under the
+    // authenticated boundary.
     let journal = pipeline.journal();
     let mut retained: Vec<CommittedTransaction> = Vec::new();
     let mut retired_canceled: Vec<TransactionId> = Vec::new();
@@ -487,11 +508,12 @@ pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
 }
 
 /// (F4-R11-B) The session-bound rotation's typed error: the binding
-/// probe's medium failures and the mechanism's journal failures,
-/// never conflated.
+/// probe's medium failures, the authenticated anchor's typed
+/// failures, and the mechanism's journal failures, never conflated.
 #[derive(Debug)]
 pub enum SessionRotationError {
     Medium(crate::medium::MediumError),
+    Anchor(crate::session_anchor::AnchorError),
     Journal(JournalError),
 }
 

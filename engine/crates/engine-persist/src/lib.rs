@@ -56,6 +56,7 @@ pub mod reclaim;
 pub mod record;
 pub mod recovery;
 pub mod rotation;
+pub mod session_anchor;
 pub mod sqlite;
 
 #[cfg(test)]

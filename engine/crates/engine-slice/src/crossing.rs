@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT, MAX_TAG_LEN};
+use engine_core::wire::{MAX_COLLECTION_COUNT, MAX_TAG_LEN};
 use engine_core::{
     CompactionError, Decoder, Diagnostics, Encoder, Event, EventClass, EventId, Field, HistoryKind,
     Level, LodLevel, ObligationView, SaveError, Schedule, Spine, Tick,
@@ -2233,21 +2233,14 @@ impl<S: MediumSource> SessionCrossing<S> {
     /// append can interleave.
     pub fn rotate_journal(&mut self) -> Result<JournalRotation, TransitionError> {
         self.assert_journal_authority()?;
-        // THE CHAIN-VERIFIED ANCHOR: the newest session snapshot's
-        // director state (a compaction the operator has not published
-        // is not subsumption evidence — the anchor on the chain is).
-        let Some((_anchor_spine, anchor_director, _content, _revision)) =
-            latest_snapshot_at(&self.source)?
-        else {
-            return Err(TransitionError::InstallIncompatible {
-                region: 0,
-                detail: "journal-rotation/no-anchor",
-            });
-        };
-        let boundary = anchor_director
-            .ledger()
-            .summarized()
-            .map(|summary| summary.boundary);
+        // (THE AUTHENTICATED RETENTION) The rotation's subsumption
+        // boundary is derived IN-CRATE by the session-bound entry —
+        // from the newest canonical session snapshot (the same
+        // HEAD-descent selection rule as the recovery), hash-verified,
+        // version-checked, and strictly decoded through the shared
+        // session-anchor module. No boundary is computed or supplied
+        // here; the crossing and the entry share ONE retirement
+        // algorithm.
         // (F4-R11-B) THE SESSION-BOUND ROTATION ENTRY: the bound
         // identities are PROBED in-crate through the pipeline's own
         // medium (never caller-supplied — a bound root can never
@@ -2261,15 +2254,30 @@ impl<S: MediumSource> SessionCrossing<S> {
         // chain-verified claim). No caller-invented retention
         // evidence exists anywhere in the API; the raw wrappers are
         // crate-private.
-        let rotation = rotate_session_journal(
-            &mut self.pipeline,
-            &self.journal_root,
-            boundary.as_ref().map(|boundary| boundary.as_slice()),
-        )
-        .map_err(|error| match error {
-            engine_persist::SessionRotationError::Medium(error) => PipelineError::Medium(error),
-            engine_persist::SessionRotationError::Journal(error) => PipelineError::Journal(error),
-        })?;
+        let rotation =
+            rotate_session_journal(&mut self.pipeline, &self.journal_root).map_err(|error| {
+                match error {
+                    engine_persist::SessionRotationError::Medium(error)
+                    | engine_persist::SessionRotationError::Anchor(
+                        engine_persist::session_anchor::AnchorError::Medium(error),
+                    ) => PipelineError::Medium(error).into(),
+                    engine_persist::SessionRotationError::Journal(error) => {
+                        PipelineError::Journal(error).into()
+                    }
+                    engine_persist::SessionRotationError::Anchor(
+                        engine_persist::session_anchor::AnchorError::NoAnchor,
+                    ) => TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "journal-rotation/no-anchor",
+                    },
+                    engine_persist::SessionRotationError::Anchor(
+                        engine_persist::session_anchor::AnchorError::UnsupportedSnapshotVersion,
+                    ) => TransitionError::CorruptSnapshot("snapshot-version-unsupported"),
+                    engine_persist::SessionRotationError::Anchor(
+                        engine_persist::session_anchor::AnchorError::CorruptSnapshot,
+                    ) => TransitionError::CorruptSnapshot("anchor-decode-failed"),
+                }
+            })?;
         // THE CAPTURE-VALIDITY GENERATION (PP-B4 checkpoint 3, the F1
         // preflight): the mechanism returned Ok — the pointer FLIPPED —
         // so every snapshot capture taken before this instant is
@@ -3792,8 +3800,10 @@ fn install_recovered_deactivation(
 /// the world section) plus the director state (the region states, the
 /// checkpoints, and the structured-keyed capture ledger — the
 /// materialization evidence) — published atomically through the B2
-/// medium's nine-step append (the verified snapshot boundary).
-pub const SESSION_SNAPSHOT_DOMAIN: &str = "engine-slice/session-snapshot/1";
+/// medium's nine-step append (the verified snapshot boundary) —
+/// authoritative in engine-persist's shared session-anchor module
+/// (the ONE wire-format interpretation).
+pub const SESSION_SNAPSHOT_DOMAIN: &str = engine_persist::session_anchor::SESSION_SNAPSHOT_DOMAIN;
 
 /// Encodes the complete session snapshot.
 pub fn save_session(
@@ -3810,16 +3820,15 @@ pub fn save_session(
 }
 
 /// Restores the complete session snapshot (fail-closed through both
-/// codecs' gates; the blob consumed exactly).
+/// codecs' gates; the blob consumed exactly). The container framing
+/// is THE SHARED interpretation (engine-persist's session-anchor
+/// module — the same decode the authenticated rotation boundary
+/// derives from; never a second container reading).
 pub fn restore_session(bytes: &[u8]) -> Result<(Spine<NpcWorld>, RegionDirector), SaveError> {
-    const SECTION: &str = "session-snapshot";
-    let mut dec = Decoder::new(bytes);
-    dec.read_domain(SESSION_SNAPSHOT_DOMAIN)?;
-    let spine_bytes = dec.read_bytes(MAX_BYTE_LEN, SECTION)?;
-    let director_bytes = dec.read_bytes(MAX_BYTE_LEN, SECTION)?;
-    dec.finish()?;
-    let spine = Spine::<NpcWorld>::restore(spine_bytes, Diagnostics::new(Level::Off))?;
-    let mut director_dec = Decoder::new(director_bytes);
+    let (spine_bytes, director_bytes) =
+        engine_persist::session_anchor::read_snapshot_container(bytes)?;
+    let spine = Spine::<NpcWorld>::restore(&spine_bytes, Diagnostics::new(Level::Off))?;
+    let mut director_dec = Decoder::new(&director_bytes);
     let director = RegionDirector::restore(&mut director_dec)?;
     Ok((spine, director))
 }
@@ -3876,13 +3885,7 @@ fn latest_snapshot_at<S: MediumSource>(
 /// intervenes exactly like a different supported one, never silently
 /// passed as a non-snapshot.
 pub(crate) fn is_session_object(bytes: &[u8]) -> bool {
-    const FAMILY: &[u8] = b"engine-slice/session-snapshot";
-    if bytes.len() < 8 {
-        return false;
-    }
-    let tag_len =
-        u64::from_le_bytes(bytes[0..8].try_into().expect("the slice is 8 bytes")) as usize;
-    tag_len >= FAMILY.len() && 8 + tag_len <= bytes.len() && &bytes[8..8 + FAMILY.len()] == FAMILY
+    engine_persist::session_anchor::is_session_object(bytes)
 }
 
 /// The recovery anchor from the LEDGER's own per-identity state —

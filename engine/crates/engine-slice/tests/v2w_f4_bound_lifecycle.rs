@@ -2012,7 +2012,7 @@ fn the_rotation_entry_verifies_the_root_agreement() {
             T1Journal::open_bound(&active_b, &founding_b, &root_id_b).expect("B's active");
         let medium_b = LocalFileMedium::open(&store_b).unwrap();
         let mut pipeline_b = engine_persist::CommitPipeline::open(medium_b, journal_b).unwrap();
-        let error = match engine_persist::rotate_session_journal(&mut pipeline_b, &root_a, None) {
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_b, &root_a) {
             Err(engine_persist::SessionRotationError::Journal(error)) => error,
             Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
             Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
@@ -2046,8 +2046,7 @@ fn the_rotation_entry_verifies_the_root_agreement() {
         let medium_a = LocalFileMedium::open(&store_a).unwrap();
         let mut pipeline_stale =
             engine_persist::CommitPipeline::open(medium_a, journal_stale).unwrap();
-        let error = match engine_persist::rotate_session_journal(&mut pipeline_stale, &root_a, None)
-        {
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_stale, &root_a) {
             Err(engine_persist::SessionRotationError::Journal(error)) => error,
             Err(other) => panic!("the stale-journal aim refuses typed: {other:?}"),
             Ok(_rotation) => panic!("a stale journal never rotates"),
@@ -2061,5 +2060,313 @@ fn the_rotation_entry_verifies_the_root_agreement() {
             rotation.new_path,
             "the pointer still names the genuine successor — no unauthorized flip"
         );
+    }
+}
+
+#[test]
+fn the_rotation_retention_boundary_is_authenticated() {
+    // (THE AUTHENTICATED RETENTION) The forged-boundary exploit is
+    // UNREPRESENTABLE (the public API accepts no boundary — the
+    // compile-time closure), and the derived boundary behaves: a
+    // confirmed-but-unsubsumed transaction (confirmed after the
+    // anchor's publication, beyond its frontier) is RETAINED in the
+    // successor through the real crossing; the unconfirmed
+    // transaction is retained; the canceled transaction retires (the
+    // independently provable class); the newest snapshot's evidence
+    // fails closed on a corrupted anchor decode and on an
+    // unsupported newer snapshot version (no fallback to an older
+    // snapshot); and a chain with NO snapshot refuses the rotation
+    // typed (no optimistic retirement).
+    let dir = TestDir::new("retention");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // (1-5) THE AUTHENTICATED CLASSIFICATION through the real
+    // crossing: the anchor (a snapshot publication), a CONFIRMED but
+    // unsubsumed transaction (the far boundary confirmed AFTER the
+    // anchor — beyond its frontier), an UNCONFIRMED transaction
+    // (the second far boundary), and a CANCELED foreign transaction
+    // (pre-seeded, canceled before the crossing opens).
+    let store = dir.store();
+    let journal_root = dir.journal();
+    let foreign_id = {
+        let mut journal = T1Journal::open(&journal_root).unwrap();
+        let receipt = journal.append_transaction(&foreign_input()).unwrap();
+        journal
+            .append_cancellation(
+                receipt.id,
+                engine_persist::CancellationReason::ApplicationPolicy,
+                b"superseded",
+            )
+            .unwrap();
+        receipt.id
+    };
+    let (mut spine, mut director) = scenario_pair(150, &near);
+    let journal = T1Journal::open(&journal_root).unwrap();
+    let mut crossing = SessionCrossing::open(&store, journal, "retention-campaign").unwrap();
+    // THE ANCHOR (the newest session snapshot — its publication
+    // precedes everything classified below).
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    // THE CONFIRMED-BUT-UNSUBSUMED transaction: the far boundary
+    // AFTER the anchor, canonically confirmed (its identities are
+    // chain-confirmed but its episodes are beyond the anchor's
+    // frontier — nothing subsumes it).
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap() else {
+        panic!("the post-anchor boundary confirms")
+    };
+    let confirmed_unsubsumed = {
+        let scan = T1Journal::scan_file(&journal_root).unwrap();
+        scan.committed.last().unwrap().id
+    };
+    // THE UNCONFIRMED transaction: the second far boundary (after
+    // the reactivation accrual), never committed.
+    durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+    run_ticks_near(&mut spine, &mut director, &near, 100);
+    durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+    let unconfirmed = {
+        let scan = T1Journal::scan_file(&journal_root).unwrap();
+        scan.committed.last().unwrap().id
+    };
+    assert_ne!(confirmed_unsubsumed, unconfirmed);
+    // THE COVERING PUBLICATION (the frontier guard's discipline) and
+    // the rotation through the real crossing.
+    run_ticks_near(&mut spine, &mut director, &near, 5);
+    crossing.publish_snapshot(&spine, &director).unwrap();
+    let rotation = crossing.rotate_journal().expect("the rotation completes");
+    // THE AUTHENTICATED CLASSIFICATION: the confirmed-but-unsubsumed
+    // and the unconfirmed transactions are RETAINED; the canceled
+    // foreign transaction retires.
+    let successor_scan = T1Journal::scan_file(&rotation.new_path).unwrap();
+    let successor_ids: Vec<_> = successor_scan
+        .committed
+        .iter()
+        .map(|transaction| transaction.id)
+        .collect();
+    assert!(
+        successor_ids.contains(&confirmed_unsubsumed),
+        "the confirmed-but-unsubsumed transaction is RETAINED (the forged-boundary \
+         retirement is impossible — the boundary derives from the newest snapshot)"
+    );
+    assert!(
+        successor_ids.contains(&unconfirmed),
+        "the unconfirmed transaction is RETAINED"
+    );
+    assert!(
+        !successor_ids.contains(&foreign_id),
+        "the canceled transaction retires (the independently provable class)"
+    );
+    drop(crossing);
+    drop(spine);
+    drop(director);
+
+    // (6) NO SNAPSHOT: a campaign whose chain carries only the
+    // founding (the journal holds a pre-seeded committed transaction,
+    // but NO session snapshot was ever published — every crossing
+    // publication path publishes one, so the state is built by
+    // pre-seeding) refuses the rotation typed (no optimistic
+    // retirement) — through the real crossing.
+    {
+        let dir = TestDir::new("retention-no-anchor");
+        let store = dir.store();
+        let journal_root = dir.journal();
+        // The pre-seeded committed transaction (no snapshot anywhere).
+        let mut preseed = T1Journal::open(&journal_root).unwrap();
+        preseed.append_transaction(&foreign_input()).unwrap();
+        drop(preseed);
+        let (spine, director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(&journal_root).unwrap();
+        let mut crossing = SessionCrossing::open(&store, journal, "no-anchor-campaign").unwrap();
+        let error = match crossing.rotate_journal() {
+            Err(error) => error,
+            Ok(_rotation) => panic!("no snapshot means no rotation"),
+        };
+        assert!(
+            matches!(
+                &error,
+                TransitionError::InstallIncompatible { detail, .. } if *detail == "journal-rotation/no-anchor"
+            ),
+            "the no-snapshot rotation refuses typed through the crossing: {error:?}"
+        );
+        drop(crossing);
+        drop(spine);
+        drop(director);
+    }
+
+    // (7) THE UNSUPPORTED NEWER SNAPSHOT VERSION: a family-recognizable
+    // object with domain /3 as the NEWEST snapshot (a future version
+    // beyond the supported /1 — the /2 domain is the REAL composite
+    // snapshot format the medium's walk recognizes, so the truly
+    // unsupported member is /3) — fail closed, no
+    // fallback to the older /1 snapshots (the rotation refuses).
+    {
+        let unsupported: engine_persist::StoredObject = engine_persist::StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-slice/session-snapshot/3");
+            enc.write_bytes(b"a future version body");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = engine_persist::RevisionRecord::regular(head, epoch, 900)
+            .with_content_refs(vec![unsupported.hash()]);
+        drop(medium);
+        // The pipeline opens over the PRE-FLIP chain (its open-time
+        // walk precedes the hand-written publication); the anchor
+        // derivation reads the head at ROTATION time — after the
+        // flip — so the hand-written newest snapshot is exactly what
+        // the rotation sees.
+        let active = active_journal_path(&journal_root).unwrap();
+        let journal = T1Journal::open(&active).unwrap();
+        let medium = LocalFileMedium::open(&store).unwrap();
+        let mut pipeline = engine_persist::CommitPipeline::open(medium, journal).unwrap();
+        // The direct-file-write publication (the snapshot family is
+        // outside the generic append's admitted families — the
+        // hand-written object + record + the HEAD flip, the
+        // established external-append pattern).
+        let objects_dir = store.join("objects");
+        std::fs::write(
+            objects_dir.join(unsupported.hash().hex()),
+            unsupported.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            objects_dir.join(record.id().hex()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/engine-persist/head/1");
+            enc.write_u32(1);
+            enc.write_bytes(record.id().as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
+        std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
+            Err(engine_persist::SessionRotationError::Anchor(
+                engine_persist::session_anchor::AnchorError::UnsupportedSnapshotVersion,
+            )) => {}
+            Err(other) => panic!("the unsupported version fails closed: {other:?}"),
+            Ok(_rotation) => panic!("an unsupported snapshot version never rotates"),
+        }
+        // The pointer did not move (no unauthorized flip).
+        assert_eq!(
+            active_journal_path(&journal_root).unwrap(),
+            active,
+            "no successor was created"
+        );
+    }
+
+    // (8) THE CORRUPTED NEWEST SNAPSHOT: a family-recognizable /1
+    // object whose director section is malformed — the strict decode
+    // fails closed (no fallback, no optimistic retirement). A fresh
+    // walkable campaign (the founding chain + a pre-seeded journal
+    // transaction — the pipeline opens over the PRE-FLIP chain; the
+    // corrupted family object is then published as the NEWEST head,
+    // exactly what the rotation's anchor derivation reads).
+    {
+        let dir = TestDir::new("retention-corrupt");
+        let store = dir.store();
+        let journal_root = dir.journal();
+        let corrupt: engine_persist::StoredObject = engine_persist::StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-slice/session-snapshot/1");
+            enc.write_bytes(b"spine-placeholder");
+            enc.write_bytes(b"not-a-valid-director-section");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let mut preseed = T1Journal::open(&journal_root).unwrap();
+        preseed.append_transaction(&foreign_input()).unwrap();
+        drop(preseed);
+        let (spine, director) = scenario_pair(150, &near);
+        let journal = T1Journal::open(&journal_root).unwrap();
+        let crossing =
+            SessionCrossing::open(&store, journal, "retention-corrupt-campaign").unwrap();
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = engine_persist::RevisionRecord::regular(head, epoch, 901)
+            .with_content_refs(vec![corrupt.hash()]);
+        drop(medium);
+        let active = active_journal_path(&journal_root).unwrap();
+        let journal = T1Journal::open(&active).unwrap();
+        let medium = LocalFileMedium::open(&store).unwrap();
+        let mut pipeline = engine_persist::CommitPipeline::open(medium, journal).unwrap();
+        let objects_dir = store.join("objects");
+        std::fs::write(objects_dir.join(corrupt.hash().hex()), corrupt.bytes()).unwrap();
+        std::fs::write(
+            objects_dir.join(record.id().hex()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/engine-persist/head/1");
+            enc.write_u32(1);
+            enc.write_bytes(record.id().as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
+        std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
+            Err(engine_persist::SessionRotationError::Anchor(
+                engine_persist::session_anchor::AnchorError::CorruptSnapshot,
+            )) => {}
+            Err(other) => panic!("the corrupted newest snapshot fails closed: {other:?}"),
+            Ok(_rotation) => panic!("a corrupted newest snapshot never rotates"),
+        }
+        assert_eq!(
+            active_journal_path(&journal_root).unwrap(),
+            active,
+            "still no successor was created"
+        );
+    }
+}
+
+/// One foreign pre-seeded transaction (the far-region identity, an
+/// empty plan — the established fixture shape).
+fn foreign_input() -> engine_persist::TransactionInput {
+    let identity = engine_persist::ConsequenceId::new(5, 99, 1);
+    let envelope = engine_persist::ConsequenceEnvelope::capture(
+        identity,
+        vec![engine_persist::ClassifiedSpan {
+            span: engine_persist::OccurrenceSpan::new(0, 2).unwrap(),
+            class: engine_persist::DurabilityClass::DurableEligible,
+        }],
+        engine_persist::SignalLane::Captured,
+        engine_persist::CounterValues::default(),
+        engine_persist::SourceBaseline {
+            counters: engine_persist::CounterValues::default(),
+            award: engine_persist::AwardCheckpoint {
+                durable: engine_persist::Coverage::new(),
+                provisional: engine_persist::Coverage::new(),
+            },
+        },
+        engine_persist::SourcePosition {
+            head: None,
+            tick: 400,
+        },
+    )
+    .unwrap();
+    engine_persist::TransactionInput {
+        envelopes: vec![envelope],
+        position: engine_persist::SourcePosition {
+            head: None,
+            tick: 400,
+        },
+        classification: engine_persist::DurabilityClass::DurableEligible,
+        dependencies: Vec::new(),
+        frontier: vec![engine_persist::FrontierEntry {
+            region: 5,
+            episode: 99,
+        }],
+        plan: Vec::new(),
     }
 }

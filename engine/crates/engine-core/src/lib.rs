@@ -56,6 +56,26 @@ pub use event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 pub use fingerprint::Fingerprinter;
+/// The game's region layout (Stage 3 metadata): eight logical
+/// regions. Authoritative in engine-core so every layer — the
+/// application's region director AND the persistence layer's shared
+/// session-snapshot anchor decoding — reads one constant (V2-W F4's
+/// authenticated retention: the rotation boundary's wire format is
+/// parameterized by this layout).
+pub const REGION_COUNT: usize = 8;
+
+/// The game's Stage 4 workload: 1,000 stable NPC identities (the
+/// shared wire-format bound — see [`REGION_COUNT`]).
+pub const NPC_COUNT: usize = 1000;
+
+/// Side length of the per-NPC region-local position grid (the shared
+/// wire-format bound — see [`REGION_COUNT`]).
+pub const REGION_GRID: u8 = 16;
+
+/// The discarded-position sentinel (the shared wire-format value —
+/// see [`REGION_COUNT`]).
+pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
+
 pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
 pub use spine::{
     CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
