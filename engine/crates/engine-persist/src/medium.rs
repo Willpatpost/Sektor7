@@ -744,4 +744,56 @@ pub trait CanonicalMedium {
         audit: &Hash,
         mk: &Hash,
     ) -> Result<crate::reclaim::BeginAuthority, MediumError>;
+
+    /// (V2X-CP2) The trusted V2 PLAN-BOUND begin admission — the
+    /// owner-ratified 206-byte format reuse with `source` = the
+    /// installed V2 plan REVISION-RECORD identity (never the plan
+    /// object's content hash, never an individual audit). The
+    /// caller names the MK only; EVERY load-bearing fact — the
+    /// checkpoint, the plan, the complete plan-defined audit set,
+    /// the original retirement evidence, the digest and seed — is
+    /// re-derived under the provider's own coordination boundary
+    /// through the accepted CP1 all-audits-first contract (a
+    /// pre-lock or pre-transaction verification never substitutes).
+    /// The begin publishes canonically ABOVE the plan and every
+    /// required audit; the duplicate resolution's exact-content
+    /// check enforces the V1/V2 source-form exclusion (an installed
+    /// V1-bound begin under the same key is a typed conflict, never
+    /// a reinterpretation); the outcomes follow the accepted
+    /// truthful model (Accepted only with the established
+    /// durability acknowledgment; the reconciled forms never
+    /// invent one). The generic publication gate on [`Self::append`]
+    /// still refuses the begin family — this method remains the
+    /// ONLY installation route. CP2 does NOT connect this to any
+    /// destructive execution or completion boundary: NO V2 begin
+    /// grants deletion capability under this checkpoint.
+    fn begin_reclamation_v2(
+        &mut self,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError>;
+
+    /// (V2X-CP2) The installed V2 plan-bound begin's retained-evidence
+    /// authority: the RECOVERY-SAFE verification (no original
+    /// retiring record is required — the retained plan, audits,
+    /// begin, checkpoint metadata, and authenticated skip tables
+    /// carry the authority) and the truthfully established grade.
+    /// Under the provider's own coordination: the checkpoint, the
+    /// plan, the founding-derived seed, the W2 mixed-state refusal,
+    /// and the shared
+    /// [`crate::reclaim::verify_installed_begin_v2`] temporal proof
+    /// (the four-field plan-record binding; the plan and every
+    /// required audit positioned BELOW the begin). The durability
+    /// grade is ESTABLISHED, never assumed: POSIX local returns
+    /// `FullPosixSequence` only after the completed reaffirmation
+    /// sequence; Windows local refuses typed (ProcessCrashOnly
+    /// never grants the destructive-authorization grade); SQLite
+    /// returns `TransactionalWalFull` from the fresh-transaction
+    /// visibility proof. No caller-supplied proof is trusted; every
+    /// failure is typed and fail-closed. CP2 does NOT connect this
+    /// to any destructive boundary.
+    fn verify_begin_authority_v2(
+        &mut self,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError>;
 }

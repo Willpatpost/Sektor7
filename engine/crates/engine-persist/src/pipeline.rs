@@ -3096,6 +3096,24 @@ mod tests {
             // (OC-C3 CP-1) The counting wrapper's plain delegation.
             self.inner.verify_begin_authority(audit, mk)
         }
+
+        fn begin_reclamation_v2(
+            &mut self,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            // (V2X-CP2) The counting wrapper's plain delegation (no
+            // read-accounting on the begin path).
+            self.inner.begin_reclamation_v2(mk, tick)
+        }
+
+        fn verify_begin_authority_v2(
+            &mut self,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            // (V2X-CP2) The counting wrapper's plain delegation.
+            self.inner.verify_begin_authority_v2(mk)
+        }
     }
 
     /// One publication revision's content object: a well-formed

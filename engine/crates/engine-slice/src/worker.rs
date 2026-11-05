@@ -105,6 +105,17 @@ pub enum MediumOp {
         audit: Hash,
         mk: Hash,
     },
+    /// (V2X-CP2) The trusted V2 plan-bound begin admission through
+    /// the queue — identity references only.
+    BeginReclamationV2 {
+        mk: Hash,
+        tick: u64,
+    },
+    /// (V2X-CP2) The retained-evidence V2 begin authority through
+    /// the queue.
+    VerifyBeginAuthorityV2 {
+        mk: Hash,
+    },
     Checkpoint,
     /// The maintenance FIFO barrier (PP-B4 checkpoint 4): a no-op
     /// job whose reply, by FIFO position, proves every previously
@@ -127,6 +138,8 @@ pub enum WorkerReply {
     ReclaimPending(bool),
     BeginReclamation(engine_persist::reclaim::BeginPublicationOutcome),
     VerifyBeginAuthority(engine_persist::reclaim::BeginAuthority),
+    BeginReclamationV2(engine_persist::reclaim::BeginPublicationOutcome),
+    VerifyBeginAuthorityV2(engine_persist::reclaim::BeginAuthority),
     Checkpoint,
     /// A queued job was canceled before it started (the optional-
     /// publication token, PP-B4 checkpoint 3) — a definite non-event:
@@ -556,6 +569,12 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
         MediumOp::VerifyBeginAuthority { audit, mk } => store
             .verify_begin_authority(&audit, &mk)
             .map(WorkerReply::VerifyBeginAuthority),
+        MediumOp::BeginReclamationV2 { mk, tick } => store
+            .begin_reclamation_v2(&mk, tick)
+            .map(WorkerReply::BeginReclamationV2),
+        MediumOp::VerifyBeginAuthorityV2 { mk } => store
+            .verify_begin_authority_v2(&mk)
+            .map(WorkerReply::VerifyBeginAuthorityV2),
         MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
         MediumOp::Barrier => Ok(WorkerReply::Barrier),
     }
@@ -778,6 +797,91 @@ impl CanonicalMedium for WorkerMedium {
             },
             Err(_) => Err(MediumError::Chain {
                 rule: "begin-authority/worker-reply-uncertain",
+            }),
+        }
+    }
+
+    fn begin_reclamation_v2(
+        &mut self,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<engine_persist::reclaim::BeginPublicationOutcome, MediumError> {
+        // (V2X-CP2) The queue-backed trusted V2 plan-bound begin
+        // admission — the same admission gate and reply-loss
+        // discipline as the V1: a refusal BEFORE admission is a
+        // definite non-event; a reply lost AFTER admission is NEVER
+        // a definite failure (the typed uncertain class, resolved
+        // only by the caller's re-submission — the deterministic
+        // MK-bound key makes the admission idempotent).
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
+        let op = MediumOp::BeginReclamationV2 { mk: *mk, tick };
+        let (reply, slot) = completion_slot();
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::BeginReclamationV2(outcome)) => Ok(outcome),
+                Ok(other) => unreachable!("the v2 begin request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err(MediumError::Chain {
+                rule: "v2-begin-admission/worker-reply-uncertain",
+            }),
+        }
+    }
+
+    fn verify_begin_authority_v2(
+        &mut self,
+        mk: &Hash,
+    ) -> Result<engine_persist::reclaim::BeginAuthority, MediumError> {
+        // (V2X-CP2) The queue-backed retained-evidence V2 begin
+        // authority — the same discipline (a lost reply is the
+        // uncertain class, never a guessed acknowledgment).
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — admission refused"
+                    .to_owned(),
+            });
+        }
+        let op = MediumOp::VerifyBeginAuthorityV2 { mk: *mk };
+        let (reply, slot) = completion_slot();
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::VerifyBeginAuthorityV2(authority)) => Ok(authority),
+                Ok(other) => unreachable!("the v2 authority request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err(MediumError::Chain {
+                rule: "v2-begin-authority/worker-reply-uncertain",
             }),
         }
     }

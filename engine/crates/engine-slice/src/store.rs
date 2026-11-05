@@ -241,6 +241,32 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
+    fn begin_reclamation_v2(
+        &mut self,
+        mk: &engine_persist::Hash,
+        tick: u64,
+    ) -> Result<engine_persist::reclaim::BeginPublicationOutcome, MediumError> {
+        // (V2X-CP2) The direct-source routing of the trusted V2
+        // plan-bound begin admission — the provider's own
+        // implementation, unchanged.
+        match self {
+            SessionStore::Local(medium) => medium.begin_reclamation_v2(mk, tick),
+            SessionStore::Sqlite(medium) => medium.begin_reclamation_v2(mk, tick),
+        }
+    }
+
+    fn verify_begin_authority_v2(
+        &mut self,
+        mk: &engine_persist::Hash,
+    ) -> Result<engine_persist::reclaim::BeginAuthority, MediumError> {
+        // (V2X-CP2) The direct-source routing of the retained-evidence
+        // V2 begin authority.
+        match self {
+            SessionStore::Local(medium) => medium.verify_begin_authority_v2(mk),
+            SessionStore::Sqlite(medium) => medium.verify_begin_authority_v2(mk),
+        }
+    }
+
     fn verify_begin_authority(
         &mut self,
         audit: &engine_persist::Hash,

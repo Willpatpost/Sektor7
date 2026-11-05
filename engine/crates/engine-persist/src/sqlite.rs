@@ -622,6 +622,34 @@ impl SqliteMedium {
 // --------------------------------------------------- the CanonicalMedium impl
 
 impl CanonicalMedium for SqliteMedium {
+    fn begin_reclamation_v2(
+        &mut self,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        // (V2X-CP2) The routing delegation to the trusted
+        // transactional V2 admission — no rewiring of any
+        // destructive or completion boundary.
+        SqliteMedium::begin_reclamation_v2(self, mk, tick)
+    }
+
+    fn verify_begin_authority_v2(
+        &mut self,
+        mk: &Hash,
+    ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+        // (V2X-CP2) One consistent read snapshot for the whole
+        // recovery-safe verification; the truthful tier captured
+        // before the transaction borrows the connection.
+        let tier = self.durability_tier();
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| sqlite_err("v2 begin-authority transaction", e))?;
+        let result = verify_begin_authority_v2_tx(&tx, mk, tier);
+        drop(tx);
+        result
+    }
+
     fn checkpoint(&mut self) -> Result<(), MediumError> {
         self.checkpoint_truncate()
     }
@@ -1359,6 +1387,146 @@ fn begin_reclamation_tx(
         },
         Some(record_id),
     ))
+}
+
+/// (V2X-CP2) The transaction-scoped reader adapter — ONE
+/// transaction backing both [`crate::reclaim::BeginReads`] kinds
+/// through the established hash-verifying loads.
+struct SqliteTxReads<'a, 'b> {
+    tx: &'b rusqlite::Transaction<'a>,
+}
+impl crate::reclaim::BeginReads for SqliteTxReads<'_, '_> {
+    fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+        load_record_verified(self.tx, id)
+    }
+    fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+        load_object_verified(self.tx, hash)
+    }
+}
+
+/// (V2X-CP2) The plan-bound V2 begin admission under ONE
+/// `BEGIN IMMEDIATE` transaction: the ALL-AUDITS-FIRST CP1 contract
+/// re-derived INSIDE the transaction over the transaction-scoped
+/// hash-verifying reads (a pre-transaction verification never
+/// substitutes); only the exact ExecutionReady positive admits; the
+/// begin from the verified values only (the ratified plan-record
+/// source semantics); the duplicate resolution's exact-content check
+/// (the V1/V2 source-form exclusion); the atomic publication (the
+/// object row + the record row + the HEAD advance + the COMMIT — a
+/// rolled-back admission leaves nothing). The tier is the provider's
+/// TransactionalWalFull, surfaced only after the wrapper's
+/// successful COMMIT.
+fn begin_reclamation_v2_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mk: &Hash,
+    tick: u64,
+) -> Result<(crate::reclaim::BeginPublicationOutcome, Option<Hash>), MediumError> {
+    // (A) The all-audits-first CP1 contract inside the transaction.
+    let head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut reads = SqliteTxReads { tx };
+    let (plan_record, range_digest, seed) =
+        match crate::reclaim::verify_v2_execution_readiness_via(&mut reads, head, mk)? {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady { plan_record, .. } => {
+                let Some((_id, meta_bytes)) =
+                    crate::reclaim::find_on_chain_via(&mut reads, head, None, Some(mk))?
+                else {
+                    return Err(MediumError::Chain {
+                        rule: "v2-begin-admission/mk-not-installed",
+                    });
+                };
+                let metadata =
+                    CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+                (plan_record, metadata.range_digest, metadata.seed)
+            }
+            _ => {
+                return Err(MediumError::Chain {
+                    rule: "v2-begin-admission/not-execution-ready",
+                });
+            }
+        };
+    // (B) The begin from the verified values only.
+    let begin = crate::reclaim::ReclamationBegin {
+        mk: *mk,
+        source: plan_record,
+        range_digest,
+        seed,
+    };
+    // (C) The duplicate resolution (the exact-content check IS the
+    // V1/V2 source-form exclusion).
+    let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
+    if let Some((installed_id, _installed)) = find_installed_begin_tx(tx, mk, &begin)? {
+        return Ok((
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id: installed_id },
+            None,
+        ));
+    }
+    // (D) The atomic publication.
+    let head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let parent_bytes = load_record_verified(tx, &head)?;
+    let parent = RevisionRecord::decode(&parent_bytes).map_err(MediumError::Format)?;
+    let parent_epoch = parent.epoch;
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
+    let object = StoredObject::new(begin.canonical_bytes())?;
+    let record = RevisionRecord::regular(head, parent_epoch, tick)
+        .with_idempotency_key(key.clone())
+        .with_content_refs(vec![object.hash()]);
+    let record_bytes = record.canonical_bytes();
+    let record_id = crate::hash::hash_object(&record_bytes);
+    insert_object_once(tx, &None, &object)?;
+    tx.execute(
+        "INSERT INTO records (hash, bytes, epoch, parent, idem, kind, tick) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        params![
+            record_id.as_bytes(),
+            record_bytes,
+            record.epoch as i64,
+            head.as_bytes(),
+            key,
+            record.tick as i64,
+        ],
+    )
+    .map_err(|e| {
+        if is_constraint(&e) {
+            MediumError::Chain {
+                rule: "duplicate-idempotency-key",
+            }
+        } else {
+            sqlite_err("v2 begin record insert", e)
+        }
+    })?;
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'head'",
+        params![record_id.as_bytes()],
+    )
+    .map_err(|e| sqlite_err("v2 begin head advance", e))?;
+    Ok((
+        crate::reclaim::BeginPublicationOutcome::Accepted {
+            id: record_id,
+            tier: SyncTier::TransactionalWalFull,
+        },
+        Some(record_id),
+    ))
+}
+
+/// (V2X-CP2) The transaction-scoped retained-evidence V2 begin
+/// authority: the recovery-safe verification (no original retiring
+/// record required) over ONE transaction-scoped reader, and the
+/// SQLite durability grade — the read-snapshot visibility proof
+/// under the verified WAL/FULL configuration.
+fn verify_begin_authority_v2_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mk: &Hash,
+    tier: SyncTier,
+) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+    let head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut reads = SqliteTxReads { tx };
+    let evidence = crate::reclaim::verify_v2_begin_authority_evidence_via(&mut reads, head, mk)?;
+    Ok(crate::reclaim::BeginAuthority {
+        id: evidence.begin_id,
+        tier,
+    })
 }
 
 fn reclaim_authorized_tx(
@@ -7151,6 +7319,126 @@ impl SqliteMedium {
             return reconcile_begin_publication(self, audit, mk, candidate);
         }
         Ok(outcome)
+    }
+
+    /// (V2X-CP2) The plan-bound V2 begin admission — the trusted
+    /// transactional wrapper: ONE `BEGIN IMMEDIATE` covering the
+    /// all-audits-first verification and the publication (the C2-R6
+    /// authoritative-chain validation first, the accepted V1
+    /// wrapper's discipline); the honest COMMIT uncertainty (the
+    /// injected CommitFailure = the definite pre-commit rollback;
+    /// the injected AfterCommit = the installed-but-acknowledgment-
+    /// lost window; a real COMMIT error = the genuine uncertainty)
+    /// reconciled through the READ-ONLY V2 observation — never a
+    /// second publication inside the reconciliation.
+    pub fn begin_reclamation_v2(
+        &mut self,
+        mk: &Hash,
+        tick: u64,
+    ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_err("v2 begin admission transaction", e))?;
+        let observed = read_meta_head(&tx)?;
+        if let Err(error) = validate_observed(&tx, &mut self.cursor, &mut self.walks, observed) {
+            let _ = tx.rollback();
+            return Err(error);
+        }
+        let (outcome, candidate) = begin_reclamation_v2_tx(&tx, mk, tick)?;
+        let uncertain =
+            if let Err(_injected) = fault_check(&self.fault, SqliteFaultPoint::CommitFailure) {
+                let _ = tx.rollback();
+                true
+            } else if tx.commit().is_err() {
+                true
+            } else {
+                fault_check(&self.fault, SqliteFaultPoint::AfterCommit).is_err()
+            };
+        if uncertain {
+            return reconcile_begin_publication_v2(self, mk, candidate);
+        }
+        Ok(outcome)
+    }
+}
+
+/// (V2X-CP2) The post-uncertain-commit V2 reconciliation: a
+/// READ-ONLY fresh observation (never publishes, never inserts,
+/// never constructs a replacement candidate) — the authoritative
+/// chain validated under the same trusted-cursor discipline, the
+/// expected V2 begin re-derived from the RETAINED evidence (the
+/// checkpoint metadata and the installed plan — the read-only
+/// forms), then the gap-aware HEAD-ancestry discovery bound to the
+/// EXACT attempted candidate identity: the candidate itself
+/// canonically present is ReconciledInstalled (the membership
+/// proof, never Accepted, never a durability claim); a DIFFERENT
+/// same-key revision is separately discovered, verified duplicate
+/// evidence (DuplicateVerified); a definite absence of any same-key
+/// begin is ReconciledNotInstalled; any failure is the typed
+/// unverifiable uncertainty.
+fn reconcile_begin_publication_v2(
+    medium: &mut SqliteMedium,
+    mk: &Hash,
+    candidate: Option<Hash>,
+) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+    let tx = medium
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| MediumError::Chain {
+            rule: "v2-begin-admission/reconcile-unverifiable",
+        })?;
+    // (READ-ONLY) The authoritative-chain validation.
+    let observed = read_meta_head(&tx)?;
+    if observed.is_none()
+        || validate_observed(&tx, &mut medium.cursor, &mut medium.walks, observed).is_err()
+    {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-admission/reconcile-unverifiable",
+        });
+    }
+    // (READ-ONLY) The expected begin re-derivation from the retained
+    // evidence: the checkpoint metadata and the installed plan.
+    let head = match observed {
+        Some(head) => head,
+        None => {
+            return Err(MediumError::Chain {
+                rule: "v2-begin-admission/reconcile-unverifiable",
+            });
+        }
+    };
+    let mut reads = SqliteTxReads { tx: &tx };
+    let expected = match crate::reclaim::find_on_chain_via(&mut reads, head, None, Some(mk)) {
+        Ok(Some((_id, meta_bytes))) => match CheckpointMetadata::decode(&meta_bytes) {
+            Ok(_metadata) => match crate::reclaim::find_installed_plan_via(&mut reads, head, mk) {
+                Ok(Some((plan_record, plan))) => Some(crate::reclaim::ReclamationBegin {
+                    mk: *mk,
+                    source: plan_record,
+                    range_digest: plan.range_digest,
+                    seed: plan.seed,
+                }),
+                _ => None,
+            },
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-admission/reconcile-unverifiable",
+        });
+    };
+    match find_installed_begin_tx(&tx, mk, &expected) {
+        Ok(Some((id, _installed))) => {
+            if candidate == Some(id) {
+                Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id })
+            } else {
+                Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id })
+            }
+        }
+        Ok(None) => Ok(crate::reclaim::BeginPublicationOutcome::ReconciledNotInstalled),
+        Err(_) => Err(MediumError::Chain {
+            rule: "v2-begin-admission/reconcile-unverifiable",
+        }),
     }
 }
 

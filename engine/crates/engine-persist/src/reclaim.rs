@@ -686,6 +686,46 @@ impl BeginReads for MediumReads<'_> {
     }
 }
 
+/// (V2X-CP2) Decodes a strictly framed revision record from its
+/// hash-verified canonical bytes — the reader-generic walks'
+/// equivalent of the medium trait's decoded `read_record`.
+pub(crate) fn decode_record(bytes: &[u8]) -> Result<RevisionRecord, MediumError> {
+    RevisionRecord::decode(bytes).map_err(MediumError::Format)
+}
+
+/// (V2X-CP2) The reader-generic decoded record read: the
+/// hash-verified canonical bytes through any [`BeginReads`], then
+/// the strict decode.
+pub(crate) fn read_record_via<R: BeginReads>(
+    reads: &mut R,
+    id: &Hash,
+) -> Result<RevisionRecord, MediumError> {
+    decode_record(&reads.read_record_bytes(id)?)
+}
+
+/// (V2X-CP2) The reader-generic founding identity: the accepted
+/// closure-parameterized [`founding_identity`] descent over ONE
+/// reader (the RefCell reborrow pattern — the publication's
+/// precedent), with the typed presence probe expressed as the
+/// reader's own MissingObject classification (an absent record is
+/// the gap signal; every other error propagates).
+pub(crate) fn founding_identity_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+) -> Result<Hash, MediumError> {
+    let cell = std::cell::RefCell::new(reads);
+    founding_identity(
+        head,
+        |id| cell.borrow_mut().read_record_bytes(id),
+        |id| cell.borrow_mut().read_object_bytes(id),
+        |id| match cell.borrow_mut().read_record_bytes(id) {
+            Ok(_) => Ok(true),
+            Err(MediumError::MissingObject { .. }) => Ok(false),
+            Err(other) => Err(other),
+        },
+    )
+}
+
 /// (OC-C3 CP-1) The shared, recovery-safe canonical installed-begin
 /// verifier — ONE implementation of the discovery discipline,
 /// callable under provider coordination (the provider adapters over
@@ -844,6 +884,374 @@ pub fn verify_installed_begin<R: BeginReads>(
     }
     Err(MediumError::Chain {
         rule: "begin-authority/descent-bound",
+    })
+}
+
+/// (V2X-CP2) The verified installed V2 begin with its canonical
+/// audit identities (the plan's deterministic batch order).
+#[derive(Debug)]
+pub struct V2InstalledBegin {
+    /// The begin revision's canonical identity.
+    pub id: Hash,
+    /// The strictly decoded 206-byte begin payload.
+    pub begin: ReclamationBegin,
+    /// The audits' revision identities, in the plan's batch order.
+    pub audit_records: Vec<Hash>,
+}
+
+/// (V2X-CP2) The shared, recovery-safe canonical installed V2
+/// plan-bound begin verifier — ONE implementation of the discovery
+/// discipline, callable under provider coordination or through the
+/// generic medium abstraction (the [`verify_installed_begin`]
+/// discipline generalized to the V2 source form). The walk proves,
+/// from the supplied HEAD down the canonical ancestry (crossing
+/// legitimate reclaimed gaps ONLY under authenticated checkpoint
+/// skip tables — RECOVERY-SAFE: no original retiring record is ever
+/// required; the retained plan/audit/begin evidence and the
+/// authenticated skip tables are the authorities):
+///
+/// - the deterministic MK-bound begin key at the discovered record
+///   (key-index occupancy alone is never authority — the record is
+///   found BY the ancestry walk, never the reverse);
+/// - the regular-revision shape (exactly one content reference, a
+///   parent) and the CHECKED parent/epoch linkage (a present parent
+///   carries epoch+1; an absent parent only under authenticated
+///   skip coverage);
+/// - the strict 206-byte begin decode of the single content object;
+/// - THE FOUR-FIELD V2 BINDING against the independently
+///   authenticated retained evidence: the exact MK, the source ==
+///   the installed PLAN REVISION-RECORD identity (never the plan
+///   object's content hash, never an individual audit — the
+///   ratified V2 source semantics; a V1-bound begin fails this
+///   binding by construction), the plan's range digest, and the
+///   plan's founding seed;
+/// - THE CANONICAL TEMPORAL POSITION: the plan revision AND every
+///   plan-defined audit key encountered BELOW the begin on the
+///   walked ancestry (each audit's object strictly decoded with the
+///   field agreement and the ordered unit sequence against the
+///   plan's own batch records — the immutable partition), the
+///   plan-key record's identity exactly the claimed plan record;
+/// - every failure typed and fail-closed; `Ok(None)` only when no
+///   begin exists under the key at all (the definitive absence).
+pub fn verify_installed_begin_v2<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    mk: &Hash,
+    plan_record: &Hash,
+    plan: &ReclaimPlan,
+) -> Result<Option<V2InstalledBegin>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
+    let begin_key = reclamation_begin_idempotency_key(mk);
+    let plan_key = reclamation_plan_idempotency_key(mk);
+    let mut expected_audit_keys: std::collections::BTreeMap<Vec<u8>, u64> =
+        std::collections::BTreeMap::new();
+    for batch in &plan.batches {
+        expected_audit_keys.insert(
+            reclamation_ledger_v2_idempotency_key(mk, batch.index),
+            batch.index,
+        );
+    }
+    let mut current = head;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    let mut installed: Option<(Hash, ReclamationBegin)> = None;
+    let mut found_plan: Option<Hash> = None;
+    let mut found_audits: std::collections::BTreeMap<u64, Hash> = std::collections::BTreeMap::new();
+    for _ in 0..MAX_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let record = read_record_via(reads, &current)?;
+        let mut first_object: Option<Vec<u8>> = None;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = reads.read_object_bytes(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+            first_object = Some(bytes);
+        }
+        // The begin discovery (only ABOVE the targets — once the
+        // begin is found, later same-key records are impossible by
+        // chain-key uniqueness; the first encounter is the one).
+        if installed.is_none() && record.idempotency_key.as_deref() == Some(begin_key.as_slice()) {
+            let Some(parent) = record.parent else {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/installed-shape-mismatch",
+                });
+            };
+            if !matches!(record.kind, crate::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/installed-shape-mismatch",
+                });
+            }
+            match reads.read_record_bytes(&parent) {
+                Ok(parent_bytes) => {
+                    let parent_record = decode_record(&parent_bytes)?;
+                    if parent_record.epoch.checked_add(1) != Some(record.epoch) {
+                        return Err(MediumError::Chain {
+                            rule: "begin-authority-v2/installed-linkage-mismatch",
+                        });
+                    }
+                }
+                Err(MediumError::MissingObject { hash: parent }) => {
+                    let Some(table) = skip_table.as_ref() else {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    };
+                    let covered = if table.sk == parent {
+                        table.self_skip().is_some()
+                    } else {
+                        table.skip_for(&current).is_some()
+                    };
+                    if !covered {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+            let object = record.content_refs[0];
+            let object_bytes = reads.read_object_bytes(&object)?;
+            let begin = ReclamationBegin::decode(&object_bytes).map_err(MediumError::Format)?;
+            if begin.mk != *mk
+                || begin.source != *plan_record
+                || begin.range_digest != plan.range_digest
+                || begin.seed != plan.seed
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/binding-mismatch",
+                });
+            }
+            installed = Some((current, begin));
+        }
+        // The target collection (the plan revision and every audit
+        // key — meaningful below OR above the begin; the temporal
+        // proof requires them BELOW, checked at termination).
+        if record.idempotency_key.as_deref() == Some(plan_key.as_slice()) {
+            if found_plan.is_some() && found_plan != Some(current) {
+                return Err(MediumError::Chain { rule: "cycle" });
+            }
+            found_plan = Some(current);
+        }
+        if let Some(key) = record.idempotency_key.clone()
+            && let Some(batch_index) = expected_audit_keys.get(&key).copied()
+        {
+            if !matches!(record.kind, crate::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/audit-shape-mismatch",
+                });
+            }
+            let object_hash = record.content_refs[0];
+            let bytes = first_object
+                .clone()
+                .expect("the single content ref was read above");
+            let ledger = ReclamationLedgerV2::decode(&bytes).map_err(MediumError::Format)?;
+            let batch = &plan.batches[batch_index as usize];
+            if ledger.mk != *mk
+                || ledger.sk != plan.sk
+                || ledger.batch != batch.index
+                || ledger.range_digest != plan.range_digest
+                || ledger.seed != plan.seed
+            {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/audit-binding-mismatch",
+                });
+            }
+            let unit_records: Vec<Hash> = ledger.units.iter().map(|unit| unit.record).collect();
+            if unit_records != batch.records {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/audit-order-mismatch",
+                });
+            }
+            found_audits.insert(batch_index, current);
+            let _ = object_hash;
+        }
+        // The completion check: the begin found AND every target
+        // collected BELOW it.
+        if let Some((begin_id, begin)) = installed.as_ref()
+            && found_plan == Some(*plan_record)
+            && found_audits.len() == plan.batches.len()
+        {
+            // The temporal proof: every target was encountered
+            // BELOW the begin (the walk descends; anything
+            // collected after the begin's encounter is below it
+            // by construction — the chain is a linear ancestry).
+            let mut audit_records = Vec::with_capacity(plan.batches.len());
+            for batch in &plan.batches {
+                audit_records.push(
+                    found_audits
+                        .get(&batch.index)
+                        .copied()
+                        .expect("the completion check established every batch"),
+                );
+            }
+            return Ok(Some(V2InstalledBegin {
+                id: *begin_id,
+                begin: begin.clone(),
+                audit_records,
+            }));
+        }
+        let Some(parent) = record.parent else {
+            // The founding: no begin under the key at all — the
+            // definitive absence; a begin found with a MISSING
+            // target never certifies.
+            if installed.is_some() {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/target-not-below-begin",
+                });
+            }
+            return Ok(None);
+        };
+        match reads.read_record_bytes(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "begin-authority-v2/descent-bound",
+    })
+}
+
+/// (V2X-CP2) The retained-evidence V2 begin authority facts — the
+/// recovery-safe verification's output (the durable grade is the
+/// PROVIDER's to establish, never this struct's).
+#[derive(Debug)]
+pub struct V2BeginAuthorityEvidence {
+    /// The begin revision's canonical identity.
+    pub begin_id: Hash,
+    /// The installed plan revision's canonical identity (the begin's
+    /// bound source).
+    pub plan_record: Hash,
+    /// The authenticated plan.
+    pub plan: ReclaimPlan,
+    /// The audits' revision identities, in the plan's batch order.
+    pub audit_records: Vec<Hash>,
+}
+
+/// (V2X-CP2) The RETAINED-EVIDENCE V2 begin authority verification —
+/// the recovery-safe form (NO original retirement record is
+/// required: the digest fold and the closure equality belong to the
+/// ADMISSION's first-execution witness, not to the post-publication
+/// authority; a future authorized CP3 execution may legitimately
+/// delete the retiring records). Over ANY [`BeginReads`]:
+/// (1) the MK checkpoint authentication (the canonical membership,
+/// the permanent metadata, the SK binding, the non-empty index);
+/// (2) the installed plan discovery (the deterministic key), the
+/// plan's binding to the checkpoint's facts, and the ledger-byte
+/// ceiling;
+/// (3) the founding-derived seed (the founding is permanent — the
+/// recovery-safe descent);
+/// (4) the W2 mixed-state refusal (a v1 audit under the MK's v1
+/// ledger key coexisting with the plan refuses — one
+/// interpretation per MK, ever);
+/// (5) [`verify_installed_begin_v2`] — the begin's canonical
+/// membership, the four-field plan-record binding, and the temporal
+/// position of the plan and every audit below the begin.
+/// Every failure is typed and fail-closed; the definitive absence
+/// of a begin under the key is the typed
+/// `v2-begin-authority/absent` refusal.
+pub(crate) fn verify_v2_begin_authority_evidence_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    mk: &Hash,
+) -> Result<V2BeginAuthorityEvidence, MediumError> {
+    // (1) The MK checkpoint authentication.
+    let Some((_mk_id, meta_bytes)) = find_on_chain_via(reads, head, None, Some(mk))? else {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/mk-not-installed",
+        });
+    };
+    let metadata =
+        crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+    let mk_record = read_record_via(reads, mk)?;
+    if Some(metadata.sk) != mk_record.parent {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/metadata-binding",
+        });
+    }
+    if metadata.index.is_empty() {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/empty-index",
+        });
+    }
+    // (2) The plan discovery, binding, and ceiling (the retained
+    // form — no original-evidence phase).
+    let Some((plan_record, plan)) = find_installed_plan_via(reads, head, mk)? else {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/plan-absent",
+        });
+    };
+    if plan.mk != *mk
+        || plan.sk != metadata.sk
+        || plan.range_digest != metadata.range_digest
+        || plan.seed != metadata.seed
+    {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/plan-binding",
+        });
+    }
+    if plan.ledger_byte_limit > MAX_RECLAMATION_LEDGER_BYTES {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/ledger-byte-limit-exceeds-ceiling",
+        });
+    }
+    // (3) The founding-derived seed (the recovery-safe descent —
+    // the founding is permanent).
+    let founding = founding_identity_via(reads, head)?;
+    if crate::checkpoint::compute_digest_seed(&founding) != metadata.seed {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/founding-seed",
+        });
+    }
+    // (4) The W2 mixed-state refusal.
+    if find_on_chain_via(
+        reads,
+        head,
+        Some(&reclamation_ledger_idempotency_key(mk)),
+        None,
+    )?
+    .is_some()
+    {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/v1-audit-mixed",
+        });
+    }
+    // (5) The canonical installed begin with the temporal proof.
+    let Some(installed) = verify_installed_begin_v2(reads, head, mk, &plan_record, &plan)? else {
+        return Err(MediumError::Chain {
+            rule: "v2-begin-authority/absent",
+        });
+    };
+    Ok(V2BeginAuthorityEvidence {
+        begin_id: installed.id,
+        plan_record,
+        plan,
+        audit_records: installed.audit_records,
     })
 }
 
@@ -2081,10 +2489,26 @@ fn find_on_chain(
     key: Option<&[u8]>,
     id: Option<&Hash>,
 ) -> Result<Option<(Hash, Vec<u8>)>, MediumError> {
-    const MAX_DESCENT: u64 = 1 << 20;
     let head = medium
         .head()?
         .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    find_on_chain_via(&mut MediumReads::new(medium), head, key, id)
+}
+
+/// (V2X-CP2) The reader-generic keyed/id gap-aware descent — the
+/// accepted [`find_on_chain`] walk over ANY [`BeginReads`] (the
+/// provider adapters under their own coordination; the public
+/// medium-based form above remains the thin wrapper). The
+/// discipline is unchanged: the hash-verifying reads, the strict
+/// decode, the authenticated skip-table tracking and gap crossing,
+/// the cycle guard, the bounded descent, the founding termination.
+pub(crate) fn find_on_chain_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    key: Option<&[u8]>,
+    id: Option<&Hash>,
+) -> Result<Option<(Hash, Vec<u8>)>, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
     let mut current = head;
     let mut seen = std::collections::BTreeSet::new();
     let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
@@ -2092,10 +2516,10 @@ fn find_on_chain(
         if !seen.insert(current) {
             return Err(MediumError::Chain { rule: "cycle" });
         }
-        let record = medium.read_record(&current)?;
+        let record = read_record_via(reads, &current)?;
         let mut first_object: Option<Vec<u8>> = None;
         if let Some(object) = record.content_refs.first().copied() {
-            let bytes = medium.read_object(&object)?;
+            let bytes = reads.read_object_bytes(&object)?;
             if StoredObject::new(bytes.clone())?.domain()
                 == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
             {
@@ -2114,7 +2538,7 @@ fn find_on_chain(
         let Some(parent) = record.parent else {
             return Ok(None);
         };
-        match medium.read_record(&parent) {
+        match reads.read_record_bytes(&parent) {
             Ok(_) => current = parent,
             Err(MediumError::MissingObject { .. }) => {
                 let Some(table) = skip_table.as_ref() else {
@@ -2219,6 +2643,29 @@ pub fn find_installed_plan(
     }
 }
 
+/// (V2X-CP2) The reader-generic installed-plan discovery: the
+/// deterministic MK-bound key lookup and the strict decode over
+/// ANY [`BeginReads`] — the provider-coordinated equivalent of
+/// [`find_installed_plan`].
+pub(crate) fn find_installed_plan_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    mk: &Hash,
+) -> Result<Option<(Hash, ReclaimPlan)>, MediumError> {
+    match find_on_chain_via(
+        reads,
+        head,
+        Some(&reclamation_plan_idempotency_key(mk)),
+        None,
+    )? {
+        None => Ok(None),
+        Some((id, bytes)) => Ok(Some((
+            id,
+            ReclaimPlan::decode(&bytes).map_err(MediumError::Format)?,
+        ))),
+    }
+}
+
 /// (V2-W) The installed v2 batch-audit discovery: the record
 /// carrying THIS (MK, batch) deterministic key, with its strictly
 /// decoded ledger.
@@ -2276,14 +2723,30 @@ pub(crate) type DiscoveredKeys = std::collections::BTreeMap<Vec<u8>, (Hash, Hash
 /// predicate — the same trust basis as every accepted discovery —
 /// and its equivalence with the per-key lookups is pinned by the
 /// CP1 regressions.
+/// (V2X-CP2) The medium-based convenience wrapper — the production
+/// paths use the reader-generic form under their own coordination;
+/// this one remains for the in-crate regression suites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn discover_keyed_set(
     medium: &mut dyn CanonicalMedium,
     expected: &std::collections::BTreeSet<Vec<u8>>,
 ) -> Result<DiscoveredKeys, MediumError> {
-    const MAX_DESCENT: u64 = 1 << 20;
     let head = medium
         .head()?
         .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    discover_keyed_set_via(&mut MediumReads::new(medium), head, expected)
+}
+
+/// (V2X-CP2) The reader-generic single-descent multi-key discovery
+/// — the accepted [`discover_keyed_set`] walk over ANY [`BeginReads`]
+/// (the provider adapters under their own coordination). The
+/// discipline and the bounded locator-only retention are unchanged.
+pub(crate) fn discover_keyed_set_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    expected: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<DiscoveredKeys, MediumError> {
+    const MAX_DESCENT: u64 = 1 << 20;
     let mut found: DiscoveredKeys = std::collections::BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
@@ -2292,12 +2755,12 @@ pub(crate) fn discover_keyed_set(
         if !seen.insert(current) {
             return Err(MediumError::Chain { rule: "cycle" });
         }
-        let record = medium.read_record(&current)?;
+        let record = read_record_via(reads, &current)?;
         if let Some(object) = record.content_refs.first().copied() {
             // The first object's bytes are read for the authenticated
             // skip-table detection and then DROPPED (the bounded
             // contract: only the hashes are retained).
-            let bytes = medium.read_object(&object)?;
+            let bytes = reads.read_object_bytes(&object)?;
             if StoredObject::new(bytes.clone())?.domain()
                 == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
             {
@@ -2327,7 +2790,7 @@ pub(crate) fn discover_keyed_set(
         let Some(parent) = record.parent else {
             return Ok(found);
         };
-        match medium.read_record(&parent) {
+        match reads.read_record_bytes(&parent) {
             Ok(_) => current = parent,
             Err(MediumError::MissingObject { .. }) => {
                 let Some(table) = skip_table.as_ref() else {
@@ -2422,19 +2885,37 @@ pub fn verify_v2_execution_readiness(
     medium: &mut dyn CanonicalMedium,
     mk: &Hash,
 ) -> Result<V2ExecutionReadiness, MediumError> {
+    let head = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    verify_v2_execution_readiness_via(&mut MediumReads::new(medium), head, mk)
+}
+
+/// (V2X-CP2) The reader-generic trusted all-audits reader — the
+/// accepted CP1 contract over ANY [`BeginReads`] (the provider
+/// adapters under their already-held coordination boundary: the
+/// LocalFile lock-held internal reads, the SQLite transaction, the
+/// public medium). Every accepted semantic is unchanged (the
+/// parity gate: the thirteen CP1 reader regressions run through
+/// the public wrapper into THIS core).
+pub fn verify_v2_execution_readiness_via<R: BeginReads>(
+    reads: &mut R,
+    head: Hash,
+    mk: &Hash,
+) -> Result<V2ExecutionReadiness, MediumError> {
     // (1) THE CHECKPOINT AUTHENTICATION — the same facts the trusted
     // plan publication established: the MK's canonical chain
     // membership (the descent match), its permanent metadata, the
     // SK binding, and the non-empty retirement index. A bogus MK is
     // a typed refusal, never an ambiguity.
-    let Some((_mk_id, meta_bytes)) = find_on_chain(medium, None, Some(mk))? else {
+    let Some((_mk_id, meta_bytes)) = find_on_chain_via(reads, head, None, Some(mk))? else {
         return Err(MediumError::Chain {
             rule: "v2-readiness/mk-not-installed",
         });
     };
     let metadata =
         crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
-    let mk_record = medium.read_record(mk)?;
+    let mk_record = read_record_via(reads, mk)?;
     if Some(metadata.sk) != mk_record.parent {
         return Err(MediumError::Chain {
             rule: "v2-readiness/metadata-binding",
@@ -2448,7 +2929,7 @@ pub fn verify_v2_execution_readiness(
     // (2) THE PLAN DISCOVERY (the deterministic MK-bound key): a
     // genuine checkpoint with no installed plan is the legitimate
     // pre-publication state — classified, never certified.
-    let Some((plan_record, plan)) = find_installed_plan(medium, mk)? else {
+    let Some((plan_record, plan)) = find_installed_plan_via(reads, head, mk)? else {
         return Ok(V2ExecutionReadiness::PublicationIncomplete {
             missing_batches: Vec::new(),
         });
@@ -2508,7 +2989,7 @@ pub fn verify_v2_execution_readiness(
     // readiness: a typed refusal, never a false PublicationIncomplete
     // (which would claim the missing set is known) and never a
     // RangeNotIntact (which claims the complete audit set).
-    let discovered = match discover_keyed_set(medium, &expected_keys) {
+    let discovered = match discover_keyed_set_via(reads, head, &expected_keys) {
         Ok(discovered) => discovered,
         Err(MediumError::MissingObject { hash })
             if plan
@@ -2566,7 +3047,7 @@ pub fn verify_v2_execution_readiness(
     let mut index_objects: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
     let mut digest_chain = metadata.seed;
     for entry in &indexed_members {
-        let record = match medium.read_record(&entry.hash) {
+        let record = match read_record_via(reads, &entry.hash) {
             Ok(record) => record,
             Err(MediumError::MissingObject { hash }) => {
                 return Ok(V2ExecutionReadiness::RangeNotIntact { absent: vec![hash] });
@@ -2590,7 +3071,7 @@ pub fn verify_v2_execution_readiness(
     // crossing is the range-not-intact classification, and the
     // founding-derived seed is verified against the metadata (the
     // accepted rule: the seed's authority is the founding).
-    let founding = match founding_identity_medium(medium) {
+    let founding = match founding_identity_via(reads, head) {
         Ok(founding) => founding,
         Err(MediumError::MissingObject { hash }) if range_member(&hash) => {
             return Ok(V2ExecutionReadiness::RangeNotIntact { absent: vec![hash] });
@@ -2612,7 +3093,7 @@ pub fn verify_v2_execution_readiness(
     // established per audit in the streaming phase below, never by
     // retaining the whole range's manifests).
     for entry in &indexed_members {
-        match collect_unit_objects(medium, &entry.hash) {
+        match collect_unit_objects_via(reads, &entry.hash) {
             Ok(_objects) => {}
             Err(MediumError::MissingObject { hash }) => {
                 return Ok(V2ExecutionReadiness::RangeNotIntact { absent: vec![hash] });
@@ -2640,8 +3121,12 @@ pub fn verify_v2_execution_readiness(
     // (reading each crossed record's canonically-first reference):
     // an absent RANGE MEMBER at those reads is the range-not-intact
     // classification; anything else propagates.
-    let v1_mixed = match find_on_chain(medium, Some(&reclamation_ledger_idempotency_key(mk)), None)
-    {
+    let v1_mixed = match find_on_chain_via(
+        reads,
+        head,
+        Some(&reclamation_ledger_idempotency_key(mk)),
+        None,
+    ) {
         Ok(found) => found,
         Err(MediumError::MissingObject { hash }) if range_member(&hash) => {
             return Ok(V2ExecutionReadiness::RangeNotIntact { absent: vec![hash] });
@@ -2711,7 +3196,7 @@ pub fn verify_v2_execution_readiness(
         let (audit_record, audit_object) = discovered
             .get(&key)
             .expect("the completeness check above established the discovery");
-        let record = medium.read_record(audit_record)?;
+        let record = read_record_via(reads, audit_record)?;
         if !matches!(record.kind, crate::record::RecordKind::Regular)
             || record.content_refs.len() != 1
             || record.idempotency_key.as_deref() != Some(key.as_slice())
@@ -2721,7 +3206,7 @@ pub fn verify_v2_execution_readiness(
                 rule: "v2-readiness/audit-shape-mismatch",
             });
         }
-        let audit_bytes = medium.read_object(audit_object)?;
+        let audit_bytes = reads.read_object_bytes(audit_object)?;
         let ledger = ReclamationLedgerV2::decode(&audit_bytes).map_err(MediumError::Format)?;
         if ledger.mk != *mk
             || ledger.sk != plan.sk
@@ -2745,8 +3230,11 @@ pub fn verify_v2_execution_readiness(
             });
         }
         for unit in &ledger.units {
-            match medium.read_record(&unit.record) {
-                Ok(_record) => match collect_unit_objects(medium, &unit.record) {
+            match reads
+                .read_record_bytes(&unit.record)
+                .map(|bytes| decode_record(&bytes))
+            {
+                Ok(_record) => match collect_unit_objects_via(reads, &unit.record) {
                     Ok(objects) => {
                         if objects != unit.objects {
                             return Err(MediumError::Chain {
@@ -2798,7 +3286,22 @@ pub(crate) fn collect_unit_objects(
     medium: &mut dyn CanonicalMedium,
     record_id: &Hash,
 ) -> Result<Vec<Hash>, MediumError> {
-    let record = medium.read_record(record_id)?;
+    let head_record = medium.read_record(record_id)?;
+    let _ = &head_record;
+    collect_unit_objects_via(&mut MediumReads::new(medium), record_id)
+}
+
+/// (V2X-CP2) The reader-generic closure-expanded manifest
+/// collection — the accepted [`collect_unit_objects`] over ANY
+/// [`BeginReads`]. Every direct reference is read through the
+/// reader's hash-verifying read; the composite /2 root's manifest
+/// is decoded and every chunk envelope verified — the same
+/// machinery, no medium lock required.
+pub(crate) fn collect_unit_objects_via<R: BeginReads>(
+    reads: &mut R,
+    record_id: &Hash,
+) -> Result<Vec<Hash>, MediumError> {
+    let record = read_record_via(reads, record_id)?;
     let mut objects: Vec<Hash> = Vec::new();
     for (position, reference) in record.content_refs.iter().enumerate() {
         // (V2W-F3) The explicit hash-verified read of EVERY direct
@@ -2806,7 +3309,7 @@ pub(crate) fn collect_unit_objects(
         // reference refuses through the typed integrity or
         // missing-object classification here, before any authority
         // installs.
-        let bytes = medium.read_object(reference)?;
+        let bytes = reads.read_object_bytes(reference)?;
         if objects.contains(reference) {
             return Err(MediumError::Chain {
                 rule: "reclamation-ledger-v2/duplicate-unit-object",
@@ -2820,7 +3323,7 @@ pub(crate) fn collect_unit_objects(
             let manifest =
                 crate::composite_manifest::decode(&bytes).map_err(MediumError::Format)?;
             for entry in &manifest.entries {
-                let chunk_bytes = medium.read_object(&entry.identity)?;
+                let chunk_bytes = reads.read_object_bytes(&entry.identity)?;
                 crate::composite_append::verify_chunk_dependency(
                     &chunk_bytes,
                     &entry.identity,
