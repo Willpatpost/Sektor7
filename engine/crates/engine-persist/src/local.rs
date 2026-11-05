@@ -7473,6 +7473,45 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// (V2X-CP2) The Windows tier guard for the V2 begin tests: on
+    /// ProcessCrashOnly platforms the admission refuses typed
+    /// (tier-insufficient) with nothing installed — the POSIX path
+    /// runs the real admission. Returns None on Windows.
+    fn v2x_begin_authorize_or_refuse(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        tick: u64,
+    ) -> Option<crate::reclaim::BeginPublicationOutcome> {
+        #[cfg(windows)]
+        {
+            let error = medium.begin_reclamation_v2(mk, tick).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-begin-admission/tier-insufficient"
+                    }
+                ),
+                "the Windows tier refusal is typed: {error:?}"
+            );
+            let v_error = medium.verify_begin_authority_v2(mk).unwrap_err();
+            assert!(
+                matches!(
+                    v_error,
+                    MediumError::Chain {
+                        rule: "v2-begin-authority/absent"
+                    }
+                ),
+                "the Windows absence is typed: {v_error:?}"
+            );
+            None
+        }
+        #[cfg(not(windows))]
+        {
+            Some(medium.begin_reclamation_v2(mk, tick).unwrap())
+        }
+    }
+
     /// The plan plus every plan-listed batch audit EXCEPT the given
     /// batch index (whose deterministic key stays unoccupied for an
     /// adversarial in-crate install) — the keys are chain-unique, so
@@ -8263,8 +8302,12 @@ mod exclusion_tests {
             v2_plan_campaign("v2x-cp2-positive");
         let (plan_id, plan, _audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
         assert!(plan.batches.len() >= 2, "the multi-batch shape");
-        // THE ADMISSION.
-        let outcome = medium.begin_reclamation_v2(&mk, 200).unwrap();
+        // THE ADMISSION (the Windows tier guard: ProcessCrashOnly
+        // refuses typed with nothing installed).
+        let Some(outcome) = v2x_begin_authorize_or_refuse(&mut medium, &mk, 200) else {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
         let crate::reclaim::BeginPublicationOutcome::Accepted { id: begin_id, .. } = outcome else {
             panic!("the begin admits at the eligible tier: {outcome:?}")
         };
@@ -8457,16 +8500,35 @@ mod exclusion_tests {
                 &object,
                 220,
             );
-            let error = medium.begin_reclamation_v2(&mk, 200).unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    MediumError::Chain {
-                        rule: "v2-begin-admission/duplicate-content-mismatch"
-                    }
-                ),
-                "{label} as the source: the forged same-key begin refuses: {error:?}"
-            );
+            // (The Windows tier gate precedes the duplicate check —
+            // the forged-content refusal is proven on POSIX; the
+            // VERIFIER's binding refusal below runs on every platform.)
+            #[cfg(not(windows))]
+            {
+                let error = medium.begin_reclamation_v2(&mk, 200).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "v2-begin-admission/duplicate-content-mismatch"
+                        }
+                    ),
+                    "{label} as the source: the forged same-key begin refuses: {error:?}"
+                );
+            }
+            #[cfg(windows)]
+            {
+                let error = medium.begin_reclamation_v2(&mk, 200).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "v2-begin-admission/tier-insufficient"
+                        }
+                    ),
+                    "{label} as the source: the Windows admission refuses typed: {error:?}"
+                );
+            }
             // The retained-evidence verifier refuses the same forged
             // forms (the four-field binding).
             let v_error = medium.verify_begin_authority_v2(&mk).unwrap_err();
@@ -8527,7 +8589,10 @@ mod exclusion_tests {
             // here: the genuine sequence verifies (the control).
             let (_plan_id, _plan, _audit_ids) =
                 v2x_publish_all(&mut medium, &mk, &journal_root, 400);
-            let outcome = medium.begin_reclamation_v2(&mk, 230).unwrap();
+            let Some(outcome) = v2x_begin_authorize_or_refuse(&mut medium, &mk, 230) else {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            };
             assert!(
                 matches!(
                     outcome,
