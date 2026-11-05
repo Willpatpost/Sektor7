@@ -382,16 +382,27 @@ pub fn compute_digest_seed(founding: &Hash) -> [u8; 32] {
     seed_hasher.finalize().into()
 }
 
+/// One range-digest chain step: `chain' = SHA-256(chain ‖ bytes)`.
+/// The bounded-memory incremental form of [`chain_range_digest`]
+/// (V2X-CP1 F1): a verifier may retain only the running 32-byte
+/// chain and fold each member's canonical bytes as it reads it —
+/// byte-exact with the slice-fold by construction (the same
+/// arithmetic, one member at a time; the parity is pinned by the
+/// regression).
+pub fn chain_range_digest_step(chain: &[u8; 32], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(chain);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
 /// Chains the range digest from a seed: the running SHA-256 over the
 /// range's record canonical bytes, oldest first. An empty range
 /// yields the seed itself.
 pub fn chain_range_digest(seed: &[u8; 32], range_record_bytes: &[impl AsRef<[u8]>]) -> [u8; 32] {
     let mut chain = *seed;
     for bytes in range_record_bytes {
-        let mut hasher = Sha256::new();
-        hasher.update(chain);
-        hasher.update(bytes.as_ref());
-        chain = hasher.finalize().into();
+        chain = chain_range_digest_step(&chain, bytes.as_ref());
     }
     chain
 }

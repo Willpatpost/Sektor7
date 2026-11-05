@@ -7487,18 +7487,23 @@ mod exclusion_tests {
         }
         let discovered = crate::reclaim::discover_keyed_set(&mut medium, &expected).unwrap();
         assert_eq!(discovered.len(), expected.len(), "every key discovered");
-        // The plan equivalence.
-        let (per_key_id, plan_bytes) = discovered
+        // The plan equivalence: the same record identity, and the
+        // locator's object hash IS the plan payload's content
+        // identity (the payload itself is NOT retained — the F1
+        // bounded-memory contract).
+        let (per_key_id, plan_object) = discovered
             .get(&crate::reclaim::reclamation_plan_idempotency_key(&mk))
             .unwrap();
         assert_eq!(*per_key_id, plan_id);
         assert_eq!(
-            crate::reclaim::ReclaimPlan::decode(plan_bytes).unwrap(),
-            plan
+            *plan_object,
+            StoredObject::new(plan.canonical_bytes()).unwrap().hash()
         );
-        // The audit equivalence (every batch).
+        // The audit equivalence (every batch): the same record
+        // identities, and each locator's object hash equals the
+        // per-key lookup's decoded ledger's content identity.
         for (batch, audit_id) in plan.batches.iter().map(|b| b.index).zip(&audit_ids) {
-            let (found_id, bytes) = discovered
+            let (found_id, object) = discovered
                 .get(&crate::reclaim::reclamation_ledger_v2_idempotency_key(
                     &mk, batch,
                 ))
@@ -7509,7 +7514,12 @@ mod exclusion_tests {
                     .unwrap()
                     .unwrap();
             assert_eq!(*found_id, per_key_id);
-            assert_eq!(bytes, &per_key_ledger.canonical_bytes());
+            assert_eq!(
+                *object,
+                StoredObject::new(per_key_ledger.canonical_bytes())
+                    .unwrap()
+                    .hash()
+            );
         }
         // THE EARLY EXIT: a single-key expected set finds its target
         // and returns without descending further.
@@ -7602,6 +7612,158 @@ mod exclusion_tests {
                 "the unsupported version refuses typed: {error:?}"
             );
             let _ = std::fs::remove_dir_all(&root_b);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_classifies_the_combined_incomplete_publication_and_degraded_range() {
+        // (V2X-CP1 F2) THE TRUTHFUL CLASSIFICATION of the combined
+        // state: a genuine plan with only a SUBSET of its audits
+        // published AND an original retirement record removed. The
+        // audit-set discovery's descent cannot cross the degraded
+        // range, so the completeness cannot be established — the
+        // truthful answer is the TYPED REFUSAL asserting NEITHER
+        // the audit-set completeness NOR the readiness (never a
+        // false PublicationIncomplete claiming the missing set is
+        // known; never a RangeNotIntact claiming the complete audit
+        // set; and NEVER ExecutionReady).
+        let (root, journal_root, mut medium, mk, r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-f2-combined");
+        // The plan + batch 0 only (the limit 460 splits the range
+        // into two batches; batch 1's publication skipped).
+        let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 1);
+        assert!(
+            plan.batches.len() >= 2,
+            "the fixture splits into multiple batches"
+        );
+        // The original retirement record removed (the degraded
+        // range — on its own this would classify RangeNotIntact
+        // under the complete-audit set).
+        std::fs::remove_file(medium.object_path(&r1)).unwrap();
+        let head_before = medium.head().unwrap().unwrap();
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/range-degraded-before-completeness"
+                }
+            ),
+            "the combined state refuses typed, asserting neither completeness nor readiness: {error:?}"
+        );
+        // The reader remains strictly read-only in the diagnostic.
+        assert_eq!(
+            medium.head().unwrap().unwrap(),
+            head_before,
+            "the reader published nothing"
+        );
+        // The control: with EVERY audit published and the same
+        // record removed, the classification IS the degraded range
+        // (the completeness-first ordering never masks it).
+        {
+            let (root_b, journal_root_b, mut medium_b, mk_b, r1_b, _r2b, _s, _p) =
+                v2_plan_campaign("v2x-f2-combined-control");
+            let (_plan_id_b, _plan_b, _audit_ids_b) =
+                v2x_publish_all(&mut medium_b, &mk_b, &journal_root_b, 400);
+            std::fs::remove_file(medium_b.object_path(&r1_b)).unwrap();
+            match crate::reclaim::verify_v2_execution_readiness(&mut medium_b, &mk_b).unwrap() {
+                crate::reclaim::V2ExecutionReadiness::RangeNotIntact { absent } => {
+                    assert!(
+                        absent.contains(&r1_b),
+                        "the absent record is named: {absent:?}"
+                    );
+                }
+                other => panic!("the complete-audit degraded range classifies: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root_b);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_verifies_the_multi_batch_audit_set_sequentially() {
+        // (V2X-CP1 F1) THE BOUNDED-MEMORY CONTRACT'S
+        // REPRESENTATIVE EVIDENCE: a three-batch campaign whose
+        // audits' AGGREGATE encoded size exceeds any individual
+        // batch's — the reader certifies through the per-audit
+        // RELOAD path (each audit's record and object re-read and
+        // hash-verified at its turn, the payload and decoded
+        // closure released before the next), never by retaining
+        // every audit's raw payload simultaneously (the discovery
+        // carries only the record identities and the content-object
+        // hashes — the structural bound, pinned by the equivalence
+        // regression). The incremental range digest's PARITY with
+        // the accepted slice algorithm is asserted directly.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-f1-sequential");
+        let (plan_id, plan, audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+        assert!(
+            plan.batches.len() >= 3,
+            "the fixture splits into at least three batches"
+        );
+        // The aggregate volume exceeds each individual audit (the
+        // representative multi-audit evidence).
+        let mut sizes = Vec::new();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            let (_id, ledger) = crate::reclaim::find_installed_v2_audit(&mut medium, &mk, batch)
+                .unwrap()
+                .unwrap();
+            sizes.push(ledger.canonical_bytes().len());
+        }
+        let aggregate: usize = sizes.iter().sum();
+        assert!(
+            sizes.iter().all(|size| aggregate > *size),
+            "the aggregate encoded size exceeds each individual audit: {sizes:?}"
+        );
+        // THE CERTIFICATION through the reload path: the exact
+        // revision identities (the discovery's locators, each
+        // re-read and hash-verified at its turn).
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady {
+                plan_record,
+                audit_records,
+                ..
+            } => {
+                assert_eq!(plan_record, plan_id);
+                assert_eq!(audit_records, audit_ids);
+            }
+            other => panic!("the sequential multi-batch state certifies ready: {other:?}"),
+        }
+        // THE DIGEST PARITY: the incremental chain_range_digest_step
+        // fold equals the accepted chain_range_digest slice
+        // algorithm over the same members (the reader's bounded fold
+        // is byte-exact with the accepted implementation).
+        {
+            // The members: the campaign's r1/r2 canonical bytes,
+            // oldest first (the fixture's own digest inputs).
+            let (root_c, journal_root_c, mut medium_c, mk_c, r1_c, r2_c, _s, _p) =
+                v2_plan_campaign("v2x-f1-sequential-parity");
+            let founding = crate::reclaim::founding_identity_medium(&mut medium_c).unwrap();
+            let seed = crate::checkpoint::compute_digest_seed(&founding);
+            let members: Vec<Vec<u8>> = [r1_c, r2_c]
+                .iter()
+                .map(|id| medium_c.read_record(id).unwrap().canonical_bytes())
+                .collect();
+            let accepted = crate::checkpoint::chain_range_digest(&seed, &members);
+            let mut incremental = seed;
+            for bytes in &members {
+                incremental = crate::checkpoint::chain_range_digest_step(&incremental, bytes);
+            }
+            assert_eq!(
+                accepted, incremental,
+                "the incremental fold is byte-exact with the accepted slice algorithm"
+            );
+            // The reader's own certification over the same campaign
+            // proves the end-to-end parity (the fixture's stored
+            // digest was computed by the ACCEPTED algorithm).
+            let (_plan_id_c, _plan_c, _audit_ids_c) =
+                v2x_publish_all(&mut medium_c, &mk_c, &journal_root_c, 400);
+            match crate::reclaim::verify_v2_execution_readiness(&mut medium_c, &mk_c).unwrap() {
+                crate::reclaim::V2ExecutionReadiness::ExecutionReady { .. } => {}
+                other => panic!("the parity campaign certifies ready: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root_c);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
