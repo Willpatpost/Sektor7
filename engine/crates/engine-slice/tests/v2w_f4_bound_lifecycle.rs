@@ -2012,12 +2012,11 @@ fn the_rotation_entry_verifies_the_root_agreement() {
             T1Journal::open_bound(&active_b, &founding_b, &root_id_b).expect("B's active");
         let medium_b = LocalFileMedium::open(&store_b).unwrap();
         let mut pipeline_b = engine_persist::CommitPipeline::open(medium_b, journal_b).unwrap();
-        let error =
-            match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline_b, &root_a) {
-                Err(engine_persist::SessionRotationError::Journal(error)) => error,
-                Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
-                Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
-            };
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_b, &root_a) {
+            Err(engine_persist::SessionRotationError::Journal(error)) => error,
+            Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
+            Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
+        };
         assert!(
             matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("not the pointer-resolved active")),
             "the journal/root agreement refuses the cross-root pipeline: {error:?}"
@@ -2047,10 +2046,7 @@ fn the_rotation_entry_verifies_the_root_agreement() {
         let medium_a = LocalFileMedium::open(&store_a).unwrap();
         let mut pipeline_stale =
             engine_persist::CommitPipeline::open(medium_a, journal_stale).unwrap();
-        let error = match engine_persist::rotate_session_journal::<_, NpcWorld>(
-            &mut pipeline_stale,
-            &root_a,
-        ) {
+        let error = match engine_persist::rotate_session_journal(&mut pipeline_stale, &root_a) {
             Err(engine_persist::SessionRotationError::Journal(error)) => error,
             Err(other) => panic!("the stale-journal aim refuses typed: {other:?}"),
             Ok(_rotation) => panic!("a stale journal never rotates"),
@@ -2249,7 +2245,7 @@ fn the_rotation_retention_boundary_is_authenticated() {
         };
         std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
         std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
-        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::UnsupportedSnapshotVersion,
             )) => {}
@@ -2319,7 +2315,7 @@ fn the_rotation_retention_boundary_is_authenticated() {
         };
         std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
         std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
-        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::CorruptSnapshot,
             )) => {}
@@ -2563,8 +2559,7 @@ fn the_unrestorable_newest_snapshot_never_authorizes_retirement() {
         // THE ROTATION REFUSES through the actual public entry (the
         // production world): no retirement on the un-restorable
         // snapshot's authority.
-        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root_b)
-        {
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root_b) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::CorruptSnapshot,
             )) => {}
@@ -2782,7 +2777,7 @@ fn the_invalid_director_configuration_never_authorizes_retirement() {
         };
         std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
         std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
-        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::CorruptSnapshot,
             )) => {}
@@ -2793,6 +2788,265 @@ fn the_invalid_director_configuration_never_authorizes_retirement() {
             active_journal_path(&journal_root).unwrap(),
             active,
             "{label}: no successor was created"
+        );
+    }
+}
+
+/// (F4-R15) THE ATTACKER'S WORLD: an external-crate `SaveWorld` that
+/// declares `NpcWorld`'s EXACT SAVE_DOMAIN but applies a far weaker
+/// world-section validation (any 8-byte payload restores). This is
+/// the reusable-engine capability the R15 bypass exploited — before
+/// the closure, the public generic rotation entry accepted this
+/// world as the spine validator and RETIRED a transaction on a
+/// snapshot the production `restore_session` refuses (the scratch
+/// observation: 1 committed before, 0 re-anchored after, the pointer
+/// flipped — reported, the scratch removed). The closure removed the
+/// world parameter from the entry entirely; this type remains in the
+/// suite to prove the refusal is the BOUND validator's doing: the
+/// weak world still ACCEPTS the adversarial snapshot's spine bytes,
+/// and the rotation refuses them anyway (no substitution site
+/// exists).
+struct WeakWorld;
+
+impl engine_core::World for WeakWorld {
+    fn execute(&mut self, _event: &engine_core::Event, _ctx: &mut engine_core::ExecCtx) {}
+    fn fingerprint(&self, _fp: &mut engine_core::Fingerprinter) {}
+}
+
+impl engine_core::SaveWorld for WeakWorld {
+    const SAVE_DOMAIN: &'static str = NpcWorld::SAVE_DOMAIN;
+
+    fn save(&self, enc: &mut engine_core::Encoder) {
+        enc.write_u64(0);
+    }
+
+    fn restore(dec: &mut engine_core::Decoder) -> Result<Self, engine_core::SaveError> {
+        dec.read_u64()?;
+        Ok(WeakWorld)
+    }
+}
+
+#[test]
+fn the_world_section_validator_is_bound_to_the_production_schema() {
+    // (F4-R15) THE WORLD-VALIDATOR AUTHORITY: the validator that
+    // authenticates retirement evidence is the validator belonging
+    // to the campaign's actual persisted world schema — NEVER a
+    // freely selected caller implementation. The adversarial
+    // snapshot: a STRUCTURALLY VALID spine (a real spine save) whose
+    // world section DECLARES the production domain but carries an
+    // NPC-INVALID payload, over the REAL compacted director bytes.
+    // The production restore refuses it; a permissive alternate
+    // world ACCEPTS its spine (the attacker's capability, unchanged
+    // — the reusable-engine codec boundary); the rotation through
+    // the actual public entry REFUSES (the validator is fixed: the
+    // entry takes no world, and the anchor restores through
+    // engine-core's NpcSaveWorld — the shared production
+    // NpcWorldSection codec). No successor, no flip, the would-retire
+    // transaction stands. The control: the genuine confirmed-and-
+    // subsumed transaction RETIRES on the valid snapshot through the
+    // real crossing (the closure refuses nothing genuine).
+    let dir = TestDir::new("r15");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // THE CONTROL: the whole lifecycle in ONE continuing session —
+    // the compaction, the covering publication from the SAME
+    // session's compacted director, and the genuine retirement
+    // through the real crossing.
+    {
+        let store = dir.store();
+        let journal_root = dir.journal();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r15-control",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the boundary confirms")
+        };
+        let retired_id = {
+            scan_bound_active(&store, &journal_root)
+                .committed
+                .last()
+                .unwrap()
+                .id
+        };
+        durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+        run_ticks_near(&mut spine, &mut director, &near, 100);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the checkpoint publishes (the compaction — the v4 summary)");
+        run_ticks_near(&mut spine, &mut director, &near, 5);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        let rotation = crossing
+            .rotate_journal()
+            .expect("the control rotation completes");
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        let scan = scan_bound_active(&store, &rotation.new_path);
+        let successor_ids: Vec<_> = scan.committed.iter().map(|t| t.id).collect();
+        assert!(
+            !successor_ids.contains(&retired_id),
+            "the genuine confirmed-and-subsumed transaction RETIRES on the valid \
+             snapshot (the closure refuses nothing genuine)"
+        );
+    }
+    // THE ADVERSARIAL CAMPAIGN: the identical shape, then the newest
+    // snapshot replaced by a hash-consistent /1 object whose spine is
+    // a REAL spine save under a permissive world (the production
+    // domain declared, an 8-byte world payload — NPC-INVALID) over
+    // the REAL director bytes.
+    let (store_b, journal_root_b, would_retire_id) = {
+        let store = dir.bound_journal().with_extension("store-c");
+        std::fs::create_dir_all(&store).unwrap();
+        let journal_root = dir.bound_journal().with_extension("root-c");
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r15-adversarial",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the boundary confirms")
+        };
+        let would_retire_id = {
+            scan_bound_active(&store, &journal_root)
+                .committed
+                .last()
+                .unwrap()
+                .id
+        };
+        durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+        run_ticks_near(&mut spine, &mut director, &near, 100);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the checkpoint publishes");
+        run_ticks_near(&mut spine, &mut director, &near, 5);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        (store, journal_root, would_retire_id)
+    };
+    // The adversarial newest snapshot: the REAL director bytes over a
+    // REAL spine save whose world section declares the production
+    // domain but carries an 8-byte payload.
+    let adversarial: engine_persist::StoredObject = {
+        let mut probe = LocalFileMedium::open(&store_b).unwrap();
+        let mut cursor = probe.head().unwrap().unwrap();
+        let snapshot_bytes = loop {
+            let record = probe.read_record(&cursor).unwrap();
+            if let Some(object) = record.content_refs.first().copied() {
+                let bytes = probe.read_object(&object).unwrap();
+                if engine_persist::session_anchor::is_session_object(&bytes) {
+                    break bytes;
+                }
+            }
+            cursor = record.parent.unwrap();
+        };
+        drop(probe);
+        let (_spine_bytes, director_bytes) =
+            engine_persist::session_anchor::read_snapshot_container(&snapshot_bytes).unwrap();
+        let weak_spine = Spine::<WeakWorld>::new(WeakWorld, 8).save_bytes();
+        let mut enc = engine_core::Encoder::new();
+        enc.write_str("engine-slice/session-snapshot/1");
+        enc.write_bytes(&weak_spine);
+        enc.write_bytes(&director_bytes);
+        engine_persist::StoredObject::new(enc.into_bytes()).unwrap()
+    };
+    // THE PRODUCTION RESTORE REFUSES (the parity reference): the
+    // world section's domain matches (the weak world declared the
+    // production domain) but the payload fails NpcWorld::restore.
+    assert!(
+        engine_slice::crossing::restore_session(adversarial.bytes()).is_err(),
+        "restore_session rejects the npc-invalid world section"
+    );
+    // THE ATTACKER'S CAPABILITY, UNCHANGED: the permissive external
+    // world ACCEPTS the same spine bytes (the reusable-engine codec
+    // boundary is not weakened) — the refusal below is the BOUND
+    // validator's, never the bytes' universal invalidity.
+    {
+        let (spine_bytes, _director_bytes) =
+            engine_persist::session_anchor::read_snapshot_container(adversarial.bytes()).unwrap();
+        Spine::<WeakWorld>::restore(
+            &spine_bytes,
+            engine_core::Diagnostics::new(engine_core::Level::Off),
+        )
+        .expect("the weak world accepts the adversarial spine — the capability exists");
+    }
+    // The hand-written publication as the NEWEST record, then the
+    // rotation through the actual public entry — which takes NO
+    // world parameter (the substitution site is gone).
+    let active_b = active_journal_path(&journal_root_b).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(&store_b).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = engine_persist::RevisionRecord::regular(head, epoch, 930)
+            .with_content_refs(vec![adversarial.hash()]);
+        drop(medium);
+        let (founding_b, root_id_b) = installed_binding(&store_b);
+        let journal = T1Journal::open_bound(&active_b, &founding_b, &root_id_b).unwrap();
+        let medium = LocalFileMedium::open(&store_b).unwrap();
+        let mut pipeline = engine_persist::CommitPipeline::open(medium, journal).unwrap();
+        let objects_dir = store_b.join("objects");
+        std::fs::write(
+            objects_dir.join(adversarial.hash().hex()),
+            adversarial.bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            objects_dir.join(record.id().hex()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/engine-persist/head/1");
+            enc.write_u32(1);
+            enc.write_bytes(record.id().as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(store_b.join("HEAD.tmp"), head_bytes).unwrap();
+        std::fs::rename(store_b.join("HEAD.tmp"), store_b.join("HEAD")).unwrap();
+        // THE ROTATION REFUSES through the actual public entry: the
+        // fixed validator rejects what the production restore
+        // rejects — no retirement on production-refused evidence, no
+        // matter what world the caller can implement.
+        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root_b) {
+            Err(engine_persist::SessionRotationError::Anchor(
+                engine_persist::session_anchor::AnchorError::CorruptSnapshot,
+            )) => {}
+            Err(other) => panic!("the npc-invalid world section fails closed: {other:?}"),
+            Ok(_rotation) => panic!(
+                "a production-refused world section never authorizes retirement — \
+                 the R15 bypass is closed"
+            ),
+        }
+    }
+    // NO SUCCESSOR, NO FLIP — the journal stands with the
+    // would-retire transaction intact.
+    assert_eq!(
+        active_journal_path(&journal_root_b).unwrap(),
+        active_b,
+        "no successor was created — the pointer stands"
+    );
+    {
+        let scan = scan_bound_active(&store_b, &active_b);
+        let ids: Vec<_> = scan.committed.iter().map(|t| t.id).collect();
+        assert!(
+            ids.contains(&would_retire_id),
+            "the would-retire transaction stands in the active journal — no \
+             retirement on production-refused evidence"
         );
     }
 }

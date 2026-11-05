@@ -2255,8 +2255,8 @@ impl<S: MediumSource> SessionCrossing<S> {
         // evidence exists anywhere in the API; the raw wrappers are
         // crate-private.
         let rotation =
-            rotate_session_journal::<_, NpcWorld>(&mut self.pipeline, &self.journal_root).map_err(
-                |error| match error {
+            rotate_session_journal(&mut self.pipeline, &self.journal_root).map_err(|error| {
+                match error {
                     engine_persist::SessionRotationError::Medium(error)
                     | engine_persist::SessionRotationError::Anchor(
                         engine_persist::session_anchor::AnchorError::Medium(error),
@@ -2276,8 +2276,8 @@ impl<S: MediumSource> SessionCrossing<S> {
                     engine_persist::SessionRotationError::Anchor(
                         engine_persist::session_anchor::AnchorError::CorruptSnapshot,
                     ) => TransitionError::CorruptSnapshot("anchor-decode-failed"),
-                },
-            )?;
+                }
+            })?;
         // THE CAPTURE-VALIDITY GENERATION (PP-B4 checkpoint 3, the F1
         // preflight): the mechanism returned Ok — the pointer FLIPPED —
         // so every snapshot capture taken before this instant is

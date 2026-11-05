@@ -45,6 +45,7 @@ pub mod diag;
 pub mod event;
 pub mod fingerprint;
 pub mod lod;
+pub mod npc_world_save;
 pub mod spine;
 pub mod wire;
 
@@ -77,6 +78,7 @@ pub const REGION_GRID: u8 = 16;
 pub const POSITION_DISCARDED: (u8, u8) = (u8::MAX, u8::MAX);
 
 pub use lod::{LodConfig, LodConfigError, LodController, LodLevel, PresenceSample};
+pub use npc_world_save::{NPC_WORLD_SAVE_DOMAIN, NpcSaveWorld, NpcWorldSection};
 pub use spine::{
     CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
     ObligationView, ScheduleError, Spine, Stats, SuspensionStats, World,

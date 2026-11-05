@@ -237,3 +237,145 @@ fn corruption_fails_closed() {
         assert!(!accepts(&section[..cut]), "cut at {cut} rejected");
     }
 }
+
+/// The world's save section as the shared engine-core data (built
+/// from the live world's accessors — the assembly the anchor's fixed
+/// world holds after a restore).
+fn world_section(world: &NpcWorld) -> engine_core::NpcWorldSection {
+    let mut near_mask = 0u64;
+    for (index, near) in world.config().near_regions.iter().enumerate() {
+        if *near {
+            near_mask |= 1 << index;
+        }
+    }
+    engine_core::NpcWorldSection {
+        seed: world.config().seed,
+        near_mask,
+        activity_period: world.config().activity_period,
+        simplify_factor: world.config().simplify_factor,
+        commitment_window: world.config().commitment_window,
+        region_lods_enabled: world.config().region_lods_enabled,
+        steps: world.steps().to_vec(),
+        routine_cursor: world.routine_cursor().to_vec(),
+        positions: world.positions().to_vec(),
+        represented_through: world.represented_through().to_vec(),
+        milestones: world.milestones().to_vec(),
+        pending_signals: world.pending_signals().to_vec(),
+        credits: world.credits().to_vec(),
+        region_lods: world.region_lods(),
+    }
+}
+
+#[test]
+fn the_shared_section_codec_restores_the_production_save_bytes() {
+    // (F4-R15) THE PARITY, ON THE WIRE: the production encoder's
+    // bytes (`NpcWorld::save` — unchanged, the pinned save path)
+    // decode through the SHARED engine-core section codec with the
+    // exact per-identity state — the anchor's fixed world and the
+    // production restore read ONE interpretation, never two.
+    let spine = lod_spine(150);
+    let mut enc = Encoder::new();
+    spine.world().save(&mut enc);
+    let bytes = enc.into_bytes();
+    let mut dec = Decoder::new(&bytes);
+    let section = engine_core::NpcWorldSection::restore(&mut dec).unwrap();
+    dec.finish().expect("the section consumed exactly");
+    let world = spine.world();
+    assert_eq!(section.seed, world.config().seed);
+    assert_eq!(section.steps, world.steps());
+    assert_eq!(section.routine_cursor, world.routine_cursor());
+    assert_eq!(section.positions, world.positions());
+    assert_eq!(section.represented_through, world.represented_through());
+    assert_eq!(section.milestones, world.milestones());
+    assert_eq!(section.pending_signals, world.pending_signals());
+    assert_eq!(section.credits, world.credits());
+    assert_eq!(section.region_lods, world.region_lods());
+}
+
+#[test]
+fn the_section_save_round_trips_through_the_production_world() {
+    // (F4-R15) THE DUAL-ENCODER PARITY: the section's own encoder
+    // (`NpcWorldSection::save` — the fixed world's save side) emits
+    // bytes the PRODUCTION `NpcWorld::restore` accepts with the
+    // identical state — the two encoders of one wire format cannot
+    // drift apart silently, and the shared walk's refusals are the
+    // production walk's refusals (the equivalence sweep).
+    let spine = lod_spine(150);
+    let section = world_section(spine.world());
+    let mut enc = Encoder::new();
+    section.save(&mut enc);
+    let bytes = enc.into_bytes();
+    let mut dec = Decoder::new(&bytes);
+    let restored = NpcWorld::restore(&mut dec).unwrap();
+    dec.finish().expect("consumed exactly");
+    assert_eq!(restored.steps(), spine.world().steps());
+    assert_eq!(restored.routine_cursor(), spine.world().routine_cursor());
+    assert_eq!(restored.positions(), spine.world().positions());
+    assert_eq!(
+        restored.represented_through(),
+        spine.world().represented_through()
+    );
+    assert_eq!(restored.milestones(), spine.world().milestones());
+    assert_eq!(restored.pending_signals(), spine.world().pending_signals());
+    assert_eq!(restored.credits(), spine.world().credits());
+    assert_eq!(restored.region_lods(), spine.world().region_lods());
+
+    // THE EQUIVALENCE SWEEP: every corrupted variant the production
+    // restore refuses, the shared section codec refuses identically
+    // (and the one sanctioned sentinel form both accept) — the
+    // acceptance sets are equal because the walk is one function.
+    let mut enc = Encoder::new();
+    spine.world().save(&mut enc);
+    let section_bytes = enc.into_bytes();
+    const CONFIG_LEN: usize = 8 * 5 + 1;
+    const COUNT_AT: usize = CONFIG_LEN;
+    const STEPS_AT: usize = COUNT_AT + 8;
+    const POSITIONS_AT: usize = STEPS_AT + NPC_COUNT * 8 + NPC_COUNT * 8;
+    const LODS_AT: usize = POSITIONS_AT
+        + NPC_COUNT * 2
+        + NPC_COUNT * 8
+        + NPC_COUNT * 8
+        + NPC_COUNT * 8
+        + NPC_COUNT * 8;
+    let mut variants: Vec<Vec<u8>> = Vec::new();
+    for value in [999u64, 1001] {
+        let mut doctored = section_bytes.clone();
+        doctored[COUNT_AT..COUNT_AT + 8].copy_from_slice(&value.to_le_bytes());
+        variants.push(doctored);
+    }
+    let mut doctored = section_bytes.clone();
+    doctored[POSITIONS_AT] = 200;
+    variants.push(doctored);
+    let mut doctored = section_bytes.clone();
+    doctored[LODS_AT] = 9;
+    variants.push(doctored);
+    let mut doctored = section_bytes.clone();
+    doctored[9] |= 0x01;
+    variants.push(doctored);
+    for cut in [
+        0,
+        1,
+        CONFIG_LEN,
+        STEPS_AT,
+        POSITIONS_AT,
+        section_bytes.len() - 8,
+    ] {
+        variants.push(section_bytes[..cut].to_vec());
+    }
+    for variant in &variants {
+        let production = NpcWorld::restore(&mut Decoder::new(variant)).is_ok();
+        let shared = engine_core::NpcWorldSection::restore(&mut Decoder::new(variant)).is_ok();
+        assert_eq!(
+            production,
+            shared,
+            "the production walk and the shared walk agree on {} bytes",
+            variant.len()
+        );
+        assert!(!production, "the corrupted variant is refused");
+    }
+    let mut sentinel = section_bytes.clone();
+    sentinel[POSITIONS_AT] = u8::MAX;
+    sentinel[POSITIONS_AT + 1] = u8::MAX;
+    assert!(NpcWorld::restore(&mut Decoder::new(&sentinel)).is_ok());
+    assert!(engine_core::NpcWorldSection::restore(&mut Decoder::new(&sentinel)).is_ok());
+}

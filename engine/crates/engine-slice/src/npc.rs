@@ -706,7 +706,7 @@ impl World for NpcWorld {
 }
 
 impl SaveWorld for NpcWorld {
-    const SAVE_DOMAIN: &'static str = "engine-slice/npc-world-save/1";
+    const SAVE_DOMAIN: &'static str = engine_core::NPC_WORLD_SAVE_DOMAIN;
 
     fn save(&self, enc: &mut Encoder) {
         // The workload configuration first — behavioral identity: a
@@ -765,110 +765,37 @@ impl SaveWorld for NpcWorld {
     }
 
     fn restore(dec: &mut Decoder) -> Result<Self, SaveError> {
-        const SECTION: &str = "npc-world-save";
-        let seed = dec.read_u64()?;
-        let near_mask = dec.read_u64()?;
-        let activity_period = dec.read_u64()?;
-        let simplify_factor = dec.read_u64()?;
-        let commitment_window = dec.read_u64()?;
-        let region_lods_enabled = match dec.read_u8()? {
-            0 => false,
-            1 => true,
-            discriminant => {
-                return Err(SaveError::Enum {
-                    section: SECTION,
-                    discriminant: u64::from(discriminant),
-                });
-            }
-        };
-        // The fixed identity set: the count is bounded by the
-        // documented workload size and the remaining bytes before any
-        // allocation trusts it, and must equal NPC_COUNT exactly — a
-        // different identity set is an incompatible workload, never a
-        // silently resized restore.
-        let npc_count = dec.read_count(NPC_COUNT as u64, SECTION, "npc-count")?;
-        if npc_count != NPC_COUNT as u64 {
-            return Err(SaveError::Integrity("npc-world-save/npc-count"));
-        }
-        let mut steps = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            steps.push(dec.read_u64()?);
-        }
-        let mut routine_cursor = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            routine_cursor.push(dec.read_u64()?);
-        }
-        // Grid positions carry the dormant-discard sentinel
-        // (`POSITION_DISCARDED` — the reconstructible representation is
-        // GONE, not merely flagged); every other position must lie on
-        // the region-local grid (the bounds invariant).
-        let mut positions = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            let x = dec.read_u8()?;
-            let y = dec.read_u8()?;
-            if (x, y) != POSITION_DISCARDED && (x >= REGION_GRID || y >= REGION_GRID) {
-                return Err(SaveError::Integrity("npc-world-save/position-bounds"));
-            }
-            positions.push((x, y));
-        }
-        let mut represented_through = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            represented_through.push(dec.read_tick()?);
-        }
-        let mut milestones = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            milestones.push(dec.read_u64()?);
-        }
-        let mut pending_signals = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            pending_signals.push(dec.read_u64()?);
-        }
-        let mut credits = Vec::with_capacity(NPC_COUNT);
-        for _ in 0..NPC_COUNT {
-            credits.push(dec.read_u64()?);
-        }
-        let mut region_lods = [LodLevel::Full; REGION_COUNT];
-        for lod in &mut region_lods {
-            *lod = match dec.read_u8()? {
-                0 => LodLevel::Full,
-                1 => LodLevel::Simplified,
-                2 => LodLevel::EventDriven,
-                3 => LodLevel::Dormant,
-                discriminant => {
-                    return Err(SaveError::Enum {
-                        section: SECTION,
-                        discriminant: u64::from(discriminant),
-                    });
-                }
-            };
-        }
-        // The near-region mask is a REGION_COUNT-bit mask — set bits
-        // above it are not this workload's configuration.
-        if near_mask >> REGION_COUNT != 0 {
-            return Err(SaveError::Integrity("npc-world-save/near-mask"));
-        }
+        // (V2-W F4, R15) The world-section rules are THE SHARED
+        // engine-core codec — the same interpretation the
+        // authenticated anchor's spine validation restores through
+        // (`NpcSaveWorld` delegates to the identical walk): the
+        // parity is by construction, one codec, two consumers. The
+        // assembly below carries no rules of its own — the
+        // near-region expansion and the configuration construction
+        // from the validated raw fields.
+        let section = engine_core::NpcWorldSection::restore(dec)?;
         let mut near_regions = [false; REGION_COUNT];
         for (index, near) in near_regions.iter_mut().enumerate() {
-            *near = near_mask & (1 << index) != 0;
+            *near = section.near_mask & (1 << index) != 0;
         }
         let config = NpcConfig {
-            seed,
+            seed: section.seed,
             near_regions,
-            activity_period,
-            simplify_factor,
-            commitment_window,
-            region_lods_enabled,
+            activity_period: section.activity_period,
+            simplify_factor: section.simplify_factor,
+            commitment_window: section.commitment_window,
+            region_lods_enabled: section.region_lods_enabled,
         };
         Ok(NpcWorld {
             config,
-            steps,
-            routine_cursor,
-            positions,
-            represented_through,
-            milestones,
-            pending_signals,
-            credits,
-            region_lods,
+            steps: section.steps,
+            routine_cursor: section.routine_cursor,
+            positions: section.positions,
+            represented_through: section.represented_through,
+            milestones: section.milestones,
+            pending_signals: section.pending_signals,
+            credits: section.credits,
+            region_lods: section.region_lods,
         })
     }
 }

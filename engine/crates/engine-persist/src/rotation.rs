@@ -380,13 +380,18 @@ fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), Journa
 /// a legacy root never takes the bound arm); the classification is
 /// DERIVED from the pipeline's own journal and confirmed set (§4.4:
 /// retire iff canceled, or actionable with every identity confirmed
-/// AND subsumed below the anchor boundary — the anchor boundary is
-/// the trusted session's chain-verified claim, passed by the
-/// crossing from the latest published snapshot); the mechanism is
-/// the accepted crate-private sequence (write + scan-verify + the
-/// pointer flip at the campaign root + the ownership record + the
-/// durability rules, all unchanged).
-pub fn rotate_session_journal<M: crate::medium::CanonicalMedium, W: engine_core::SaveWorld>(
+/// AND subsumed below the anchor boundary — the boundary is the
+/// newest canonical snapshot's chain-verified claim, derived
+/// in-crate); the mechanism is the accepted crate-private sequence
+/// (write + scan-verify + the pointer flip at the campaign root +
+/// the ownership record + the durability rules, all unchanged).
+/// (F4-R15) THE WORLD VALIDATOR IS FIXED: the entry takes NO world
+/// parameter — the anchor validates the newest snapshot's spine
+/// under engine-core's `NpcSaveWorld` (the shared production
+/// `NpcWorldSection` codec), so no caller can substitute a weaker
+/// `SaveWorld` and retire on evidence the production restore
+/// refuses.
+pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
     pipeline: &mut crate::pipeline::CommitPipeline<M>,
     root: &Path,
 ) -> Result<JournalRotation, SessionRotationError> {
@@ -440,16 +445,20 @@ pub fn rotate_session_journal<M: crate::medium::CanonicalMedium, W: engine_core:
     // canonical session snapshot — selected from the chain (the
     // HEAD-descent, the same selection rule as the recovery),
     // hash-verified through the medium's read, its domain exactly
-    // the supported version, its director section strictly
-    // validated (the shared session-anchor decoder — the ONE
-    // interpretation of the wire format), and the boundary derived
-    // from the decoded lane summary. NO caller-supplied boundary
-    // exists in the API; a forged boundary is unrepresentable. No
-    // snapshot on the chain refuses (no-anchor); an uncompacted
-    // ledger (no summary) retires only what is independently
-    // provable (cancellations); a malformed or
-    // newer-unsupported-version snapshot fails closed.
-    let anchor = crate::session_anchor::latest_session_anchor::<W>(pipeline.medium_mut())
+    // the supported version, its spine section validated under the
+    // FIXED production world codec (engine-core's NpcSaveWorld —
+    // no caller-selected SaveWorld exists in the API; the R15
+    // caller-substitution bypass is unrepresentable at the call
+    // site), its director section strictly validated (the shared
+    // session-anchor decoder — the ONE interpretation of the wire
+    // format), and the boundary derived from the decoded lane
+    // summary. NO caller-supplied boundary exists in the API; a
+    // forged boundary is unrepresentable. No snapshot on the chain
+    // refuses (no-anchor); an uncompacted ledger (no summary)
+    // retires only what is independently provable (cancellations);
+    // a malformed or newer-unsupported-version snapshot fails
+    // closed.
+    let anchor = crate::session_anchor::latest_session_anchor(pipeline.medium_mut())
         .map_err(SessionRotationError::Anchor)
         .and_then(|anchor| {
             anchor.ok_or(SessionRotationError::Anchor(

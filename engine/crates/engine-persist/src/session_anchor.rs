@@ -31,8 +31,10 @@
 //! falling back to an older one). The recognized object's domain
 //! must be EXACTLY the supported version (`…/1`) — a family match
 //! with a newer version is an UNSUPPORTED snapshot, refused typed.
-//! The container decode splits the spine section (read and
-//! discarded — bounded) from the director section (validated
+//! The container decode splits the spine section (validated through
+//! the FIXED production world codec — engine-core's `NpcSaveWorld`
+//! restoring the shared `NpcWorldSection` walk, never a
+//! caller-selected `SaveWorld`) from the director section (validated
 //! field-by-field), and the boundary derives EXCLUSIVELY from the
 //! decoded lane-summary evidence. An uncompacted ledger (v3, no
 //! summary) yields NO boundary — the rotation then retires only
@@ -40,8 +42,8 @@
 
 use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT, MAX_TAG_LEN};
 use engine_core::{
-    Decoder, Diagnostics, Level, LodConfig, NPC_COUNT, POSITION_DISCARDED, REGION_COUNT,
-    REGION_GRID, SaveError, SaveWorld, Spine,
+    Decoder, Diagnostics, Level, LodConfig, NPC_COUNT, NpcSaveWorld, POSITION_DISCARDED,
+    REGION_COUNT, REGION_GRID, SaveError, Spine,
 };
 
 use crate::consequence::ConsequenceId;
@@ -137,11 +139,15 @@ pub fn read_snapshot_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SaveE
 /// chain: the newest session snapshot (the HEAD-descent selection —
 /// the FIRST family-recognizable first content object), hash-verified
 /// through the medium's read, its domain exactly the supported
-/// version, its director section strictly validated, and the
-/// boundary derived exclusively from the decoded lane summary.
-/// `Ok(None)` when the chain carries no session snapshot at all (the
-/// rotation's no-anchor refusal applies).
-pub fn latest_session_anchor<W: SaveWorld>(
+/// version, its spine section validated under the FIXED production
+/// world codec (engine-core's `NpcSaveWorld` — the shared
+/// `NpcWorldSection` walk the application's `NpcWorld::restore`
+/// delegates to; never a caller-selected `SaveWorld`), its director
+/// section strictly validated, and the boundary derived exclusively
+/// from the decoded lane summary. `Ok(None)` when the chain carries
+/// no session snapshot at all (the rotation's no-anchor refusal
+/// applies).
+pub fn latest_session_anchor(
     medium: &mut dyn CanonicalMedium,
 ) -> Result<Option<SessionAnchor>, AnchorError> {
     let Some(head) = medium.head()? else {
@@ -169,15 +175,21 @@ pub fn latest_session_anchor<W: SaveWorld>(
                 }
                 let (spine_bytes, director_bytes) = read_snapshot_container(&bytes)
                     .map_err(|_error| AnchorError::CorruptSnapshot)?;
-                // (F4-R14-A) THE FULL SPINE VALIDATION — the
-                // production restore's own call, verbatim: the
-                // newest snapshot must be RESTORABLE before any of
-                // its evidence authorizes retirement (a
-                // hash-verified object is not automatically a valid
-                // restorable snapshot; the recovery would fail
-                // closed on an un-restorable newest session — the
-                // rotation's anchor must agree).
-                Spine::<W>::restore(&spine_bytes, Diagnostics::new(Level::Off))
+                // (F4-R14-A + R15) THE FULL SPINE VALIDATION under
+                // the PRODUCTION world's own codec: the newest
+                // snapshot must be RESTORABLE before any of its
+                // evidence authorizes retirement (a hash-verified
+                // object is not automatically a valid restorable
+                // snapshot; the recovery would fail closed on an
+                // un-restorable newest session — the rotation's
+                // anchor must agree). The world is FIXED —
+                // engine-core's NpcSaveWorld, whose section
+                // acceptance is exactly the production
+                // NpcWorld::restore's (the ONE shared
+                // NpcWorldSection codec) — so no caller can select a
+                // weaker validator: the R15 caller-substitution
+                // bypass is unrepresentable at every call site.
+                Spine::<NpcSaveWorld>::restore(&spine_bytes, Diagnostics::new(Level::Off))
                     .map_err(|_error| AnchorError::CorruptSnapshot)?;
                 let boundary = decode_director_anchor(&director_bytes)
                     .map_err(|_error| AnchorError::CorruptSnapshot)?;
