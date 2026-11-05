@@ -7271,6 +7271,273 @@ mod exclusion_tests {
         }
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// (V2X-CP2 F3) The SQLite V2 plan campaign for the
+    /// reconciliation regressions: the bound-bootstrapped founding,
+    /// the journal binding, the retained pre-range record p1, the
+    /// two range records (r2 carrying the shared+private pair), SK,
+    /// and the hand-built checkpoint MK over the [r1, r2, sk] index
+    /// with the self-skip to p1 — the reader-matrix fixture shape,
+    /// with the genuine plan published at the 460 split (batch 0 =
+    /// [sk, r2], batch 1 = [r1]). Returns (root, medium, mk,
+    /// plan_id, r1).
+    fn v2x_sqlite_reconcile_campaign(
+        label: &str,
+    ) -> (std::path::PathBuf, SqliteMedium, Hash, Hash, Hash) {
+        let root = std::env::temp_dir().join(format!(
+            "s7-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-f3-sqlite-shared");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-f3-sqlite-private");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let journal_root = root.join("journal-root");
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding_id, _binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+        let r1 = step(&mut medium, std::slice::from_ref(&shared), 2);
+        let r2 = step(&mut medium, &[shared.clone(), private.clone()], 3);
+        let sk = step(&mut medium, std::slice::from_ref(&shared), 4);
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let member_bytes: Vec<Vec<u8>> = [r1, r2]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, r2, 3),
+                ReclaimedIndexEntry::new(None, sk, 4),
+            ],
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 460, &journal_root, 90)
+                .unwrap();
+        (root, medium, mk, plan_id, r1)
+    }
+
+    #[test]
+    fn the_v2_begin_reconciliation_proves_the_different_candidates_authority() {
+        // (V2X-CP2 F3) The different-candidate reconciliation: after
+        // an uncertain publication, a DIFFERENT same-key begin is
+        // DuplicateVerified ONLY when its OWN retained authority
+        // holds — the strict temporal position, the complete
+        // retained membership, and the source binding, re-proved
+        // over the same READ-ONLY transaction with the verifier's
+        // begin identity exactly the observed revision. The payload
+        // match alone is never trusted completion. The exact
+        // attempted candidate remains the canonical
+        // ReconciledInstalled installation evidence, and the valid
+        // different candidate verifies as the OBSERVED duplicate
+        // without inventing an installation acknowledgment for the
+        // attempted one.
+        // (a) THE MANDATORY FIXTURE — a different-or-absent
+        // attempted candidate over a byte-identical but temporally
+        // invalid installed begin: never DuplicateVerified.
+        {
+            let (root, mut medium, mk, plan_id, r1) =
+                v2x_sqlite_reconcile_campaign("v2x-cp2-f3-invalid");
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.batches.len(), 2, "the 460 split: two batches");
+            // The partial audit set: batch 0 only.
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 91).unwrap();
+            // The correctly encoded, correctly plan-bound begin
+            // installed adversarially under the deterministic key
+            // (the admitted in-crate receipt — the only bypass).
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: plan_id,
+                range_digest: plan.range_digest,
+                seed: plan.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 96)
+                .with_idempotency_key(crate::reclaim::reclamation_begin_idempotency_key(&mk))
+                .with_content_refs(vec![object.hash()]);
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            // The REMAINING valid audit published ABOVE that begin
+            // (the normal gate — the audit evidence itself remains
+            // valid).
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 1, 97).unwrap();
+            // The reconciliation observation with an ABSENT
+            // attempted candidate identity: the typed temporal
+            // refusal propagates — the byte-identical payload match
+            // alone never classifies as DuplicateVerified.
+            let error = reconcile_begin_publication_v2(&mut medium, &mk, None).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the absent candidate over the temporally invalid begin refuses typed: {error:?}"
+            );
+            // The DIFFERENT attempted candidate identity: the same
+            // typed refusal.
+            let error = reconcile_begin_publication_v2(&mut medium, &mk, Some(r1)).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the different candidate over the temporally invalid begin refuses typed: {error:?}"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) THE POSITIVE DIFFERENT-CANDIDATE CONTROL — a different
+        // same-key begin with VALID retained authority: the verified
+        // duplicate naming the OBSERVED revision, never an
+        // installation acknowledgment for the attempted candidate.
+        {
+            let (root, mut medium, mk, plan_id, r1) =
+                v2x_sqlite_reconcile_campaign("v2x-cp2-f3-valid");
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            // EVERY plan-listed audit (the complete all-audits-first
+            // set).
+            for batch in plan.batches.iter().map(|b| b.index) {
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 91).unwrap();
+            }
+            // The genuine-valued begin installed ABOVE every audit
+            // (the adversarial install at the head — the temporally
+            // valid position the admission itself would occupy).
+            let begin = crate::reclaim::ReclamationBegin {
+                mk,
+                source: plan_id,
+                range_digest: plan.range_digest,
+                seed: plan.seed,
+            };
+            let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 96)
+                .with_idempotency_key(crate::reclaim::reclamation_begin_idempotency_key(&mk))
+                .with_content_refs(vec![object.hash()]);
+            let installed_id = record.id();
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(&object));
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            // The different-candidate observation: the complete
+            // authority holds → DuplicateVerified.
+            let outcome = reconcile_begin_publication_v2(&mut medium, &mk, Some(r1)).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } if id == installed_id
+                ),
+                "the valid different candidate verifies as the observed duplicate: {outcome:?}"
+            );
+            // The absent attempted candidate classifies the same
+            // way.
+            let outcome = reconcile_begin_publication_v2(&mut medium, &mk, None).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } if id == installed_id
+                ),
+                "the absent candidate over the valid authority verifies the observed duplicate: {outcome:?}"
+            );
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) THE EXACT ATTEMPTED CANDIDATE — the production
+        // uncertain-commit route (the established AfterCommit seam:
+        // the commit succeeded, the acknowledgment lost) reconciles
+        // to the canonical ReconciledInstalled installation
+        // evidence.
+        {
+            let (root, mut medium, mk, _plan_id, _r1) =
+                v2x_sqlite_reconcile_campaign("v2x-cp2-f3-exact");
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            for batch in plan.batches.iter().map(|b| b.index) {
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 91).unwrap();
+            }
+            medium.fault = Some(SqliteFaultControl::new().arm(
+                SqliteFaultPoint::AfterCommit,
+                SqliteFaultAction::InjectError,
+            ));
+            let outcome = medium.begin_reclamation_v2(&mk, 98).unwrap();
+            let crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id } = outcome
+            else {
+                panic!(
+                    "the exact attempted candidate reconciles to the installation evidence: {outcome:?}"
+                )
+            };
+            assert_eq!(
+                medium.head().unwrap().unwrap(),
+                id,
+                "the reconciled installation is the HEAD"
+            );
+            medium.fault = None;
+            medium.validate().unwrap();
+            drop(medium);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 }
 
 /// The OC-C2 trusted begin admission (the transactional twin — see
@@ -7381,9 +7648,15 @@ impl SqliteMedium {
 /// EXACT attempted candidate identity: the candidate itself
 /// canonically present is ReconciledInstalled (the membership
 /// proof, never Accepted, never a durability claim); a DIFFERENT
-/// same-key revision is separately discovered, verified duplicate
-/// evidence (DuplicateVerified); a definite absence of any same-key
-/// begin is ReconciledNotInstalled; any failure is the typed
+/// same-key revision is DuplicateVerified ONLY under its OWN
+/// complete retained-authority proof (V2X-CP2 F3: the strict
+/// temporal position, the complete retained membership, and the
+/// source binding, re-proved over the same read-only transaction
+/// with the verifier's begin identity exactly the observed
+/// revision — the payload match alone is never trusted completion;
+/// a failure is the appropriate typed refusal or the unverifiable
+/// classification); a definite absence of any same-key begin is
+/// ReconciledNotInstalled; any discovery failure is the typed
 /// unverifiable uncertainty.
 fn reconcile_begin_publication_v2(
     medium: &mut SqliteMedium,
@@ -7441,7 +7714,33 @@ fn reconcile_begin_publication_v2(
             if candidate == Some(id) {
                 Ok(crate::reclaim::BeginPublicationOutcome::ReconciledInstalled { id })
             } else {
-                Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id })
+                // (V2X-CP2 F3) A DIFFERENT same-key revision is
+                // DuplicateVerified ONLY when its OWN retained
+                // authority holds: the complete strict temporal,
+                // retained-membership, and source-binding proof over
+                // the SAME read-only transaction snapshot (no nested
+                // transaction — the reader borrows this transaction),
+                // with the verifier's begin identity exactly the
+                // observed same-key revision. The payload match
+                // alone (the expected-form equality above) is never
+                // trusted completion: a verification failure is the
+                // appropriate typed refusal (or the unverifiable
+                // classification when the observed revision is not
+                // the proven authority), never DuplicateVerified.
+                let mut authority_reads = SqliteTxReads { tx: &tx };
+                match crate::reclaim::verify_v2_begin_authority_evidence_via(
+                    &mut authority_reads,
+                    head,
+                    mk,
+                ) {
+                    Ok(evidence) if evidence.begin_id == id => {
+                        Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id })
+                    }
+                    Ok(_) => Err(MediumError::Chain {
+                        rule: "v2-begin-admission/reconcile-unverifiable",
+                    }),
+                    Err(error) => Err(error),
+                }
             }
         }
         Ok(None) => Ok(crate::reclaim::BeginPublicationOutcome::ReconciledNotInstalled),
