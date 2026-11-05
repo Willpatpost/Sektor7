@@ -2224,6 +2224,23 @@ impl LocalFileMedium {
         // (E) The duplicate resolution.
         if let Some((installed_id, installed)) = self.find_installed_begin_locked(mk)? {
             if installed == begin {
+                // (V2X-CP2 F1) A byte-identical installed begin is
+                // DuplicateVerified ONLY when the installed begin's
+                // own authority holds — the strict temporal position
+                // (the plan revision and every plan-listed audit
+                // strictly BELOW the begin) and the complete
+                // retained membership, re-proved here under the
+                // same lock. An adversarially installed
+                // byte-identical begin sitting above a
+                // later-published audit is a typed temporal refusal,
+                // never a trusted duplicate: "DuplicateVerified"
+                // asserts verified authority, never merely occupied
+                // bytes under the key.
+                let dup_head = self
+                    .read_head_file()?
+                    .ok_or(MediumError::Chain { rule: "unfounded" })?;
+                let mut reads = LocalLockedReads { medium: &*self };
+                crate::reclaim::verify_v2_begin_authority_evidence_via(&mut reads, dup_head, mk)?;
                 return Ok(crate::reclaim::BeginPublicationOutcome::DuplicateVerified {
                     id: installed_id,
                 });
@@ -7537,6 +7554,115 @@ mod exclusion_tests {
         plan
     }
 
+    /// (V2X-CP2 F1/F2) The adversarial genuine-valued begin
+    /// install: the byte-identical-to-admission form (the source =
+    /// the given plan revision record, the checkpoint's own digest
+    /// and seed) under the deterministic begin key — the route
+    /// around the admission's ordering gates that the VERIFIER's
+    /// own strict temporal proof must independently refuse.
+    fn v2x_install_begin(medium: &mut LocalFileMedium, mk: &Hash, source: Hash) {
+        let mk_record = medium.read_record(mk).unwrap();
+        let metadata =
+            CheckpointMetadata::decode(&medium.read_object(&mk_record.content_refs[0]).unwrap())
+                .unwrap();
+        let begin = crate::reclaim::ReclamationBegin {
+            mk: *mk,
+            source,
+            range_digest: metadata.range_digest,
+            seed: metadata.seed,
+        };
+        let object = StoredObject::new(begin.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            medium,
+            crate::reclaim::reclamation_begin_idempotency_key(mk),
+            &object,
+            250,
+        );
+    }
+
+    /// (V2X-CP2 F2) The adversarial plan install: the given plan
+    /// object under the deterministic plan key (the keys are
+    /// chain-unique — each doctored form needs its own fresh
+    /// campaign). Returns the installed plan revision's identity.
+    fn v2x_install_plan(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        plan: &crate::reclaim::ReclaimPlan,
+    ) -> Hash {
+        let object = StoredObject::new(plan.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            medium,
+            crate::reclaim::reclamation_plan_idempotency_key(mk),
+            &object,
+            251,
+        )
+    }
+
+    /// (V2X-CP2 F2) The adversarial audit install: the given batch
+    /// ledger under the (MK, batch) deterministic key.
+    fn v2x_install_audit(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        ledger: &crate::reclaim::ReclamationLedgerV2,
+    ) -> Hash {
+        let object = StoredObject::new(ledger.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            medium,
+            crate::reclaim::reclamation_ledger_v2_idempotency_key(mk, ledger.batch),
+            &object,
+            252,
+        )
+    }
+
+    /// (V2X-CP2 F2) The genuine-content batch ledger for a plan
+    /// batch: the units closure-collected while the retiring
+    /// records are present, the fields from the plan and the
+    /// checkpoint's own key-presence count (the recomputation the
+    /// authority itself performs — the honest value).
+    fn v2x_build_ledger(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        metadata: &CheckpointMetadata,
+        plan: &crate::reclaim::ReclaimPlan,
+        batch: &crate::reclaim::PlanBatch,
+    ) -> crate::reclaim::ReclamationLedgerV2 {
+        let mut units = Vec::with_capacity(batch.records.len());
+        let mut reclaimed_keys = 0u64;
+        for record in &batch.records {
+            let objects = crate::reclaim::collect_unit_objects(medium, record).unwrap();
+            if metadata
+                .index
+                .iter()
+                .any(|entry| entry.hash == *record && entry.key.is_some())
+            {
+                reclaimed_keys += 1;
+            }
+            units.push(crate::reclaim::ReclaimUnit {
+                record: *record,
+                objects,
+            });
+        }
+        crate::reclaim::ReclamationLedgerV2 {
+            mk: *mk,
+            sk: plan.sk,
+            batch: batch.index,
+            range_digest: plan.range_digest,
+            seed: plan.seed,
+            records: units.len() as u64,
+            reclaimed_keys,
+            units,
+        }
+    }
+
+    /// (V2X-CP2 F1/F2) The campaign's authenticated checkpoint
+    /// metadata (the permanent index — the retained key-presence
+    /// and retirement-sequence evidence).
+    fn v2x_campaign_metadata(medium: &mut LocalFileMedium, mk: &Hash) -> CheckpointMetadata {
+        let mk_record = medium.read_record(mk).unwrap();
+        CheckpointMetadata::decode(&medium.read_object(&mk_record.content_refs[0]).unwrap())
+            .unwrap()
+    }
+
     #[test]
     fn the_v2_reader_refuses_the_membership_and_order_violations() {
         // (V2X-CP1) The ordered-unit refusals: the adversarially
@@ -8548,25 +8674,139 @@ mod exclusion_tests {
 
     #[test]
     fn the_v2_begin_verifier_enforces_the_temporal_position() {
-        // (V2X-CP2 §10 TEMPORAL) The canonical position proof: the
-        // begin must sit ABOVE the plan and every audit. The
-        // adversarial constructions: (a) the plan published AFTER
-        // the begin (the begin below its source — the walk reaches
-        // the founding without the plan below → the typed
-        // target-not-below-begin); (b) one audit published AFTER
-        // the begin (the same refusal); (c) the legitimate control —
-        // everything below the begin verifies.
-        // (a)+(c): the begin first, then the plan.
+        // (V2X-CP2 F1) THE STRICT TEMPORAL BOUNDARY: every required
+        // V2 audit and the exact source plan revision must be
+        // encountered STRICTLY BELOW the installed begin on the
+        // canonical ancestry — a sighting ABOVE the begin (the walk
+        // descends from HEAD, so a sighting PRECEDING the begin's
+        // encounter is temporally after it) never counts toward
+        // certification. The decisive adversarial ordering (the
+        // review's mandatory fixture): the genuine plan and a
+        // partial audit set published through the REAL gates, the
+        // correctly encoded MK-bound V2 begin adversarially
+        // installed under the deterministic key with source == the
+        // genuine plan revision identity (the only bypass — the
+        // admission's ordering gates are routed around, the audit
+        // evidence itself remains valid), and the REMAINING valid
+        // batch audits published through the NORMAL publication
+        // gates ABOVE that begin (the publication has no
+        // begin-ordering gate by design — all-audits-first is the
+        // ADMISSION's discipline; the recovery reader's temporal
+        // proof is the independent backstop).
+        // (a) THE DECISIVE FIXTURE — one required audit above the
+        // begin: refused, never an eligible authority.
         {
             let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
-                v2_plan_campaign("v2x-cp2-plan-above");
-            // A GENUINE-LOOKING begin installed BEFORE any plan
-            // exists: the source field must name a plan record —
-            // but no plan exists yet, so the forged form names a
-            // fabricated identity; the verifier's four-field
-            // binding refuses (no plan under the key to derive the
-            // expected source — the plan-absent refusal fires
-            // first, the honest ordering).
+                v2_plan_campaign("v2x-cp2-f1-one-above");
+            // The limit 460 splits the fixture into batch 0 = [sk,
+            // r2] and batch 1 = [r1]; publish batch 0's audit only.
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 1);
+            assert!(
+                plan.batches.len() == 2 && plan.batches[0].records.len() == 2,
+                "the two-batch split with a two-record batch 0: {:?}",
+                plan.batches.len()
+            );
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            // The correctly encoded, MK-bound begin under the
+            // deterministic key — genuine values, adversarial
+            // position discipline.
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            // The REMAINING valid batch audit published ABOVE the
+            // begin through the normal gate.
+            let (_audit_id, outcome) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 1, 231).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::LedgerV2PublicationOutcome::Accepted { .. }
+                ),
+                "the valid audit publishes above the begin: {outcome:?}"
+            );
+            // The independent authority refuses the typed temporal
+            // refusal — never an eligible BeginAuthority.
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the audit above the begin refuses typed: {error:?}"
+            );
+            // THE DUPLICATE-PATH HONESTY: the admission over the
+            // same state reaches the byte-identical duplicate
+            // resolution — which now re-proves the installed
+            // begin's own authority under the lock and propagates
+            // the typed temporal refusal. A byte-identical but
+            // temporally invalid begin is never characterized as
+            // trusted completion (POSIX: the tier gate precedes the
+            // duplicate on Windows).
+            #[cfg(not(windows))]
+            {
+                let error = medium.begin_reclamation_v2(&mk, 232).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "begin-authority-v2/target-above-begin"
+                        }
+                    ),
+                    "the byte-identical duplicate is never a trusted completion: {error:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) MULTIPLE required audits above the begin: refused.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-many-above");
+            // The limit 400 splits the fixture into three
+            // single-record batches; publish batch 0's audit only.
+            let (_plan_id, _) =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 400, &journal_root, 100)
+                    .unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            assert!(
+                plan.batches.len() >= 3,
+                "the limit splits three single-record batches"
+            );
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 101).unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            for batch in plan.batches.iter().map(|b| b.index).skip(1) {
+                let (_id, outcome) =
+                    crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 233)
+                        .unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        crate::reclaim::LedgerV2PublicationOutcome::Accepted { .. }
+                    ),
+                    "the valid audit publishes above the begin: {outcome:?}"
+                );
+            }
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the audits above the begin refuse typed: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) EVERY audit below the begin: accepted — the genuine
+        // control (the plan-absent honest ordering first: no plan,
+        // the typed plan-absent refusal — never a temporal guess).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-control");
             let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
             assert!(
                 matches!(
@@ -8577,43 +8817,588 @@ mod exclusion_tests {
                 ),
                 "no plan: the verifier refuses honestly: {error:?}"
             );
-            // Now publish the plan + audits, then install the
-            // FORGED begin BELOW them: the begin must be on the
-            // ancestry ABOVE the plan — hand-install the begin
-            // first is impossible after the plan (the chain is
-            // append-only)... the adversarial below-begin form is
-            // therefore constructed by verifying with a forged
-            // source that names an ABOVE-plan record: the
-            // four-field binding is the refusing gate (proved in
-            // the forged-source test). The honest temporal proof
-            // here: the genuine sequence verifies (the control).
             let (_plan_id, _plan, _audit_ids) =
                 v2x_publish_all(&mut medium, &mk, &journal_root, 400);
-            let Some(outcome) = v2x_begin_authorize_or_refuse(&mut medium, &mk, 230) else {
-                let _ = std::fs::remove_dir_all(&root);
-                return;
-            };
-            assert!(
-                matches!(
-                    outcome,
-                    crate::reclaim::BeginPublicationOutcome::Accepted { .. }
-                ),
-                "the genuine sequence admits: {outcome:?}"
-            );
-            let authority = medium.verify_begin_authority_v2(&mk).unwrap();
-            assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            let admitted = v2x_begin_authorize_or_refuse(&mut medium, &mk, 230);
+            #[cfg(not(windows))]
+            {
+                let crate::reclaim::BeginPublicationOutcome::Accepted { .. } = admitted.unwrap()
+                else {
+                    panic!("the genuine sequence admits")
+                };
+                let authority = medium.verify_begin_authority_v2(&mk).unwrap();
+                assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            }
+            #[cfg(windows)]
+            {
+                assert!(admitted.is_none());
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
-        // (b) One audit AFTER the begin: the begin admitted over the
-        // complete set, then a NEW plan+audits campaign above it —
-        // the verifier over the SECOND campaign's mk is a different
-        // key (no interference); the honest form: a campaign whose
-        // begin exists but one audit was REPUBLISHED above (a
-        // duplicate key refuses) — unconstructible through the
-        // publications. The direct walk-level proof is the
-        // forged-source regression above + the completion check's
-        // target-not-below-begin (covered by the plan-absent arm's
-        // honest ordering and the binding-mismatch arms).
+        // (d) The begin absent: the definitive absence, not success.
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-absent");
+            let _ = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-begin-authority/absent"
+                    }
+                ),
+                "the beginless state is the definitive absence: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (e) A required audit ABSENT from the canonical ancestry:
+        // refused (the same two-batch split, the begin installed,
+        // batch 1 never published at all).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-audit-absent");
+            let _ = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 1);
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-not-below-begin"
+                    }
+                ),
+                "the never-published audit refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (f) A required audit PHYSICALLY STORED but not canonically
+        // reachable: refused — the record and object files exist in
+        // the store, but nothing on the canonical ancestry parents
+        // the record (HEAD never reaches it).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-orphan");
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 1);
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            // The genuine batch-1 ledger — stored as an orphan: the
+            // files written directly, the append never made, nothing
+            // parenting the record.
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &plan, &plan.batches[1]);
+            let object = StoredObject::new(ledger.canonical_bytes()).unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let orphan = RevisionRecord::regular(head, epoch, 253)
+                .with_idempotency_key(crate::reclaim::reclamation_ledger_v2_idempotency_key(
+                    &mk,
+                    ledger.batch,
+                ))
+                .with_content_refs(vec![object.hash()]);
+            std::fs::write(medium.object_path(&orphan.id()), orphan.canonical_bytes()).unwrap();
+            std::fs::write(medium.object_path(&object.hash()), object.bytes()).unwrap();
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-not-below-begin"
+                    }
+                ),
+                "the stored-but-unreachable audit refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (g) The WRONG-SOURCE begin: refused at the four-field
+        // binding (the plan object's content hash is not the plan
+        // revision-record identity).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-wrong-source");
+            let (plan_id, _plan, _audit_ids) =
+                v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+            let plan_object = medium.read_record(&plan_id).unwrap().content_refs[0];
+            v2x_install_begin(&mut medium, &mk, plan_object);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/binding-mismatch"
+                    }
+                ),
+                "the wrong-source begin refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (h) LEGITIMATE HISTORICAL SKIP GAPS: accepted when
+        // independently authenticated — the authorized simulated
+        // original-record disappearance (every retiring range
+        // record's object removed): the authority must NOT depend
+        // on the removed original bytes.
+        {
+            let (root, journal_root, mut medium, mk, r1, r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f1-gaps");
+            let (_plan_id, _plan, _audit_ids) =
+                v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            #[cfg(not(windows))]
+            {
+                let crate::reclaim::BeginPublicationOutcome::Accepted { id: begin_id, .. } =
+                    medium.begin_reclamation_v2(&mk, 240).unwrap()
+                else {
+                    panic!("the genuine sequence admits")
+                };
+                // The disappearing originals: r1, r2, and SK's own
+                // retirement entry — the CP3-shaped retired range.
+                std::fs::remove_file(medium.object_path(&r1)).unwrap();
+                std::fs::remove_file(medium.object_path(&r2)).unwrap();
+                std::fs::remove_file(medium.object_path(&metadata.sk)).unwrap();
+                // The authority still verifies: the recovery-safe
+                // walk crosses the retired range under the
+                // authenticated self-skip — no original retiring
+                // record is ever required.
+                let authority = medium.verify_begin_authority_v2(&mk).unwrap();
+                assert_eq!(authority.id, begin_id);
+                assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            }
+            #[cfg(windows)]
+            {
+                // The admission cannot run at this tier; the
+                // adversarial genuine-valued install drives the same
+                // recovery-safe evidence walk — the typed TIER
+                // refusal (not a missing-object or temporal error)
+                // proves the walk itself crossed the gapped chain
+                // and completed.
+                v2x_install_begin(&mut medium, &mk, _plan_id);
+                std::fs::remove_file(medium.object_path(&r1)).unwrap();
+                std::fs::remove_file(medium.object_path(&r2)).unwrap();
+                std::fs::remove_file(medium.object_path(&metadata.sk)).unwrap();
+                let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        MediumError::Chain {
+                            rule: "v2-begin-authority/tier-insufficient"
+                        }
+                    ),
+                    "the gapped-chain walk completed (the tier gate, never a walk failure): {error:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (i) UNCOVERED GAPS AND CORRUPTION: refused.
+        {
+            // The uncovered gap: a RETAINED record below the range
+            // removed (the self-skip's target — not an indexed
+            // member, covered by no skip entry): the founding
+            // descent hits the missing parent with no authenticated
+            // coverage — the typed refusal, never success.
+            {
+                let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                    v2_plan_campaign("v2x-cp2-f1-uncovered");
+                let (plan_id, _plan, _audit_ids) =
+                    v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+                v2x_install_begin(&mut medium, &mk, plan_id);
+                let metadata = v2x_campaign_metadata(&mut medium, &mk);
+                let retained_below = metadata.self_skip().unwrap().nearest_retained_ancestor;
+                std::fs::remove_file(medium.object_path(&retained_below)).unwrap();
+                let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+                assert!(
+                    matches!(error, MediumError::MissingObject { .. }),
+                    "the uncovered gap refuses typed: {error:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            // The corruption: a below-begin audit's payload object
+            // tampered — the hash-verified read refuses.
+            {
+                let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                    v2_plan_campaign("v2x-cp2-f1-corrupt");
+                let (plan_id, _plan, audit_ids) =
+                    v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+                v2x_install_begin(&mut medium, &mk, plan_id);
+                let audit_record = medium.read_record(&audit_ids[0]).unwrap();
+                let object_hash = audit_record.content_refs[0];
+                let mut tampered = medium.read_object(&object_hash).unwrap();
+                tampered[0] ^= 0xff;
+                std::fs::write(medium.object_path(&object_hash), tampered).unwrap();
+                let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+                assert!(
+                    matches!(error, MediumError::HashMismatch { .. }),
+                    "the corrupted audit object refuses: {error:?}"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn the_v2_begin_authority_proves_the_complete_retained_membership() {
+        // (V2X-CP2 F2) THE COMPLETE RETAINED MEMBERSHIP: the
+        // recovery-safe authority must independently prove that the
+        // complete ordered union of the plan's batches equals the
+        // checkpoint metadata's ENTIRE retirement index — the
+        // deterministic newest-first sequence derived from the
+        // indexed epochs, compared position by position. A forged,
+        // correctly keyed plan that is otherwise perfectly bound
+        // (the MK, SK, digest, and seed all matching) and perfectly
+        // self-consistent with its own audit set and begin refuses
+        // typed — the retained evidence alone exposes the
+        // incomplete or reordered partition, with NO original
+        // retiring record required.
+        // (a) THE HEADLINE FIXTURE — one indexed retiring record
+        // omitted from an otherwise-matching plan.
+        {
+            let (root, _journal_root, mut medium, mk, _r1, r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-omitted");
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            // The deterministic newest-first retirement sequence,
+            // derived exactly as the authority derives it.
+            let mut newest_first: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
+            newest_first
+                .sort_unstable_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.hash.cmp(&b.hash)));
+            // The shortened membership: r2 omitted.
+            let shortened: Vec<Hash> = newest_first
+                .iter()
+                .map(|entry| entry.hash)
+                .filter(|hash| *hash != r2)
+                .collect();
+            assert_eq!(shortened.len() + 1, metadata.index.len());
+            let doctored = crate::reclaim::ReclaimPlan {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                ledger_byte_limit: 460,
+                batches: vec![
+                    crate::reclaim::PlanBatch {
+                        index: 0,
+                        records: vec![shortened[0]],
+                    },
+                    crate::reclaim::PlanBatch {
+                        index: 1,
+                        records: vec![shortened[1]],
+                    },
+                ],
+                journal_files: Vec::new(),
+            };
+            let doctored_record = v2x_install_plan(&mut medium, &mk, &doctored);
+            // The MATCHING audits for the shortened plan (genuine
+            // content — the units closure-collected, the key-count
+            // the honest recomputation) and the plan-bound begin:
+            // everything self-consistent except the membership.
+            for batch in &doctored.batches {
+                let ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &doctored, batch);
+                v2x_install_audit(&mut medium, &mk, &ledger);
+            }
+            v2x_install_begin(&mut medium, &mk, doctored_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-begin-authority/plan-index-partition"
+                    }
+                ),
+                "the omitted retirement member refuses the authority: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) SET-EQUAL but incorrectly ordered membership: refused
+        // (the same three members, the batches reordered — the
+        // deterministic order is the identity, never set equality).
+        {
+            let (root, _journal_root, mut medium, mk, r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-reordered");
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let mut newest_first: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
+            newest_first
+                .sort_unstable_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.hash.cmp(&b.hash)));
+            let members: Vec<Hash> = newest_first.iter().map(|entry| entry.hash).collect();
+            // The reversed partition: the same three members, one
+            // per batch, oldest-first (r1, sk, r2) — set-equal but
+            // not order-equal.
+            let doctored = crate::reclaim::ReclaimPlan {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                ledger_byte_limit: 460,
+                batches: vec![
+                    crate::reclaim::PlanBatch {
+                        index: 0,
+                        records: vec![r1],
+                    },
+                    crate::reclaim::PlanBatch {
+                        index: 1,
+                        records: vec![members[0]],
+                    },
+                    crate::reclaim::PlanBatch {
+                        index: 2,
+                        records: vec![members[1]],
+                    },
+                ],
+                journal_files: Vec::new(),
+            };
+            let doctored_record = v2x_install_plan(&mut medium, &mk, &doctored);
+            for batch in &doctored.batches {
+                let ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &doctored, batch);
+                v2x_install_audit(&mut medium, &mk, &ledger);
+            }
+            v2x_install_begin(&mut medium, &mk, doctored_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-begin-authority/plan-index-partition"
+                    }
+                ),
+                "the reordered membership refuses the authority: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) The audit's units DISAGREEING with the plan: refused
+        // (the genuine two-record batch 0, the audit's ordered units
+        // reversed — the ordered-unit sequence is the identity).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-units");
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 0);
+            assert_eq!(plan.batches[0].records.len(), 2, "the two-record batch 0");
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let mut ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &plan, &plan.batches[0]);
+            ledger.units.reverse();
+            v2x_install_audit(&mut medium, &mk, &ledger);
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/audit-order-mismatch"
+                    }
+                ),
+                "the disagreeing units refuse: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (d) The WRONG AUDIT BATCH: refused (the batch-1 ledger's
+        // content under batch 0's deterministic key — the key and
+        // the payload's own batch index disagree).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-batch");
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 0);
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &plan, &plan.batches[1]);
+            let object = StoredObject::new(ledger.canonical_bytes()).unwrap();
+            v2x_install_under_key(
+                &mut medium,
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, 0),
+                &object,
+                255,
+            );
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/audit-binding-mismatch"
+                    }
+                ),
+                "the wrong-batch audit refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (e) The audit EXCEEDING the recorded byte limit: refused
+        // (a complete, correctly ordered plan whose admitted
+        // ledger-byte limit is 1 — every genuine-content audit
+        // exceeds it; the reader-side mirror of the publication's
+        // own capacity gate).
+        {
+            let (root, _journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-byte-limit");
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let mut newest_first: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
+            newest_first
+                .sort_unstable_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.hash.cmp(&b.hash)));
+            let members: Vec<Hash> = newest_first.iter().map(|entry| entry.hash).collect();
+            let doctored = crate::reclaim::ReclaimPlan {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                ledger_byte_limit: 1,
+                batches: vec![crate::reclaim::PlanBatch {
+                    index: 0,
+                    records: members.clone(),
+                }],
+                journal_files: Vec::new(),
+            };
+            let doctored_record = v2x_install_plan(&mut medium, &mk, &doctored);
+            let ledger =
+                v2x_build_ledger(&mut medium, &mk, &metadata, &doctored, &doctored.batches[0]);
+            assert!(
+                StoredObject::new(ledger.canonical_bytes())
+                    .unwrap()
+                    .bytes()
+                    .len() as u64
+                    > doctored.ledger_byte_limit,
+                "the genuine-content audit exceeds the doctored limit"
+            );
+            v2x_install_audit(&mut medium, &mk, &ledger);
+            v2x_install_begin(&mut medium, &mk, doctored_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/audit-byte-limit"
+                    }
+                ),
+                "the over-limit audit refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (f) The INCOHERENT retained key-count evidence: refused
+        // (the genuine plan and audit content, the ledger's
+        // reclaimed_keys count doctored — the retained index's
+        // key-presence information disagrees).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-key-count");
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 0);
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let mut ledger = v2x_build_ledger(&mut medium, &mk, &metadata, &plan, &plan.batches[0]);
+            ledger.reclaimed_keys += 1;
+            v2x_install_audit(&mut medium, &mk, &ledger);
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            v2x_install_begin(&mut medium, &mk, plan_record);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/audit-key-count"
+                    }
+                ),
+                "the incoherent key-count evidence refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (g) The plan revision's INSTALLED SHAPE: refused (a
+        // correctly keyed plan record carrying TWO content
+        // references — not the publication's single-reference
+        // form).
+        {
+            let (root, _journal_root, mut medium, mk, _r1, _r2, _shared, _p) =
+                v2_plan_campaign("v2x-cp2-f2-plan-shape");
+            let metadata = v2x_campaign_metadata(&mut medium, &mk);
+            let mut newest_first: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
+            newest_first
+                .sort_unstable_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.hash.cmp(&b.hash)));
+            let members: Vec<Hash> = newest_first.iter().map(|entry| entry.hash).collect();
+            let genuine = crate::reclaim::ReclaimPlan {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                ledger_byte_limit: 460,
+                batches: vec![crate::reclaim::PlanBatch {
+                    index: 0,
+                    records: members.clone(),
+                }],
+                journal_files: Vec::new(),
+            };
+            let object = StoredObject::new(genuine.canonical_bytes()).unwrap();
+            // The record codec canonically ORDERS the content
+            // references, so the second object is CHOSEN to keep
+            // the plan payload as the canonical first reference
+            // (the discovery's read) — the shape violation is the
+            // reference COUNT, never a misdirected first read.
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let mut second = None;
+            for nonce in 0..64u64 {
+                let candidate = StoredObject::new({
+                    let mut enc = Encoder::new();
+                    enc.write_str("sektor7/save/1");
+                    enc.write_bytes(format!("v2x-cp2-f2-shape-second-{nonce}").as_bytes());
+                    enc.into_bytes()
+                })
+                .unwrap();
+                let probe = RevisionRecord::regular(head, epoch, 256)
+                    .with_idempotency_key(crate::reclaim::reclamation_plan_idempotency_key(&mk))
+                    .with_content_refs(vec![object.hash(), candidate.hash()]);
+                let canonical = RevisionRecord::decode(&probe.canonical_bytes()).unwrap();
+                if canonical.content_refs[0] == object.hash() {
+                    second = Some(candidate);
+                    break;
+                }
+            }
+            let second =
+                second.expect("a canonical-order-preserving second object exists (64 candidates)");
+            let record = RevisionRecord::regular(head, epoch, 256)
+                .with_idempotency_key(crate::reclaim::reclamation_plan_idempotency_key(&mk))
+                .with_content_refs(vec![object.hash(), second.hash()]);
+            let record_id = record.id();
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, vec![object, second].as_slice());
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            v2x_install_begin(&mut medium, &mk, record_id);
+            let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-begin-authority/plan-shape-mismatch"
+                    }
+                ),
+                "the non-installed plan shape refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (h) THE CONTROL — the correct complete membership:
+        // accepted (the genuine publication's own partition, the
+        // genuine admission, the authority's grade).
+        {
+            let (root, journal_root, mut medium, mk, _r1, _r2, _s, _p) =
+                v2_plan_campaign("v2x-cp2-f2-control");
+            let (_plan_id, _plan, _audit_ids) =
+                v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+            let admitted = v2x_begin_authorize_or_refuse(&mut medium, &mk, 260);
+            #[cfg(not(windows))]
+            {
+                let crate::reclaim::BeginPublicationOutcome::Accepted { .. } = admitted.unwrap()
+                else {
+                    panic!("the genuine complete membership admits")
+                };
+                let authority = medium.verify_begin_authority_v2(&mk).unwrap();
+                assert_eq!(authority.tier, crate::medium::SyncTier::FullPosixSequence);
+            }
+            #[cfg(windows)]
+            {
+                assert!(admitted.is_none());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -8817,6 +9602,141 @@ mod exclusion_tests {
             authority.tier,
             crate::medium::SyncTier::TransactionalWalFull
         );
+        // (V2X-CP2 F1) THE DECISIVE TEMPORAL ORDERING through the
+        // transaction twin: the genuine plan and a partial audit
+        // set, the adversarial genuine-valued begin installed under
+        // the deterministic key (the admitted in-crate receipt —
+        // the only bypass), the REMAINING valid audit published
+        // through the normal gate ABOVE the begin. The sqlite
+        // authority refuses typed, and the ADMISSION's
+        // byte-identical duplicate resolution — which now re-proves
+        // the installed begin's authority inside the transaction —
+        // propagates the temporal refusal, never DuplicateVerified.
+        {
+            let label2 = "v2x-cp2-sqlite-f1";
+            let root2 = std::env::temp_dir().join(format!(
+                "s7-{label2}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root2).unwrap();
+            let mut medium2 = crate::SqliteMedium::open(root2.join("db.sqlite")).unwrap();
+            let founding2 = RevisionRecord::founding(AuthorityMode::Standalone, label2, 0)
+                .with_content_refs(vec![shared.hash()]);
+            medium2
+                .append(&founding2, std::slice::from_ref(&shared), None)
+                .unwrap();
+            let journal_root2 = root2.join("journal-root");
+            let founding_id2 = founding2.id();
+            let location2 = crate::reclaim::JournalRootBinding::normalize_location(&journal_root2);
+            let root_id2 = crate::reclaim::journal_root_id(&founding_id2, &location2);
+            drop(
+                crate::reclaim::create_campaign_bound_journal(
+                    &mut medium2,
+                    &journal_root2,
+                    &founding_id2,
+                )
+                .unwrap(),
+            );
+            let (_binding2, _) = crate::reclaim::publish_journal_root_binding(
+                &mut medium2,
+                &founding_id2,
+                &root_id2,
+                &location2,
+                1,
+            )
+            .unwrap();
+            let step2 =
+                |medium: &mut crate::SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+                    let head = medium.head().unwrap().unwrap();
+                    let epoch = medium.read_record(&head).unwrap().epoch;
+                    let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+                    let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+                    medium.append(&record, objects, Some(head)).unwrap();
+                    record.id()
+                };
+            let p1_2 = step2(&mut medium2, std::slice::from_ref(&shared), 1);
+            let r1_2 = step2(&mut medium2, std::slice::from_ref(&shared), 2);
+            let r2_2 = step2(&mut medium2, &[shared.clone(), private.clone()], 3);
+            let sk_2 = step2(&mut medium2, std::slice::from_ref(&shared), 4);
+            let seed2 = crate::checkpoint::compute_digest_seed(&founding_id2);
+            let member_bytes2: Vec<Vec<u8>> = [r1_2, r2_2]
+                .iter()
+                .map(|id| medium2.read_record(id).unwrap().canonical_bytes())
+                .collect();
+            let digest2 = crate::checkpoint::chain_range_digest(&seed2, &member_bytes2);
+            let meta2 = CheckpointMetadata::new(
+                sk_2,
+                r1_2,
+                vec![SkipEntry::new(Hash::ZERO, p1_2)],
+                vec![
+                    ReclaimedIndexEntry::new(None, r1_2, 2),
+                    ReclaimedIndexEntry::new(None, r2_2, 3),
+                    ReclaimedIndexEntry::new(None, sk_2, 4),
+                ],
+                digest2,
+                seed2,
+            );
+            let meta_object2 = StoredObject::new(meta2.canonical_bytes()).unwrap();
+            let mk2 = step2(&mut medium2, std::slice::from_ref(&meta_object2), 5);
+            // The 460 split: batch 0 = [sk, r2], batch 1 = [r1] —
+            // publish batch 0's audit only.
+            let (plan_id2, _) = crate::reclaim::publish_reclamation_plan(
+                &mut medium2,
+                &mk2,
+                460,
+                &journal_root2,
+                90,
+            )
+            .unwrap();
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium2, &mk2, 0, 91).unwrap();
+            // The adversarial genuine-valued begin under the
+            // deterministic key (the admitted in-crate receipt).
+            let begin2 = crate::reclaim::ReclamationBegin {
+                mk: mk2,
+                source: plan_id2,
+                range_digest: meta2.range_digest,
+                seed: meta2.seed,
+            };
+            let object2 = StoredObject::new(begin2.canonical_bytes()).unwrap();
+            let head2 = medium2.head().unwrap().unwrap();
+            let epoch2 = medium2.read_record(&head2).unwrap().epoch;
+            let record2 = RevisionRecord::regular(head2, epoch2, 96)
+                .with_idempotency_key(crate::reclaim::reclamation_begin_idempotency_key(&mk2))
+                .with_content_refs(vec![object2.hash()]);
+            let admitted2 =
+                crate::medium::AdmittedAppend::generic(&record2, std::slice::from_ref(&object2));
+            medium2.append_admitted(admitted2, Some(head2)).unwrap();
+            // The REMAINING valid audit published ABOVE the begin.
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium2, &mk2, 1, 97).unwrap();
+            // The sqlite authority refuses the typed temporal refusal.
+            let error = medium2.verify_begin_authority_v2(&mk2).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the sqlite audit-above-begin refuses typed: {error:?}"
+            );
+            // The admission's byte-identical duplicate resolution
+            // propagates the refusal — never a trusted duplicate.
+            let error = medium2.begin_reclamation_v2(&mk2, 98).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "begin-authority-v2/target-above-begin"
+                    }
+                ),
+                "the sqlite byte-identical duplicate is never a trusted completion: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root2);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1452,9 +1452,18 @@ fn begin_reclamation_v2_tx(
         seed,
     };
     // (C) The duplicate resolution (the exact-content check IS the
-    // V1/V2 source-form exclusion).
+    // V1/V2 source-form exclusion). A byte-identical installed
+    // begin is DuplicateVerified ONLY when the installed begin's
+    // own authority holds (V2X-CP2 F1): the strict temporal
+    // position and the complete retained membership, re-proved
+    // inside this same transaction — an adversarially installed
+    // byte-identical begin above a later-published audit is a
+    // typed temporal refusal, never a trusted duplicate.
     let key = crate::reclaim::reclamation_begin_idempotency_key(&begin.mk);
     if let Some((installed_id, _installed)) = find_installed_begin_tx(tx, mk, &begin)? {
+        let mut reads = SqliteTxReads { tx };
+        let dup_head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+        crate::reclaim::verify_v2_begin_authority_evidence_via(&mut reads, dup_head, mk)?;
         return Ok((
             crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id: installed_id },
             None,

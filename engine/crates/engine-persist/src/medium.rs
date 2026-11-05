@@ -780,10 +780,13 @@ pub trait CanonicalMedium {
     /// carry the authority) and the truthfully established grade.
     /// Under the provider's own coordination: the checkpoint, the
     /// plan, the founding-derived seed, the W2 mixed-state refusal,
-    /// and the shared
+    /// the complete retained-membership proof (the plan's batches
+    /// equal the checkpoint index's entire retirement set in the
+    /// newest-first epoch order), and the shared
     /// [`crate::reclaim::verify_installed_begin_v2`] temporal proof
-    /// (the four-field plan-record binding; the plan and every
-    /// required audit positioned BELOW the begin). The durability
+    /// (the four-field plan-record binding; the per-audit immutable
+    /// invariants; the plan and every required audit positioned
+    /// STRICTLY BELOW the begin). The durability
     /// grade is ESTABLISHED, never assumed: POSIX local returns
     /// `FullPosixSequence` only after the completed reaffirmation
     /// sequence; Windows local refuses typed (ProcessCrashOnly

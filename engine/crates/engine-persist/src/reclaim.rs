@@ -925,12 +925,22 @@ pub struct V2InstalledBegin {
 ///   ratified V2 source semantics; a V1-bound begin fails this
 ///   binding by construction), the plan's range digest, and the
 ///   plan's founding seed;
-/// - THE CANONICAL TEMPORAL POSITION: the plan revision AND every
-///   plan-defined audit key encountered BELOW the begin on the
-///   walked ancestry (each audit's object strictly decoded with the
+/// - THE CANONICAL TEMPORAL POSITION (the strict boundary): the
+///   begin's discovered location is a STRICT temporal boundary —
+///   the plan revision and every plan-defined audit key count
+///   toward certification ONLY when encountered strictly BELOW
+///   that boundary during the HEAD-to-founding descent; a sighting
+///   ABOVE the begin is recorded as the boundary violation and
+///   NEVER reused as below-begin proof (the walk descends, so
+///   sightings preceding the begin's encounter are temporally
+///   AFTER it — above it on the ancestry);
+/// - each below-begin audit's object strictly decoded with the
 ///   field agreement and the ordered unit sequence against the
-///   plan's own batch records — the immutable partition), the
-///   plan-key record's identity exactly the claimed plan record;
+///   plan's own batch records (the immutable partition), its
+///   encoded bytes within the plan's admitted ledger byte limit,
+///   and its `reclaimed_keys` count recomputed from the retained
+///   checkpoint index's key-presence information (the plan-key
+///   record's identity exactly the claimed plan record);
 /// - every failure typed and fail-closed; `Ok(None)` only when no
 ///   begin exists under the key at all (the definitive absence).
 pub fn verify_installed_begin_v2<R: BeginReads>(
@@ -939,6 +949,7 @@ pub fn verify_installed_begin_v2<R: BeginReads>(
     mk: &Hash,
     plan_record: &Hash,
     plan: &ReclaimPlan,
+    metadata: &crate::checkpoint::CheckpointMetadata,
 ) -> Result<Option<V2InstalledBegin>, MediumError> {
     const MAX_DESCENT: u64 = 1 << 20;
     let begin_key = reclamation_begin_idempotency_key(mk);
@@ -957,6 +968,11 @@ pub fn verify_installed_begin_v2<R: BeginReads>(
     let mut installed: Option<(Hash, ReclamationBegin)> = None;
     let mut found_plan: Option<Hash> = None;
     let mut found_audits: std::collections::BTreeMap<u64, Hash> = std::collections::BTreeMap::new();
+    // (V2X-CP2 F1) The strict-boundary state: targets collected
+    // ONLY below the begin; a required target sighted ABOVE the
+    // begin (before its encounter in the descending walk) is the
+    // recorded boundary violation — never below-begin proof.
+    let mut target_above_begin = false;
     for _ in 0..MAX_DESCENT {
         if !seen.insert(current) {
             return Err(MediumError::Chain { rule: "cycle" });
@@ -1030,13 +1046,19 @@ pub fn verify_installed_begin_v2<R: BeginReads>(
             installed = Some((current, begin));
         }
         // The target collection (the plan revision and every audit
-        // key — meaningful below OR above the begin; the temporal
-        // proof requires them BELOW, checked at termination).
+        // key) — STRICTLY BELOW the begin only (V2X-CP2 F1): a
+        // sighting while the begin is not yet encountered is ABOVE
+        // the begin on the ancestry (the walk descends from HEAD),
+        // recorded as the boundary violation and never counted.
         if record.idempotency_key.as_deref() == Some(plan_key.as_slice()) {
-            if found_plan.is_some() && found_plan != Some(current) {
-                return Err(MediumError::Chain { rule: "cycle" });
+            if installed.is_some() {
+                if found_plan.is_some() && found_plan != Some(current) {
+                    return Err(MediumError::Chain { rule: "cycle" });
+                }
+                found_plan = Some(current);
+            } else {
+                target_above_begin = true;
             }
-            found_plan = Some(current);
         }
         if let Some(key) = record.idempotency_key.clone()
             && let Some(batch_index) = expected_audit_keys.get(&key).copied()
@@ -1070,19 +1092,63 @@ pub fn verify_installed_begin_v2<R: BeginReads>(
                     rule: "begin-authority-v2/audit-order-mismatch",
                 });
             }
-            found_audits.insert(batch_index, current);
+            // (V2X-CP2 F2) The audit's encoded byte limit against
+            // the plan's admitted bound — the same immutable
+            // invariant the CP1 reader enforces on the audit set.
+            if bytes.len() as u64 > plan.ledger_byte_limit {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/audit-byte-limit",
+                });
+            }
+            // (V2X-CP2 F2) The retained key-count recomputation:
+            // the audit's `reclaimed_keys` count recomputed from
+            // the retained checkpoint index's key-presence
+            // information (the index is permanent evidence — the
+            // check needs no original retiring record). Every unit
+            // is an indexed member (the membership proof precedes
+            // this walk); a lookup miss is fail-closed.
+            let mut recomputed_keys = 0u64;
+            for unit in &ledger.units {
+                match metadata
+                    .index
+                    .binary_search_by(|entry| entry.hash.cmp(&unit.record))
+                {
+                    Ok(position) => {
+                        if metadata.index[position].key.is_some() {
+                            recomputed_keys =
+                                recomputed_keys.checked_add(1).ok_or(MediumError::Chain {
+                                    rule: "begin-authority-v2/audit-key-count",
+                                })?;
+                        }
+                    }
+                    Err(_) => {
+                        return Err(MediumError::Chain {
+                            rule: "begin-authority-v2/audit-member-not-indexed",
+                        });
+                    }
+                }
+            }
+            if recomputed_keys != ledger.reclaimed_keys {
+                return Err(MediumError::Chain {
+                    rule: "begin-authority-v2/audit-key-count",
+                });
+            }
+            if installed.is_some() {
+                found_audits.insert(batch_index, current);
+            } else {
+                target_above_begin = true;
+            }
             let _ = object_hash;
         }
         // The completion check: the begin found AND every target
-        // collected BELOW it.
+        // collected BELOW it (the collections are below-gated —
+        // only sightings strictly after the begin's encounter in
+        // the descending walk count, which are exactly the records
+        // strictly below the begin on the linear ancestry).
         if let Some((begin_id, begin)) = installed.as_ref()
             && found_plan == Some(*plan_record)
             && found_audits.len() == plan.batches.len()
         {
-            // The temporal proof: every target was encountered
-            // BELOW the begin (the walk descends; anything
-            // collected after the begin's encounter is below it
-            // by construction — the chain is a linear ancestry).
             let mut audit_records = Vec::with_capacity(plan.batches.len());
             for batch in &plan.batches {
                 audit_records.push(
@@ -1100,11 +1166,19 @@ pub fn verify_installed_begin_v2<R: BeginReads>(
         }
         let Some(parent) = record.parent else {
             // The founding: no begin under the key at all — the
-            // definitive absence; a begin found with a MISSING
-            // target never certifies.
+            // definitive absence; a begin found with a required
+            // target NOT strictly below it never certifies — the
+            // typed temporal refusal distinguishes the sighting
+            // ABOVE the begin (the strict-boundary violation — a
+            // required audit or the plan revision published after
+            // the begin) from the never-encountered-below absence.
             if installed.is_some() {
                 return Err(MediumError::Chain {
-                    rule: "begin-authority-v2/target-not-below-begin",
+                    rule: if target_above_begin {
+                        "begin-authority-v2/target-above-begin"
+                    } else {
+                        "begin-authority-v2/target-not-below-begin"
+                    },
                 });
             }
             return Ok(None);
@@ -1162,16 +1236,21 @@ pub struct V2BeginAuthorityEvidence {
 /// (1) the MK checkpoint authentication (the canonical membership,
 /// the permanent metadata, the SK binding, the non-empty index);
 /// (2) the installed plan discovery (the deterministic key), the
-/// plan's binding to the checkpoint's facts, and the ledger-byte
-/// ceiling;
+/// plan's binding to the checkpoint's facts, the ledger-byte
+/// ceiling, the plan revision's installed shape and exact key, and
+/// THE COMPLETE RETAINED MEMBERSHIP PROOF (the flattened plan
+/// batches equal the checkpoint index's retirement set in the
+/// ratified newest-first epoch order, position by position);
 /// (3) the founding-derived seed (the founding is permanent — the
 /// recovery-safe descent);
 /// (4) the W2 mixed-state refusal (a v1 audit under the MK's v1
 /// ledger key coexisting with the plan refuses — one
 /// interpretation per MK, ever);
 /// (5) [`verify_installed_begin_v2`] — the begin's canonical
-/// membership, the four-field plan-record binding, and the temporal
-/// position of the plan and every audit below the begin.
+/// membership, the four-field plan-record binding, the per-audit
+/// immutable invariants (the byte limit, the retained key-count
+/// recomputation), and the STRICT temporal position of the plan
+/// and every audit below the begin.
 /// Every failure is typed and fail-closed; the definitive absence
 /// of a begin under the key is the typed
 /// `v2-begin-authority/absent` refusal.
@@ -1220,6 +1299,59 @@ pub(crate) fn verify_v2_begin_authority_evidence_via<R: BeginReads>(
             rule: "v2-begin-authority/ledger-byte-limit-exceeds-ceiling",
         });
     }
+    // (V2X-CP2 F2) THE INSTALLED PLAN REVISION'S SHAPE AND EXACT
+    // DETERMINISTIC KEY: the discovery matched the key, and the
+    // decoded content is bound — the revision ITSELF must carry
+    // the publication's shape (a regular revision with exactly one
+    // content reference — the already-decoded plan object), or the
+    // record under the key is not the installed plan form.
+    {
+        let plan_key = reclamation_plan_idempotency_key(mk);
+        let plan_revision = read_record_via(reads, &plan_record)?;
+        if !matches!(plan_revision.kind, crate::record::RecordKind::Regular)
+            || plan_revision.content_refs.len() != 1
+            || plan_revision.idempotency_key.as_deref() != Some(plan_key.as_slice())
+        {
+            return Err(MediumError::Chain {
+                rule: "v2-begin-authority/plan-shape-mismatch",
+            });
+        }
+    }
+    // (V2X-CP2 F2) THE COMPLETE RETAINED MEMBERSHIP PROOF — the
+    // recovery-safe equivalent of the CP1 reader's ordered
+    // partition agreement, from permanent evidence only: the
+    // checkpoint's retained index independently re-derived into
+    // its deterministic newest-first retirement sequence (from
+    // the indexed epochs — the index is stored hash-sorted, so the
+    // retirement order is DERIVED here, never trusted) and
+    // compared position by position with the flattened plan batch
+    // membership: no omission, no injection, no duplicate, no
+    // reordering (a set-equal but reordered partition refuses —
+    // the deterministic order is the identity). A forged,
+    // correctly keyed plan that is otherwise self-consistent with
+    // its own audit set therefore cannot appear complete.
+    {
+        let index_records: Vec<Hash> = {
+            let mut newest_first: Vec<&crate::checkpoint::ReclaimedIndexEntry> =
+                metadata.index.iter().collect();
+            // Newest-first by epoch; the hash is the deterministic
+            // tiebreak (genuine epochs are unique — an adversarial
+            // duplicate-epoch index still derives one fixed order).
+            newest_first
+                .sort_unstable_by(|a, b| b.epoch.cmp(&a.epoch).then_with(|| a.hash.cmp(&b.hash)));
+            newest_first.iter().map(|entry| entry.hash).collect()
+        };
+        let plan_records: Vec<Hash> = plan
+            .batches
+            .iter()
+            .flat_map(|batch| batch.records.iter().copied())
+            .collect();
+        if plan_records != index_records {
+            return Err(MediumError::Chain {
+                rule: "v2-begin-authority/plan-index-partition",
+            });
+        }
+    }
     // (3) The founding-derived seed (the recovery-safe descent —
     // the founding is permanent).
     let founding = founding_identity_via(reads, head)?;
@@ -1241,8 +1373,12 @@ pub(crate) fn verify_v2_begin_authority_evidence_via<R: BeginReads>(
             rule: "v2-begin-authority/v1-audit-mixed",
         });
     }
-    // (5) The canonical installed begin with the temporal proof.
-    let Some(installed) = verify_installed_begin_v2(reads, head, mk, &plan_record, &plan)? else {
+    // (5) The canonical installed begin with the strict temporal
+    // proof (the metadata supplies the retained key-presence
+    // evidence the per-audit key-count recomputation needs).
+    let Some(installed) =
+        verify_installed_begin_v2(reads, head, mk, &plan_record, &plan, &metadata)?
+    else {
         return Err(MediumError::Chain {
             rule: "v2-begin-authority/absent",
         });
