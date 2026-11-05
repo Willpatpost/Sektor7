@@ -7768,6 +7768,268 @@ mod exclusion_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn the_v2_reader_refuses_the_over_ceiling_ledger_byte_limit() {
+        // (V2X-CP1 F3) The accepted plan publisher enforces the
+        // canonical MAX_RECLAMATION_LEDGER_BYTES upper bound; the
+        // reader now independently rejects a decoded installed plan
+        // whose recorded limit exceeds it (the plan codec refuses
+        // only the zero form). The adversarial install: a correctly
+        // keyed, hash-valid plan carrying an over-ceiling limit with
+        // otherwise GENUINE checkpoint fields (the binding passes;
+        // the ceiling check refuses BEFORE anything downstream
+        // trusts the recorded bound — never ExecutionReady).
+        let (root, _journal_root, mut medium, mk, r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-f3-ceiling");
+        // The genuine checkpoint facts (read from the installed
+        // metadata — the binding must pass so the ceiling check is
+        // the refusing gate).
+        let mk_record = medium.read_record(&mk).unwrap();
+        let sk = mk_record.parent.unwrap();
+        let metadata =
+            CheckpointMetadata::decode(&medium.read_object(&mk_record.content_refs[0]).unwrap())
+                .unwrap();
+        let doctored = crate::reclaim::ReclaimPlan {
+            mk,
+            sk,
+            range_digest: metadata.range_digest,
+            seed: metadata.seed,
+            ledger_byte_limit: crate::reclaim::MAX_RECLAMATION_LEDGER_BYTES + 1,
+            batches: vec![crate::reclaim::PlanBatch {
+                index: 0,
+                records: vec![r1],
+            }],
+            journal_files: Vec::new(),
+        };
+        let object = StoredObject::new(doctored.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            &mut medium,
+            crate::reclaim::reclamation_plan_idempotency_key(&mk),
+            &object,
+            160,
+        );
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/ledger-byte-limit-exceeds-ceiling"
+                }
+            ),
+            "the over-ceiling recorded limit refuses: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_enforces_the_unconditional_empty_range_digest() {
+        // (V2X-CP1 F4) THE UNCONDITIONAL DIGEST COMPARISON: an empty
+        // digest-member sequence's digest is the SEED itself (the
+        // accepted chain_range_digest contract for an empty range),
+        // and the incremental fold agrees — asserted directly, then
+        // END-TO-END through the reader over a genuine SK-only
+        // campaign (the index's single member is the SK, which the
+        // digest membership excludes — the empty fold equals the
+        // stored seed commitment and the reader certifies), and the
+        // ADVERSARIAL refusal: a wrong stored commitment with the
+        // same empty member set refuses range-digest-mismatch (the
+        // removed digest_members > 0 conditional would have skipped
+        // exactly this case).
+        // (a) The unit parity: the accepted empty digest is the seed.
+        let seed = [7u8; 32];
+        let accepted_empty = crate::checkpoint::chain_range_digest(&seed, &[] as &[Vec<u8>]);
+        assert_eq!(accepted_empty, seed);
+        let incremental_empty = seed;
+        assert_eq!(incremental_empty, accepted_empty);
+        // (b) The genuine end-to-end: the SK-only campaign (the
+        // bound bootstrap at the founding, the SK record, the
+        // metadata whose index is exactly [SK] and whose stored
+        // digest is the accepted empty digest = the seed).
+        let root = temp_store("v2x-f4-empty");
+        let mut medium = LocalFileMedium::open(root.clone()).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-f4-shared");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "v2x-f4-empty", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let journal_root = std::env::temp_dir().join(format!(
+            "s7-v2x-f4-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding_id, _binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut LocalFileMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let sk = step(&mut medium, std::slice::from_ref(&shared), 2);
+        let digest_seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let meta = CheckpointMetadata::new(
+            sk,
+            sk,
+            Vec::new(),
+            vec![ReclaimedIndexEntry::new(None, sk, 2)],
+            digest_seed,
+            digest_seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = step(&mut medium, std::slice::from_ref(&meta_object), 3);
+        // The genuine publications (the plan and its single-batch
+        // audit) — the publication's own V2W-F2 evidence accepts the
+        // empty digest member set (the recomputation is the seed).
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 10)
+                .unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.batches.len(), 1);
+        let (audit_id, _) =
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 11).unwrap();
+        // THE READER CERTIFIES with the empty incremental fold (the
+        // accumulator equals the seed — the stored commitment).
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady {
+                plan_record,
+                audit_records,
+                ..
+            } => {
+                assert_eq!(plan_record, plan_id);
+                assert_eq!(audit_records, vec![audit_id]);
+            }
+            other => panic!("the genuine SK-only campaign certifies ready: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        // (c) THE ADVERSARIAL REFUSAL: the same shape with a WRONG
+        // stored commitment ([9; 32] instead of the seed) — the
+        // genuine publications would refuse it (the V2W-F2
+        // recomputation), so the plan and the audit are adversarially
+        // installed under their deterministic keys carrying the same
+        // wrong digest (the binding passes); the reader's
+        // UNCONDITIONAL comparison refuses (the empty fold = the
+        // seed != the wrong commitment) — exactly the case the
+        // removed conditional skipped.
+        let root_c = temp_store("v2x-f4-empty-adversarial");
+        let mut medium_c = LocalFileMedium::open(root_c.clone()).unwrap();
+        let shared_c = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-f4-shared-c");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding_c = RevisionRecord::founding(AuthorityMode::Standalone, "v2x-f4-empty-adv", 0)
+            .with_content_refs(vec![shared_c.hash()]);
+        medium_c
+            .append(&founding_c, std::slice::from_ref(&shared_c), None)
+            .unwrap();
+        let step_c = |medium: &mut LocalFileMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let sk_c = step_c(&mut medium_c, std::slice::from_ref(&shared_c), 1);
+        let seed_c = crate::checkpoint::compute_digest_seed(&founding_c.id());
+        let wrong_digest = [9u8; 32];
+        let meta_c = CheckpointMetadata::new(
+            sk_c,
+            sk_c,
+            Vec::new(),
+            vec![ReclaimedIndexEntry::new(None, sk_c, 1)],
+            wrong_digest,
+            seed_c,
+        );
+        let meta_object_c = StoredObject::new(meta_c.canonical_bytes()).unwrap();
+        let mk_c = step_c(&mut medium_c, std::slice::from_ref(&meta_object_c), 2);
+        // The adversarial plan (the binding-matching wrong digest,
+        // a within-ceiling limit, the SK-only batch).
+        let doctored_plan = crate::reclaim::ReclaimPlan {
+            mk: mk_c,
+            sk: sk_c,
+            range_digest: wrong_digest,
+            seed: seed_c,
+            ledger_byte_limit: 1024,
+            batches: vec![crate::reclaim::PlanBatch {
+                index: 0,
+                records: vec![sk_c],
+            }],
+            journal_files: Vec::new(),
+        };
+        let plan_object_c = StoredObject::new(doctored_plan.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            &mut medium_c,
+            crate::reclaim::reclamation_plan_idempotency_key(&mk_c),
+            &plan_object_c,
+            20,
+        );
+        // The adversarial audit (the same wrong digest, the SK unit
+        // with its genuine closure).
+        let sk_objects = crate::reclaim::collect_unit_objects(&mut medium_c, &sk_c).unwrap();
+        let doctored_audit = crate::reclaim::ReclamationLedgerV2 {
+            mk: mk_c,
+            sk: sk_c,
+            batch: 0,
+            range_digest: wrong_digest,
+            seed: seed_c,
+            records: 1,
+            reclaimed_keys: 0,
+            units: vec![crate::reclaim::ReclaimUnit {
+                record: sk_c,
+                objects: sk_objects,
+            }],
+        };
+        let audit_object_c = StoredObject::new(doctored_audit.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            &mut medium_c,
+            crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk_c, 0),
+            &audit_object_c,
+            21,
+        );
+        let error =
+            crate::reclaim::verify_v2_execution_readiness(&mut medium_c, &mk_c).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/range-digest-mismatch"
+                }
+            ),
+            "the wrong empty-range commitment refuses unconditionally: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root_c);
+    }
+
     fn two_retirement_store(
         label: &str,
     ) -> (

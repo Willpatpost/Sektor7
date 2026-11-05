@@ -2467,6 +2467,20 @@ pub fn verify_v2_execution_readiness(
             rule: "v2-readiness/plan-binding",
         });
     }
+    // (V2X-CP1 F3) THE LEDGER-BYTE CEILING — the accepted plan
+    // publisher enforces the canonical upper bound
+    // (MAX_RECLAMATION_LEDGER_BYTES); the reader independently
+    // rejects a decoded installed plan whose recorded limit exceeds
+    // it (the plan codec itself refuses only the zero form, so an
+    // adversarially installed over-ceiling plan must be caught
+    // HERE, before anything downstream trusts the recorded bound).
+    // The constant is unchanged and its numerical value is NOT
+    // ratified by this check.
+    if plan.ledger_byte_limit > MAX_RECLAMATION_LEDGER_BYTES {
+        return Err(MediumError::Chain {
+            rule: "v2-readiness/ledger-byte-limit-exceeds-ceiling",
+        });
+    }
     // (4) THE ALL-AUDITS DISCOVERY AND COMPLETENESS — BEFORE any
     // range-crossing descent or evidence verification (V2X-CP1 F2:
     // the readiness classifications are truthful — the
@@ -2551,7 +2565,6 @@ pub fn verify_v2_execution_readiness(
     indexed_members.sort_unstable_by_key(|entry| entry.epoch);
     let mut index_objects: std::collections::BTreeSet<Hash> = std::collections::BTreeSet::new();
     let mut digest_chain = metadata.seed;
-    let mut digest_members = 0u64;
     for entry in &indexed_members {
         let record = match medium.read_record(&entry.hash) {
             Ok(record) => record,
@@ -2566,7 +2579,6 @@ pub fn verify_v2_execution_readiness(
                 &digest_chain,
                 &record.canonical_bytes(),
             );
-            digest_members += 1;
         }
     }
     let range_member = |hash: &Hash| {
@@ -2608,10 +2620,14 @@ pub fn verify_v2_execution_readiness(
             Err(other) => return Err(other),
         }
     }
-    // (5d) THE DIGEST COMPARISON — the incrementally recomputed
-    // range digest equals the checkpoint's stored commitment (the
-    // fabricated-checkpoint counterexample refuses here).
-    if digest_members > 0 && digest_chain != metadata.range_digest {
+    // (5d) THE DIGEST COMPARISON — UNCONDITIONAL (V2X-CP1 F4): the
+    // incrementally recomputed range digest equals the checkpoint's
+    // stored commitment regardless of the member count — an empty
+    // digest-member sequence's digest is the seed itself (exactly
+    // the accepted chain_range_digest contract for an empty range),
+    // and an incorrect stored commitment refuses even then; the
+    // fabricated-checkpoint counterexample refuses here.
+    if digest_chain != metadata.range_digest {
         return Err(MediumError::Chain {
             rule: "v2-readiness/range-digest-mismatch",
         });
