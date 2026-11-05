@@ -6976,6 +6976,636 @@ mod exclusion_tests {
         let _ = std::fs::remove_file(absolute.with_extension("lock"));
     }
 
+    // -------------------------------------------------------------
+    // (V2X-CP1) THE TRUSTED ALL-AUDITS READER
+    // -------------------------------------------------------------
+
+    /// The complete publication helper: the plan at the given limit
+    /// plus EVERY plan-listed batch audit (the all-audits-first
+    /// discipline), returning (plan_id, plan, audit_ids).
+    fn v2x_publish_all(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        journal_root: &std::path::Path,
+        limit: u64,
+    ) -> (Hash, crate::reclaim::ReclaimPlan, Vec<Hash>) {
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(medium, mk, limit, journal_root, 100).unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(medium, mk)
+            .unwrap()
+            .unwrap();
+        let mut audit_ids = Vec::new();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            let (audit_id, outcome) =
+                crate::reclaim::publish_reclamation_ledger_v2(medium, mk, batch, 101).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::reclaim::LedgerV2PublicationOutcome::Accepted { id } if id == audit_id
+                ),
+                "the batch audit publishes: {outcome:?}"
+            );
+            audit_ids.push(audit_id);
+        }
+        (plan_id, plan, audit_ids)
+    }
+
+    /// The in-crate adversarial install (the F5B pattern): a record
+    /// under the given deterministic key carrying the given content
+    /// object — the route around the publication gates the reader's
+    /// own checks must independently refuse.
+    fn v2x_install_under_key(
+        medium: &mut LocalFileMedium,
+        key: Vec<u8>,
+        object: &StoredObject,
+        tick: u64,
+    ) -> Hash {
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, tick)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object.hash()]);
+        let id = record.id();
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(object));
+        medium.append_admitted(admitted, Some(head)).unwrap();
+        id
+    }
+
+    #[test]
+    fn the_v2_reader_certifies_the_complete_first_execution_ready_state() {
+        // (V2X-CP1) THE TRUSTED POSITIVE: the complete plan + every
+        // plan-listed audit, over the multi-batch split (the shared
+        // object crossing unit and batch boundaries) — the reader
+        // certifies FIRST-EXECUTION-READY with the exact revision
+        // identities, STRICTLY READ-ONLY (nothing published, nothing
+        // deleted), and the restart (a fresh handle) certifies
+        // identically.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-cp1-ready");
+        let records_before = medium.validate().unwrap().records;
+        let (plan_id, plan, audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+        assert!(
+            plan.batches.len() >= 2,
+            "the fixture splits into multiple batches (the shared object crosses them)"
+        );
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady {
+                plan_record,
+                plan_object,
+                audit_records,
+            } => {
+                assert_eq!(plan_record, plan_id);
+                // The plan's RECORD identity is distinct from the
+                // payload object's hash (the recorded D1 obligation:
+                // any future begin binds the record identity).
+                let content_ref = medium.read_record(&plan_id).unwrap().content_refs[0];
+                assert_eq!(plan_object, content_ref);
+                assert_ne!(plan_record, plan_object);
+                assert_eq!(audit_records, audit_ids);
+            }
+            other => panic!("the complete state certifies ready: {other:?}"),
+        }
+        // STRICTLY READ-ONLY: exactly the plan + the audits were
+        // added by the publication; the reader itself added nothing.
+        assert_eq!(
+            medium.validate().unwrap().records,
+            records_before + 1 + audit_ids.len() as u64
+        );
+        // THE RESTART: a fresh handle certifies identically.
+        drop(medium);
+        let mut reopened = LocalFileMedium::open(root.clone()).unwrap();
+        match crate::reclaim::verify_v2_execution_readiness(&mut reopened, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady { plan_record, .. } => {
+                assert_eq!(plan_record, plan_id);
+            }
+            other => panic!("the restart certifies ready: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_classifies_the_incomplete_publication_states() {
+        // (V2X-CP1) §5: the legitimate non-destructive
+        // mid-publication states are CLASSIFIED, never certified —
+        // the genuine checkpoint with no plan, and the plan with a
+        // partial audit set.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-cp1-incomplete");
+        // (a) No plan: the pre-publication state.
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::PublicationIncomplete { missing_batches } => {
+                assert!(missing_batches.is_empty(), "no plan is published yet");
+            }
+            other => panic!("the pre-publication state classifies: {other:?}"),
+        }
+        // (b) The plan with only the FIRST batch's audit published.
+        let (_plan_id, plan, _audit_ids) = {
+            let (plan_id, _) =
+                crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 400, &journal_root, 100)
+                    .unwrap();
+            let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+                .unwrap()
+                .unwrap();
+            let (_audit_id, _) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, 0, 101).unwrap();
+            (plan_id, plan, Vec::<Hash>::new())
+        };
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::PublicationIncomplete { missing_batches } => {
+                let expected: Vec<u64> = plan
+                    .batches
+                    .iter()
+                    .map(|b| b.index)
+                    .filter(|index| *index != 0)
+                    .collect();
+                assert_eq!(missing_batches, expected);
+            }
+            other => panic!("the partial audit set classifies: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_refuses_the_mixed_v1_v2_interpretation() {
+        // (V2X-CP1) The reader-side W2 mirror: a v1 audit coexisting
+        // with an installed plan (constructible only by bypassing
+        // the publication gates — the in-crate adversarial install)
+        // refuses typed. One interpretation per MK, ever.
+        let (root, journal_root, mut medium, mk, r1, r2, _shared, _private) =
+            v2_plan_campaign("v2x-cp1-mixed");
+        let (_plan_id, _plan, _audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+        let v1_shaped = crate::reclaim::ReclamationLedger {
+            mk,
+            sk: r2,
+            range_digest: [0u8; 32],
+            seed: [0u8; 32],
+            records: 1,
+            reclaimed_keys: 0,
+            journal_files: Vec::new(),
+            units: vec![crate::reclaim::ReclaimUnit {
+                record: r1,
+                objects: Vec::new(),
+            }],
+        };
+        let object = StoredObject::new(v1_shaped.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            &mut medium,
+            crate::reclaim::reclamation_ledger_idempotency_key(&mk),
+            &object,
+            110,
+        );
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/v1-audit-mixed"
+                }
+            ),
+            "the mixed interpretation refuses: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_refuses_the_wrongly_bound_installed_evidence() {
+        // (V2X-CP1) The binding refusals against adversarially
+        // installed evidence (the in-crate route around the
+        // publication gates): (a) a plan under the right
+        // deterministic key whose content names foreign identities;
+        // (b) a batch audit under the right (MK, batch) key whose
+        // fields disagree with the plan.
+        let (root, _journal_root, mut medium, mk, r1, r2, _shared, _private) =
+            v2_plan_campaign("v2x-cp1-bound");
+        // (a) The wrongly bound plan (the F5B shape, refused now by
+        // the READER rather than the publication): the doctored form
+        // occupies the plan key DIRECTLY on the fresh campaign — no
+        // genuine plan is published (the keys are chain-unique).
+        {
+            let foreign = crate::reclaim::ReclaimPlan {
+                mk: r1,
+                sk: r2,
+                range_digest: [9u8; 32],
+                seed: [9u8; 32],
+                ledger_byte_limit: 1024,
+                batches: vec![crate::reclaim::PlanBatch {
+                    index: 0,
+                    records: vec![r1],
+                }],
+                journal_files: Vec::new(),
+            };
+            let object = StoredObject::new(foreign.canonical_bytes()).unwrap();
+            v2x_install_under_key(
+                &mut medium,
+                crate::reclaim::reclamation_plan_idempotency_key(&mk),
+                &object,
+                120,
+            );
+            let error =
+                crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-readiness/plan-binding"
+                    }
+                ),
+                "the foreign plan refuses: {error:?}"
+            );
+        }
+        // (b) The wrongly bound audit: the genuine plan and the
+        // audits EXCEPT batch 0 (whose key the doctored form
+        // occupies — the keys are chain-unique), the doctored
+        // ledger's SK, digest, and seed disagreeing with the plan.
+        {
+            let (root_b, journal_root_b, mut medium_b, mk_b, _r1b, r2b, _shared_b, _private_b) =
+                v2_plan_campaign("v2x-cp1-bound-audit");
+            let plan = v2x_publish_all_except(&mut medium_b, &mk_b, &journal_root_b, 400, 0);
+            let doctored = crate::reclaim::ReclamationLedgerV2 {
+                mk: mk_b,
+                sk: r2b,
+                batch: 0,
+                range_digest: [9u8; 32],
+                seed: [9u8; 32],
+                records: 0,
+                reclaimed_keys: 0,
+                units: Vec::new(),
+            };
+            let object = StoredObject::new(doctored.canonical_bytes()).unwrap();
+            v2x_install_under_key(
+                &mut medium_b,
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk_b, 0),
+                &object,
+                121,
+            );
+            let error =
+                crate::reclaim::verify_v2_execution_readiness(&mut medium_b, &mk_b).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-readiness/audit-binding"
+                    }
+                ),
+                "the doctored audit refuses: {error:?}"
+            );
+            let _ = plan;
+            let _ = std::fs::remove_dir_all(&root_b);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The plan plus every plan-listed batch audit EXCEPT the given
+    /// batch index (whose deterministic key stays unoccupied for an
+    /// adversarial in-crate install) — the keys are chain-unique, so
+    /// each doctored form needs its own fresh campaign.
+    fn v2x_publish_all_except(
+        medium: &mut LocalFileMedium,
+        mk: &Hash,
+        journal_root: &std::path::Path,
+        limit: u64,
+        skip: u64,
+    ) -> crate::reclaim::ReclaimPlan {
+        let (_plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(medium, mk, limit, journal_root, 100).unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(medium, mk)
+            .unwrap()
+            .unwrap();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            if batch == skip {
+                continue;
+            }
+            crate::reclaim::publish_reclamation_ledger_v2(medium, mk, batch, 101).unwrap();
+        }
+        plan
+    }
+
+    #[test]
+    fn the_v2_reader_refuses_the_membership_and_order_violations() {
+        // (V2X-CP1) The ordered-unit refusals: the adversarially
+        // installed batch-0 audits (under batch 0's own
+        // plan-listed key — the genuine publication skipped) carrying
+        // (a) an OMITTED unit, (b) an INJECTED foreign unit (a
+        // record from a LATER batch — not a batch-0 member), (c) the
+        // correct set in the WRONG order — set equality is never
+        // sufficient; the deterministic order is the identity, and
+        // the reader reaches the ORDER check (the completeness and
+        // binding checks pass first). The limit 460 splits the
+        // fixture's range so batch 0 carries TWO records (the
+        // reorder is meaningful; a one-record batch reversed is
+        // itself).
+        for (label, doctor) in [("omitted", 1u8), ("injected", 0), ("reordered", 2)] {
+            let (root, journal_root, mut medium, mk, r1, _r2, _shared, _private) =
+                v2_plan_campaign(&format!("v2x-cp1-order-{label}"));
+            let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 460, 0);
+            let batch = &plan.batches[0];
+            assert!(
+                batch.records.len() >= 2,
+                "the limit splits a multi-record batch 0 (the reorder is meaningful)"
+            );
+            let genuine: Vec<crate::reclaim::ReclaimUnit> = batch
+                .records
+                .iter()
+                .map(|record| crate::reclaim::ReclaimUnit {
+                    record: *record,
+                    objects: crate::reclaim::collect_unit_objects(&mut medium, record).unwrap(),
+                })
+                .collect();
+            let units: Vec<crate::reclaim::ReclaimUnit> = match doctor {
+                0 => genuine
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(crate::reclaim::ReclaimUnit {
+                        record: r1,
+                        objects: crate::reclaim::collect_unit_objects(&mut medium, &r1).unwrap(),
+                    }))
+                    .collect(),
+                1 => genuine[1..].to_vec(),
+                _ => genuine.iter().rev().cloned().collect(),
+            };
+            let doctored = crate::reclaim::ReclamationLedgerV2 {
+                mk,
+                sk: plan.sk,
+                batch: batch.index,
+                range_digest: plan.range_digest,
+                seed: plan.seed,
+                records: units.len() as u64,
+                reclaimed_keys: 0,
+                units,
+            };
+            let object = StoredObject::new(doctored.canonical_bytes()).unwrap();
+            v2x_install_under_key(
+                &mut medium,
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, batch.index),
+                &object,
+                130,
+            );
+            let error =
+                crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "v2-readiness/audit-order"
+                    }
+                ),
+                "{label}: the membership/order violation refuses at the order check: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_v2_reader_refuses_the_falsified_closure_manifest() {
+        // (V2X-CP1) The original-evidence equality: an adversarially
+        // installed batch-0 audit (the genuine publication skipped,
+        // the key occupied by the doctored form) whose unit objects
+        // differ from the RECOMPUTED closure (the direct references
+        // plus the verified composite closure) refuses typed — a
+        // plausible manifest is never authority. The record sequence
+        // is genuine (the order and binding checks pass) and the
+        // limit is generous (the byte-limit check passes): the
+        // closure equality is the failing gate.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, private) =
+            v2_plan_campaign("v2x-cp1-closure");
+        let plan = v2x_publish_all_except(&mut medium, &mk, &journal_root, 2048, 0);
+        let batch = &plan.batches[0];
+        let genuine: Vec<crate::reclaim::ReclaimUnit> = batch
+            .records
+            .iter()
+            .map(|record| crate::reclaim::ReclaimUnit {
+                record: *record,
+                objects: crate::reclaim::collect_unit_objects(&mut medium, record).unwrap(),
+            })
+            .collect();
+        // The falsified form: the first unit's objects with a foreign
+        // object injected (not a duplicate — the codec's sharing
+        // rules pass; the recomputation exposes the fabrication).
+        let mut falsified = genuine.clone();
+        falsified[0].objects.push(private);
+        let doctored = crate::reclaim::ReclamationLedgerV2 {
+            mk,
+            sk: plan.sk,
+            batch: batch.index,
+            range_digest: plan.range_digest,
+            seed: plan.seed,
+            records: falsified.len() as u64,
+            reclaimed_keys: 0,
+            units: falsified,
+        };
+        let object = StoredObject::new(doctored.canonical_bytes()).unwrap();
+        v2x_install_under_key(
+            &mut medium,
+            crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, batch.index),
+            &object,
+            140,
+        );
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/unit-closure-mismatch"
+                }
+            ),
+            "the falsified closure refuses: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_classifies_the_absent_range_without_a_begin() {
+        // (V2X-CP1) Option C strict: with the complete plan/audit
+        // set installed and NO execution begin in existence, an
+        // absent retirement evidence member (a range record, or a
+        // content object) is the RANGE-NOT-INTACT classification —
+        // never certified ready, never silently crossed — and the
+        // reader remains strictly read-only in the diagnostic.
+        let (root, _journal_root, medium, mk, r1, _r2, _shared, private) =
+            v2_plan_campaign("v2x-cp1-absent");
+        {
+            let (root_a, journal_root_a, mut medium_a, mk_a, r1_a, _r2a, _s, _p) =
+                v2_plan_campaign("v2x-cp1-absent-record");
+            let (_plan_id_a, _plan_a, _audit_ids_a) =
+                v2x_publish_all(&mut medium_a, &mk_a, &journal_root_a, 400);
+            let head_before = medium_a.head().unwrap().unwrap();
+            std::fs::remove_file(medium_a.object_path(&r1_a)).unwrap();
+            match crate::reclaim::verify_v2_execution_readiness(&mut medium_a, &mk_a).unwrap() {
+                crate::reclaim::V2ExecutionReadiness::RangeNotIntact { absent } => {
+                    assert!(
+                        absent.contains(&r1_a),
+                        "the absent range record is named: {absent:?}"
+                    );
+                }
+                other => panic!("the absent record classifies not-intact: {other:?}"),
+            }
+            assert_eq!(
+                medium_a.head().unwrap().unwrap(),
+                head_before,
+                "the diagnostic reader published nothing"
+            );
+            let _ = std::fs::remove_dir_all(&root_a);
+        }
+        {
+            let (root_b, journal_root_b, mut medium_b, mk_b, _r1b, _r2b, _s, private_b) =
+                v2_plan_campaign("v2x-cp1-absent-object");
+            let (_plan_id_b, _plan_b, _audit_ids_b) =
+                v2x_publish_all(&mut medium_b, &mk_b, &journal_root_b, 400);
+            std::fs::remove_file(medium_b.object_path(&private_b)).unwrap();
+            match crate::reclaim::verify_v2_execution_readiness(&mut medium_b, &mk_b).unwrap() {
+                crate::reclaim::V2ExecutionReadiness::RangeNotIntact { absent } => {
+                    assert!(
+                        absent.contains(&private_b),
+                        "the absent content object is named: {absent:?}"
+                    );
+                }
+                other => panic!("the absent object classifies not-intact: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root_b);
+        }
+        let _ = (root, r1, private, mk, medium);
+    }
+
+    #[test]
+    fn the_v2_reader_discovery_is_equivalent_to_the_per_key_lookups() {
+        // (V2X-CP1) §3: the single-descent multi-key discovery gives
+        // the SAME canonical membership results as the accepted
+        // per-key lookups, on the intact (skip-bearing) chain — and
+        // the early exit fires on the partial key set.
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, _private) =
+            v2_plan_campaign("v2x-cp1-discovery");
+        let (plan_id, plan, audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+        let mut expected: std::collections::BTreeSet<Vec<u8>> =
+            std::collections::BTreeSet::from([crate::reclaim::reclamation_plan_idempotency_key(
+                &mk,
+            )]);
+        for batch in plan.batches.iter().map(|b| b.index) {
+            expected.insert(crate::reclaim::reclamation_ledger_v2_idempotency_key(
+                &mk, batch,
+            ));
+        }
+        let discovered = crate::reclaim::discover_keyed_set(&mut medium, &expected).unwrap();
+        assert_eq!(discovered.len(), expected.len(), "every key discovered");
+        // The plan equivalence.
+        let (per_key_id, plan_bytes) = discovered
+            .get(&crate::reclaim::reclamation_plan_idempotency_key(&mk))
+            .unwrap();
+        assert_eq!(*per_key_id, plan_id);
+        assert_eq!(
+            crate::reclaim::ReclaimPlan::decode(plan_bytes).unwrap(),
+            plan
+        );
+        // The audit equivalence (every batch).
+        for (batch, audit_id) in plan.batches.iter().map(|b| b.index).zip(&audit_ids) {
+            let (found_id, bytes) = discovered
+                .get(&crate::reclaim::reclamation_ledger_v2_idempotency_key(
+                    &mk, batch,
+                ))
+                .unwrap();
+            assert_eq!(*found_id, *audit_id);
+            let (per_key_id, per_key_ledger) =
+                crate::reclaim::find_installed_v2_audit(&mut medium, &mk, batch)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(*found_id, per_key_id);
+            assert_eq!(bytes, &per_key_ledger.canonical_bytes());
+        }
+        // THE EARLY EXIT: a single-key expected set finds its target
+        // and returns without descending further.
+        let single = crate::reclaim::discover_keyed_set(
+            &mut medium,
+            &std::collections::BTreeSet::from([
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, plan.batches[0].index),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(single.len(), 1, "the early exit returns the one match");
+        // A MISSING key in the set: the walk terminates at the
+        // founding with the found subset (the completeness check is
+        // the caller's).
+        let with_missing = crate::reclaim::discover_keyed_set(
+            &mut medium,
+            &std::collections::BTreeSet::from([
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, 0),
+                crate::reclaim::reclamation_ledger_v2_idempotency_key(&mk, 99),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            with_missing.len() == 1,
+            "the genuinely-absent key is not fabricated: {:?}",
+            with_missing.len()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_v2_reader_refuses_the_corrupt_and_unsupported_evidence() {
+        // (V2X-CP1) The corruption and unsupported-protocol classes
+        // are typed failures, never classifications: (a) corrupt
+        // content under the correct content-addressed name (the
+        // hash mismatch propagates); (b) a malformed wire version
+        // under the plan key (the strict decode refuses).
+        let (root, journal_root, mut medium, mk, _r1, _r2, _shared, private) =
+            v2_plan_campaign("v2x-cp1-corrupt");
+        let (_plan_id, _plan, _audit_ids) = v2x_publish_all(&mut medium, &mk, &journal_root, 400);
+        // (a) The corrupt object bytes under the correct name: the
+        // hash-verifying read refuses (not the not-intact
+        // classification — corruption is a failure).
+        std::fs::write(medium.object_path(&private), b"corrupted-bytes").unwrap();
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap_err();
+        assert!(
+            matches!(error, MediumError::HashMismatch { .. }),
+            "the corrupt content refuses typed: {error:?}"
+        );
+        // (b) The malformed version: a plan object carrying an
+        // unsupported version under the plan key.
+        {
+            let (root_b, _journal_root_b, mut medium_b, mk_b, _r1b, _r2b, _s, _p) =
+                v2_plan_campaign("v2x-cp1-version");
+            let mut bytes = {
+                let plan = crate::reclaim::ReclaimPlan {
+                    mk: mk_b,
+                    sk: _r2b,
+                    range_digest: [0u8; 32],
+                    seed: [0u8; 32],
+                    ledger_byte_limit: 1024,
+                    batches: vec![crate::reclaim::PlanBatch {
+                        index: 0,
+                        records: vec![_r1b],
+                    }],
+                    journal_files: Vec::new(),
+                };
+                plan.canonical_bytes()
+            };
+            // The version follows the domain tag (the length-
+            // prefixed string + the u32): flip it to an unsupported
+            // value in the encoded bytes.
+            let domain_len = crate::reclaim::RECLAMATION_PLAN_DOMAIN.len() as u64;
+            let version_at = 8 + domain_len as usize;
+            bytes[version_at..version_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let object = StoredObject::new(bytes).unwrap();
+            v2x_install_under_key(
+                &mut medium_b,
+                crate::reclaim::reclamation_plan_idempotency_key(&mk_b),
+                &object,
+                150,
+            );
+            let error =
+                crate::reclaim::verify_v2_execution_readiness(&mut medium_b, &mk_b).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Format(engine_core::SaveError::Version { .. })
+                ),
+                "the unsupported version refuses typed: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root_b);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn two_retirement_store(
         label: &str,
     ) -> (

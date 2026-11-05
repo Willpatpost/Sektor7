@@ -6951,6 +6951,149 @@ mod exclusion_tests {
         }
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_v2_sqlite_reader_matrix() {
+        // (V2X-CP1) The trusted all-audits reader on the SQLite
+        // provider: the incomplete publication state classified, the
+        // complete state certified FIRST-EXECUTION-READY with the
+        // exact revision identities (strictly read-only), the
+        // restart (a fresh connection) certifying identically, and
+        // the bogus-MK typed refusal.
+        let label = "v2x-cp1-sqlite";
+        let root = std::env::temp_dir().join(format!(
+            "s7-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        let shared = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-sqlite-shared");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let private = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"v2x-sqlite-private");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let journal_root = root.join("journal-root");
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding_id, _binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut SqliteMedium, objects: &[StoredObject], tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+            let record = RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+            medium.append(&record, objects, Some(head)).unwrap();
+            record.id()
+        };
+        let p1 = step(&mut medium, std::slice::from_ref(&shared), 1);
+        let r1 = step(&mut medium, std::slice::from_ref(&shared), 2);
+        let r2 = step(&mut medium, &[shared.clone(), private.clone()], 3);
+        let sk = step(&mut medium, std::slice::from_ref(&shared), 4);
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let member_bytes: Vec<Vec<u8>> = [r1, r2]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let meta = CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![SkipEntry::new(Hash::ZERO, p1)],
+            vec![
+                ReclaimedIndexEntry::new(None, r1, 2),
+                ReclaimedIndexEntry::new(None, r2, 3),
+                ReclaimedIndexEntry::new(None, sk, 4),
+            ],
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let mk = step(&mut medium, std::slice::from_ref(&meta_object), 5);
+        // THE BOGUS MK: a real non-zero identity that is no
+        // checkpoint — the typed refusal, never a classification.
+        let error = crate::reclaim::verify_v2_execution_readiness(&mut medium, &private.hash())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-readiness/mk-not-installed"
+                }
+            ),
+            "the bogus MK refuses typed: {error:?}"
+        );
+        // THE INCOMPLETE STATE: the plan published, no audits yet.
+        let (plan_id, _) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk, 1024, &journal_root, 90)
+                .unwrap();
+        let (_, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::PublicationIncomplete { missing_batches } => {
+                let expected: Vec<u64> = plan.batches.iter().map(|b| b.index).collect();
+                assert_eq!(missing_batches, expected);
+            }
+            other => panic!("the sqlite mid-publication state classifies: {other:?}"),
+        }
+        // THE COMPLETE STATE: every batch audit published.
+        let mut audit_ids = Vec::new();
+        for batch in plan.batches.iter().map(|b| b.index) {
+            let (audit_id, _) =
+                crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk, batch, 91).unwrap();
+            audit_ids.push(audit_id);
+        }
+        match crate::reclaim::verify_v2_execution_readiness(&mut medium, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady {
+                plan_record,
+                audit_records,
+                ..
+            } => {
+                assert_eq!(plan_record, plan_id);
+                assert_eq!(audit_records, audit_ids);
+            }
+            other => panic!("the sqlite complete state certifies ready: {other:?}"),
+        }
+        // THE RESTART: a fresh connection certifies identically.
+        drop(medium);
+        let mut reopened = SqliteMedium::open(root.join("db.sqlite")).unwrap();
+        match crate::reclaim::verify_v2_execution_readiness(&mut reopened, &mk).unwrap() {
+            crate::reclaim::V2ExecutionReadiness::ExecutionReady { plan_record, .. } => {
+                assert_eq!(plan_record, plan_id);
+            }
+            other => panic!("the sqlite restart certifies ready: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The OC-C2 trusted begin admission (the transactional twin — see
