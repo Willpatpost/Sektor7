@@ -386,7 +386,7 @@ fn write_journal_generations(root: &Path, names: &[String]) -> Result<(), Journa
 /// the accepted crate-private sequence (write + scan-verify + the
 /// pointer flip at the campaign root + the ownership record + the
 /// durability rules, all unchanged).
-pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
+pub fn rotate_session_journal<M: crate::medium::CanonicalMedium, W: engine_core::SaveWorld>(
     pipeline: &mut crate::pipeline::CommitPipeline<M>,
     root: &Path,
 ) -> Result<JournalRotation, SessionRotationError> {
@@ -449,7 +449,7 @@ pub fn rotate_session_journal<M: crate::medium::CanonicalMedium>(
     // ledger (no summary) retires only what is independently
     // provable (cancellations); a malformed or
     // newer-unsupported-version snapshot fails closed.
-    let anchor = crate::session_anchor::latest_session_anchor(pipeline.medium_mut())
+    let anchor = crate::session_anchor::latest_session_anchor::<W>(pipeline.medium_mut())
         .map_err(SessionRotationError::Anchor)
         .and_then(|anchor| {
             anchor.ok_or(SessionRotationError::Anchor(

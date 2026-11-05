@@ -39,7 +39,10 @@
 //! what it can independently prove safe (cancellations).
 
 use engine_core::wire::{MAX_BYTE_LEN, MAX_COLLECTION_COUNT, MAX_TAG_LEN};
-use engine_core::{Decoder, NPC_COUNT, POSITION_DISCARDED, REGION_COUNT, REGION_GRID, SaveError};
+use engine_core::{
+    Decoder, Diagnostics, Level, LodConfig, NPC_COUNT, POSITION_DISCARDED, REGION_COUNT,
+    REGION_GRID, SaveError, SaveWorld, Spine,
+};
 
 use crate::consequence::ConsequenceId;
 use crate::medium::CanonicalMedium;
@@ -138,7 +141,7 @@ pub fn read_snapshot_container(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SaveE
 /// boundary derived exclusively from the decoded lane summary.
 /// `Ok(None)` when the chain carries no session snapshot at all (the
 /// rotation's no-anchor refusal applies).
-pub fn latest_session_anchor(
+pub fn latest_session_anchor<W: SaveWorld>(
     medium: &mut dyn CanonicalMedium,
 ) -> Result<Option<SessionAnchor>, AnchorError> {
     let Some(head) = medium.head()? else {
@@ -164,7 +167,17 @@ pub fn latest_session_anchor(
                 if domain != SESSION_SNAPSHOT_DOMAIN {
                     return Err(AnchorError::UnsupportedSnapshotVersion);
                 }
-                let (_spine_bytes, director_bytes) = read_snapshot_container(&bytes)
+                let (spine_bytes, director_bytes) = read_snapshot_container(&bytes)
+                    .map_err(|_error| AnchorError::CorruptSnapshot)?;
+                // (F4-R14-A) THE FULL SPINE VALIDATION — the
+                // production restore's own call, verbatim: the
+                // newest snapshot must be RESTORABLE before any of
+                // its evidence authorizes retirement (a
+                // hash-verified object is not automatically a valid
+                // restorable snapshot; the recovery would fail
+                // closed on an un-restorable newest session — the
+                // rotation's anchor must agree).
+                Spine::<W>::restore(&spine_bytes, Diagnostics::new(Level::Off))
                     .map_err(|_error| AnchorError::CorruptSnapshot)?;
                 let boundary = decode_director_anchor(&director_bytes)
                     .map_err(|_error| AnchorError::CorruptSnapshot)?;
@@ -213,10 +226,25 @@ fn decode_director_anchor(bytes: &[u8]) -> Result<Option<[u64; REGION_COUNT]>, S
         read_finite_f64(&mut dec)?;
         read_finite_f64(&mut dec)?;
     }
-    for _ in 0..7 {
-        read_finite_f64(&mut dec)?;
-    }
+    let lod = LodConfig {
+        full_enter: read_finite_f64(&mut dec)?,
+        full_exit: read_finite_f64(&mut dec)?,
+        simplified_enter: read_finite_f64(&mut dec)?,
+        simplified_exit: read_finite_f64(&mut dec)?,
+        event_enter: read_finite_f64(&mut dec)?,
+        event_exit: read_finite_f64(&mut dec)?,
+        lookahead: read_finite_f64(&mut dec)?,
+    };
     dec.read_u64()?; // adaptive_threshold
+    // (F4-R14-B) THE DIRECTOR-CONFIGURATION VALIDATION — the
+    // production restore's own rule (RegionDirector::new →
+    // LodController::new → LodConfig::validated, the shared
+    // engine-core primitive): finiteness, non-negative thresholds
+    // and lookahead, the finiteness of every SQUARED threshold, and
+    // the required hysteresis ordering — an invalid configuration
+    // can never authorize subsumption retirement.
+    lod.validated()
+        .map_err(|_error| SaveError::Integrity("region-director-save/lod-config"))?;
     // The per-region authoritative states.
     let state_count = dec.read_count(REGION_COUNT as u64, SECTION, "state-count")?;
     if state_count != REGION_COUNT as u64 {

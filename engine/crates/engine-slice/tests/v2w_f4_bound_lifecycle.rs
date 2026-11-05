@@ -2012,11 +2012,12 @@ fn the_rotation_entry_verifies_the_root_agreement() {
             T1Journal::open_bound(&active_b, &founding_b, &root_id_b).expect("B's active");
         let medium_b = LocalFileMedium::open(&store_b).unwrap();
         let mut pipeline_b = engine_persist::CommitPipeline::open(medium_b, journal_b).unwrap();
-        let error = match engine_persist::rotate_session_journal(&mut pipeline_b, &root_a) {
-            Err(engine_persist::SessionRotationError::Journal(error)) => error,
-            Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
-            Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
-        };
+        let error =
+            match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline_b, &root_a) {
+                Err(engine_persist::SessionRotationError::Journal(error)) => error,
+                Err(other) => panic!("the cross-root aim refuses typed: {other:?}"),
+                Ok(_rotation) => panic!("a pipeline from another root never rotates this root"),
+            };
         assert!(
             matches!(error, engine_persist::JournalError::CorruptHeader { ref detail } if detail.contains("not the pointer-resolved active")),
             "the journal/root agreement refuses the cross-root pipeline: {error:?}"
@@ -2046,7 +2047,10 @@ fn the_rotation_entry_verifies_the_root_agreement() {
         let medium_a = LocalFileMedium::open(&store_a).unwrap();
         let mut pipeline_stale =
             engine_persist::CommitPipeline::open(medium_a, journal_stale).unwrap();
-        let error = match engine_persist::rotate_session_journal(&mut pipeline_stale, &root_a) {
+        let error = match engine_persist::rotate_session_journal::<_, NpcWorld>(
+            &mut pipeline_stale,
+            &root_a,
+        ) {
             Err(engine_persist::SessionRotationError::Journal(error)) => error,
             Err(other) => panic!("the stale-journal aim refuses typed: {other:?}"),
             Ok(_rotation) => panic!("a stale journal never rotates"),
@@ -2245,7 +2249,7 @@ fn the_rotation_retention_boundary_is_authenticated() {
         };
         std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
         std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
-        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
+        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::UnsupportedSnapshotVersion,
             )) => {}
@@ -2315,7 +2319,7 @@ fn the_rotation_retention_boundary_is_authenticated() {
         };
         std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
         std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
-        match engine_persist::rotate_session_journal(&mut pipeline, &journal_root) {
+        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
             Err(engine_persist::SessionRotationError::Anchor(
                 engine_persist::session_anchor::AnchorError::CorruptSnapshot,
             )) => {}
@@ -2368,5 +2372,427 @@ fn foreign_input() -> engine_persist::TransactionInput {
             episode: 99,
         }],
         plan: Vec::new(),
+    }
+}
+
+/// The bound campaign's journal scan (the bound identities from the
+/// installed binding).
+fn scan_bound_active(
+    store: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> engine_persist::JournalScan {
+    let (founding, root_id) = installed_binding(store);
+    engine_persist::journal::scan_bound_file(journal_path, &founding, &root_id).unwrap()
+}
+
+#[test]
+fn the_unrestorable_newest_snapshot_never_authorizes_retirement() {
+    // (F4-R14-A) THE SPINE-VALIDATION PARITY: the newest session
+    // snapshot must be RESTORABLE before any of its evidence
+    // authorizes subsumption retirement — a hash-verified object
+    // with a valid director summary but an INVALID SPINE section is
+    // rejected by the production restore_session, and the rotation
+    // (through the actual public entry, the production world)
+    // refuses equally: no successor, no pointer flip, no
+    // retirement. The control: the genuine confirmed-and-subsumed
+    // transaction retires on the VALID snapshot (the accepted
+    // optimization preserved).
+    let dir = TestDir::new("r14a");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // THE CONTROL CAMPAIGN: the checkpoint compacts (the v4 summary
+    // in the SK) and the confirmed+subsumed transaction RETIRES
+    // through the real crossing.
+    // THE CONTROL: the whole lifecycle in ONE continuing session —
+    // the compaction (the v4 summary in the SK), the covering
+    // publication from the SAME session's compacted director, and
+    // the rotation through the real crossing (the re-opened-session
+    // trap avoided: a fresh director would publish an UNCOMPACTED
+    // covering and the anchor would legitimately find no summary).
+    {
+        let store = dir.store();
+        let journal_root = dir.journal();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r14a-control",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the boundary confirms")
+        };
+        let retired_id = {
+            scan_bound_active(&store, &journal_root)
+                .committed
+                .last()
+                .unwrap()
+                .id
+        };
+        durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+        run_ticks_near(&mut spine, &mut director, &near, 100);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the checkpoint publishes (the compaction — the v4 summary)");
+        run_ticks_near(&mut spine, &mut director, &near, 5);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        let rotation = crossing
+            .rotate_journal()
+            .expect("the control rotation completes");
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        let scan = scan_bound_active(&store, &rotation.new_path);
+        let successor_ids: Vec<_> = scan.committed.iter().map(|t| t.id).collect();
+        assert!(
+            !successor_ids.contains(&retired_id),
+            "the genuine confirmed-and-subsumed transaction RETIRES on the valid \
+             snapshot (the accepted optimization preserved)"
+        );
+    }
+    // THE CORRUPTED-SPINE CAMPAIGN: the identical shape, then the
+    // newest snapshot replaced by a hash-consistent /1 object with
+    // the REAL director section and a GARBAGE spine.
+    let (store_b, journal_root_b, would_retire_id) = {
+        let store = dir.bound_journal().with_extension("store-b");
+        std::fs::create_dir_all(&store).unwrap();
+        let journal_root = dir.bound_journal().with_extension("root-b");
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r14a-corrupt",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the boundary confirms")
+        };
+        let would_retire_id = {
+            scan_bound_active(&store, &journal_root)
+                .committed
+                .last()
+                .unwrap()
+                .id
+        };
+        durable_boundary(&mut crossing, &mut spine, &mut director, &near);
+        run_ticks_near(&mut spine, &mut director, &near, 100);
+        crossing
+            .publish_checkpoint(&mut spine, &mut director, 10)
+            .expect("the checkpoint publishes");
+        run_ticks_near(&mut spine, &mut director, &near, 5);
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        // The session's own handle releases the active journal's
+        // sidecar lock for the entry's pipeline below.
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        (store, journal_root, would_retire_id)
+    };
+    // The corrupted newest snapshot: the real director bytes, a
+    // garbage spine — hash-consistent (a genuine new object),
+    // family-recognizable /1.
+    let corrupted: engine_persist::StoredObject = {
+        let mut probe = LocalFileMedium::open(&store_b).unwrap();
+        // Find the newest snapshot's bytes (the HEAD-descent — the
+        // first family-recognizable first content object).
+        let mut cursor = probe.head().unwrap().unwrap();
+        let snapshot_bytes = loop {
+            let record = probe.read_record(&cursor).unwrap();
+            if let Some(object) = record.content_refs.first().copied() {
+                let bytes = probe.read_object(&object).unwrap();
+                if engine_persist::session_anchor::is_session_object(&bytes) {
+                    break bytes;
+                }
+            }
+            cursor = record.parent.unwrap();
+        };
+        drop(probe);
+        let (_spine_bytes, director_bytes) =
+            engine_persist::session_anchor::read_snapshot_container(&snapshot_bytes).unwrap();
+        let mut enc = engine_core::Encoder::new();
+        enc.write_str("engine-slice/session-snapshot/1");
+        enc.write_bytes(b"not-a-valid-spine-section");
+        enc.write_bytes(&director_bytes);
+        engine_persist::StoredObject::new(enc.into_bytes()).unwrap()
+    };
+    // THE PRODUCTION RESTORE REJECTS the corrupted newest snapshot
+    // (the parity reference).
+    assert!(
+        engine_slice::crossing::restore_session(corrupted.bytes()).is_err(),
+        "restore_session rejects the invalid-spine newest snapshot"
+    );
+    // The hand-written publication as the NEWEST record (the
+    // snapshot family is outside the generic append's admitted
+    // families), then the rotation through the actual public entry.
+    let active_b = active_journal_path(&journal_root_b).unwrap();
+    {
+        let mut medium = LocalFileMedium::open(&store_b).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = engine_persist::RevisionRecord::regular(head, epoch, 910)
+            .with_content_refs(vec![corrupted.hash()]);
+        drop(medium);
+        // The pipeline opens over the PRE-FLIP chain (the anchor
+        // derivation reads the head at rotation time).
+        let (founding_b, root_id_b) = installed_binding(&store_b);
+        let journal = T1Journal::open_bound(&active_b, &founding_b, &root_id_b).unwrap();
+        let medium = LocalFileMedium::open(&store_b).unwrap();
+        let mut pipeline = engine_persist::CommitPipeline::open(medium, journal).unwrap();
+        let objects_dir = store_b.join("objects");
+        std::fs::write(objects_dir.join(corrupted.hash().hex()), corrupted.bytes()).unwrap();
+        std::fs::write(
+            objects_dir.join(record.id().hex()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/engine-persist/head/1");
+            enc.write_u32(1);
+            enc.write_bytes(record.id().as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(store_b.join("HEAD.tmp"), head_bytes).unwrap();
+        std::fs::rename(store_b.join("HEAD.tmp"), store_b.join("HEAD")).unwrap();
+        // THE ROTATION REFUSES through the actual public entry (the
+        // production world): no retirement on the un-restorable
+        // snapshot's authority.
+        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root_b)
+        {
+            Err(engine_persist::SessionRotationError::Anchor(
+                engine_persist::session_anchor::AnchorError::CorruptSnapshot,
+            )) => {}
+            Err(other) => panic!("the un-restorable snapshot fails closed: {other:?}"),
+            Ok(_rotation) => panic!("an un-restorable snapshot never authorizes retirement"),
+        }
+    }
+    // NO SUCCESSOR, NO FLIP — the journal stands with the
+    // would-retire transaction intact.
+    assert_eq!(
+        active_journal_path(&journal_root_b).unwrap(),
+        active_b,
+        "no successor was created — the pointer stands"
+    );
+    {
+        let scan = scan_bound_active(&store_b, &active_b);
+        let ids: Vec<_> = scan.committed.iter().map(|t| t.id).collect();
+        assert!(
+            ids.contains(&would_retire_id),
+            "the would-retire transaction stands in the active journal — no \
+             retirement on invalid evidence"
+        );
+    }
+}
+
+#[test]
+fn the_invalid_director_configuration_never_authorizes_retirement() {
+    // (F4-R14-B) THE DIRECTOR-CONFIGURATION PARITY: the anchor's
+    // acceptance agrees with the production RegionDirector::restore
+    // contract (RegionDirector::new → LodController::new →
+    // LodConfig::validated — the shared engine-core primitive):
+    // negative LOD thresholds, violated hysteresis ordering,
+    // squared-threshold overflow, and negative lookahead each
+    // refuse BOTH the production restore AND the rotation's anchor
+    // (no retirement on an invalidly-configured snapshot's
+    // authority); the VALID control config is accepted by both (the
+    // hand-built form itself is not the refusal's cause).
+    let dir = TestDir::new("r14b");
+    let near = near_region_4();
+    let far = far_from_region_4();
+    // A real campaign providing the restorable spine section (any
+    // published snapshot's spine) and the chain to flip.
+    let (store, journal_root) = {
+        let store = dir.store();
+        let journal_root = dir.journal();
+        let (mut spine, mut director) = scenario_pair(150, &near);
+        let mut crossing = SessionCrossing::open_bound_bootstrap(
+            &StoreLocation::Directory(store.clone()),
+            &journal_root,
+            "r14b-campaign",
+        )
+        .unwrap();
+        crossing.publish_snapshot(&spine, &director).unwrap();
+        durable_boundary(&mut crossing, &mut spine, &mut director, &far);
+        let engine_persist::CommitOutcome::Confirmed(_) = crossing.commit_canonical().unwrap()
+        else {
+            panic!("the boundary confirms")
+        };
+        drop(crossing);
+        drop(spine);
+        drop(director);
+        (store, journal_root)
+    };
+    // The real spine section (from the newest snapshot).
+    let spine_bytes = {
+        let mut probe = LocalFileMedium::open(&store).unwrap();
+        let mut cursor = probe.head().unwrap().unwrap();
+        loop {
+            let record = probe.read_record(&cursor).unwrap();
+            if let Some(object) = record.content_refs.first().copied() {
+                let bytes = probe.read_object(&object).unwrap();
+                if engine_persist::session_anchor::is_session_object(&bytes) {
+                    break engine_persist::session_anchor::read_snapshot_container(&bytes)
+                        .unwrap()
+                        .0;
+                }
+            }
+            cursor = record.parent.unwrap();
+        }
+    };
+    // The hand-built director section (the save form verbatim):
+    // the config under test + structurally valid minimal state.
+    let build_director = |lod: engine_core::LodConfig| -> Vec<u8> {
+        let mut enc = engine_core::Encoder::new();
+        enc.write_count(engine_core::REGION_COUNT);
+        for _ in 0..engine_core::REGION_COUNT {
+            enc.write_u64(0.0f64.to_bits());
+            enc.write_u64(0.0f64.to_bits());
+        }
+        for value in [
+            lod.full_enter,
+            lod.full_exit,
+            lod.simplified_enter,
+            lod.simplified_exit,
+            lod.event_enter,
+            lod.event_exit,
+            lod.lookahead,
+        ] {
+            enc.write_u64(value.to_bits());
+        }
+        enc.write_u64(0); // adaptive_threshold
+        enc.write_count(engine_core::REGION_COUNT);
+        for _ in 0..engine_core::REGION_COUNT {
+            enc.write_u8(3); // Dormant
+            enc.write_u64(0); // episode
+            enc.write_u8(0); // no checkpoint
+            enc.write_u8(0); // method: None
+            enc.write_u64(0); // reconstructed_activities
+            enc.write_u64(0); // last_dormancy_span
+        }
+        enc.write_u8(3); // ledger v3 (uncompacted)
+        enc.write_count(0); // pending
+        enc.write_count(0); // applied
+        enc.into_bytes()
+    };
+    let valid_lod = engine_core::LodConfig {
+        full_enter: 10.0,
+        full_exit: 20.0,
+        simplified_enter: 20.0,
+        simplified_exit: 40.0,
+        event_enter: 40.0,
+        event_exit: 80.0,
+        lookahead: 1.0,
+    };
+    let bad_lods = [
+        (
+            "negative threshold",
+            engine_core::LodConfig {
+                full_enter: -1.0,
+                ..valid_lod
+            },
+        ),
+        (
+            "hysteresis ordering",
+            engine_core::LodConfig {
+                full_exit: 5.0,
+                ..valid_lod
+            },
+        ),
+        (
+            "squared-threshold overflow",
+            engine_core::LodConfig {
+                full_enter: 1e200,
+                ..valid_lod
+            },
+        ),
+        (
+            "negative lookahead",
+            engine_core::LodConfig {
+                lookahead: -1.0,
+                ..valid_lod
+            },
+        ),
+    ];
+    // THE VALID CONTROL: the production restore accepts the
+    // hand-built form with the valid config (the form itself is not
+    // the refusal's cause).
+    {
+        let director_bytes = build_director(valid_lod);
+        let mut dec = engine_core::Decoder::new(&director_bytes);
+        assert!(
+            engine_slice::region::RegionDirector::restore(&mut dec).is_ok(),
+            "the production restore accepts the valid hand-built director"
+        );
+    }
+    // THE FOUR INVALID CONFIGURATIONS: the production restore
+    // rejects each; the rotation's anchor refuses equally (no
+    // retirement, no successor).
+    let active = active_journal_path(&journal_root).unwrap();
+    let (founding, root_id) = installed_binding(&store);
+    for (label, lod) in bad_lods {
+        let director_bytes = build_director(lod);
+        // The production parity: RegionDirector::restore rejects.
+        let mut dec = engine_core::Decoder::new(&director_bytes);
+        assert!(
+            engine_slice::region::RegionDirector::restore(&mut dec).is_err(),
+            "{label}: the production restore rejects the invalid config"
+        );
+        // The container: the real spine + the invalid director.
+        let mut enc = engine_core::Encoder::new();
+        enc.write_str("engine-slice/session-snapshot/1");
+        enc.write_bytes(&spine_bytes);
+        enc.write_bytes(&director_bytes);
+        let object = engine_persist::StoredObject::new(enc.into_bytes()).unwrap();
+        // restore_session rejects (the spine is real; the director
+        // config is the failing gate).
+        assert!(
+            engine_slice::crossing::restore_session(object.bytes()).is_err(),
+            "{label}: restore_session rejects the invalidly-configured snapshot"
+        );
+        // Publish as the newest + rotate through the actual public
+        // entry.
+        let mut medium = LocalFileMedium::open(&store).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = engine_persist::RevisionRecord::regular(head, epoch, 920)
+            .with_content_refs(vec![object.hash()]);
+        drop(medium);
+        let journal = T1Journal::open_bound(&active, &founding, &root_id).unwrap();
+        let medium = LocalFileMedium::open(&store).unwrap();
+        let mut pipeline = engine_persist::CommitPipeline::open(medium, journal).unwrap();
+        let objects_dir = store.join("objects");
+        std::fs::write(objects_dir.join(object.hash().hex()), object.bytes()).unwrap();
+        std::fs::write(
+            objects_dir.join(record.id().hex()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let head_bytes = {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/engine-persist/head/1");
+            enc.write_u32(1);
+            enc.write_bytes(record.id().as_bytes());
+            enc.into_bytes()
+        };
+        std::fs::write(store.join("HEAD.tmp"), head_bytes).unwrap();
+        std::fs::rename(store.join("HEAD.tmp"), store.join("HEAD")).unwrap();
+        match engine_persist::rotate_session_journal::<_, NpcWorld>(&mut pipeline, &journal_root) {
+            Err(engine_persist::SessionRotationError::Anchor(
+                engine_persist::session_anchor::AnchorError::CorruptSnapshot,
+            )) => {}
+            Err(other) => panic!("{label}: the invalid config fails closed: {other:?}"),
+            Ok(_rotation) => panic!("{label}: an invalid config never authorizes retirement"),
+        }
+        assert_eq!(
+            active_journal_path(&journal_root).unwrap(),
+            active,
+            "{label}: no successor was created"
+        );
     }
 }
