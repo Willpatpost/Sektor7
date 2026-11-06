@@ -1096,34 +1096,48 @@ fn verify_member_facts(
 /// installed plan revision, the manifest discovery with the strict
 /// bindings (the MK, the plan record, the begin record, and the
 /// metadata object), EVERY declared shard `0..shard_count`
-/// discovered and strictly decoded (a missing one is the typed
+/// discovered (a missing one is the typed
 /// installed-state-integrity refusal — an installed manifest
-/// claims completeness), and the complete standalone composite over
-/// the discovered set (the index shape, the structural round-trip
-/// decodes, the per-entry authentication, the parent-edge
-/// coherence, the exact coverage, census, digest, and greedy
-/// layout). A manifest-present degraded state therefore NEVER
-/// verifies; a manifestless shard prefix fails the manifest
+/// claims completeness), and the complete verification — the index
+/// shape, the structural decodes, the per-entry authentication,
+/// the parent-edge coherence, the exact coverage, census, digest,
+/// and greedy layout. A manifest-present degraded state therefore
+/// NEVER verifies; a manifestless shard prefix fails the manifest
 /// discovery here and remains resumable by the publisher.
 ///
-/// **The memory contract (honest):** the kernel holds the
-/// discovered aggregate — O(total witness bytes) — the A0
-/// reference form; the bounded streaming consumer is the
-/// separately gated A1-3 obligation.
+/// **(The A1-2 F1 corrective — the bounded form.)** The discovery
+/// is ONE multi-key descent that locates the manifest AND every
+/// declared shard in a single pass (the manifest's strict decode
+/// grows the key set to the declared shard keys at the match; the
+/// walk terminates as soon as the family is complete, bounded by
+/// the witness's own span) — never a separate full-chain descent
+/// per shard; at most one additional completion pass covers
+/// exactly the still-missing keys (an adversarial above-manifest
+/// placement the publisher's own layout never produces). Each
+/// shard is then re-read and hash-verified AS IT IS CONSUMED and
+/// verified streaming: the shard in hand is the only preimage
+/// retention, the per-entry facts (the indexed epoch and key, the
+/// parent-edge rules with their checked arithmetic) are checked
+/// with O(1) carry across the shard boundaries, the coverage
+/// sequence runs against the index-derived canonical order with a
+/// position counter, the census accumulates, the greedy
+/// maximality of each non-final shard is checked against the next
+/// shard's first entry, and the coverage digest folds over the
+/// collected identities through the canonical
+/// [`witness_coverage_digest`] recipe. The aggregate A0 standalone
+/// verifier is never invoked on the installed witness; no shard
+/// bytes survive a shard's own verification. The retained state is
+/// O(member count) identities and index references — never
+/// O(total witness bytes).
 #[cfg(feature = "composite-test-fixture")]
 pub(crate) fn verify_installed_witness_internal(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
-) -> Result<(Hash, AncestryWitnessManifest, Vec<AncestryWitnessShard>), MediumError> {
+) -> Result<(Hash, AncestryWitnessManifest), MediumError> {
     let authority = medium.verify_begin_authority_v2(mk)?;
     let Some((plan_record, _plan)) = crate::reclaim::find_installed_plan(medium, mk)? else {
         return Err(MediumError::Chain {
             rule: "ancestry-witness/plan-absent",
-        });
-    };
-    let Some((manifest_record, manifest)) = find_installed_witness_manifest(medium, mk)? else {
-        return Err(MediumError::Chain {
-            rule: "ancestry-witness/manifest-absent",
         });
     };
     let mk_record = medium.read_record(mk)?;
@@ -1132,8 +1146,19 @@ pub(crate) fn verify_installed_witness_internal(
             rule: "ancestry-witness/mk-metadata-binding",
         });
     };
-    if manifest.mk != *mk
-        || manifest.plan_record != plan_record
+    let meta_bytes = medium.read_object(&metadata_object)?;
+    let metadata =
+        crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+    // THE MULTI-KEY DISCOVERY: one bounded descent for the whole
+    // family (at most one completion pass over exactly the missing
+    // keys).
+    let discovery = find_installed_witness_family(medium, mk)?;
+    let Some((manifest_record, manifest)) = discovery.manifest else {
+        return Err(MediumError::Chain {
+            rule: "ancestry-witness/manifest-absent",
+        });
+    };
+    if manifest.plan_record != plan_record
         || manifest.begin_record != authority.id()
         || manifest.metadata_object != metadata_object
     {
@@ -1141,20 +1166,318 @@ pub(crate) fn verify_installed_witness_internal(
             rule: "ancestry-witness/manifest-binding-mismatch",
         });
     }
-    let meta_bytes = medium.read_object(&metadata_object)?;
-    let metadata =
-        crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
-    let mut shards = Vec::with_capacity(manifest.shard_count as usize);
+    verify_installed_witness_streaming(medium, &manifest, &discovery.shards, &metadata)?;
+    Ok((manifest_record, manifest))
+}
+
+/// The typed streaming-verification refusal (the A0 rule names,
+/// carried in the kernel's MediumError channel).
+#[cfg(feature = "composite-test-fixture")]
+fn witness_integrity_refusal(rule: &'static str) -> MediumError {
+    MediumError::Format(SaveError::Integrity(rule))
+}
+
+/// The multi-key discovery's result: the manifest record with its
+/// strictly decoded manifest (the decode happens at the walk's
+/// match — the declared shard count grows the key set), and each
+/// declared shard's record identity with its single content
+/// object's identity (the bytes are NEVER retained here — each
+/// shard is re-read and hash-verified as it is consumed).
+#[cfg(feature = "composite-test-fixture")]
+struct WitnessFamilyDiscovery {
+    manifest: Option<(Hash, AncestryWitnessManifest)>,
+    shards: Vec<Option<(Hash, Hash)>>,
+}
+
+/// (The A1-2 F1 corrective) THE MULTI-KEY WITNESS-FAMILY DISCOVERY:
+/// ONE gap-aware, cycle-guarded descent from the authoritative
+/// HEAD that locates the manifest and every declared shard record
+/// in a single pass — never a separate full-chain descent per
+/// shard. The walk matches each encountered record's idempotency
+/// key against the deterministic key set (the manifest key first;
+/// the manifest's strict decode from the walk's own hash-verified
+/// first-object read admits the `0..shard_count` shard keys), and
+/// terminates as soon as the manifest and every shard are found —
+/// bounded by the witness's own span, never the founding when the
+/// family is complete. A match is a CANDIDATE only: the revision
+/// shape (regular, exactly one content reference) is validated at
+/// the matched record, and the manifest's MK binding is checked at
+/// its decode. At most one completion pass follows — ONLY over
+/// exactly the still-missing shard keys (an adversarial
+/// above-manifest placement the publisher's own manifest-LAST
+/// layout never produces; the legitimate layout always completes
+/// in the primary pass).
+#[cfg(feature = "composite-test-fixture")]
+fn find_installed_witness_family(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    mk: &Hash,
+) -> Result<WitnessFamilyDiscovery, MediumError> {
+    let mut discovery = WitnessFamilyDiscovery {
+        manifest: None,
+        shards: Vec::new(),
+    };
+    let mut shard_key_slots: std::collections::BTreeMap<Vec<u8>, usize> =
+        std::collections::BTreeMap::new();
+    let manifest_key = reclamation_witness_manifest_idempotency_key(mk);
+    for pass in 0..2 {
+        let completion = pass == 1;
+        if completion {
+            // The completion pass runs ONLY when shards are still
+            // missing under a found manifest; the key set narrows
+            // to exactly those keys.
+            if discovery.manifest.is_none() || discovery.shards.iter().all(|slot| slot.is_some()) {
+                break;
+            }
+            shard_key_slots.clear();
+            for (index, slot) in discovery.shards.iter().enumerate() {
+                if slot.is_none() {
+                    shard_key_slots.insert(
+                        reclamation_witness_shard_idempotency_key(mk, index as u64),
+                        index,
+                    );
+                }
+            }
+        }
+        let mut current = medium
+            .head()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+        for _ in 0..WITNESS_DISCOVERY_DESCENT {
+            if !seen.insert(current) {
+                return Err(MediumError::Chain { rule: "cycle" });
+            }
+            let record = medium.read_record(&current)?;
+            let mut first_object: Option<Vec<u8>> = None;
+            if let Some(object) = record.content_refs.first().copied() {
+                let bytes = medium.read_object(&object)?;
+                if StoredObject::new(bytes.clone())?.domain()
+                    == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+                {
+                    skip_table = Some(
+                        crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                            .map_err(MediumError::Format)?,
+                    );
+                }
+                first_object = Some(bytes);
+            }
+            let key = record.idempotency_key.as_deref();
+            if !completion && key == Some(&manifest_key[..]) {
+                if !matches!(record.kind, RecordKind::Regular) || record.content_refs.len() != 1 {
+                    return Err(MediumError::Chain {
+                        rule: "ancestry-witness-discovery/shape-mismatch",
+                    });
+                }
+                let bytes = first_object.expect("the single content ref was read above");
+                let decoded =
+                    AncestryWitnessManifest::decode(&bytes).map_err(MediumError::Format)?;
+                if decoded.mk != *mk {
+                    return Err(MediumError::Chain {
+                        rule: "ancestry-witness-discovery/binding-mismatch",
+                    });
+                }
+                discovery.shards = vec![None; decoded.shard_count as usize];
+                for index in 0..decoded.shard_count {
+                    shard_key_slots.insert(
+                        reclamation_witness_shard_idempotency_key(mk, index),
+                        index as usize,
+                    );
+                }
+                discovery.manifest = Some((current, decoded));
+            } else if let Some(&slot) = key.and_then(|candidate| shard_key_slots.get(candidate)) {
+                if !matches!(record.kind, RecordKind::Regular) || record.content_refs.len() != 1 {
+                    return Err(MediumError::Chain {
+                        rule: "ancestry-witness-discovery/shape-mismatch",
+                    });
+                }
+                discovery.shards[slot] = Some((current, record.content_refs[0]));
+            }
+            if discovery.manifest.is_some()
+                && !discovery.shards.is_empty()
+                && discovery.shards.iter().all(|slot| slot.is_some())
+            {
+                return Ok(discovery);
+            }
+            // The founding terminates this pass's descent (the
+            // family was not completed above it).
+            let Some(parent) = record.parent else {
+                break;
+            };
+            match medium.read_record(&parent) {
+                Ok(_) => current = parent,
+                Err(MediumError::MissingObject { .. }) => {
+                    let Some(table) = skip_table.as_ref() else {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    };
+                    let target = if table.sk == parent {
+                        table
+                            .self_skip()
+                            .map(|entry| entry.nearest_retained_ancestor)
+                    } else {
+                        table
+                            .skip_for(&current)
+                            .map(|entry| entry.nearest_retained_ancestor)
+                    };
+                    let Some(target) = target else {
+                        return Err(MediumError::MissingObject { hash: parent });
+                    };
+                    current = target;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+    Ok(discovery)
+}
+
+/// (The A1-2 F1 corrective) THE BOUNDED STREAMING VERIFICATION:
+/// each declared shard is re-read (the provider's hash-verified
+/// read — the bytes never survive this shard's own verification)
+/// and verified AS CONSUMED, preserving the exact A0 rule set: the
+/// shard's structural decode and its mk/index/count bindings; the
+/// identity-by-identity coverage against the index-derived
+/// canonical order; the per-entry indexed epoch and key
+/// authentication; the standalone parent-edge rules with their
+/// checked arithmetic (the one-entry pipeline carries the previous
+/// entry's facts across the shard boundaries); the census; the
+/// greedy maximality of every non-final shard against the next
+/// shard's first entry; and the coverage digest over the collected
+/// identities through the canonical recipe. A missing declared
+/// shard refuses typed BEFORE any consumption.
+#[cfg(feature = "composite-test-fixture")]
+fn verify_installed_witness_streaming(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    manifest: &AncestryWitnessManifest,
+    shards: &[Option<(Hash, Hash)>],
+    metadata: &crate::checkpoint::CheckpointMetadata,
+) -> Result<(), MediumError> {
+    let expected_order = canonical_member_order(&metadata.index);
+    if expected_order.len() as u64 != manifest.member_count {
+        return Err(witness_integrity_refusal(
+            "ancestry-witness/index-count-mismatch",
+        ));
+    }
+    let index_by_identity: std::collections::BTreeMap<Hash, &ReclaimedIndexEntry> = metadata
+        .index
+        .iter()
+        .map(|entry| (entry.hash, entry))
+        .collect();
+    let mut position = 0usize;
+    let mut total = 0u64;
+    let mut identities: Vec<Hash> = Vec::with_capacity(manifest.member_count as usize);
+    let mut previous_shard_size: Option<u64> = None;
+    let mut pending_edge: Option<(u64, bool)> = None;
     for shard_index in 0..manifest.shard_count {
-        let Some((_record, shard)) = find_installed_witness_shard(medium, mk, shard_index)? else {
+        let Some((_record, object)) = shards[shard_index as usize] else {
             return Err(MediumError::Chain {
                 rule: "ancestry-witness/installed-state-integrity",
             });
         };
-        shards.push(shard);
+        let bytes = medium.read_object(&object)?;
+        let shard = AncestryWitnessShard::decode(&bytes).map_err(MediumError::Format)?;
+        if shard.mk != manifest.mk
+            || shard.shard_index != shard_index
+            || shard.shard_count != manifest.shard_count
+        {
+            return Err(witness_integrity_refusal(
+                "ancestry-witness/shard-index-incoherent",
+            ));
+        }
+        if shard.member_count != shard.entries.len() as u64 {
+            return Err(witness_integrity_refusal(
+                "ancestry-witness/shard-count-declared-mismatch",
+            ));
+        }
+        let mut shard_size = WITNESS_SHARD_HEADER_BYTES;
+        for (entry_position, entry) in shard.entries.iter().enumerate() {
+            let decoded = decode_validated_entry(entry).map_err(MediumError::Format)?;
+            let Some(expected) = expected_order.get(position) else {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/coverage-sequence-mismatch",
+                ));
+            };
+            if expected.hash != entry.member {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/coverage-sequence-mismatch",
+                ));
+            }
+            if decoded.epoch != expected.epoch {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/index-epoch-mismatch",
+                ));
+            }
+            if decoded.idempotency_key != expected.key {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/index-key-mismatch",
+                ));
+            }
+            // The standalone parent-edge rules: the parent exists
+            // and is non-zero for this entry; an indexed parent
+            // sits at exactly the child's epoch minus one (the
+            // checked arithmetic); and the held previous entry —
+            // whose parent was NOT indexed — cannot have the next
+            // canonical member at its own epoch minus one (two
+            // distinct records claiming one chain height).
+            let Some(parent) = decoded.parent else {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/parent-edge-missing",
+                ));
+            };
+            if parent == Hash::ZERO {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/parent-edge-zero",
+                ));
+            }
+            let parent_indexed = index_by_identity.contains_key(&parent);
+            if parent_indexed
+                && index_by_identity[&parent].epoch.checked_add(1) != Some(decoded.epoch)
+            {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/parent-epoch-incoherent",
+                ));
+            }
+            if let Some((previous_epoch, previous_parent_indexed)) = pending_edge.take()
+                && !previous_parent_indexed
+                && decoded.epoch.checked_add(1) == Some(previous_epoch)
+            {
+                return Err(witness_integrity_refusal(
+                    "ancestry-witness/parent-edge-contradictory",
+                ));
+            }
+            pending_edge = Some((decoded.epoch, parent_indexed));
+            // The greedy maximality of the PREVIOUS shard: the
+            // next canonical entry (this shard's first) would not
+            // have fit alongside the previous shard's payload.
+            if entry_position == 0
+                && let Some(previous_size) = previous_shard_size
+            {
+                let next_framed = WITNESS_ENTRY_FRAMING_BYTES + entry.preimage.len() as u64;
+                if previous_size + next_framed <= WITNESS_SHARD_PAYLOAD_CEILING {
+                    return Err(witness_integrity_refusal(
+                        "ancestry-witness/shard-not-maximal",
+                    ));
+                }
+            }
+            shard_size += WITNESS_ENTRY_FRAMING_BYTES + entry.preimage.len() as u64;
+            identities.push(entry.member);
+            position += 1;
+        }
+        total += shard.member_count;
+        previous_shard_size = Some(shard_size);
     }
-    verify_witness_standalone(&manifest, &shards, &metadata.index).map_err(MediumError::Format)?;
-    Ok((manifest_record, manifest, shards))
+    if total != manifest.member_count {
+        return Err(witness_integrity_refusal(
+            "ancestry-witness/member-count-mismatch",
+        ));
+    }
+    let digest =
+        witness_coverage_digest(&manifest.mk, manifest.member_count, identities.into_iter());
+    if digest != manifest.coverage_digest {
+        return Err(witness_integrity_refusal(
+            "ancestry-witness/coverage-digest-mismatch",
+        ));
+    }
+    Ok(())
 }
 
 /// (V2X-CP3-A1-2) THE TEST-GATED WITNESS PUBLISHER — the
@@ -1187,6 +1510,39 @@ pub(crate) fn verify_installed_witness_internal(
 /// greedy shard boundaries derive from the recorded sizes. Bounded
 /// memory: one member's bytes at a time plus the per-member size
 /// table — never the aggregate A0 constructor.
+///
+/// **(The A1-2 F3 corrective — the pre-manifest parent-edge
+/// proof.)** No parent-edge validation is added to PASS 0 because
+/// the accepted authority already makes every invalid indexed
+/// parent-edge state impossible before the manifest append.
+/// First, every indexed member is a GENUINE canonical-chain
+/// record — PASS 0's member stream reads each through the
+/// provider's hash-verified `read_record` (a fabricated or
+/// substituted identity fails `MissingObject`/`HashMismatch`),
+/// and the store is content-addressed and insert-once, so a
+/// record's canonical bytes are immutable once installed. Second,
+/// the chain's parent-edge coherence was established under the
+/// provider's own validation — the CP2 begin admission that
+/// `verify_begin_authority_v2` authenticates walked the complete
+/// founding-to-begin ancestry enforcing the checked epoch linkage
+/// (child epoch = parent epoch + 1, the real parent, the cycle
+/// guard, the key uniqueness) for every record below the begin,
+/// the members included. Third, PASS 0 then establishes
+/// `index entry epoch == record epoch` and the key agreement for
+/// every member. Together: the parent of an indexed member is a
+/// real record at exactly the member's epoch minus one, so when
+/// that parent is itself indexed its indexed epoch is exactly the
+/// child's minus one (the standalone checked-arithmetic rule), and
+/// when it is not indexed the next canonical member cannot sit at
+/// the child's epoch minus one without two distinct records
+/// claiming one chain height — which the provider's linkage
+/// validation already excluded. A member deleted between the
+/// admission and PASS 0 fails the member stream's read typed
+/// (never an invalid-edge state). The kernel nonetheless
+/// re-establishes the FULL standalone parent-edge discipline over
+/// the witness preimages (the streaming form), because the future
+/// A1-3 consumer runs post-deletion where the live chain no
+/// longer backs these facts.
 ///
 /// **PASS 1 — the reauthenticated publication:** every member is
 /// re-read and re-verified (the round-trip identity re-hash and
@@ -1373,8 +1729,7 @@ pub fn publish_ancestry_witness(
     };
     // The complete installed-state verification BEFORE any
     // positive result.
-    let (discovered_record, discovered_manifest, _shards) =
-        verify_installed_witness_internal(medium, mk)?;
+    let (discovered_record, discovered_manifest) = verify_installed_witness_internal(medium, mk)?;
     if discovered_record != manifest_record {
         return Err(MediumError::Chain {
             rule: "ancestry-witness/manifest-record-divergence",
@@ -1393,10 +1748,18 @@ pub fn publish_ancestry_witness(
 /// is a CANDIDATE — byte-identical content is the verified
 /// duplicate, ANY difference the typed conflict), then the CAS
 /// append through the in-crate unforgeable receipt with the
-/// bounded two-attempt retry (stale parent → the fresh-head retry;
-/// Unknown → the lock-held reconciliation: Installed carries no
-/// invented tier, NotInstalled retries, Unverifiable refuses
-/// typed).
+/// bounded two-attempt retry. **(The A1-2 F2 corrective)** every
+/// retry — after a stale-parent CAS loss and after an Unknown
+/// append reconciled to the verified absence — RE-RESOLVES the
+/// deterministic key against the authoritative ancestry before
+/// re-appending: a competing publication may have installed under
+/// the same key while this attempt held its stale expectation (or
+/// during the uncertain window); byte-identical competing content
+/// is the tierless verified duplicate (the competing record's own
+/// acknowledgment is never fabricated as this caller's durability),
+/// different content is the typed conflict, and a still-free key
+/// retries. Unknown reconciliation remains exact (Installed
+/// carries no invented tier; Unverifiable refuses typed).
 #[cfg(feature = "composite-test-fixture")]
 fn publish_witness_object(
     medium: &mut dyn crate::medium::CanonicalMedium,
@@ -1404,15 +1767,8 @@ fn publish_witness_object(
     object: &StoredObject,
     tick: u64,
 ) -> Result<WitnessPublicationOutcome, MediumError> {
-    if let Some((installed_record, installed_bytes)) = find_witness_record_by_key(medium, key)? {
-        if installed_bytes == object.bytes() {
-            return Ok(WitnessPublicationOutcome::DuplicateVerified {
-                record: installed_record,
-            });
-        }
-        return Err(MediumError::Chain {
-            rule: "ancestry-witness/duplicate-content-mismatch",
-        });
+    if let Some(outcome) = resolve_witness_duplicate(medium, key, object)? {
+        return Ok(outcome);
     }
     for attempt in 0..2 {
         let head = medium
@@ -1435,6 +1791,13 @@ fn publish_witness_object(
                         rule: "ancestry-witness/stale-parent-unresolved",
                     });
                 }
+                // (F2) The concurrent same-key recheck: a competing
+                // publication may have won the deterministic key
+                // while this attempt lost the CAS — the retry
+                // re-resolves the key, never blindly re-appends.
+                if let Some(outcome) = resolve_witness_duplicate(medium, key, object)? {
+                    return Ok(outcome);
+                }
                 continue;
             }
             crate::medium::AppendOutcome::Unknown { .. } => {
@@ -1448,6 +1811,12 @@ fn publish_witness_object(
                                 rule: "ancestry-witness/unknown-not-installed",
                             });
                         }
+                        // (F2) The same recheck after the reconciled
+                        // absence: the uncertain window may have
+                        // admitted a competing same-key publication.
+                        if let Some(outcome) = resolve_witness_duplicate(medium, key, object)? {
+                            return Ok(outcome);
+                        }
                         continue;
                     }
                     crate::medium::Reconciliation::Unverifiable { .. } => {
@@ -1460,6 +1829,34 @@ fn publish_witness_object(
         }
     }
     unreachable!("the bounded retry returns within two attempts")
+}
+
+/// (The A1-2 F2 corrective) The deterministic-key duplicate
+/// resolution against the authoritative ancestry: a free key
+/// returns `None` (the caller may append or retry); an occupied
+/// key is a CANDIDATE only — byte-identical content is the
+/// tierless verified duplicate (never a fabricated durability),
+/// ANY difference the typed conflict.
+#[cfg(feature = "composite-test-fixture")]
+fn resolve_witness_duplicate(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    key: &[u8],
+    object: &StoredObject,
+) -> Result<Option<WitnessPublicationOutcome>, MediumError> {
+    match find_witness_record_by_key(medium, key)? {
+        None => Ok(None),
+        Some((installed_record, installed_bytes)) => {
+            if installed_bytes == object.bytes() {
+                Ok(Some(WitnessPublicationOutcome::DuplicateVerified {
+                    record: installed_record,
+                }))
+            } else {
+                Err(MediumError::Chain {
+                    rule: "ancestry-witness/duplicate-content-mismatch",
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3140,10 +3537,11 @@ mod a12_tests {
 
     /// The in-crate admitted install under a deterministic key (the
     /// same unforgeable-receipt route the publisher uses — the only
-    /// route around the family gate). Only the POSIX resumability
-    /// regression drives it (the Windows arm refuses at the begin
-    /// tier before any installation).
-    #[cfg(unix)]
+    /// route around the family gate). Driven by the POSIX
+    /// resumability regression directly and by the F2
+    /// concurrent-competitor wrapper arms on every platform (the
+    /// Windows direct arm refuses at the begin tier before any
+    /// installation could exist).
     fn a12_install_under_key(
         medium: &mut dyn CanonicalMedium,
         key: Vec<u8>,
@@ -3188,6 +3586,27 @@ mod a12_tests {
         journal_root: &std::path::Path,
         members: &[(usize, Vec<u8>)],
         ledger_limit: u64,
+    ) -> A12Campaign {
+        a12_campaign_variant(medium, label, journal_root, members, ledger_limit, false)
+    }
+
+    /// The campaign variant with the adversarial index control:
+    /// `off_by_one_index_epochs` publishes the metadata's index
+    /// entries at each record's TRUE epoch minus one — exactly the
+    /// accepted local-corpus fixture's shape, which the ENTIRE
+    /// CP2 chain (the plan, the audits, the begin admission, and
+    /// the begin authority) admits without complaint, proving the
+    /// machinery never checks the index epochs against the
+    /// records. The F3 regression shows the publisher's PASS 0
+    /// refusing this predictable invalid state before any manifest
+    /// append.
+    fn a12_campaign_variant(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+        members: &[(usize, Vec<u8>)],
+        ledger_limit: u64,
+        off_by_one_index_epochs: bool,
     ) -> A12Campaign {
         let shared = plain_object(b"a12-shared-payload");
         let founding = crate::record::RevisionRecord::founding(
@@ -3248,6 +3667,13 @@ mod a12_tests {
         // the retained pre-checkpoint head).
         let seed = crate::checkpoint::compute_digest_seed(&founding_id);
         let mut digest = seed;
+        let doctor = |epoch: u64| {
+            if off_by_one_index_epochs {
+                epoch - 1
+            } else {
+                epoch
+            }
+        };
         let mut index = Vec::with_capacity(members.len() + 1);
         for id in &member_ids {
             let record = medium.read_record(id).unwrap();
@@ -3255,14 +3681,14 @@ mod a12_tests {
             index.push(crate::checkpoint::ReclaimedIndexEntry::new(
                 record.idempotency_key.clone(),
                 *id,
-                record.epoch,
+                doctor(record.epoch),
             ));
         }
         let sk_record = medium.read_record(&sk_id).unwrap();
         index.push(crate::checkpoint::ReclaimedIndexEntry::new(
             sk_record.idempotency_key.clone(),
             sk_id,
-            sk_record.epoch,
+            doctor(sk_record.epoch),
         ));
         let meta = crate::checkpoint::CheckpointMetadata::new(
             sk_id,
@@ -3310,12 +3736,15 @@ mod a12_tests {
 
     // ------------------------------ the CAS/reconciliation double
 
-    /// The single-fire interception the stale-parent, Unknown, and
-    /// pass-divergence arms drive.
+    /// The single-fire interception the stale-parent, Unknown,
+    /// pass-divergence, and concurrent-competitor arms drive.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum A12Arm {
         None,
         StaleOnce,
+        StaleWithCompetitorOnce,
+        StaleWithConflictingCompetitorOnce,
+        UnknownWithCompetitorOnce,
         UnknownNotInstalledOnce,
         UnknownInstalledOnce,
         UnverifiableOnce,
@@ -3326,11 +3755,17 @@ mod a12_tests {
     /// method delegates unchanged; the armed interception fires
     /// ONCE at the chosen boundary and stands down (the publisher's
     /// bounded retry then converges, or the typed refusal lands).
+    /// The wrapper also COUNTS the record reads per identity (the
+    /// F1 bounded-discovery regression observes the kernel's
+    /// descent discipline) and retains the last competitor's record
+    /// identity (the F2 arms install one beneath the publisher).
     struct A12Wrapped {
         inner: crate::SqliteMedium,
         arm: A12Arm,
         diverge_reads: u32,
         unverifiable_reconcile: bool,
+        read_counts: std::collections::BTreeMap<Hash, u32>,
+        last_competitor: Option<Hash>,
     }
 
     impl A12Wrapped {
@@ -3340,11 +3775,37 @@ mod a12_tests {
                 arm,
                 diverge_reads: 0,
                 unverifiable_reconcile: false,
+                read_counts: std::collections::BTreeMap::new(),
+                last_competitor: None,
             }
         }
 
         fn into_inner(self) -> crate::SqliteMedium {
             self.inner
+        }
+
+        fn read_count(&self, id: &Hash) -> u32 {
+            self.read_counts.get(id).copied().unwrap_or(0)
+        }
+
+        fn competitor(&self) -> Hash {
+            self.last_competitor
+                .expect("the arm installed a competitor")
+        }
+
+        /// The F2 competitor install: a GENUINE competing
+        /// publication under the publisher's own deterministic key
+        /// at its own tick (a distinct record identity carrying
+        /// either the identical content — the concurrent
+        /// installation — or the supplied conflicting content).
+        fn install_competitor(
+            &mut self,
+            key: &[u8],
+            object: &StoredObject,
+        ) -> Result<(), MediumError> {
+            let competitor = a12_install_under_key(&mut self.inner, key.to_vec(), object, 10);
+            self.last_competitor = Some(competitor);
+            Ok(())
         }
     }
 
@@ -3362,7 +3823,8 @@ mod a12_tests {
             if matches!(&self.arm, A12Arm::DivergeMemberRead(_)) {
                 return self.inner.append_admitted(admitted, expected_parent);
             }
-            match std::mem::replace(&mut self.arm, A12Arm::None) {
+            let arm = std::mem::replace(&mut self.arm, A12Arm::None);
+            match arm {
                 A12Arm::None => self.inner.append_admitted(admitted, expected_parent),
                 A12Arm::StaleOnce => {
                     // Advance the authoritative head beneath the
@@ -3377,6 +3839,39 @@ mod a12_tests {
                         .append(&record, std::slice::from_ref(&decoy), Some(head))
                         .unwrap();
                     self.inner.append_admitted(admitted, expected_parent)
+                }
+                A12Arm::StaleWithCompetitorOnce
+                | A12Arm::StaleWithConflictingCompetitorOnce
+                | A12Arm::UnknownWithCompetitorOnce => {
+                    // (F2) The concurrent same-key competitor: a
+                    // genuine competing publication installs under
+                    // the publisher's own deterministic key — the
+                    // identical content (the concurrent
+                    // installation) or a conflicting payload —
+                    // while this attempt holds its expectation; the
+                    // publisher then observes the stale-parent loss
+                    // (or the uncertain Unknown) and must re-resolve
+                    // the key instead of blindly re-appending.
+                    let (record, objects, _) = admitted.parts();
+                    let key = record
+                        .idempotency_key
+                        .clone()
+                        .expect("the witness publication carries its key");
+                    let competing_object = match arm {
+                        A12Arm::StaleWithConflictingCompetitorOnce => {
+                            plain_object(b"a12-conflicting-competitor-content")
+                        }
+                        _ => objects[0].clone(),
+                    };
+                    self.install_competitor(&key, &competing_object)?;
+                    if matches!(arm, A12Arm::UnknownWithCompetitorOnce) {
+                        Ok(crate::medium::AppendOutcome::Unknown {
+                            reason: crate::medium::UnknownReason::CommitUncertain,
+                        })
+                    } else {
+                        let observed = self.inner.head()?;
+                        Ok(crate::medium::AppendOutcome::RejectedStaleParent { observed })
+                    }
                 }
                 A12Arm::UnknownNotInstalledOnce => Ok(crate::medium::AppendOutcome::Unknown {
                     reason: crate::medium::UnknownReason::CommitUncertain,
@@ -3403,6 +3898,7 @@ mod a12_tests {
         }
 
         fn read_record(&mut self, id: &Hash) -> Result<crate::record::RevisionRecord, MediumError> {
+            *self.read_counts.entry(*id).or_insert(0) += 1;
             let diverge = matches!(&self.arm, A12Arm::DivergeMemberRead(target) if target == id);
             let record = self.inner.read_record(id)?;
             if diverge {
@@ -4063,6 +4559,11 @@ mod a12_tests {
 
     #[test]
     fn the_stale_parent_retry_converges() {
+        // (The A1-2 F2 corrective — the ordinary unrelated-head
+        // advancement arm) An UNRELATED decoy append advances the
+        // head (no competing same-key publication exists); the
+        // CAS loss's retry re-resolves the deterministic key
+        // (finding it free) and re-appends against the fresh head.
         let (path, mut medium) = a12_sqlite_store("stale-parent");
         let journal = a12_journal_root("stale-parent");
         let members = a12_small_members("stale-parent");
@@ -4250,6 +4751,252 @@ mod a12_tests {
             find_installed_witness_manifest(&mut medium, &campaign.mk)
                 .unwrap()
                 .is_some()
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[test]
+    fn the_kernel_discovery_is_bounded_not_per_shard() {
+        // (The A1-2 F1 corrective) The bounded-kernel evidence: a
+        // TWO-shard witness, then a direct kernel invocation under
+        // the read-counting wrapper. Every walk reads each non-head
+        // record twice (once as the parent-existence check, once as
+        // the current) — the counting arithmetic: the plan
+        // discovery's descent contributes 1 to the head (the
+        // manifest) and 2 to each record below it; the family walk
+        // contributes the same over ONLY the witness's own span
+        // (the manifest + the two shards). So the bounded kernel
+        // reads the manifest record exactly 2 (the per-shard form
+        // replaced by this corrective read it 4 — once per shard
+        // walk) and each shard record at most 4 (the per-shard form
+        // read the UPPER shard 6 — once more per deeper shard's
+        // walk); the family walk's early exit provably never
+        // descends past the deepest shard (the begin record stays
+        // at the plan descent's 2, where a founding-reaching walk
+        // would add its own 2).
+        let (path, mut medium) = a12_sqlite_store("bounded");
+        let journal = a12_journal_root("bounded");
+        let members: Vec<(usize, Vec<u8>)> = (0..70)
+            .map(|index| (60_000, format!("a12-bounded-payload-m{index}").into_bytes()))
+            .collect();
+        let campaign = a12_campaign(&mut medium, "bounded", &journal, &members, 100_000);
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            other => panic!("the begin admits: {other:?}"),
+        };
+        let publication = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        assert_eq!(publication.manifest.shard_count, 2);
+        let shard_records: Vec<Hash> = publication
+            .shard_outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                WitnessPublicationOutcome::Accepted { record, .. } => *record,
+                other => panic!("every shard freshly accepted: {other:?}"),
+            })
+            .collect();
+        // The direct kernel invocation with the read counting.
+        let mut wrapped = A12Wrapped::armed(medium, A12Arm::None);
+        let (_record, _manifest) =
+            verify_installed_witness_internal(&mut wrapped, &campaign.mk).unwrap();
+        assert_eq!(
+            wrapped.read_count(&publication.manifest_record),
+            2,
+            "the manifest record: the plan descent + the family walk, never once per shard"
+        );
+        for shard_record in &shard_records {
+            assert!(
+                wrapped.read_count(shard_record) <= 4,
+                "each shard record stays at the two-walk bound (the per-shard form read the upper shard 6): {}",
+                wrapped.read_count(shard_record)
+            );
+        }
+        assert_eq!(
+            wrapped.read_count(&begin_id),
+            2,
+            "the family walk's early exit never descends past the deepest shard"
+        );
+        drop(wrapped);
+        a12_sqlite_cleanup(&path);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[test]
+    fn the_stale_cas_with_a_same_key_competitor_returns_the_tierless_duplicate() {
+        // (The A1-2 F2 corrective) The concurrent same-key
+        // installation: while the publisher's first shard attempt
+        // holds its expectation, a genuine competing publication
+        // installs the IDENTICAL content under the same
+        // deterministic key at its own tick; the CAS loss's retry
+        // re-resolves the key and returns the TIERLESS verified
+        // duplicate — never a second append, never a fabricated
+        // durability.
+        let (path, mut medium) = a12_sqlite_store("competitor-identical");
+        let journal = a12_journal_root("competitor-identical");
+        let members = a12_small_members("competitor-identical");
+        let campaign = a12_campaign(
+            &mut medium,
+            "competitor-identical",
+            &journal,
+            &members,
+            10_000,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let mut wrapped = A12Wrapped::armed(medium, A12Arm::StaleWithCompetitorOnce);
+        let publication = publish_ancestry_witness(&mut wrapped, &campaign.mk, 9).unwrap();
+        let competitor = wrapped.competitor();
+        match publication.shard_outcomes[0] {
+            WitnessPublicationOutcome::DuplicateVerified { record } => {
+                assert_eq!(record, competitor);
+            }
+            other => {
+                panic!("the concurrent identical competitor is the verified duplicate: {other:?}")
+            }
+        }
+        // The manifest still publishes fresh above the competitor's
+        // shard, and the complete state verifies.
+        match publication.manifest_outcome {
+            WitnessPublicationOutcome::Accepted { .. } => {}
+            other => panic!("the manifest publishes fresh: {other:?}"),
+        }
+        assert_eq!(
+            wrapped.head().unwrap().unwrap(),
+            publication.manifest_record
+        );
+        let mut inner = wrapped.into_inner();
+        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        drop(inner);
+        a12_sqlite_cleanup(&path);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[test]
+    fn the_stale_cas_with_a_conflicting_same_key_competitor_refuses_typed() {
+        // (The A1-2 F2 corrective) The concurrent same-key CONFLICT:
+        // the competing publication installs DIFFERENT content
+        // under the same deterministic key; the retry's key
+        // re-resolution refuses the typed conflict — never a
+        // reinterpretation, never a second append.
+        let (path, mut medium) = a12_sqlite_store("competitor-conflicting");
+        let journal = a12_journal_root("competitor-conflicting");
+        let members = a12_small_members("competitor-conflicting");
+        let campaign = a12_campaign(
+            &mut medium,
+            "competitor-conflicting",
+            &journal,
+            &members,
+            10_000,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let mut wrapped = A12Wrapped::armed(medium, A12Arm::StaleWithConflictingCompetitorOnce);
+        let error = publish_ancestry_witness(&mut wrapped, &campaign.mk, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness/duplicate-content-mismatch"
+                }
+            ),
+            "the conflicting competitor refuses typed: {error:?}"
+        );
+        // Nothing completes: no manifest beyond the competitor's
+        // conflicting shard record.
+        let mut inner = wrapped.into_inner();
+        assert!(
+            find_installed_witness_manifest(&mut inner, &campaign.mk)
+                .unwrap()
+                .is_none()
+        );
+        drop(inner);
+        a12_sqlite_cleanup(&path);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[test]
+    fn the_unknown_retry_with_a_same_key_competitor_returns_the_duplicate() {
+        // (The A1-2 F2 corrective) The same re-resolution on the
+        // Unknown path: the uncertain append reconciles to the
+        // verified absence, and the retry then finds the
+        // competitor's byte-identical installation under the key —
+        // the tierless verified duplicate, never a re-append.
+        let (path, mut medium) = a12_sqlite_store("competitor-unknown");
+        let journal = a12_journal_root("competitor-unknown");
+        let members = a12_small_members("competitor-unknown");
+        let campaign = a12_campaign(
+            &mut medium,
+            "competitor-unknown",
+            &journal,
+            &members,
+            10_000,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let mut wrapped = A12Wrapped::armed(medium, A12Arm::UnknownWithCompetitorOnce);
+        let publication = publish_ancestry_witness(&mut wrapped, &campaign.mk, 9).unwrap();
+        let competitor = wrapped.competitor();
+        match publication.shard_outcomes[0] {
+            WitnessPublicationOutcome::DuplicateVerified { record } => {
+                assert_eq!(record, competitor);
+            }
+            other => {
+                panic!("the uncertain-then-competing shard is the verified duplicate: {other:?}")
+            }
+        }
+        match publication.manifest_outcome {
+            WitnessPublicationOutcome::Accepted { .. } => {}
+            other => panic!("the manifest publishes fresh: {other:?}"),
+        }
+        let mut inner = wrapped.into_inner();
+        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        drop(inner);
+        a12_sqlite_cleanup(&path);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_doctored_index_epoch_refuses_before_the_manifest() {
+        // (The A1-2 F3 corrective) The predictable invalid state:
+        // the metadata's index entries published at each record's
+        // TRUE epoch minus one — exactly the accepted local-corpus
+        // fixture's shape, which the ENTIRE CP2 chain admits (the
+        // plan, the audits, the begin admission, and the begin
+        // authority all authenticate) because the machinery never
+        // checks the index epochs against the records. The
+        // publisher's PASS 0 refuses the disagreement at the FIRST
+        // member — BEFORE any manifest append.
+        let (root, mut medium) = a12_local_store("f3-epoch");
+        let journal = a12_journal_root("f3-epoch");
+        let members = a12_small_members("f3-epoch");
+        let campaign =
+            a12_campaign_variant(&mut medium, "f3-epoch", &journal, &members, 10_000, true);
+        // The doctored campaign admits the full CP2 chain.
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        // PASS 0 refuses the indexed-epoch disagreement — the
+        // pre-manifest parent-edge proof's load-bearing premise
+        // (index epoch == record epoch) is enforced here.
+        let before_head = medium.head().unwrap().unwrap();
+        let error = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness/member-epoch-mismatch"
+                }
+            ),
+            "the doctored index epoch refuses typed: {error:?}"
+        );
+        assert_eq!(medium.head().unwrap().unwrap(), before_head);
+        assert!(
+            find_installed_witness_manifest(&mut medium, &campaign.mk)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_installed_witness_shard(&mut medium, &campaign.mk, 0)
+                .unwrap()
+                .is_none()
         );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
