@@ -37,6 +37,7 @@
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
+pub mod ancestry_witness;
 pub mod checkpoint;
 pub mod composite_append;
 pub mod composite_manifest;
@@ -66,6 +67,17 @@ mod sqlite_tests;
 #[cfg(test)]
 mod tests;
 
+pub use ancestry_witness::{
+    AncestryWitnessManifest, AncestryWitnessShard, MAX_WITNESS_MEMBER_PREIMAGE_BYTES,
+    RECLAMATION_WITNESS_FAMILY, RECLAMATION_WITNESS_KEY_DOMAIN,
+    RECLAMATION_WITNESS_MANIFEST_DOMAIN, RECLAMATION_WITNESS_MANIFEST_VERSION,
+    RECLAMATION_WITNESS_SHARD_DOMAIN, RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
+    RECLAMATION_WITNESS_SHARD_VERSION, WITNESS_ENTRY_FRAMING_BYTES, WITNESS_SHARD_HEADER_BYTES,
+    WITNESS_SHARD_PAYLOAD_CEILING, WitnessEntry, authenticate_against_index,
+    canonical_member_order, construct_witness, is_reclamation_ancestry_witness_family,
+    reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
+    validate_parent_edges_standalone, verify_exact_coverage, witness_coverage_digest,
+};
 pub use checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,
     CheckpointMetadata, ReclaimedIndexEntry, SkipEntry, chain_range_digest,
