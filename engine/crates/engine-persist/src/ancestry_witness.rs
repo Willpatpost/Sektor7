@@ -715,8 +715,39 @@ pub fn verify_exact_coverage(
     Ok(())
 }
 
+/// The index-shape validation (the standalone API boundary): the
+/// supplied index must carry UNIQUE member identities and UNIQUE
+/// epochs — two different records cannot occupy one height on a
+/// linear canonical ancestry, and one identity cannot appear
+/// twice. The accepted `CheckpointMetadata::decode` enforces this
+/// shape for decoded metadata objects (the sorted-unique index
+/// rule), but the standalone helpers accept caller-supplied index
+/// slices directly — never through the metadata decode — so this
+/// check closes the boundary explicitly rather than assuming the
+/// decode's guarantee.
+pub fn validate_index_shape(index: &[ReclaimedIndexEntry]) -> Result<(), SaveError> {
+    let mut identities = std::collections::BTreeSet::new();
+    let mut epochs = std::collections::BTreeSet::new();
+    for entry in index {
+        if !identities.insert(entry.hash) {
+            return Err(SaveError::Integrity(
+                "ancestry-witness/index-duplicate-identity",
+            ));
+        }
+        if !epochs.insert(entry.epoch) {
+            return Err(SaveError::Integrity(
+                "ancestry-witness/index-duplicate-epoch",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// THE COMPLETE STANDALONE WITNESS VALIDATION — the composite every
 /// positive result of which establishes the full contract: the
+/// INDEX SHAPE (the unique identities and epochs — two records
+/// cannot share one canonical height, one identity cannot appear
+/// twice, even when the supplied index itself repeats them); the
 /// manifest's structural coherence (via its own strict round-trip
 /// decode — the non-zero bindings, the bounded counts); every
 /// shard's structural coherence, payload-ceiling conformity, and
@@ -727,9 +758,9 @@ pub fn verify_exact_coverage(
 /// with the Some/None agreement); the standalone parent-edge
 /// consistency (the checked arithmetic); and the exact
 /// all-shards-complete coverage with the deterministic greedy
-/// layout. A directly constructed or mutated manifest, shard, or
-/// entry that fails ANY component refuses here — no subset helper
-/// or decoder invocation is required alongside it.
+/// layout. A directly constructed or mutated manifest, shard,
+/// index, or entry that fails ANY component refuses here — no
+/// subset helper or decoder invocation is required alongside it.
 ///
 /// **The memory contract (honest):** the composite holds the
 /// supplied aggregate for its duration and re-decodes every
@@ -741,6 +772,10 @@ pub fn verify_witness_standalone(
     shards: &[AncestryWitnessShard],
     index: &[ReclaimedIndexEntry],
 ) -> Result<(), SaveError> {
+    // The index shape FIRST (pure, no I/O): the unique identities
+    // and epochs — the impossible-ancestry duplicates refuse
+    // before any other work.
+    validate_index_shape(index)?;
     // The structural coherence via the strict decodes.
     let decoded_manifest = AncestryWitnessManifest::decode(&manifest.canonical_bytes())?;
     if decoded_manifest != *manifest {
@@ -1657,5 +1692,128 @@ mod tests {
         // The successful construction passes the complete
         // standalone validation (the strict round-trip included).
         verify_witness_standalone(&forward_manifest, &forward_shards, &index).unwrap();
+    }
+
+    #[test]
+    fn the_standalone_composite_rejects_duplicate_index_shapes() {
+        // (C2-F1) The supplied index's shape is validated at the
+        // standalone API boundary: two different records at the
+        // SAME epoch cannot occupy one height on a linear canonical
+        // ancestry, and one identity cannot appear twice — even
+        // when the supplied index itself repeats them and every
+        // per-entry fact is genuine. The metadata decode's
+        // sorted-unique guarantee never reaches this boundary (the
+        // helpers accept caller-supplied slices), so the composite
+        // enforces it explicitly.
+        // (Fixture A) Two DIFFERENT valid records at the same
+        // epoch, a supplied index containing both, a directly
+        // constructed structurally valid manifest and shard with
+        // the correct digest — the composite refuses typed.
+        let (mk, plan, begin, metadata, entries, index) = golden_fixture();
+        let parent = fixture_hash(b"c2-shared-parent");
+        let ra = crate::record::RevisionRecord::regular(parent, 1, 10);
+        let rb = crate::record::RevisionRecord::regular(parent, 1, 11);
+        assert_ne!(
+            ra.id(),
+            rb.id(),
+            "the different ticks yield different identities"
+        );
+        let mut pair = vec![
+            WitnessEntry {
+                member: ra.id(),
+                preimage: ra.canonical_bytes(),
+            },
+            WitnessEntry {
+                member: rb.id(),
+                preimage: rb.canonical_bytes(),
+            },
+        ];
+        let dup_epoch_index = vec![
+            crate::checkpoint::ReclaimedIndexEntry::new(None, ra.id(), 2),
+            crate::checkpoint::ReclaimedIndexEntry::new(None, rb.id(), 2),
+        ];
+        // The per-entry subset still passes (each entry is
+        // genuinely authenticated against its index row) — the
+        // violation is the INDEX SHAPE alone.
+        authenticate_against_index(&pair, &dup_epoch_index).unwrap();
+        // The directly constructed witness: the canonical order
+        // (both epoch 2 — the identity tiebreak ascending), the
+        // correct digest, the structurally valid manifest and
+        // shard.
+        pair.sort_unstable_by_key(|entry| entry.member);
+        let digest = witness_coverage_digest(
+            &mk,
+            2,
+            pair.iter()
+                .map(|entry| entry.member)
+                .collect::<Vec<_>>()
+                .into_iter(),
+        );
+        let manifest = AncestryWitnessManifest {
+            mk,
+            plan_record: plan,
+            begin_record: begin,
+            metadata_object: metadata,
+            member_count: 2,
+            shard_count: 1,
+            coverage_digest: digest,
+        };
+        let shard = AncestryWitnessShard {
+            mk,
+            shard_index: 0,
+            shard_count: 1,
+            member_count: 2,
+            entries: pair,
+        };
+        let error =
+            verify_witness_standalone(&manifest, std::slice::from_ref(&shard), &dup_epoch_index)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("index-duplicate-epoch"),
+            "the duplicate-epoch index refuses typed: {error:?}"
+        );
+        // (Fixture B) The duplicate indexed IDENTITY: the supplied
+        // index carries the same identity twice, with two matching
+        // valid entries and a correct digest — the composite
+        // refuses typed.
+        let rr = crate::record::RevisionRecord::regular(parent, 1, 12);
+        let rr_entry = WitnessEntry {
+            member: rr.id(),
+            preimage: rr.canonical_bytes(),
+        };
+        let dup_identity_index = vec![
+            crate::checkpoint::ReclaimedIndexEntry::new(None, rr.id(), 2),
+            crate::checkpoint::ReclaimedIndexEntry::new(None, rr.id(), 2),
+        ];
+        let digest = witness_coverage_digest(&mk, 2, [rr.id(), rr.id()].into_iter());
+        let manifest = AncestryWitnessManifest {
+            mk,
+            plan_record: plan,
+            begin_record: begin,
+            metadata_object: metadata,
+            member_count: 2,
+            shard_count: 1,
+            coverage_digest: digest,
+        };
+        let shard = AncestryWitnessShard {
+            mk,
+            shard_index: 0,
+            shard_count: 1,
+            member_count: 2,
+            entries: vec![rr_entry.clone(), rr_entry],
+        };
+        let error =
+            verify_witness_standalone(&manifest, std::slice::from_ref(&shard), &dup_identity_index)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("index-duplicate-identity"),
+            "the duplicate-identity index refuses typed: {error:?}"
+        );
+        // The genuine interleaved-anchor control (the golden
+        // fixture — the unindexed anchor occupying the intervening
+        // height, the unique-epoch/identity index) still passes the
+        // complete composite.
+        let (manifest, shards) = construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
+        verify_witness_standalone(&manifest, &shards, &index).unwrap();
     }
 }
