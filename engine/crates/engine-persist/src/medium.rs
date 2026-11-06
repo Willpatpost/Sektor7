@@ -528,6 +528,11 @@ pub trait CanonicalMedium {
         // authoritative journal-root binding is installable only
         // through the trusted in-crate admission.
         crate::reclaim::enforce_journal_root_binding_gate(objects)?;
+        // (V2X-CP3-A1) The ancestry-witness family gate: a witness
+        // object (the manifest, a shard, or any family variant) is
+        // installable only through the future admission-controlled
+        // publication boundary — never the unrestricted path.
+        crate::ancestry_witness::enforce_ancestry_witness_family_gate(objects)?;
         let admitted = AdmittedAppend::generic(record, objects);
         self.append_admitted(admitted, expected_parent)
     }

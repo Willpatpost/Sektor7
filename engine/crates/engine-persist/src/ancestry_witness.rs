@@ -43,6 +43,7 @@ use engine_core::{Decoder, Encoder, SaveError};
 
 use crate::checkpoint::ReclaimedIndexEntry;
 use crate::hash::{Hash, hash_object};
+use crate::medium::{MediumError, StoredObject, SyncTier};
 use crate::record::{RecordKind, RevisionRecord};
 
 /// The witness manifest's versioned domain (45 bytes).
@@ -60,15 +61,34 @@ pub const RECLAMATION_WITNESS_SHARD_DOMAIN: &str =
 pub const RECLAMATION_WITNESS_SHARD_VERSION: u32 = 1;
 
 /// The ancestry-witness family prefix — every version in this
-/// family is refused by the future generic publication path (the
-/// established W2-A discipline; the gate itself is CP3-A1 scope,
-/// NOT implemented here).
+/// family is refused by the generic publication path (the
+/// owner-ratified sixth family gate, V2X-CP3-A1).
 pub const RECLAMATION_WITNESS_FAMILY: &str = "engine-persist/reclamation-ancestry-witness";
 
 /// Whether a domain belongs to the recognized ancestry-witness
 /// family (any version).
 pub fn is_reclamation_ancestry_witness_family(domain: &str) -> bool {
     domain.starts_with(RECLAMATION_WITNESS_FAMILY)
+}
+
+/// The witness family's generic-append gate (V2X-CP3-A1, the
+/// owner-ratified sixth family gate — the completion-marker
+/// gate's witness twin): an ancestry-witness object — the exact
+/// manifest and shard domains, unsupported family versions, and
+/// any variant with a readable family-domain prefix — may enter
+/// the chain ONLY through the future admission-controlled
+/// publication boundary (A1-2, NOT IMPLEMENTED). The unrestricted
+/// generic append refuses every family member typed; the
+/// unrelated existing families are untouched.
+pub fn enforce_ancestry_witness_family_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
+    for object in objects {
+        if object.domain().starts_with(RECLAMATION_WITNESS_FAMILY) {
+            return Err(MediumError::Chain {
+                rule: "ancestry-witness/generic-append-refused",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The manifest record's future idempotency-key domain (defined by
@@ -98,6 +118,169 @@ pub fn reclamation_witness_shard_idempotency_key(mk: &Hash, shard_index: u64) ->
         mk.hex()
     )
     .into_bytes()
+}
+
+/// (V2X-CP3-A1) The per-object witness publication outcome —
+/// defined for the future publication (A1-2, NOT IMPLEMENTED; no
+/// publisher exists in A1-1). The owner-ratified
+/// installation-versus-durability contract: ONLY `Accepted`
+/// carries an actual acknowledged provider tier (the honest grade,
+/// recorded never promoted — the caller compares it against their
+/// own requirement); `DuplicateVerified` (the key already occupied
+/// by the re-authenticated exact canonical content) and
+/// `ReconciledInstalled` (the uncertain append reconciled to a
+/// proven canonical installation) establish INSTALLATION ONLY —
+/// no durability grade is invented for them, and the destructive
+/// consumer must independently establish the provider-durable
+/// witness authority before any mutation. `ReconciledNotInstalled`
+/// is the verified, retryable absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessPublicationOutcome {
+    /// Installed through a durably acknowledged append — the
+    /// provider's ACTUAL tier.
+    Accepted { record: Hash, tier: SyncTier },
+    /// The deterministic key was already occupied by content
+    /// verified byte-identical through the complete installed-state
+    /// verification — installation only, no grade.
+    DuplicateVerified { record: Hash },
+    /// The uncertain append reconciled to a proven canonical
+    /// installation — installation only, NO tier claimed.
+    ReconciledInstalled { record: Hash },
+    /// The verified absence after an uncertain append — retryable.
+    ReconciledNotInstalled,
+}
+
+/// The discovery descent's bound (the documented safety valve —
+/// the same policy class as every accepted walk).
+const WITNESS_DISCOVERY_DESCENT: u64 = 1 << 20;
+
+/// The keyed-record discovery shared by the witness manifest and
+/// shard discoveries: the gap-aware, cycle-guarded HEAD-to-founding
+/// descent (the accepted `find_on_chain` skeleton — the skip-table
+/// tracking, the authenticated gap crossing, the uncovered-gap
+/// refusal, the bounded descent), matching each encountered
+/// record's idempotency key against the expected deterministic
+/// form. A match is a CANDIDATE, never authority by key occupancy
+/// alone: the revision shape (a regular record with exactly one
+/// content reference) is validated at the matched record and the
+/// single content object's hash-verified bytes are returned for
+/// the caller's strict decode and binding checks.
+fn find_witness_record_by_key(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    key: &[u8],
+) -> Result<Option<(Hash, Vec<u8>)>, MediumError> {
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..WITNESS_DISCOVERY_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let record = medium.read_record(&current)?;
+        let mut first_object: Option<Vec<u8>> = None;
+        if let Some(object) = record.content_refs.first().copied() {
+            let bytes = medium.read_object(&object)?;
+            if StoredObject::new(bytes.clone())?.domain()
+                == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            {
+                skip_table = Some(
+                    crate::checkpoint::CheckpointMetadata::decode(&bytes)
+                        .map_err(MediumError::Format)?,
+                );
+            }
+            first_object = Some(bytes);
+        }
+        if record.idempotency_key.as_deref() == Some(key) {
+            if !matches!(record.kind, RecordKind::Regular) || record.content_refs.len() != 1 {
+                return Err(MediumError::Chain {
+                    rule: "ancestry-witness-discovery/shape-mismatch",
+                });
+            }
+            let bytes = first_object.expect("the single content ref was read above");
+            return Ok(Some((current, bytes)));
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "ancestry-witness-discovery/descent-bound",
+    })
+}
+
+/// (V2X-CP3-A1) The installed witness manifest's discovery: the
+/// deterministic MK-bound key lookup over the canonical ancestry,
+/// returning the matched revision's identity and the strictly
+/// decoded manifest with the MK binding checked. Key occupancy
+/// alone is never authority — the canonical membership (the
+/// descent), the revision shape, the object's hash-verified read,
+/// the strict decode, and the binding are all established here.
+/// **Discovery of the manifest alone does NOT establish
+/// all-shards-complete authority** — the complete installed-state
+/// verification is the separately gated A1-3 consumer.
+pub fn find_installed_witness_manifest(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    mk: &Hash,
+) -> Result<Option<(Hash, AncestryWitnessManifest)>, MediumError> {
+    let key = reclamation_witness_manifest_idempotency_key(mk);
+    let Some((record, bytes)) = find_witness_record_by_key(medium, &key)? else {
+        return Ok(None);
+    };
+    let manifest = AncestryWitnessManifest::decode(&bytes).map_err(MediumError::Format)?;
+    if manifest.mk != *mk {
+        return Err(MediumError::Chain {
+            rule: "ancestry-witness-discovery/binding-mismatch",
+        });
+    }
+    Ok(Some((record, manifest)))
+}
+
+/// (V2X-CP3-A1) The installed witness shard's discovery: the
+/// deterministic (MK, shard index) key lookup over the canonical
+/// ancestry, returning the matched revision's identity and the
+/// strictly decoded shard with the MK and shard-index bindings
+/// checked. The same discovery discipline as the manifest's —
+/// never key occupancy alone; never a completeness claim.
+pub fn find_installed_witness_shard(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    mk: &Hash,
+    shard_index: u64,
+) -> Result<Option<(Hash, AncestryWitnessShard)>, MediumError> {
+    let key = reclamation_witness_shard_idempotency_key(mk, shard_index);
+    let Some((record, bytes)) = find_witness_record_by_key(medium, &key)? else {
+        return Ok(None);
+    };
+    let shard = AncestryWitnessShard::decode(&bytes).map_err(MediumError::Format)?;
+    if shard.mk != *mk || shard.shard_index != shard_index {
+        return Err(MediumError::Chain {
+            rule: "ancestry-witness-discovery/binding-mismatch",
+        });
+    }
+    Ok(Some((record, shard)))
 }
 
 /// The witness-shard payload ceiling — the owner-ratified
@@ -719,11 +902,13 @@ pub fn verify_exact_coverage(
 /// supplied index must carry UNIQUE member identities and UNIQUE
 /// epochs — two different records cannot occupy one height on a
 /// linear canonical ancestry, and one identity cannot appear
-/// twice. The accepted `CheckpointMetadata::decode` enforces this
-/// shape for decoded metadata objects (the sorted-unique index
-/// rule), but the standalone helpers accept caller-supplied index
-/// slices directly — never through the metadata decode — so this
-/// check closes the boundary explicitly rather than assuming the
+/// twice. The accepted `CheckpointMetadata::decode` enforces
+/// strictly increasing, unique index HASHES for decoded metadata
+/// objects — it does NOT enforce unique epochs; this helper
+/// independently provides the epoch uniqueness — and the
+/// standalone helpers accept caller-supplied index slices
+/// directly, never through the metadata decode, so BOTH checks
+/// close the boundary explicitly rather than assuming the
 /// decode's guarantee.
 pub fn validate_index_shape(index: &[ReclaimedIndexEntry]) -> Result<(), SaveError> {
     let mut identities = std::collections::BTreeSet::new();
@@ -1815,5 +2000,591 @@ mod tests {
         // complete composite.
         let (manifest, shards) = construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
         verify_witness_standalone(&manifest, &shards, &index).unwrap();
+    }
+
+    // -------------------------------------------------------------
+    // (V2X-CP3-A1) THE DARK FOUNDATION: the family gate, the
+    // discovery helpers, and the outcome types. NO publisher
+    // exists — the in-crate admitted receipt is the only install
+    // route in these fixtures (the established test-only seam).
+    // -------------------------------------------------------------
+
+    /// An isolated LocalFile store for the A1 fixtures.
+    fn a11_store(label: &str) -> (std::path::PathBuf, crate::LocalFileMedium) {
+        let root = std::env::temp_dir().join(format!(
+            "s7-a11-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        (root.clone(), crate::LocalFileMedium::open(root).unwrap())
+    }
+
+    /// A plain non-witness content object.
+    fn plain_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    /// The in-crate admitted install under a deterministic key
+    /// (the only route around the family gate — the established
+    /// test-only seam; NOT a publication path).
+    fn a11_install_under_key(
+        medium: &mut crate::LocalFileMedium,
+        key: Vec<u8>,
+        object: &StoredObject,
+        tick: u64,
+    ) -> Hash {
+        use crate::medium::CanonicalMedium;
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = crate::record::RevisionRecord::regular(head, epoch, tick)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object.hash()]);
+        let id = record.id();
+        let admitted =
+            crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(object));
+        medium.append_admitted(admitted, Some(head)).unwrap();
+        id
+    }
+
+    /// A regular step with the given objects.
+    fn a11_step(medium: &mut crate::LocalFileMedium, objects: &[StoredObject], tick: u64) -> Hash {
+        use crate::medium::CanonicalMedium;
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let refs: Vec<Hash> = objects.iter().map(|o| o.hash()).collect();
+        let record =
+            crate::record::RevisionRecord::regular(head, epoch, tick).with_content_refs(refs);
+        medium.append(&record, objects, Some(head)).unwrap();
+        record.id()
+    }
+
+    /// A family-variant object with the given readable domain.
+    fn family_variant_object(domain: &str) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(domain);
+            enc.write_bytes(b"a11-family-variant");
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_generic_append_refuses_every_witness_family_domain() {
+        // (A1-1 §3.1-5) The sixth family gate: the exact manifest
+        // and shard domains, the unsupported family versions and
+        // variants, and the multi-object form all refuse typed
+        // through the ordinary generic append; the non-witness
+        // appends remain accepted; no bypass exists through the
+        // public call.
+        use crate::medium::CanonicalMedium;
+        let (root, mut medium) = a11_store("gate");
+        let plain = plain_object(b"a11-gate-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "a11-gate",
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        // The golden witness objects.
+        let (mk, plan, begin, metadata, entries, _index) = golden_fixture();
+        let (manifest, shards) = construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        let cases = [
+            ("the manifest domain", manifest_object.clone()),
+            ("the shard domain", shard_object.clone()),
+            (
+                "an unsupported manifest version",
+                family_variant_object("engine-persist/reclamation-ancestry-witness/2"),
+            ),
+            (
+                "an unsupported shard version",
+                family_variant_object("engine-persist/reclamation-ancestry-witness-shard/9"),
+            ),
+            (
+                "a bare family prefix",
+                family_variant_object("engine-persist/reclamation-ancestry-witness"),
+            ),
+            (
+                "a family prefix with a suffix",
+                family_variant_object("engine-persist/reclamation-ancestry-witness-bogus/x"),
+            ),
+        ];
+        for (label, object) in cases {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 5)
+                .with_content_refs(vec![object.hash()]);
+            let error = medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "ancestry-witness/generic-append-refused"
+                    }
+                ),
+                "{label}: the family gate refuses typed: {error:?}"
+            );
+        }
+        // The multi-object form (a plain object beside a witness
+        // object) refuses — the gate iterates every supplied
+        // object; no bypass through composition.
+        {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 6)
+                .with_content_refs(vec![plain.hash(), manifest_object.hash()]);
+            let error = medium
+                .append(&record, &[plain.clone(), manifest_object], Some(head))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "ancestry-witness/generic-append-refused"
+                    }
+                ),
+                "the composed object set refuses: {error:?}"
+            );
+        }
+        // The non-witness append remains ACCEPTED (the unrelated
+        // families untouched).
+        let head = medium.head().unwrap().unwrap();
+        let _ = head;
+        a11_step(&mut medium, std::slice::from_ref(&plain), 7);
+        assert!(medium.head().unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_deterministic_key_discovery_finds_and_authenticates() {
+        // (A1-1 §3.6-10) The discovery: the canonical membership,
+        // the revision shape, the exact key, the object binding,
+        // and the strict decode; the wrong MK and the wrong shard
+        // index are the definitive absences; the bad shapes and
+        // objects refuse typed.
+        use crate::medium::CanonicalMedium;
+        let (root, mut medium) = a11_store("discovery");
+        let plain = plain_object(b"a11-discovery-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "a11-discovery",
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let _r1 = a11_step(&mut medium, std::slice::from_ref(&plain), 1);
+        // The golden witness, installed under the deterministic
+        // keys through the in-crate receipt.
+        let (mk, plan, begin, metadata, entries, _index) = golden_fixture();
+        let (manifest, shards) = construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        let manifest_record = a11_install_under_key(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&mk),
+            &manifest_object,
+            10,
+        );
+        let shard_record = a11_install_under_key(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&mk, 0),
+            &shard_object,
+            11,
+        );
+        // The positive discovery: the exact identities and the
+        // decoded objects with the bindings checked.
+        let (found_id, found_manifest) = find_installed_witness_manifest(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_id, manifest_record);
+        assert_eq!(found_manifest, manifest);
+        let (found_sid, found_shard) = find_installed_witness_shard(&mut medium, &mk, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_sid, shard_record);
+        assert_eq!(found_shard, shards[0]);
+        // The wrong MK and the wrong shard index: the definitive
+        // absences (the descent reaches the founding).
+        let foreign = fixture_hash(b"a11-foreign-mk");
+        assert!(
+            find_installed_witness_manifest(&mut medium, &foreign)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_installed_witness_shard(&mut medium, &mk, 7)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_discovery_refuses_bad_shapes_objects_and_bindings() {
+        // (A1-1 §3.8-10) The matched record's shape, the object's
+        // decode, and the decoded binding each refuse typed. Each
+        // arm uses its own isolated store (the deterministic keys
+        // are chain-unique).
+        use crate::medium::CanonicalMedium;
+        let (mk, plan, begin, metadata, entries, _index) = golden_fixture();
+        let (manifest, _shards) =
+            construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let plain = plain_object(b"a11-bad-payload");
+        // (a) The invalid revision shape: a record under the key
+        // with TWO content references.
+        {
+            let (root, mut medium) = a11_store("discovery-shape");
+            let founding = crate::record::RevisionRecord::founding(
+                crate::record::AuthorityMode::Standalone,
+                "a11-shape",
+                0,
+            )
+            .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&plain), None)
+                .unwrap();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 20)
+                .with_idempotency_key(reclamation_witness_manifest_idempotency_key(&mk))
+                .with_content_refs(vec![manifest_object.hash(), plain.hash()]);
+            let admitted = crate::medium::AdmittedAppend::generic(
+                &record,
+                &[manifest_object.clone(), plain.clone()],
+            );
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            let error = find_installed_witness_manifest(&mut medium, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "ancestry-witness-discovery/shape-mismatch"
+                    }
+                ),
+                "the two-reference shape refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (b) The wrong content-object binding: a record under the
+        // key whose single object is not a manifest — the strict
+        // decode refuses.
+        {
+            let (root, mut medium) = a11_store("discovery-object");
+            let founding = crate::record::RevisionRecord::founding(
+                crate::record::AuthorityMode::Standalone,
+                "a11-object",
+                0,
+            )
+            .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&plain), None)
+                .unwrap();
+            a11_install_under_key(
+                &mut medium,
+                reclamation_witness_manifest_idempotency_key(&mk),
+                &plain,
+                22,
+            );
+            let error = find_installed_witness_manifest(&mut medium, &mk).unwrap_err();
+            assert!(
+                matches!(error, MediumError::Format(_)),
+                "the non-manifest object refuses at the strict decode: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // (c) The binding mismatch: a well-formed manifest decoded
+        // under the right key but naming a DIFFERENT mk.
+        {
+            let other_mk = fixture_hash(b"a11-other-mk");
+            let doctored = AncestryWitnessManifest {
+                mk: other_mk,
+                ..manifest.clone()
+            };
+            let doctored_object = StoredObject::new(doctored.canonical_bytes()).unwrap();
+            let (root, mut medium) = a11_store("discovery-binding");
+            let founding = crate::record::RevisionRecord::founding(
+                crate::record::AuthorityMode::Standalone,
+                "a11-binding",
+                0,
+            )
+            .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&plain), None)
+                .unwrap();
+            a11_install_under_key(
+                &mut medium,
+                reclamation_witness_manifest_idempotency_key(&mk),
+                &doctored_object,
+                23,
+            );
+            let error = find_installed_witness_manifest(&mut medium, &mk).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "ancestry-witness-discovery/binding-mismatch"
+                    }
+                ),
+                "the foreign-mk manifest refuses the binding: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn the_discovery_crosses_legitimate_gaps_and_refuses_uncovered_ones() {
+        // (A1-1 §3.11-12) The gap-aware descent: the positive
+        // discovery above a retired range; the definitive absence
+        // ACROSS the retired range (the self-skip crossing); the
+        // uncovered gap refusing; and the skip-target cycle
+        // (a structurally valid table whose self-skip names an
+        // already-seen record) refusing through the cycle guard.
+        use crate::medium::CanonicalMedium;
+        let (root, mut medium) = a11_store("gaps");
+        let plain = plain_object(b"a11-gap-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "a11-gaps",
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let p1 = a11_step(&mut medium, std::slice::from_ref(&plain), 1);
+        let r1 = a11_step(&mut medium, std::slice::from_ref(&plain), 2);
+        let r2 = a11_step(&mut medium, std::slice::from_ref(&plain), 3);
+        let sk = a11_step(&mut medium, std::slice::from_ref(&plain), 4);
+        // The checkpoint metadata: the index [r1, r2, sk] with the
+        // self-skip to p1 (the retained below-range record).
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let member_bytes: Vec<Vec<u8>> = [r1, r2]
+            .iter()
+            .map(|id| medium.read_record(id).unwrap().canonical_bytes())
+            .collect();
+        let digest = crate::checkpoint::chain_range_digest(&seed, &member_bytes);
+        let meta = crate::checkpoint::CheckpointMetadata::new(
+            sk,
+            r1,
+            vec![crate::checkpoint::SkipEntry::self_skip(p1)],
+            vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(None, r1, 2),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, r2, 3),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, sk, 4),
+            ],
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk_record = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk_record, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        let _mk = mk_record.id();
+        // The witness above the checkpoint.
+        let (gmk, plan, begin, metadata, entries, _index) = golden_fixture();
+        let (manifest, _shards) =
+            construct_witness(&gmk, &plan, &begin, &metadata, entries).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let manifest_record = a11_install_under_key(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&gmk),
+            &manifest_object,
+            10,
+        );
+        // The retired range: delete the index members' object
+        // files (the legitimate gap under the authenticated
+        // self-skip).
+        for id in [r1, r2, sk] {
+            std::fs::remove_file(medium.object_path_pub(&id)).unwrap();
+        }
+        // (a) The positive discovery (the witness above the gap).
+        let (found_id, found_manifest) = find_installed_witness_manifest(&mut medium, &gmk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_id, manifest_record);
+        assert_eq!(found_manifest, manifest);
+        // (b) The definitive absence ACROSS the gap: the foreign
+        // MK's descent must cross the retired range via the
+        // self-skip and reach the founding.
+        let foreign = fixture_hash(b"a11-gap-foreign-mk");
+        assert!(
+            find_installed_witness_manifest(&mut medium, &foreign)
+                .unwrap()
+                .is_none()
+        );
+        // (c) The uncovered gap: delete p1 (the retained below the
+        // range — covered by no skip) — the descent refuses typed.
+        std::fs::remove_file(medium.object_path_pub(&p1)).unwrap();
+        let error = find_installed_witness_manifest(&mut medium, &foreign).unwrap_err();
+        assert!(
+            matches!(error, MediumError::MissingObject { .. }),
+            "the uncovered gap refuses: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        // (d) The skip-target cycle: a structurally valid metadata
+        // whose self-skip names a record the walk has ALREADY
+        // VISITED (the target appended BEFORE the table carrier —
+        // no hash circularity). The chain: F → X (the future gap)
+        // → T (the target) → C (the carrier, whose content is the
+        // metadata with self_skip(T)); deleting X's object makes
+        // the walk at T jump back UP to the seen T — the cycle
+        // guard fires.
+        {
+            let (root2, mut medium2) = a11_store("cycle");
+            let founding2 = crate::record::RevisionRecord::founding(
+                crate::record::AuthorityMode::Standalone,
+                "a11-cycle",
+                0,
+            )
+            .with_content_refs(vec![plain.hash()]);
+            medium2
+                .append(&founding2, std::slice::from_ref(&plain), None)
+                .unwrap();
+            let c_x = a11_step(&mut medium2, std::slice::from_ref(&plain), 1);
+            let c_t = a11_step(&mut medium2, std::slice::from_ref(&plain), 2);
+            // The metadata: sk = X (the future missing parent),
+            // sk_parent = X (indexed — the self-entry equality rule
+            // yields to the indexed form), the self-skip target =
+            // T (not indexed, retained — structurally decodable).
+            let cyclic_meta = crate::checkpoint::CheckpointMetadata::new(
+                c_x,
+                c_x,
+                vec![crate::checkpoint::SkipEntry::self_skip(c_t)],
+                vec![crate::checkpoint::ReclaimedIndexEntry::new(None, c_x, 1)],
+                [7u8; 32],
+                [7u8; 32],
+            );
+            let cyclic_object = StoredObject::new(cyclic_meta.canonical_bytes()).unwrap();
+            let head = medium2.head().unwrap().unwrap();
+            let epoch = medium2.read_record(&head).unwrap().epoch;
+            let carrier = crate::record::RevisionRecord::regular(head, epoch, 3)
+                .with_content_refs(vec![cyclic_object.hash()]);
+            medium2
+                .append(&carrier, std::slice::from_ref(&cyclic_object), Some(head))
+                .unwrap();
+            // The gap: delete X — the walk (the carrier → T →
+            // T.parent = X missing) jumps via the tracked table
+            // back to the SEEN T.
+            std::fs::remove_file(medium2.object_path_pub(&c_x)).unwrap();
+            let foreign2 = fixture_hash(b"a11-cycle-foreign-mk");
+            let error = find_installed_witness_manifest(&mut medium2, &foreign2).unwrap_err();
+            assert!(
+                matches!(error, MediumError::Chain { rule: "cycle" }),
+                "the skip-target cycle refuses: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root2);
+        }
+    }
+
+    #[test]
+    fn the_discovery_twin_over_sqlite() {
+        // (A1-1 §3.13) The provider-parity twin: the same
+        // discovery over SqliteMedium — the positive find with the
+        // exact identity and the definitive absence.
+        use crate::medium::CanonicalMedium;
+        let path = std::env::temp_dir().join(format!(
+            "s7-a11-sqlite-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut medium = crate::SqliteMedium::open(&path).unwrap();
+        let plain = plain_object(b"a11-sqlite-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "a11-sqlite",
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let r1 = crate::record::RevisionRecord::regular(head, epoch, 1)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&r1, std::slice::from_ref(&plain), Some(head))
+            .unwrap();
+        let (mk, plan, begin, metadata, entries, _index) = golden_fixture();
+        let (manifest, shards) = construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        // The in-crate installs under the keys.
+        let install = |medium: &mut crate::SqliteMedium,
+                       key: Vec<u8>,
+                       object: &StoredObject,
+                       tick: u64|
+         -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, tick)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            let id = record.id();
+            let admitted =
+                crate::medium::AdmittedAppend::generic(&record, std::slice::from_ref(object));
+            medium.append_admitted(admitted, Some(head)).unwrap();
+            id
+        };
+        let manifest_record = install(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&mk),
+            &manifest_object,
+            10,
+        );
+        let shard_record = install(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&mk, 0),
+            &shard_object,
+            11,
+        );
+        let (found_id, found_manifest) = find_installed_witness_manifest(&mut medium, &mk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_id, manifest_record);
+        assert_eq!(found_manifest, manifest);
+        let (found_sid, found_shard) = find_installed_witness_shard(&mut medium, &mk, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_sid, shard_record);
+        assert_eq!(found_shard, shards[0]);
+        let foreign = fixture_hash(b"a11-sqlite-foreign-mk");
+        assert!(
+            find_installed_witness_manifest(&mut medium, &foreign)
+                .unwrap()
+                .is_none()
+        );
+        drop(medium);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 }
