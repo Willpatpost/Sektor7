@@ -3140,7 +3140,10 @@ mod a12_tests {
 
     /// The in-crate admitted install under a deterministic key (the
     /// same unforgeable-receipt route the publisher uses — the only
-    /// route around the family gate).
+    /// route around the family gate). Only the POSIX resumability
+    /// regression drives it (the Windows arm refuses at the begin
+    /// tier before any installation).
+    #[cfg(unix)]
     fn a12_install_under_key(
         medium: &mut dyn CanonicalMedium,
         key: Vec<u8>,
@@ -3162,6 +3165,7 @@ mod a12_tests {
     struct A12Campaign {
         mk: Hash,
         members: Vec<Hash>,
+        #[cfg_attr(not(unix), allow(dead_code))]
         sk: Hash,
     }
 
