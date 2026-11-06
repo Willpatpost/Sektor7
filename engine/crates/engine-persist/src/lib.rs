@@ -76,7 +76,8 @@ pub use ancestry_witness::{
     WITNESS_SHARD_PAYLOAD_CEILING, WitnessEntry, authenticate_against_index,
     canonical_member_order, construct_witness, is_reclamation_ancestry_witness_family,
     reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
-    validate_parent_edges_standalone, verify_exact_coverage, witness_coverage_digest,
+    validate_parent_edges_standalone, verify_exact_coverage, verify_witness_standalone,
+    witness_coverage_digest,
 };
 pub use checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,

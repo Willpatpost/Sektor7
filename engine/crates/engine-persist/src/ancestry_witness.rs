@@ -323,7 +323,7 @@ impl AncestryWitnessShard {
                 });
             }
             let entry = WitnessEntry { member, preimage };
-            validate_entry_intrinsic(&entry)?;
+            decode_validated_entry(&entry)?;
             entries.push(entry);
         }
         dec.finish()?;
@@ -337,14 +337,18 @@ impl AncestryWitnessShard {
     }
 }
 
-/// The intrinsic per-entry validation (shared by the shard decode
-/// and the deterministic construction): the preimage's SHA-256
-/// equals the declared member identity (the indexed commitment —
-/// a substituted or altered preimage refuses), and the preimage
-/// strict-decodes as a canonical REGULAR revision record (the
-/// retirement members are regular publications; a founding or
-/// malformed record refuses).
-fn validate_entry_intrinsic(entry: &WitnessEntry) -> Result<(), SaveError> {
+/// The intrinsic per-entry validation (the shared authentication
+/// point used by the shard decode, every standalone helper, and
+/// the construction): the preimage's SHA-256 equals the declared
+/// member identity (the indexed commitment — a substituted or
+/// altered preimage refuses), the preimage strict-decodes as a
+/// canonical REGULAR revision record (the retirement members are
+/// regular publications; a founding or malformed record refuses),
+/// and a regular retirement member never sits at epoch zero (its
+/// parent would need a negative chain height — the impossible
+/// ancestry). Returns the decoded record so the callers never
+/// re-decode.
+fn decode_validated_entry(entry: &WitnessEntry) -> Result<RevisionRecord, SaveError> {
     if hash_object(&entry.preimage) != entry.member {
         return Err(SaveError::Integrity(
             "ancestry-witness-shard/preimage-hash-mismatch",
@@ -356,7 +360,12 @@ fn validate_entry_intrinsic(entry: &WitnessEntry) -> Result<(), SaveError> {
             "ancestry-witness-shard/member-not-regular",
         ));
     }
-    Ok(())
+    if record.epoch == 0 {
+        return Err(SaveError::Integrity(
+            "ancestry-witness-shard/member-epoch-zero",
+        ));
+    }
+    Ok(record)
 }
 
 /// The canonical member order: the index entries sorted by epoch
@@ -393,31 +402,78 @@ pub fn witness_coverage_digest(
     digest
 }
 
-/// The deterministic witness construction: validates every supplied
-/// entry intrinsically, partitions the canonical-order members into
-/// maximal shards under the fixed ceiling (an entry that cannot fit
-/// alone in a shard is the fail-closed oversized refusal — it never
-/// reaches any publication or destructive operation), and derives
-/// the manifest with the coverage digest. A pure function of the
-/// supplied evidence: the same entries produce byte-identical
-/// output across processes, providers, and restarts.
+/// The deterministic witness construction. Derives the RATIFIED
+/// canonical member order (the decoded epochs descending, the
+/// member identity ascending as the tiebreak) from the
+/// authenticated member metadata itself — the same evidence
+/// supplied in ANY iteration order produces byte-identical
+/// canonical witness bytes. Before construction: the manifest
+/// binding identities are real (non-zero); the member census is
+/// within the plan's aggregate ceiling; no member identity repeats;
+/// no two members share an epoch (the unique chain heights — a
+/// duplicate epoch is the impossible ancestry); every entry passes
+/// the intrinsic validation; and no preimage exceeds the standalone
+/// maximum (the fail-closed oversized refusal — before any
+/// publication or destructive operation, which do not exist in
+/// this checkpoint). Every emitted manifest and shard passes its
+/// own strict decode before the constructor returns.
+///
+/// **The memory contract (honest):** the dark construction holds
+/// the ENTIRE witness in memory — every member preimage and every
+/// assembled shard (the entries are MOVED into the shards, never
+/// cloned, but the aggregate is O(total witness bytes), up to the
+/// ~256 GiB schema maximum). The bounded-memory streaming
+/// publication and consumption belong to the separately authorized
+/// CP3-A1/A2 integration; this constructor is the A0 deterministic
+/// reference form.
 pub fn construct_witness(
     mk: &Hash,
     plan_record: &Hash,
     begin_record: &Hash,
     metadata_object: &Hash,
-    ordered_members: &[WitnessEntry],
+    members: Vec<WitnessEntry>,
 ) -> Result<(AncestryWitnessManifest, Vec<AncestryWitnessShard>), SaveError> {
-    if ordered_members.is_empty() {
-        return Err(SaveError::Integrity("ancestry-witness/empty-members"));
+    if *mk == Hash::ZERO
+        || *plan_record == Hash::ZERO
+        || *begin_record == Hash::ZERO
+        || *metadata_object == Hash::ZERO
+    {
+        return Err(SaveError::Integrity(
+            "ancestry-witness/zero-binding-identity",
+        ));
     }
-    for entry in ordered_members {
-        validate_entry_intrinsic(entry)?;
+    let member_count = members.len() as u64;
+    if member_count == 0 || member_count > crate::reclaim::MAX_RECLAMATION_UNITS {
+        return Err(SaveError::Integrity("ancestry-witness/member-count"));
     }
+    // The authenticated member metadata: the decoded epoch per
+    // entry (the intrinsic validation included), the duplicate
+    // checks, and the canonical order derivation.
+    let mut decoded: Vec<(WitnessEntry, u64)> = Vec::with_capacity(members.len());
+    let mut seen_members = std::collections::BTreeSet::new();
+    let mut seen_epochs = std::collections::BTreeSet::new();
+    for entry in members {
+        let record = decode_validated_entry(&entry)?;
+        if !seen_members.insert(entry.member) {
+            return Err(SaveError::Integrity(
+                "ancestry-witness/duplicate-member-identity",
+            ));
+        }
+        if !seen_epochs.insert(record.epoch) {
+            return Err(SaveError::Integrity("ancestry-witness/duplicate-epoch"));
+        }
+        decoded.push((entry, record.epoch));
+    }
+    // The ratified canonical order: epoch DESCENDING, identity
+    // ASCENDING — derived from the authenticated metadata,
+    // independent of the input iteration order.
+    decoded.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.member.cmp(&b.0.member)));
+    let ordered_identities: Vec<Hash> = decoded.iter().map(|(entry, _)| entry.member).collect();
+    let ordered: Vec<WitnessEntry> = decoded.into_iter().map(|(entry, _)| entry).collect();
     let mut shards: Vec<Vec<WitnessEntry>> = Vec::new();
     let mut current: Vec<WitnessEntry> = Vec::new();
     let mut current_size = WITNESS_SHARD_HEADER_BYTES;
-    for entry in ordered_members {
+    for entry in ordered {
         let framed = WITNESS_ENTRY_FRAMING_BYTES + entry.preimage.len() as u64;
         if WITNESS_SHARD_HEADER_BYTES + framed > WITNESS_SHARD_PAYLOAD_CEILING {
             return Err(SaveError::Limit {
@@ -433,16 +489,11 @@ pub fn construct_witness(
             shards.push(closed);
         }
         current_size += framed;
-        current.push(entry.clone());
+        current.push(entry);
     }
     shards.push(current);
     let shard_count = shards.len() as u64;
-    let member_count = ordered_members.len() as u64;
-    let coverage_digest = witness_coverage_digest(
-        mk,
-        member_count,
-        ordered_members.iter().map(|entry| entry.member),
-    );
+    let coverage_digest = witness_coverage_digest(mk, member_count, ordered_identities.into_iter());
     let manifest = AncestryWitnessManifest {
         mk: *mk,
         plan_record: *plan_record,
@@ -463,15 +514,28 @@ pub fn construct_witness(
             entries,
         })
         .collect();
+    // The self-verification: every emitted object passes its own
+    // strict decode (the structural coherence, the ceiling, and
+    // the intrinsic entry validation) before the constructor
+    // returns.
+    AncestryWitnessManifest::decode(&manifest.canonical_bytes())?;
+    for shard in &shards {
+        AncestryWitnessShard::decode(&shard.canonical_bytes())?;
+    }
     Ok((manifest, shards))
 }
 
-/// The complete index-entry authentication (the standalone helper):
-/// for every witnessed member, the preimage's SHA-256 equals the
-/// indexed hash, the decoded record's epoch equals the indexed
-/// epoch, and the record's idempotency key equals the indexed key —
-/// including the Some/None shape agreement in both directions. A
-/// member absent from the index refuses.
+/// The complete index-entry authentication (the standalone
+/// helper). For every witnessed member this establishes: the
+/// INTRINSIC preimage authentication (the SHA-256 equality with
+/// the declared identity, the strict canonical REGULAR record
+/// decode, the non-zero epoch) AND the complete index-entry
+/// agreement — the indexed hash (by the intrinsic equality), the
+/// decoded epoch, and the idempotency key with the Some/None shape
+/// agreement in both directions. A member absent from the index
+/// refuses. A directly constructed or mutated in-memory entry
+/// whose preimage disagrees with its declared identity refuses
+/// here — no caller needs the shard decoder for the hash fact.
 pub fn authenticate_against_index(
     ordered_members: &[WitnessEntry],
     index: &[ReclaimedIndexEntry],
@@ -483,7 +547,7 @@ pub fn authenticate_against_index(
         else {
             return Err(SaveError::Integrity("ancestry-witness/index-member-absent"));
         };
-        let record = RevisionRecord::decode(&entry.preimage)?;
+        let record = decode_validated_entry(entry)?;
         if record.epoch != index_entry.epoch {
             return Err(SaveError::Integrity(
                 "ancestry-witness/index-epoch-mismatch",
@@ -518,7 +582,7 @@ pub fn validate_parent_edges_standalone(
     index: &[ReclaimedIndexEntry],
 ) -> Result<(), SaveError> {
     for (position, entry) in ordered_members.iter().enumerate() {
-        let record = RevisionRecord::decode(&entry.preimage)?;
+        let record = decode_validated_entry(entry)?;
         let Some(parent) = record.parent else {
             return Err(SaveError::Integrity("ancestry-witness/parent-edge-missing"));
         };
@@ -526,14 +590,17 @@ pub fn validate_parent_edges_standalone(
             return Err(SaveError::Integrity("ancestry-witness/parent-edge-zero"));
         }
         if let Some(parent_entry) = index.iter().find(|candidate| candidate.hash == parent) {
-            if parent_entry.epoch + 1 != record.epoch {
+            // The CHECKED arithmetic: an indexed parent at u64::MAX
+            // has no successor epoch — the typed refusal, identical
+            // in debug and release, never a panic or a wrap.
+            if parent_entry.epoch.checked_add(1) != Some(record.epoch) {
                 return Err(SaveError::Integrity(
                     "ancestry-witness/parent-epoch-incoherent",
                 ));
             }
         } else if let Some(next) = ordered_members.get(position + 1) {
-            let next_record = RevisionRecord::decode(&next.preimage)?;
-            if next_record.epoch + 1 == record.epoch {
+            let next_record = decode_validated_entry(next)?;
+            if next_record.epoch.checked_add(1) == Some(record.epoch) {
                 return Err(SaveError::Integrity(
                     "ancestry-witness/parent-edge-contradictory",
                 ));
@@ -544,18 +611,27 @@ pub fn validate_parent_edges_standalone(
 }
 
 /// The exact all-shards-complete coverage verification (the
-/// standalone helper over supplied decoded evidence): the shard
-/// census and indices form exactly 0..shard_count−1; each shard's
-/// entry count equals its declared member count; the summed member
-/// counts equal the manifest's; the concatenated entry runs equal
-/// the index-derived canonical member sequence identity-by-identity
+/// standalone helper over supplied decoded or directly constructed
+/// evidence): the shard census and indices form exactly
+/// 0..shard_count−1; each shard's entry count equals its declared
+/// member count; the summed member counts equal the manifest's;
+/// every entry passes the INTRINSIC validation (the preimage
+/// SHA-256 equality, the canonical REGULAR decode, the non-zero
+/// epoch — a mutated in-memory entry refuses here, never only at
+/// the shard decoder); the concatenated entry runs equal the
+/// index-derived canonical member sequence identity-by-identity
 /// (exactly once, in order — a missing, duplicated, extra,
 /// substituted, or reordered member refuses); every shard except
 /// the last is maximal under the deterministic greedy rule; and
 /// re-folding the coverage digest over the concatenated identities
-/// reproduces the manifest's. Every entry's preimage hash was
-/// verified at decode; nothing unverified, trailing, or unconsumed
-/// survives.
+/// reproduces the manifest's. Nothing unverified, trailing, or
+/// unconsumed survives.
+///
+/// **The memory contract (honest):** this aggregate verification
+/// holds ALL the supplied shards (and their entries) for its
+/// duration — O(total witness bytes), not a one-shard operation.
+/// The bounded streaming consumption belongs to the separately
+/// authorized CP3-A1/A2 integration.
 pub fn verify_exact_coverage(
     manifest: &AncestryWitnessManifest,
     shards: &[AncestryWitnessShard],
@@ -581,6 +657,9 @@ pub fn verify_exact_coverage(
             return Err(SaveError::Integrity(
                 "ancestry-witness/shard-count-declared-mismatch",
             ));
+        }
+        for entry in &shard.entries {
+            decode_validated_entry(entry)?;
         }
     }
     let total: u64 = sorted.iter().map(|shard| shard.member_count).sum();
@@ -633,6 +712,60 @@ pub fn verify_exact_coverage(
             return Err(SaveError::Integrity("ancestry-witness/shard-not-maximal"));
         }
     }
+    Ok(())
+}
+
+/// THE COMPLETE STANDALONE WITNESS VALIDATION — the composite every
+/// positive result of which establishes the full contract: the
+/// manifest's structural coherence (via its own strict round-trip
+/// decode — the non-zero bindings, the bounded counts); every
+/// shard's structural coherence, payload-ceiling conformity, and
+/// intrinsic entry validation (via each shard's own strict
+/// round-trip decode); the complete index-entry authentication
+/// (the intrinsic preimage SHA-256, the canonical REGULAR decode,
+/// the non-zero epoch, the indexed epoch, and the idempotency key
+/// with the Some/None agreement); the standalone parent-edge
+/// consistency (the checked arithmetic); and the exact
+/// all-shards-complete coverage with the deterministic greedy
+/// layout. A directly constructed or mutated manifest, shard, or
+/// entry that fails ANY component refuses here — no subset helper
+/// or decoder invocation is required alongside it.
+///
+/// **The memory contract (honest):** the composite holds the
+/// supplied aggregate for its duration and re-decodes every
+/// emitted object — O(total witness bytes), the A0 reference form;
+/// the bounded streaming consumption is the separately authorized
+/// CP3-A1/A2 obligation.
+pub fn verify_witness_standalone(
+    manifest: &AncestryWitnessManifest,
+    shards: &[AncestryWitnessShard],
+    index: &[ReclaimedIndexEntry],
+) -> Result<(), SaveError> {
+    // The structural coherence via the strict decodes.
+    let decoded_manifest = AncestryWitnessManifest::decode(&manifest.canonical_bytes())?;
+    if decoded_manifest != *manifest {
+        return Err(SaveError::Integrity(
+            "ancestry-witness/manifest-noncanonical",
+        ));
+    }
+    let mut sorted: Vec<&AncestryWitnessShard> = shards.iter().collect();
+    sorted.sort_unstable_by_key(|shard| shard.shard_index);
+    let mut concatenated: Vec<WitnessEntry> = Vec::new();
+    for shard in &sorted {
+        let decoded = AncestryWitnessShard::decode(&shard.canonical_bytes())?;
+        if decoded != **shard {
+            return Err(SaveError::Integrity("ancestry-witness/shard-noncanonical"));
+        }
+        concatenated.extend(decoded.entries.iter().cloned());
+    }
+    // The complete index-entry authentication (the intrinsic
+    // included) over the canonical-order concatenation.
+    authenticate_against_index(&concatenated, index)?;
+    // The standalone parent-edge consistency (the checked
+    // arithmetic, the intrinsic included).
+    validate_parent_edges_standalone(&concatenated, index)?;
+    // The exact coverage, the census, and the greedy layout.
+    verify_exact_coverage(manifest, shards, index)?;
     Ok(())
 }
 
@@ -767,7 +900,7 @@ mod tests {
     fn the_golden_fixture_reproduces_the_ratatified_vectors_exactly() {
         let (mk, plan, begin, metadata, entries, index) = golden_fixture();
         let (manifest, shards) =
-            construct_witness(&mk, &plan, &begin, &metadata, &entries).unwrap();
+            construct_witness(&mk, &plan, &begin, &metadata, entries.clone()).unwrap();
         assert_eq!(manifest.member_count, 2);
         assert_eq!(manifest.shard_count, 1);
         let manifest_bytes = manifest.canonical_bytes();
@@ -783,7 +916,7 @@ mod tests {
         // The deterministic construction is a pure function of the
         // evidence: repeated construction yields identical bytes.
         let (manifest2, shards2) =
-            construct_witness(&mk, &plan, &begin, &metadata, &entries).unwrap();
+            construct_witness(&mk, &plan, &begin, &metadata, entries.clone()).unwrap();
         assert_eq!(manifest2.canonical_bytes(), manifest_bytes);
         assert_eq!(shards2[0].canonical_bytes(), shard_bytes);
         // The round trips: decode reproduces the objects and the
@@ -798,6 +931,7 @@ mod tests {
         authenticate_against_index(&entries, &index).unwrap();
         validate_parent_edges_standalone(&entries, &index).unwrap();
         verify_exact_coverage(&manifest, &shards, &index).unwrap();
+        verify_witness_standalone(&manifest, &shards, &index).unwrap();
         // The deterministic key derivations (dormant, defined).
         assert_eq!(
             reclamation_witness_manifest_idempotency_key(&mk),
@@ -836,7 +970,7 @@ mod tests {
     fn the_manifest_refuses_domain_version_and_field_violations() {
         let (mk, plan, begin, metadata, entries, _index) = golden_fixture();
         let (manifest, _shards) =
-            construct_witness(&mk, &plan, &begin, &metadata, &entries).unwrap();
+            construct_witness(&mk, &plan, &begin, &metadata, entries).unwrap();
         let bytes = manifest.canonical_bytes();
         // The exact domain: an unrecognized family version refuses
         // at read_domain (the recognized-but-unsupported class).
@@ -887,7 +1021,7 @@ mod tests {
     #[test]
     fn the_shard_refuses_malformed_and_incoherent_entries() {
         let (mk, _plan, _begin, _metadata, entries, _index) = golden_fixture();
-        let (_manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, &entries).unwrap();
+        let (_manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, entries.clone()).unwrap();
         let bytes = shards[0].canonical_bytes();
         // The domain and version refusals.
         let mut doctored = bytes.clone();
@@ -1010,7 +1144,7 @@ mod tests {
         let (mk, _plan, _begin, _metadata, _entries, index) = golden_fixture();
         // The fixture's genuine state: m0's parent is the unindexed
         // anchor A with an epoch gap of 2 toward m1 — consistent.
-        let (_m, shards) = construct_witness(&mk, &mk, &mk, &mk, &golden_fixture().4).unwrap();
+        let (_m, shards) = construct_witness(&mk, &mk, &mk, &mk, golden_fixture().4).unwrap();
         validate_parent_edges_standalone(&shards[0].entries, &index).unwrap();
         // The contradictory case: two members at CONTIGUOUS epochs
         // whose upper member's parent is NOT the indexed lower
@@ -1070,7 +1204,7 @@ mod tests {
     #[test]
     fn the_coverage_verification_refuses_every_sequence_violation() {
         let (mk, _plan, _begin, _metadata, entries, index) = golden_fixture();
-        let (manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, &entries).unwrap();
+        let (manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, entries.clone()).unwrap();
         // The genuine state verifies.
         verify_exact_coverage(&manifest, &shards, &index).unwrap();
         // A missing member (one entry dropped): the counts and the
@@ -1124,23 +1258,28 @@ mod tests {
         bad_digest.coverage_digest[0] ^= 0xff;
         assert!(verify_exact_coverage(&bad_digest, &shards, &index).is_err());
         // A non-maximal middle shard (the greedy rule violated).
+        // The synthetic members' index entries are derived from the
+        // records themselves (the epochs and keys agreeing by
+        // construction — the internally consistent positive
+        // fixture).
         let large_a = synthetic_entry(0, 60_000);
         let large_b = synthetic_entry(1, 60_000);
         let large_c = synthetic_entry(2, 60_000);
+        let multi_index = vec![
+            synthetic_index_entry(&large_a),
+            synthetic_index_entry(&large_b),
+            synthetic_index_entry(&large_c),
+        ];
         let (multi_manifest, multi_shards) = construct_witness(
             &mk,
             &mk,
             &mk,
             &mk,
-            &[large_a.clone(), large_b.clone(), large_c.clone()],
+            vec![large_a.clone(), large_b.clone(), large_c.clone()],
         )
         .unwrap();
-        let multi_index = vec![
-            crate::checkpoint::ReclaimedIndexEntry::new(None, large_a.member, 30),
-            crate::checkpoint::ReclaimedIndexEntry::new(None, large_b.member, 20),
-            crate::checkpoint::ReclaimedIndexEntry::new(None, large_c.member, 10),
-        ];
         verify_exact_coverage(&multi_manifest, &multi_shards, &multi_index).unwrap();
+        verify_witness_standalone(&multi_manifest, &multi_shards, &multi_index).unwrap();
         assert!(multi_shards.len() >= 2, "the synthetic sizes force a split");
         // A hand-built non-maximal split refuses.
         let mut non_maximal = multi_shards.clone();
@@ -1159,10 +1298,13 @@ mod tests {
     /// A synthetic member with a given reference count and a small
     /// deterministic key — used for the shard-split and boundary
     /// tests. The identity derives from the content (the hash
-    /// check holds by construction).
+    /// check holds by construction). The epoch steps by TWO per
+    /// slot so consecutive members leave an intervening height for
+    /// their unindexed synthetic parents (the standalone
+    /// parent-edge consistency holds by construction).
     fn synthetic_entry(slot: u8, refs: usize) -> WitnessEntry {
         let parent = fixture_hash(format!("synthetic-parent-{slot}").as_bytes());
-        let record = crate::record::RevisionRecord::regular(parent, 100 + slot as u64, 1)
+        let record = crate::record::RevisionRecord::regular(parent, 100 + 2 * slot as u64, 1)
             .with_idempotency_key(format!("synthetic-key-{slot}").into_bytes())
             .with_content_refs(ascending_hashes(refs));
         let preimage = record.canonical_bytes();
@@ -1170,6 +1312,18 @@ mod tests {
             member: hash_object(&preimage),
             preimage,
         }
+    }
+
+    /// The internally consistent index entry for a synthetic
+    /// member: the key and epoch read from the member's own decoded
+    /// record (never fabricated independently).
+    fn synthetic_index_entry(entry: &WitnessEntry) -> crate::checkpoint::ReclaimedIndexEntry {
+        let record = crate::record::RevisionRecord::decode(&entry.preimage).unwrap();
+        crate::checkpoint::ReclaimedIndexEntry::new(
+            record.idempotency_key.clone(),
+            entry.member,
+            record.epoch,
+        )
     }
 
     /// Strictly ascending, distinct, non-zero 32-byte identities
@@ -1196,7 +1350,7 @@ mod tests {
             synthetic_entry(1, 60_000),
             synthetic_entry(2, 60_000),
         ];
-        let (manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, &members).unwrap();
+        let (manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, members.clone()).unwrap();
         assert!(shards.len() >= 2, "the sizes force a multi-shard split");
         assert_eq!(manifest.shard_count, shards.len() as u64);
         // Every shard except the last is maximal: the next entry
@@ -1215,7 +1369,7 @@ mod tests {
             assert!(shard.canonical_bytes().len() as u64 <= WITNESS_SHARD_PAYLOAD_CEILING);
         }
         // The deterministic reconstruction: byte-identical shards.
-        let (_m2, shards2) = construct_witness(&mk, &mk, &mk, &mk, &members).unwrap();
+        let (_m2, shards2) = construct_witness(&mk, &mk, &mk, &mk, members).unwrap();
         for (a, b) in shards.iter().zip(shards2.iter()) {
             assert_eq!(a.canonical_bytes(), b.canonical_bytes());
         }
@@ -1233,8 +1387,7 @@ mod tests {
         assert_eq!(MAX_WITNESS_MEMBER_PREIMAGE_BYTES, 4_194_121);
         // The single-entry shard totals exactly the ceiling and is
         // accepted by the construction AND the decode.
-        let (manifest, shards) =
-            construct_witness(&mk, &mk, &mk, &mk, std::slice::from_ref(&exact_fit)).unwrap();
+        let (manifest, shards) = construct_witness(&mk, &mk, &mk, &mk, vec![exact_fit]).unwrap();
         assert_eq!(shards.len(), 1);
         let bytes = shards[0].canonical_bytes();
         assert_eq!(bytes.len() as u64, WITNESS_SHARD_PAYLOAD_CEILING);
@@ -1246,8 +1399,7 @@ mod tests {
         // and a doctored shard over the ceiling refuses at decode.
         let one_over = boundary_record(27);
         assert_eq!(one_over.preimage.len(), 4_194_122);
-        let error =
-            construct_witness(&mk, &mk, &mk, &mk, std::slice::from_ref(&one_over)).unwrap_err();
+        let error = construct_witness(&mk, &mk, &mk, &mk, vec![one_over.clone()]).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -1283,5 +1435,227 @@ mod tests {
             member: hash_object(&preimage),
             preimage,
         }
+    }
+
+    #[test]
+    fn the_altered_tick_entry_refuses_every_standalone_path() {
+        // (C1-F1) The mandatory counterexample: a DIRECTLY
+        // CONSTRUCTED entry whose preimage was altered (only the
+        // tick — the epoch, parent, key, and references intact)
+        // while the declared member identity, the index, and the
+        // manifest digest stay original. Every standalone helper
+        // AND the composite refuse — the intrinsic preimage-hash
+        // authentication is included in each, never only at the
+        // shard decoder.
+        let (mk, plan, begin, metadata, entries, index) = golden_fixture();
+        let original = entries[0].clone();
+        let mut record = crate::record::RevisionRecord::decode(&original.preimage).unwrap();
+        record.tick += 1;
+        let altered_preimage = record.canonical_bytes();
+        assert_ne!(
+            hash_object(&altered_preimage),
+            original.member,
+            "the altered tick changes the preimage hash"
+        );
+        let altered = WitnessEntry {
+            member: original.member,
+            preimage: altered_preimage,
+        };
+        let pair = vec![altered.clone(), entries[1].clone()];
+        // Each subset helper refuses on its own (no decoder
+        // invocation involved).
+        assert!(
+            authenticate_against_index(&pair, &index).is_err(),
+            "the index authentication includes the intrinsic hash check"
+        );
+        assert!(
+            validate_parent_edges_standalone(&pair, &index).is_err(),
+            "the parent-edge validation includes the intrinsic hash check"
+        );
+        // The directly constructed shard carrying the altered entry
+        // refuses at the coverage helper and at the composite.
+        let (manifest, _shards) =
+            construct_witness(&mk, &plan, &begin, &metadata, entries.clone()).unwrap();
+        let doctored_shards = vec![AncestryWitnessShard {
+            mk,
+            shard_index: 0,
+            shard_count: 1,
+            member_count: 2,
+            entries: pair.clone(),
+        }];
+        assert!(
+            verify_exact_coverage(&manifest, &doctored_shards, &index).is_err(),
+            "the coverage verification includes the intrinsic hash check"
+        );
+        assert!(
+            verify_witness_standalone(&manifest, &doctored_shards, &index).is_err(),
+            "the complete standalone validation refuses the altered entry"
+        );
+    }
+
+    #[test]
+    fn the_checked_epoch_arithmetic_refuses_impossible_ancestry() {
+        // (C1-F2) The checked arithmetic: the u64::MAX epochs
+        // refuse typed (never a panic or a wrap — identical in
+        // debug and release); the epoch-zero regular member
+        // refuses; the valid indexed-adjacent and gapped forms
+        // pass (the golden fixture's two-height gap is proven in
+        // the parent-edge test above).
+        // (a) An indexed parent at u64::MAX: no successor epoch
+        // exists — the typed refusal (pre-fix this panicked in
+        // debug and wrapped in release).
+        {
+            let parent = fixture_hash(b"max-epoch-parent");
+            let child = crate::record::RevisionRecord::regular(parent, 5, 1);
+            let entries = vec![WitnessEntry {
+                member: child.id(),
+                preimage: child.canonical_bytes(),
+            }];
+            let index = vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(None, child.id(), 6),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, parent, u64::MAX),
+            ];
+            assert!(validate_parent_edges_standalone(&entries, &index).is_err());
+        }
+        // (b) A next canonical member at u64::MAX with an unindexed
+        // parent above: the checked add yields None (never equal to
+        // any record epoch) — no panic, no wrap, no contradiction
+        // fired; the state is consistently gapped.
+        {
+            let anchor = fixture_hash(b"max-next-anchor");
+            let upper = crate::record::RevisionRecord::regular(anchor, 4, 1);
+            let lower = crate::record::RevisionRecord::regular(
+                fixture_hash(b"max-next-below"),
+                u64::MAX - 1,
+                2,
+            );
+            let entries = vec![
+                WitnessEntry {
+                    member: lower.id(),
+                    preimage: lower.canonical_bytes(),
+                },
+                WitnessEntry {
+                    member: upper.id(),
+                    preimage: upper.canonical_bytes(),
+                },
+            ];
+            let index = vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(None, lower.id(), u64::MAX),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, upper.id(), 5),
+            ];
+            validate_parent_edges_standalone(&entries, &index).unwrap();
+        }
+        // (c) A regular retirement member at epoch zero: the
+        // parent would need a negative chain height — the
+        // impossible-ancestry refusal.
+        {
+            let zero_epoch = crate::record::RevisionRecord {
+                epoch: 0,
+                ..crate::record::RevisionRecord::regular(fixture_hash(b"zero-epoch-below"), 5, 1)
+            };
+            let entry = WitnessEntry {
+                member: zero_epoch.id(),
+                preimage: zero_epoch.canonical_bytes(),
+            };
+            let index = vec![crate::checkpoint::ReclaimedIndexEntry::new(
+                None,
+                entry.member,
+                0,
+            )];
+            assert!(
+                authenticate_against_index(std::slice::from_ref(&entry), &index).is_err(),
+                "the epoch-zero regular member refuses"
+            );
+        }
+        // (d) The valid indexed-adjacent form: the parent indexed
+        // at exactly the child's epoch minus one.
+        {
+            let parent = fixture_hash(b"adjacent-parent");
+            let child = crate::record::RevisionRecord::regular(parent, 4, 1);
+            let entries = vec![WitnessEntry {
+                member: child.id(),
+                preimage: child.canonical_bytes(),
+            }];
+            let index = vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(None, child.id(), 5),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, parent, 4),
+            ];
+            validate_parent_edges_standalone(&entries, &index).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_construction_derives_the_canonical_order_and_refuses_bad_census() {
+        // (C1-F3) The canonical order is DERIVED from the
+        // authenticated member metadata — the same evidence in ANY
+        // iteration order produces the identical canonical bytes;
+        // the duplicate identity, the duplicate epoch, the
+        // above-ceiling census, and the zero bindings refuse typed;
+        // and the successful construction passes the COMPLETE
+        // standalone validation.
+        let (mk, plan, begin, metadata, entries, index) = golden_fixture();
+        // The REVERSE input order produces the identical output.
+        let (forward_manifest, forward_shards) =
+            construct_witness(&mk, &plan, &begin, &metadata, entries.clone()).unwrap();
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        let (reverse_manifest, reverse_shards) =
+            construct_witness(&mk, &plan, &begin, &metadata, reversed).unwrap();
+        assert_eq!(
+            reverse_manifest.canonical_bytes(),
+            forward_manifest.canonical_bytes()
+        );
+        for (a, b) in forward_shards.iter().zip(reverse_shards.iter()) {
+            assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        }
+        // The duplicate member identity refuses.
+        let mut duplicated = entries.clone();
+        duplicated.push(entries[0].clone());
+        assert!(
+            construct_witness(&mk, &plan, &begin, &metadata, duplicated)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate-member-identity")
+        );
+        // The duplicate epoch refuses (a distinct record at m0's
+        // epoch — the unique chain heights).
+        let twin = crate::record::RevisionRecord::regular(fixture_hash(b"twin-parent"), 3, 9);
+        let twin_entry = WitnessEntry {
+            member: twin.id(),
+            preimage: twin.canonical_bytes(),
+        };
+        let error = construct_witness(
+            &mk,
+            &plan,
+            &begin,
+            &metadata,
+            vec![entries[0].clone(), twin_entry],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate-epoch"));
+        // The above-ceiling census refuses (one member over the
+        // plan's aggregate ceiling — minimal distinct-epoch
+        // records).
+        let over: Vec<WitnessEntry> = (0..=crate::reclaim::MAX_RECLAMATION_UNITS)
+            .map(|position| {
+                let parent = fixture_hash(format!("over-census-parent-{position}").as_bytes());
+                let record = crate::record::RevisionRecord::regular(parent, position, 1);
+                let preimage = record.canonical_bytes();
+                WitnessEntry {
+                    member: hash_object(&preimage),
+                    preimage,
+                }
+            })
+            .collect();
+        let error = construct_witness(&mk, &plan, &begin, &metadata, over).unwrap_err();
+        assert!(error.to_string().contains("member-count"));
+        // The zero binding identities refuse.
+        assert!(construct_witness(&Hash::ZERO, &plan, &begin, &metadata, entries.clone()).is_err());
+        assert!(construct_witness(&mk, &Hash::ZERO, &begin, &metadata, entries.clone()).is_err());
+        assert!(construct_witness(&mk, &plan, &Hash::ZERO, &metadata, entries.clone()).is_err());
+        assert!(construct_witness(&mk, &plan, &begin, &Hash::ZERO, entries.clone()).is_err());
+        // The successful construction passes the complete
+        // standalone validation (the strict round-trip included).
+        verify_witness_standalone(&forward_manifest, &forward_shards, &index).unwrap();
     }
 }
