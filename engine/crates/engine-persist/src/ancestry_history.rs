@@ -471,8 +471,29 @@ pub fn walk_authenticated_history_bounded(
                     });
                 }
                 let meta_bytes = medium.read_object(&record.content_refs[0])?;
-                crate::checkpoint::CheckpointMetadata::decode(&meta_bytes)
+                let boundary_metadata = crate::checkpoint::CheckpointMetadata::decode(&meta_bytes)
                     .map_err(MediumError::Format)?;
+                // (F2-B) THE LOCAL CHECKPOINT BINDING: the prior MK
+                // is bound to ITS OWN metadata — a regular revision
+                // whose parent is exactly the metadata's SK and
+                // whose idempotency key is the ratified
+                // deterministic checkpoint key for that SK. A
+                // strictly decodable metadata object under a
+                // metadata-domain first reference alone is
+                // INSUFFICIENT.
+                if !matches!(record.kind, crate::record::RecordKind::Regular)
+                    || record.parent != Some(boundary_metadata.sk)
+                    || record.idempotency_key.as_deref()
+                        != Some(
+                            &crate::checkpoint::checkpoint_mk_idempotency_key(
+                                &boundary_metadata.sk,
+                            )[..],
+                        )
+                {
+                    return Err(MediumError::Chain {
+                        rule: "history/boundary-checkpoint-binding",
+                    });
+                }
                 // (F1) The complete-coverage proof: every indexed
                 // member consumed in the exact canonical order and
                 // the witness shard/entry sequence exhausted — a
@@ -1376,11 +1397,11 @@ mod a2f_tests {
     /// [m0, m1, sk] → mk → plan → audits → begin → witness.
     /// Returns (mk, m0, m1, sk).
     #[cfg(unix)]
-    fn bespoke_middle_campaign(
+    pub(crate) fn bespoke_middle_campaign(
         medium: &mut dyn CanonicalMedium,
         label: &str,
         journal_root: &std::path::Path,
-        middle_object: &StoredObject,
+        middle_spec: &dyn Fn(Hash) -> (StoredObject, Option<Vec<u8>>),
         middle_after_m0: bool,
     ) -> (Hash, Hash, Hash, Hash) {
         let plain = {
@@ -1428,19 +1449,24 @@ mod a2f_tests {
             record.id()
         };
         let p1_id = step(medium, 2);
-        let append_middle = |medium: &mut dyn CanonicalMedium| {
+        let append_middle = |medium: &mut dyn CanonicalMedium, parent: Hash| {
+            let (middle_object, middle_key) = middle_spec(parent);
             let head = medium.head().unwrap().unwrap();
             let epoch = medium.read_record(&head).unwrap().epoch;
             let middle = crate::record::RevisionRecord::regular(head, epoch, 3)
                 .with_content_refs(vec![middle_object.hash()]);
+            let middle = match middle_key {
+                Some(key) => middle.with_idempotency_key(key),
+                None => middle,
+            };
             medium
-                .append(&middle, std::slice::from_ref(middle_object), Some(head))
+                .append(&middle, std::slice::from_ref(&middle_object), Some(head))
                 .unwrap();
         };
         // The middle BEFORE m0 (between p1 and the range's bottom)
         // when the caller chooses that placement.
         if !middle_after_m0 {
-            append_middle(medium);
+            append_middle(medium, p1_id);
         }
         // The members m0 and m1 (the middle inserted between them
         // when the caller chooses that placement).
@@ -1466,7 +1492,7 @@ mod a2f_tests {
                 .unwrap();
             member_ids.push(record.id());
             if middle_after_m0 && index == 0 {
-                append_middle(medium);
+                append_middle(medium, member_ids[0]);
             }
         }
         let sk_id = step(medium, 4);
@@ -1532,21 +1558,29 @@ mod a2f_tests {
         let journal = temp_dir_path("journal", "f1");
         let mut medium = crate::LocalFileMedium::open(&root).unwrap();
         std::fs::create_dir_all(&root).unwrap();
-        // The fake mid-range checkpoint-metadata record's object: a
-        // STRICTLY VALID checkpoint metadata (an empty index, a
-        // coherent shape) — the boundary authentication must PASS
-        // so that the PREMATURE-COVERAGE refusal is what fires.
-        let fake_meta = crate::checkpoint::CheckpointMetadata::new(
-            crate::hash::hash_object(b"a2f-fake-mk-sk"),
-            crate::hash::hash_object(b"a2f-fake-mk-sk-parent"),
-            Vec::new(),
-            Vec::new(),
-            [0x11; 32],
-            [0x12; 32],
-        );
-        let middle_object = StoredObject::new(fake_meta.canonical_bytes()).unwrap();
+        // The fake mid-range checkpoint-metadata record: a
+        // STRICTLY VALID checkpoint metadata whose LOCAL CHECKPOINT
+        // BINDING is COHERENT — the record's parent (m0's identity,
+        // handed to the spec) IS the metadata's SK and the record
+        // carries the ratified deterministic checkpoint key — so the
+        // boundary authentication AND the F2-B binding both pass and
+        // the PREMATURE-COVERAGE refusal is what fires.
+        let coherent_fake_mk = |parent: Hash| -> (StoredObject, Option<Vec<u8>>) {
+            let fake_meta = crate::checkpoint::CheckpointMetadata::new(
+                parent,
+                crate::hash::hash_object(b"a2f-fake-mk-sk-parent"),
+                Vec::new(),
+                Vec::new(),
+                [0x11; 32],
+                [0x12; 32],
+            );
+            (
+                StoredObject::new(fake_meta.canonical_bytes()).unwrap(),
+                Some(crate::checkpoint::checkpoint_mk_idempotency_key(&parent)),
+            )
+        };
         let (mk_id, m0_id, _m1_id, _sk_id) =
-            bespoke_middle_campaign(&mut medium, "f1", &journal, &middle_object, true);
+            bespoke_middle_campaign(&mut medium, "f1", &journal, &coherent_fake_mk, true);
         // The A1-3 verifier independently confirms the witness
         // complete and bound.
         assert!(matches!(
@@ -1599,18 +1633,19 @@ mod a2f_tests {
         let journal = temp_dir_path("journal", "f2");
         std::fs::create_dir_all(&root).unwrap();
         let mut medium = crate::LocalFileMedium::open(&root).unwrap();
-        let middle_object = {
+        let snapshot_middle = |_parent: Hash| -> (StoredObject, Option<Vec<u8>>) {
             use engine_core::Encoder;
-            StoredObject::new({
+            let object = StoredObject::new({
                 let mut enc = Encoder::new();
                 enc.write_str("engine-slice/session-snapshot/1");
                 enc.write_bytes(b"a2f-snapshot-payload");
                 enc.into_bytes()
             })
-            .unwrap()
+            .unwrap();
+            (object, None)
         };
         let (mk_id, _m0, _m1, _sk) =
-            bespoke_middle_campaign(&mut medium, "f2", &journal, &middle_object, false);
+            bespoke_middle_campaign(&mut medium, "f2", &journal, &snapshot_middle, false);
         // The walk: all three members visited, then the snapshot
         // record (m0's original parent) — the typed
         // unindexed-snapshot refusal, never a silent anchor.
@@ -1692,6 +1727,341 @@ mod a2f_tests {
             .collect();
         let expected: Vec<Hash> = order.iter().map(|entry| entry.hash).collect();
         assert_eq!(walked_members, expected);
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+}
+
+#[cfg(all(test, feature = "composite-test-fixture"))]
+mod a2b_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::medium::CanonicalMedium;
+
+    #[cfg(unix)]
+    fn temp_dir_path(prefix: &str, label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-a2b-{prefix}-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// (F2-B) The incoherent checkpoint SK: a fully verified witness
+    /// with every indexed member traversed, then a fake
+    /// prior-checkpoint record whose metadata is STRICTLY decodable
+    /// and whose deterministic key matches the METADATA's OWN SK —
+    /// but whose SK is not the record's actual parent. The local
+    /// checkpoint binding refuses typed; the walk never returns a
+    /// completed history.
+    #[cfg(unix)]
+    #[test]
+    fn the_incoherent_checkpoint_sk_refuses() {
+        let root = temp_dir_path("store", "b1");
+        let journal = temp_dir_path("journal", "b1");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        // The fake prior MK below the whole range (between p1 and
+        // m0): the metadata's SK is an unrelated identity, and the
+        // record's key is the CORRECT deterministic key FOR THAT
+        // (wrong) SK — so the key arm passes and the SK/parent
+        // mismatch is the refusing arm.
+        let incoherent_sk = |_parent: Hash| -> (StoredObject, Option<Vec<u8>>) {
+            let sk = crate::hash::hash_object(b"a2b-arbitrary-sk");
+            let meta = crate::checkpoint::CheckpointMetadata::new(
+                sk,
+                crate::hash::hash_object(b"a2b-arbitrary-sk-parent"),
+                Vec::new(),
+                Vec::new(),
+                [0x21; 32],
+                [0x22; 32],
+            );
+            (
+                StoredObject::new(meta.canonical_bytes()).unwrap(),
+                Some(crate::checkpoint::checkpoint_mk_idempotency_key(&sk)),
+            )
+        };
+        let (mk_id, _m0, _m1, _sk) = crate::ancestry_history::a2f_tests::bespoke_middle_campaign(
+            &mut medium,
+            "b1",
+            &journal,
+            &incoherent_sk,
+            false,
+        );
+        // The A1-3 verifier independently confirms the witness
+        // complete and bound.
+        assert!(matches!(
+            crate::ancestry_witness::verify_installed_ancestry_witness(&mut medium, &mk_id)
+                .unwrap(),
+            crate::ancestry_witness::InstalledWitnessVerification::Verified { .. }
+        ));
+        // The walk: all three members visited, then the fake prior
+        // MK — the typed checkpoint-binding refusal.
+        let mut steps = Vec::new();
+        let error = walk_authenticated_history(&mut medium, &mk_id, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "history/boundary-checkpoint-binding"
+                }
+            ),
+            "the incoherent checkpoint SK refuses typed: {error:?}"
+        );
+        assert_eq!(steps.len(), 3, "every indexed member was traversed first");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (F2-B) The wrong deterministic key: the fake prior
+    /// checkpoint's metadata SK IS the record's actual parent (the
+    /// parent arm passes), but the record's idempotency key is not
+    /// the ratified checkpoint key for that SK. The binding refuses
+    /// typed.
+    #[cfg(unix)]
+    #[test]
+    fn the_wrong_checkpoint_key_refuses() {
+        let root = temp_dir_path("store", "b2");
+        let journal = temp_dir_path("journal", "b2");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let wrong_key = |parent: Hash| -> (StoredObject, Option<Vec<u8>>) {
+            let meta = crate::checkpoint::CheckpointMetadata::new(
+                parent,
+                crate::hash::hash_object(b"a2b-wrong-key-sk-parent"),
+                Vec::new(),
+                Vec::new(),
+                [0x31; 32],
+                [0x32; 32],
+            );
+            (
+                StoredObject::new(meta.canonical_bytes()).unwrap(),
+                Some(b"a2b-wrong-checkpoint-key".to_vec()),
+            )
+        };
+        let (mk_id, _m0, _m1, _sk) = crate::ancestry_history::a2f_tests::bespoke_middle_campaign(
+            &mut medium,
+            "b2",
+            &journal,
+            &wrong_key,
+            false,
+        );
+        let mut steps = Vec::new();
+        let error = walk_authenticated_history(&mut medium, &mk_id, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "history/boundary-checkpoint-binding"
+                }
+            ),
+            "the wrong checkpoint key refuses typed: {error:?}"
+        );
+        assert_eq!(steps.len(), 3, "every indexed member was traversed first");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (F2-B) The genuine prior checkpoint: a truly constructed
+    /// previous checkpoint — its own member, its own SK, its own MK
+    /// (a regular revision, the parent exactly the metadata's SK,
+    /// the ratified deterministic key, the strictly decodable
+    /// metadata) — standing below the current range. The walk
+    /// traverses every current member and ACCEPTS the prior MK as
+    /// the boundary: the completed summary with
+    /// prior_checkpoint=true.
+    #[cfg(unix)]
+    #[test]
+    fn the_genuine_prior_checkpoint_boundary_is_accepted() {
+        let root = temp_dir_path("store", "b3");
+        let journal = temp_dir_path("journal", "b3");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let plain = {
+            use engine_core::Encoder;
+            StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"a2b-payload");
+                enc.into_bytes()
+            })
+            .unwrap()
+        };
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "b3",
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, _outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, tick)
+                .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&plain), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let p1_id = step(&mut medium, 2);
+        // THE GENUINE PRIOR CHECKPOINT: its own member, its own SK,
+        // and its MK — a regular revision on SK, the ratified
+        // deterministic key, and the strictly coherent metadata over
+        // the prior range.
+        let prior_m0 = step(&mut medium, 3);
+        let prior_m0_bytes = medium.read_record(&prior_m0).unwrap().canonical_bytes();
+        let prior_sk = step(&mut medium, 4);
+        let prior_seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let prior_digest = crate::checkpoint::chain_range_digest(&prior_seed, &[prior_m0_bytes]);
+        let prior_metadata = crate::checkpoint::CheckpointMetadata::new(
+            prior_sk,
+            prior_m0,
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1_id)],
+            vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(None, prior_m0, 3),
+                crate::checkpoint::ReclaimedIndexEntry::new(None, prior_sk, 4),
+            ],
+            prior_digest,
+            prior_seed,
+        );
+        let prior_metadata_object = StoredObject::new(prior_metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let prior_epoch = medium.read_record(&head).unwrap().epoch;
+        let prior_mk = crate::record::RevisionRecord::regular(prior_sk, prior_epoch, 5)
+            .with_idempotency_key(crate::checkpoint::checkpoint_mk_idempotency_key(&prior_sk))
+            .with_content_refs(vec![prior_metadata_object.hash()]);
+        medium
+            .append(
+                &prior_mk,
+                std::slice::from_ref(&prior_metadata_object),
+                Some(prior_sk),
+            )
+            .unwrap();
+        let prior_mk_id = prior_mk.id();
+        // The current range on top of the prior MK.
+        let mut member_ids = Vec::new();
+        for index in 0..2u32 {
+            let object = {
+                use engine_core::Encoder;
+                StoredObject::new({
+                    let mut enc = Encoder::new();
+                    enc.write_str("sektor7/save/1");
+                    enc.write_bytes(format!("a2b-member-{index}").as_bytes());
+                    enc.into_bytes()
+                })
+                .unwrap()
+            };
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 6)
+                .with_idempotency_key(format!("a2b-member-key-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            member_ids.push(record.id());
+        }
+        let sk_id = step(&mut medium, 7);
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::new();
+        for id in &member_ids {
+            let record = medium.read_record(id).unwrap();
+            digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let metadata = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_ids[0],
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, prior_mk_id)],
+            index,
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 8)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        crate::reclaim::publish_reclamation_plan(&mut medium, &mk_id, 10_000, &journal, 9).unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk_id, batch.index, 10)
+                .unwrap();
+        }
+        medium.begin_reclamation_v2(&mk_id, 11).unwrap();
+        crate::ancestry_witness::publish_ancestry_witness(&mut medium, &mk_id, 12).unwrap();
+        // The walk: the three current members, then the genuine
+        // prior MK — the local checkpoint binding PASSES (regular,
+        // the parent exactly the prior metadata's SK, the ratified
+        // key) and the boundary is ACCEPTED.
+        let mut steps = Vec::new();
+        let summary = walk_authenticated_history(&mut medium, &mk_id, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.members, 3);
+        assert_eq!(summary.anchors, 0);
+        assert!(summary.prior_checkpoint);
+        assert_eq!(summary.boundary, prior_mk_id);
+        match steps.last() {
+            Some(HistoricalStep::Boundary {
+                identity,
+                prior_checkpoint: true,
+            }) => {
+                assert_eq!(*identity, prior_mk_id);
+            }
+            other => panic!("the genuine prior MK is the accepted boundary: {other:?}"),
+        }
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
