@@ -82,6 +82,22 @@ jobs:
             echo "the feature-disabled build is missing the authorized read-only witness verifier"
             exit 1
           fi
+          # (V2X-CP3-A2/A3) The authenticated historical walker and
+          # the exact preservation accounting are the authorized
+          # read-only A2/A3 production surfaces: their PRESENCE in
+          # the feature-disabled rlib is asserted alongside the
+          # A1-3 verifier — the read-only lineage stays shippable
+          # while the publisher stays compile-time excluded.
+          walker_surface=$(nm "$rlib" | grep -c walk_authenticated_history || true)
+          if [ "$walker_surface" == "0" ]; then
+            echo "the feature-disabled build is missing the authorized read-only A2 historical walker"
+            exit 1
+          fi
+          a3_surface=$(nm "$rlib" | grep -c account_batch_retirement || true)
+          if [ "$a3_surface" == "0" ]; then
+            echo "the feature-disabled build is missing the authorized read-only A3 preservation accounting"
+            exit 1
+          fi
           # (T2-B) The crossing's crash-test seams are compile-time
           # excluded from the production build — the process-exit
           # arm must be absent from the feature-disabled engine-slice

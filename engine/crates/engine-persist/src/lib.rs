@@ -37,6 +37,7 @@
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
+pub mod ancestry_accounting;
 pub mod ancestry_history;
 pub mod ancestry_witness;
 pub mod checkpoint;
@@ -68,6 +69,13 @@ mod sqlite_tests;
 #[cfg(test)]
 mod tests;
 
+pub use ancestry_accounting::{
+    AccountingCounts, AccountingLimitations, AccountingLimits, Classification,
+    CollisionClassification, DeeperHistoryScope, DeferredIdentity, LiveCoordination,
+    MandatoryIdentity, NamespaceCollision, PriorBatchCompletionTrust, PriorBatchPremise,
+    ProtectorKind, ProtectorRef, RetirementAccounting, ScratchReport, SharedReference, StorageRole,
+    SurvivorRootSummary, account_batch_retirement,
+};
 pub use ancestry_history::{
     BatchPosition, HistoricalStep, HistoryWalkSummary, walk_authenticated_history,
     walk_authenticated_history_bounded,
