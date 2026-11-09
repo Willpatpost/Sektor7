@@ -1735,6 +1735,7 @@ mod a2f_tests {
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a2b_tests {
+    #[cfg(unix)]
     use super::*;
     #[cfg(unix)]
     use crate::medium::CanonicalMedium;
