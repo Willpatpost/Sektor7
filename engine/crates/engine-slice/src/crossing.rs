@@ -4913,6 +4913,10 @@ mod a1r_reader_tests {
     /// revisions are recognized as RETAINED EVIDENCE (the anchor
     /// kind), never as reclaimable publications, and the walk
     /// terminates at the campaign's own MK checkpoint boundary.
+    /// Unix-gated: the genuine route's begin admission refuses the
+    /// Windows LocalFile ProcessCrashOnly tier — the Windows
+    /// coverage is the SQLite twin below (the transactional begin).
+    #[cfg(unix)]
     #[test]
     fn the_witness_manifest_and_shard_read_as_retained_evidence() {
         let root = temp_store("retained");
