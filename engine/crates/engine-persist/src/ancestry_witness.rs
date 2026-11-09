@@ -3676,7 +3676,10 @@ mod a12_tests {
         /// Every index entry at its record's TRUE epoch minus one —
         /// exactly the accepted local-corpus fixture's shape (the
         /// F3 regression: the publisher's member-epoch check
-        /// refuses).
+        /// refuses). Constructed only by the unix-gated regression
+        /// (the Windows begin-tier arm never reaches a publication),
+        /// hence the non-unix dormancy marker.
+        #[cfg_attr(not(unix), allow(dead_code))]
         OffByOneEpochs,
     }
 
