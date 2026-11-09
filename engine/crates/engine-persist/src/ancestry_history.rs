@@ -487,6 +487,7 @@ mod a2_tests {
         ))
     }
 
+    #[cfg(unix)]
     fn a2_store(label: &str) -> (std::path::PathBuf, crate::LocalFileMedium) {
         let root = temp_dir_path("store", label);
         std::fs::create_dir_all(&root).unwrap();
@@ -506,6 +507,7 @@ mod a2_tests {
 
     /// The store's complete file inventory (the names and sizes of
     /// every file under the root) — the read-only proof's basis.
+    #[cfg(unix)]
     fn inventory(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
         let mut files = Vec::new();
         if root.is_file() {
@@ -600,6 +602,7 @@ mod a2_tests {
         }
     }
 
+    #[cfg(unix)]
     fn step_parent(step: &HistoricalStep) -> Hash {
         match step {
             HistoricalStep::Member { parent, .. } | HistoricalStep::Anchor { parent, .. } => {
