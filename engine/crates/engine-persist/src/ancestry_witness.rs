@@ -3774,7 +3774,9 @@ mod a12_tests {
         a12_campaign(medium, label, journal_root, members, 10_000)
     }
 
-    /// (A1-3) The sibling-module in-crate install accessor.
+    /// (A1-3) The sibling-module in-crate install accessor (the
+    /// unix-gated a13 adversarial arms only).
+    #[cfg(unix)]
     pub(super) fn a12_install_under_key_for_a13(
         medium: &mut dyn CanonicalMedium,
         key: Vec<u8>,
@@ -5755,8 +5757,10 @@ mod a12_tests {
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a13_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::medium::CanonicalMedium;
 
+    #[cfg(unix)]
     fn a13_local_store(_label: &str) -> (std::path::PathBuf, crate::LocalFileMedium) {
         let root = std::env::temp_dir().join(format!(
             "s7-a13-{}-{}",
@@ -5781,6 +5785,7 @@ mod a13_tests {
         ))
     }
 
+    #[cfg(unix)]
     fn plain_object(payload: &[u8]) -> StoredObject {
         StoredObject::new({
             let mut enc = Encoder::new();
