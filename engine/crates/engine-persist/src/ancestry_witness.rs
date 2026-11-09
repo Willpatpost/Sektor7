@@ -1420,9 +1420,9 @@ fn witness_integrity_refusal(rule: &'static str) -> MediumError {
 /// object's identity (the bytes are NEVER retained here — each
 /// shard is re-read and hash-verified as it is consumed).
 #[derive(Debug)]
-struct WitnessFamilyDiscovery {
-    manifest: Option<(Hash, AncestryWitnessManifest)>,
-    shards: Vec<Option<(Hash, Hash)>>,
+pub(crate) struct WitnessFamilyDiscovery {
+    pub(crate) manifest: Option<(Hash, AncestryWitnessManifest)>,
+    pub(crate) shards: Vec<Option<(Hash, Hash)>>,
 }
 
 /// (The A1-2 F1 corrective) THE MULTI-KEY WITNESS-FAMILY DISCOVERY:
@@ -1455,7 +1455,7 @@ struct WitnessFamilyDiscovery {
 /// (`WITNESS_DISCOVERY_DESCENT`) is unchanged; the bounded form
 /// exists so the exhaustion is regressable at a test-controlled
 /// small bound.
-fn find_installed_witness_family(
+pub(crate) fn find_installed_witness_family(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
 ) -> Result<WitnessFamilyDiscovery, MediumError> {
@@ -3790,7 +3790,7 @@ mod tests {
 // -------------------------------------------------------------
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
-mod a12_tests {
+pub(crate) mod a12_tests {
     use super::*;
     use crate::medium::CanonicalMedium;
 
@@ -3901,23 +3901,36 @@ mod a12_tests {
         id
     }
 
-    pub(super) struct A12Campaign {
-        pub(super) mk: Hash,
-        pub(super) members: Vec<Hash>,
+    pub(crate) struct A12Campaign {
+        pub(crate) mk: Hash,
+        pub(crate) members: Vec<Hash>,
         #[cfg_attr(not(unix), allow(dead_code))]
-        pub(super) sk: Hash,
+        pub(crate) sk: Hash,
     }
 
     /// (A1-3) The sibling-module campaign accessor: the a13
     /// regressions reuse the provider-neutral campaign fixture
     /// through this narrow pub(super) form.
-    pub(super) fn a12_campaign_for_a13(
+    pub(crate) fn a12_campaign_for_a13(
         medium: &mut dyn CanonicalMedium,
         label: &str,
         journal_root: &std::path::Path,
         members: &[(usize, Vec<u8>)],
     ) -> A12Campaign {
         a12_campaign(medium, label, journal_root, members, 10_000)
+    }
+
+    /// (A2) The ledger-limit-controlled campaign form: the A2
+    /// multi-batch regressions derive multi-batch plan partitions
+    /// by shrinking the plan's per-batch ledger limit.
+    pub(crate) fn a12_campaign_with_limit(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+        members: &[(usize, Vec<u8>)],
+        ledger_limit: u64,
+    ) -> A12Campaign {
+        a12_campaign(medium, label, journal_root, members, ledger_limit)
     }
 
     /// (A1-3) The sibling-module in-crate install accessor (the

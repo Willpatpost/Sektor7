@@ -37,6 +37,7 @@
 //! remains the identified production fallback (an evidence-based
 //! comparison is delivered at the Batch 2 review; the lead selects).
 
+pub mod ancestry_history;
 pub mod ancestry_witness;
 pub mod checkpoint;
 pub mod composite_append;
@@ -67,6 +68,10 @@ mod sqlite_tests;
 #[cfg(test)]
 mod tests;
 
+pub use ancestry_history::{
+    BatchPosition, HistoricalStep, HistoryWalkSummary, walk_authenticated_history,
+    walk_authenticated_history_bounded,
+};
 pub use ancestry_witness::{
     AncestryWitnessManifest, AncestryWitnessShard, InstalledWitnessVerification,
     MAX_WITNESS_MEMBER_PREIMAGE_BYTES, RECLAMATION_WITNESS_FAMILY, RECLAMATION_WITNESS_KEY_DOMAIN,
