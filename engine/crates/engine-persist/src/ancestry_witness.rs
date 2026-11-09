@@ -1140,15 +1140,26 @@ pub(crate) fn verify_installed_witness_internal(
             rule: "ancestry-witness/plan-absent",
         });
     };
+    // (C1) The MK binds EXACTLY ONE content reference — the
+    // checkpoint metadata object — not merely a present first
+    // reference (a multi-reference MK is not the ratified shape,
+    // whatever the first reference carries).
     let mk_record = medium.read_record(mk)?;
-    let Some(&metadata_object) = mk_record.content_refs.first() else {
+    if mk_record.content_refs.len() != 1 {
         return Err(MediumError::Chain {
             rule: "ancestry-witness/mk-metadata-binding",
         });
-    };
+    }
+    let metadata_object = mk_record.content_refs[0];
     let meta_bytes = medium.read_object(&metadata_object)?;
     let metadata =
         crate::checkpoint::CheckpointMetadata::decode(&meta_bytes).map_err(MediumError::Format)?;
+    // (C1) The index-shape parity with the A0 composite: the
+    // unique member identities and epochs are established HERE,
+    // before any witness coverage is accepted — the standalone
+    // helpers' boundary discipline, enforced independently of the
+    // metadata decode's sorted-unique-HASH rule.
+    validate_index_shape(&metadata.index).map_err(MediumError::Format)?;
     // THE MULTI-KEY DISCOVERY: one bounded descent for the whole
     // family (at most one completion pass over exactly the missing
     // keys).
@@ -1511,38 +1522,26 @@ fn verify_installed_witness_streaming(
 /// memory: one member's bytes at a time plus the per-member size
 /// table — never the aggregate A0 constructor.
 ///
-/// **(The A1-2 F3 corrective — the pre-manifest parent-edge
-/// proof.)** No parent-edge validation is added to PASS 0 because
-/// the accepted authority already makes every invalid indexed
-/// parent-edge state impossible before the manifest append.
-/// First, every indexed member is a GENUINE canonical-chain
-/// record — PASS 0's member stream reads each through the
-/// provider's hash-verified `read_record` (a fabricated or
-/// substituted identity fails `MissingObject`/`HashMismatch`),
-/// and the store is content-addressed and insert-once, so a
-/// record's canonical bytes are immutable once installed. Second,
-/// the chain's parent-edge coherence was established under the
-/// provider's own validation — the CP2 begin admission that
-/// `verify_begin_authority_v2` authenticates walked the complete
-/// founding-to-begin ancestry enforcing the checked epoch linkage
-/// (child epoch = parent epoch + 1, the real parent, the cycle
-/// guard, the key uniqueness) for every record below the begin,
-/// the members included. Third, PASS 0 then establishes
-/// `index entry epoch == record epoch` and the key agreement for
-/// every member. Together: the parent of an indexed member is a
-/// real record at exactly the member's epoch minus one, so when
-/// that parent is itself indexed its indexed epoch is exactly the
-/// child's minus one (the standalone checked-arithmetic rule), and
-/// when it is not indexed the next canonical member cannot sit at
-/// the child's epoch minus one without two distinct records
-/// claiming one chain height — which the provider's linkage
-/// validation already excluded. A member deleted between the
-/// admission and PASS 0 fails the member stream's read typed
-/// (never an invalid-edge state). The kernel nonetheless
-/// re-establishes the FULL standalone parent-edge discipline over
-/// the witness preimages (the streaming form), because the future
-/// A1-3 consumer runs post-deletion where the live chain no
-/// longer backs these facts.
+/// **(The C2 corrective — the pre-manifest parent-edge
+/// admission.)** PASS 0 validates the ratified A0 standalone
+/// parent-edge constraints over bounded per-member facts
+/// (identity, epoch, parent — collected during the member stream,
+/// never the preimages) in the canonical order, BEFORE any witness
+/// append: every indexed member has a valid nonzero parent; an
+/// indexed parent sits at exactly the member's epoch minus one
+/// (the checked arithmetic); and a nonindexed parent cannot
+/// coexist with a distinct next indexed member at the immediately
+/// preceding epoch. The physical readability of a member does NOT
+/// establish its canonical ancestry membership — a shared
+/// content-addressed namespace (LocalFile) serves any hash-valid
+/// off-chain revision preimage, and the CP2 chain's own linkage
+/// validation never crosses the index-to-record correspondence —
+/// so the constraints are enforced at admission rather than
+/// assumed from the begin authority's chain walk. No historical
+/// ancestry walker is built. The kernel re-establishes the same
+/// discipline over the witness preimages in its streaming
+/// verification, preserving it for the future A1-3 consumer's
+/// post-deletion world.
 ///
 /// **PASS 1 — the reauthenticated publication:** every member is
 /// re-read and re-verified (the round-trip identity re-hash and
@@ -1610,11 +1609,14 @@ pub fn publish_ancestry_witness(
     // identity check); the canonical re-encoding round-trip is
     // re-hashed against the indexed identity (belt-and-braces —
     // the divergence detector shared with PASS 1); the size is
-    // recorded for the boundary derivation.
+    // recorded for the boundary derivation; and the per-member
+    // PARENT FACTS (identity, epoch, parent — never the preimages)
+    // are collected for the pre-manifest parent-edge admission.
     let mut ascending: Vec<&ReclaimedIndexEntry> = metadata.index.iter().collect();
     ascending.sort_unstable_by_key(|entry| entry.epoch);
     let mut sizes = std::collections::BTreeMap::<Hash, u64>::new();
     let mut digest = metadata.seed;
+    let mut parent_facts: Vec<(Hash, u64, Hash)> = Vec::with_capacity(metadata.index.len());
     for entry in &ascending {
         let record = medium.read_record(&entry.hash)?;
         let bytes = record.canonical_bytes();
@@ -1624,6 +1626,12 @@ pub fn publish_ancestry_witness(
             });
         }
         verify_member_facts(entry, &bytes, &record)?;
+        let Some(parent) = record.parent else {
+            return Err(MediumError::Chain {
+                rule: "ancestry-witness/parent-edge-missing",
+            });
+        };
+        parent_facts.push((entry.hash, record.epoch, parent));
         sizes.insert(entry.hash, bytes.len() as u64);
         if entry.hash == metadata.sk {
             continue;
@@ -1635,12 +1643,65 @@ pub fn publish_ancestry_witness(
             rule: "ancestry-witness/range-digest-mismatch",
         });
     }
+    // (0f2 — the C2 corrective) THE PRE-MANIFEST PARENT-EDGE
+    // ADMISSION: the ratified A0 standalone parent-edge constraints
+    // validated over the bounded per-member facts in the canonical
+    // order, BEFORE any witness append. The physical readability of
+    // a member does NOT establish its canonical ancestry membership
+    // — LocalFile's shared content-addressed namespace serves any
+    // hash-valid off-chain revision preimage, and the CP2 chain's
+    // own linkage validation never crosses the index-to-record
+    // correspondence — so the constraints are ENFORCED here rather
+    // than assumed: every indexed member has a valid nonzero
+    // parent; an indexed parent sits at exactly the member's epoch
+    // minus one (the checked arithmetic); and a nonindexed parent
+    // cannot coexist with a distinct next indexed member at the
+    // immediately preceding epoch (two distinct records claiming
+    // one chain height). No historical ancestry walker is built
+    // and no preimage is retained — the facts table and the index
+    // are the whole admission state.
+    let descending = canonical_member_order(&metadata.index);
+    {
+        let facts_by_identity: std::collections::BTreeMap<Hash, (u64, Hash)> = parent_facts
+            .into_iter()
+            .map(|(identity, epoch, parent)| (identity, (epoch, parent)))
+            .collect();
+        let index_by_identity: std::collections::BTreeMap<Hash, &ReclaimedIndexEntry> = metadata
+            .index
+            .iter()
+            .map(|entry| (entry.hash, entry))
+            .collect();
+        for (position, entry) in descending.iter().enumerate() {
+            let Some(&(epoch, parent)) = facts_by_identity.get(&entry.hash) else {
+                return Err(MediumError::Chain {
+                    rule: "ancestry-witness/member-facts-absent",
+                });
+            };
+            if parent == Hash::ZERO {
+                return Err(MediumError::Chain {
+                    rule: "ancestry-witness/parent-edge-zero",
+                });
+            }
+            if let Some(parent_entry) = index_by_identity.get(&parent) {
+                if parent_entry.epoch.checked_add(1) != Some(epoch) {
+                    return Err(MediumError::Chain {
+                        rule: "ancestry-witness/parent-epoch-incoherent",
+                    });
+                }
+            } else if let Some(next) = descending.get(position + 1)
+                && next.epoch.checked_add(1) == Some(epoch)
+            {
+                return Err(MediumError::Chain {
+                    rule: "ancestry-witness/parent-edge-contradictory",
+                });
+            }
+        }
+    }
     // (0g) The deterministic shard boundaries — the canonical
     // DESCENDING order (epoch DESC, identity ASC — the witness
     // covers EVERY indexed retiring record, SK included) under the
     // greedy maximality rule: identical inputs always produce the
     // identical boundaries.
-    let descending = canonical_member_order(&metadata.index);
     let mut boundaries: Vec<(usize, usize)> = Vec::new();
     {
         let mut start = 0usize;
@@ -3587,26 +3648,51 @@ mod a12_tests {
         members: &[(usize, Vec<u8>)],
         ledger_limit: u64,
     ) -> A12Campaign {
-        a12_campaign_variant(medium, label, journal_root, members, ledger_limit, false)
+        a12_campaign_variant(
+            medium,
+            label,
+            journal_root,
+            members,
+            ledger_limit,
+            A12IndexDoctor::None,
+            false,
+        )
     }
 
-    /// The campaign variant with the adversarial index control:
-    /// `off_by_one_index_epochs` publishes the metadata's index
-    /// entries at each record's TRUE epoch minus one — exactly the
-    /// accepted local-corpus fixture's shape, which the ENTIRE
-    /// CP2 chain (the plan, the audits, the begin admission, and
-    /// the begin authority) admits without complaint, proving the
-    /// machinery never checks the index epochs against the
-    /// records. The F3 regression shows the publisher's PASS 0
-    /// refusing this predictable invalid state before any manifest
-    /// append.
+    /// The adversarial index-shape control for the campaign
+    /// variant: the accepted local corpus proves the ENTIRE CP2
+    /// chain (the plan, the audits, the begin admission, and the
+    /// begin authority) never checks the index epochs against the
+    /// records — the doctor mode exploits exactly that blindness
+    /// to deliver an otherwise-invalid installed state to the
+    /// publisher's independent validations. (The duplicate-epoch
+    /// arm is not a doctor mode: the E2 retirement-order gate
+    /// excludes it at the plan publication — see the C1
+    /// regression.)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum A12IndexDoctor {
+        /// The true record epochs.
+        None,
+        /// Every index entry at its record's TRUE epoch minus one —
+        /// exactly the accepted local-corpus fixture's shape (the
+        /// F3 regression: the publisher's member-epoch check
+        /// refuses).
+        OffByOneEpochs,
+    }
+
+    /// The campaign variant with the adversarial controls: the
+    /// index doctor (see [`A12IndexDoctor`]) and the optional
+    /// EXTRA MK content reference (a second plain payload beside
+    /// the checkpoint metadata — the C1 regression: the
+    /// exactly-one-reference MK binding refuses).
     fn a12_campaign_variant(
         medium: &mut dyn CanonicalMedium,
         label: &str,
         journal_root: &std::path::Path,
         members: &[(usize, Vec<u8>)],
         ledger_limit: u64,
-        off_by_one_index_epochs: bool,
+        index_doctor: A12IndexDoctor,
+        extra_mk_reference: bool,
     ) -> A12Campaign {
         let shared = plain_object(b"a12-shared-payload");
         let founding = crate::record::RevisionRecord::founding(
@@ -3667,28 +3753,25 @@ mod a12_tests {
         // the retained pre-checkpoint head).
         let seed = crate::checkpoint::compute_digest_seed(&founding_id);
         let mut digest = seed;
-        let doctor = |epoch: u64| {
-            if off_by_one_index_epochs {
-                epoch - 1
-            } else {
-                epoch
-            }
+        let doctor = |_position: usize, epoch: u64| match index_doctor {
+            A12IndexDoctor::None => epoch,
+            A12IndexDoctor::OffByOneEpochs => epoch - 1,
         };
         let mut index = Vec::with_capacity(members.len() + 1);
-        for id in &member_ids {
+        for (position, id) in member_ids.iter().enumerate() {
             let record = medium.read_record(id).unwrap();
             digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
             index.push(crate::checkpoint::ReclaimedIndexEntry::new(
                 record.idempotency_key.clone(),
                 *id,
-                doctor(record.epoch),
+                doctor(position, record.epoch),
             ));
         }
         let sk_record = medium.read_record(&sk_id).unwrap();
         index.push(crate::checkpoint::ReclaimedIndexEntry::new(
             sk_record.idempotency_key.clone(),
             sk_id,
-            doctor(sk_record.epoch),
+            doctor(member_ids.len(), sk_record.epoch),
         ));
         let meta = crate::checkpoint::CheckpointMetadata::new(
             sk_id,
@@ -3701,11 +3784,33 @@ mod a12_tests {
         let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
         let head = medium.head().unwrap().unwrap();
         let epoch = medium.read_record(&head).unwrap().epoch;
-        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
-            .with_content_refs(vec![meta_object.hash()]);
-        medium
-            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
-            .unwrap();
+        // The MK: the metadata object as its SINGLE content
+        // reference — or, under the C1 adversarial control, the
+        // metadata first plus a second plain payload. The record's
+        // content references are canonically ASCENDING by identity,
+        // so the extra payload is CHOSEN to sort strictly after the
+        // metadata object's identity — the metadata-first ordering
+        // under test is deterministic by construction, never
+        // hash-fate (the metadata identity varies with the
+        // journal-location-dependent chain).
+        let (mk_refs, mk_objects): (Vec<Hash>, Vec<StoredObject>) = if extra_mk_reference {
+            let mut counter = 0u32;
+            let extra = loop {
+                let candidate = plain_object(format!("a12-extra-mk-payload-{counter}").as_bytes());
+                if candidate.hash() > meta_object.hash() {
+                    break candidate;
+                }
+                counter += 1;
+            };
+            (
+                vec![meta_object.hash(), extra.hash()],
+                vec![meta_object.clone(), extra],
+            )
+        } else {
+            (vec![meta_object.hash()], vec![meta_object])
+        };
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5).with_content_refs(mk_refs);
+        medium.append(&mk, &mk_objects, Some(head)).unwrap();
         let mk_id = mk.id();
         // The plan and EVERY plan-defined audit (the
         // all-audits-first contract the begin admission enforces).
@@ -4969,8 +5074,15 @@ mod a12_tests {
         let (root, mut medium) = a12_local_store("f3-epoch");
         let journal = a12_journal_root("f3-epoch");
         let members = a12_small_members("f3-epoch");
-        let campaign =
-            a12_campaign_variant(&mut medium, "f3-epoch", &journal, &members, 10_000, true);
+        let campaign = a12_campaign_variant(
+            &mut medium,
+            "f3-epoch",
+            &journal,
+            &members,
+            10_000,
+            A12IndexDoctor::OffByOneEpochs,
+            false,
+        );
         // The doctored campaign admits the full CP2 chain.
         medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
         // PASS 0 refuses the indexed-epoch disagreement — the
@@ -4995,6 +5107,429 @@ mod a12_tests {
         );
         assert!(
             find_installed_witness_shard(&mut medium, &campaign.mk, 0)
+                .unwrap()
+                .is_none()
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_duplicate_epoch_index_is_excluded_before_the_witness_context() {
+        // (The C1 corrective) The kernel's validate_index_shape
+        // parity — restored per the review — is defense-in-depth:
+        // the duplicate-epoch index (the second member's entry at
+        // the first member's epoch, unique hashes, so the metadata
+        // decode admits it) is EXCLUDED EARLIER by an accepted CP2
+        // gate: the E2 retirement-order verification
+        // (reclaim.rs's verify_newest_first_order) requires the
+        // persisted unit sequence to be strictly descending by
+        // indexed epoch and refuses the duplicate at the PLAN
+        // PUBLICATION — before any plan, audit, or begin can exist,
+        // and therefore before the kernel (which requires the begin
+        // authority) is reachable with the shape through any
+        // constructible path. The regression demonstrates the
+        // excluding gate's typed refusal and the publisher's
+        // pre-witness refusal over the planless chain.
+        let (root, mut medium) = a12_local_store("c1-dup-epoch");
+        let journal = a12_journal_root("c1-dup-epoch");
+        let label = "c1-dup-epoch";
+        let shared = plain_object(b"a12-shared-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            label,
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            binding_outcome,
+            crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+        ));
+        let p1_id = a12_step(&mut medium, std::slice::from_ref(&shared), 2);
+        let mut member_ids = Vec::new();
+        for index in 0..2u32 {
+            let object = plain_object(format!("a12-{label}-payload-m{index}").as_bytes());
+            let key = a12_member_key(label, index as usize, 48);
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            member_ids.push(record.id());
+        }
+        let sk_id = a12_step(&mut medium, std::slice::from_ref(&shared), 4);
+        // The metadata with the SECOND member's index entry at the
+        // FIRST member's epoch — the duplicate.
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(3);
+        for (position, id) in member_ids.iter().enumerate() {
+            let record = medium.read_record(id).unwrap();
+            digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
+            let doctored_epoch = if position == 1 {
+                record.epoch - 1
+            } else {
+                record.epoch
+            };
+            index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                doctored_epoch,
+            ));
+        }
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let meta = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_ids[0],
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1_id)],
+            index,
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        // THE EXCLUDING GATE: the plan publication's E2
+        // retirement-order verification refuses the duplicate
+        // indexed epoch — no plan, no audit, no begin, no witness
+        // context can follow.
+        let error =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk_id, 10_000, &journal, 6)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "reclaim/unit-order-not-newest-first"
+                }
+            ),
+            "the E2 retirement-order gate refuses the duplicate indexed epoch: {error:?}"
+        );
+        // The publisher over the planless chain refuses at the CP2
+        // begin authority's own plan discovery — before any witness
+        // work.
+        let before_head = medium.head().unwrap().unwrap();
+        let error = publish_ancestry_witness(&mut medium, &mk_id, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "v2-begin-authority/plan-absent"
+                }
+            ),
+            "the publisher refuses the planless chain at the authority: {error:?}"
+        );
+        assert_eq!(medium.head().unwrap().unwrap(), before_head);
+        assert!(
+            find_installed_witness_manifest(&mut medium, &mk_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_kernel_refuses_the_multi_reference_mk() {
+        // (The C1 corrective) The exactly-one-reference MK binding:
+        // the MK record carries the checkpoint metadata FIRST plus
+        // a second plain payload — a shape the CP2 chain admits
+        // (the metadata discovery reads the first content
+        // reference). The publisher's own PASS-0 binding check
+        // refuses the publication; a HAND-INSTALLED family then
+        // proves the KERNEL's independent exactly-one check
+        // refuses the installed state.
+        let (root, mut medium) = a12_local_store("c1-mk-refs");
+        let journal = a12_journal_root("c1-mk-refs");
+        let members = a12_small_members("c1-mk-refs");
+        let campaign = a12_campaign_variant(
+            &mut medium,
+            "c1-mk-refs",
+            &journal,
+            &members,
+            10_000,
+            A12IndexDoctor::None,
+            true,
+        );
+        // The doctored campaign admits the full CP2 chain.
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        // The publisher refuses at its own PASS-0 binding check —
+        // before any witness append.
+        let error = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness/mk-metadata-binding"
+                }
+            ),
+            "the publisher's binding check refuses the multi-reference MK: {error:?}"
+        );
+        assert!(
+            find_installed_witness_manifest(&mut medium, &campaign.mk)
+                .unwrap()
+                .is_none()
+        );
+        // The hand-installed family: the kernel's independent
+        // exactly-one check refuses the installed state.
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => id,
+            other => panic!("the begin admits idempotently: {other:?}"),
+        };
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (manifest, shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        assert_eq!(shards.len(), 1);
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        a12_install_under_key(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &shard_object,
+            9,
+        );
+        a12_install_under_key(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            &manifest_object,
+            9,
+        );
+        let error = verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness/mk-metadata-binding"
+                }
+            ),
+            "the kernel's exactly-one check refuses the multi-reference MK: {error:?}"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_off_chain_member_contradiction_refuses_before_publication() {
+        // (The C2 corrective) The physically addressable, hash-valid
+        // OFF-CHAIN revision preimage: the chain carries an
+        // unindexed filler X between m0 and SK, while the index
+        // names an m1' record that was NEVER appended — its
+        // canonical bytes and payload written directly into the
+        // shared content-addressed namespace, its indexed epoch
+        // and key agreeing with its own decoded facts (every
+        // existing PASS-0 member check passes; the CP2 chain's
+        // own validation never crosses the index-to-record
+        // correspondence, so the plan, the audits, and the begin
+        // all admit it). Its parent is a fabricated unindexed
+        // identity while the next canonical member (m0) sits at
+        // exactly its epoch minus one — the standalone
+        // parent-edge contradiction. The C2 admission refuses
+        // BEFORE shard 0 and BEFORE the manifest.
+        let (root, mut medium) = a12_local_store("c2-off-chain");
+        let journal = a12_journal_root("c2-off-chain");
+        let label = "c2-off-chain";
+        let shared = plain_object(b"a12-shared-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            label,
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            binding_outcome,
+            crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+        ));
+        let p1_id = a12_step(&mut medium, std::slice::from_ref(&shared), 2);
+        // m0 — the genuine on-chain member.
+        let m0_object = plain_object(b"c2-off-chain-m0-payload");
+        let m0_key = a12_member_key(label, 0, 48);
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let m0 = crate::record::RevisionRecord::regular(head, epoch, 3)
+            .with_idempotency_key(m0_key)
+            .with_content_refs(vec![m0_object.hash()]);
+        medium
+            .append(&m0, std::slice::from_ref(&m0_object), Some(head))
+            .unwrap();
+        // X — the unindexed on-chain filler occupying the height
+        // the off-chain member will CLAIM from the other side.
+        a12_step(&mut medium, std::slice::from_ref(&shared), 3);
+        // The OFF-CHAIN m1': a hash-valid regular revision preimage
+        // (its identity is the SHA-256 of its canonical bytes) with
+        // the agreeing epoch and key, a genuine payload object, and
+        // a fabricated UNINDEXED parent — written directly into the
+        // shared namespace, never appended to the chain.
+        let fabricated_parent = fixture_hash(b"c2-off-chain-fabricated-parent");
+        let m1_prime_payload = plain_object(b"c2-off-chain-m1-prime-payload");
+        let m1_prime_key = a12_member_key(label, 1, 48);
+        let m1_prime = crate::record::RevisionRecord::regular(fabricated_parent, 3, 3)
+            .with_idempotency_key(m1_prime_key)
+            .with_content_refs(vec![m1_prime_payload.hash()]);
+        let m1_prime_id = m1_prime.id();
+        std::fs::write(
+            medium.object_path_pub(&m1_prime_id),
+            m1_prime.canonical_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            medium.object_path_pub(&m1_prime_payload.hash()),
+            m1_prime_payload.bytes(),
+        )
+        .unwrap();
+        // SK — the genuine chain parent is the filler X.
+        let sk_id = a12_step(&mut medium, std::slice::from_ref(&shared), 4);
+        // The metadata: the index [m0, m1', sk] with the TRUE
+        // epochs (m1's indexed epoch agrees with its own decoded
+        // record), the digest over [m0, m1'] ascending (m1's
+        // canonical bytes are physically readable), the self-skip
+        // to p1.
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(3);
+        for id in [&m0.id(), &m1_prime_id] {
+            let record = medium.read_record(id).unwrap();
+            digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let meta = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            m0.id(),
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1_id)],
+            index,
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        let (_plan_record, _plan_outcome) =
+            crate::reclaim::publish_reclamation_plan(&mut medium, &mk_id, 10_000, &journal, 6)
+                .unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(&mut medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(&mut medium, &mk_id, batch.index, 7)
+                .unwrap();
+        }
+        // The ENTIRE CP2 chain admits the off-chain member: the
+        // begin admission and the begin authority both authenticate
+        // (the index-to-record correspondence is never crossed).
+        medium.begin_reclamation_v2(&mk_id, 8).unwrap();
+        medium.verify_begin_authority_v2(&mk_id).unwrap();
+        // The C2 admission refuses the parent-edge contradiction —
+        // BEFORE shard 0 and BEFORE the manifest.
+        let before_head = medium.head().unwrap().unwrap();
+        let error = publish_ancestry_witness(&mut medium, &mk_id, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness/parent-edge-contradictory"
+                }
+            ),
+            "the off-chain member's parent-edge contradiction refuses typed: {error:?}"
+        );
+        assert_eq!(medium.head().unwrap().unwrap(), before_head);
+        assert!(
+            find_installed_witness_manifest(&mut medium, &mk_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_installed_witness_shard(&mut medium, &mk_id, 0)
                 .unwrap()
                 .is_none()
         );
