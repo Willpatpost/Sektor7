@@ -4027,6 +4027,13 @@ enum RangeKind {
     Anchor,
 }
 
+#[cfg(test)]
+impl RangeKind {
+    fn is_anchor(&self) -> bool {
+        matches!(self, RangeKind::Anchor)
+    }
+}
+
 /// One walked chain record with its classification.
 struct WalkedRecord {
     record: RevisionRecord,
@@ -4177,6 +4184,86 @@ fn walk_checkpoint_range(
             // exactly like the v1 audit arm above.
             engine_persist::reclaim::ReclamationLedgerV2::decode(&bytes)
                 .map_err(PipelineError::Format)?;
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if engine_persist::ancestry_witness::is_reclamation_ancestry_witness_family(&domain)
+        {
+            // (A1-R) The ancestry-witness family — the manifest and
+            // the shards, the record-preimage evidence backing the
+            // post-deletion ancestry verification: RETAINED
+            // EVIDENCE, never a reclaimable snapshot publication;
+            // the witness revision AND its referenced content are
+            // preserved through every later checkpoint and
+            // retirement selection. The recognition is LOCAL to
+            // this one revision — its authorized shape, its exact
+            // ratified domain and version, its strict A0 decode,
+            // and its deterministic idempotency-key binding — and
+            // is deliberately NOT a completeness authority: the
+            // accepted A1-3 public verifier remains the
+            // installed-state authority, and a manifestless shard
+            // prefix is an explicitly supported recovery state (one
+            // witness revision's recognition never depends on its
+            // siblings being installed). No Verified outcome, no
+            // new durability tier, and no destructive authority is
+            // manufactured here. A family-domain version other
+            // than the ratified /1 forms is UNSUPPORTED — the typed
+            // incompatibility, never an ignorable unknown record
+            // and never a reclaimable snapshot.
+            if domain != engine_persist::ancestry_witness::RECLAMATION_WITNESS_MANIFEST_DOMAIN
+                && domain != engine_persist::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/witness-unsupported-version",
+                });
+            }
+            // The authorized revision shape: a REGULAR revision
+            // with EXACTLY ONE witness content reference (the
+            // publisher's own publication shape — anything else is
+            // not a witness revision).
+            if !matches!(record.kind, engine_persist::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/witness-shape-mismatch",
+                });
+            }
+            if domain == engine_persist::ancestry_witness::RECLAMATION_WITNESS_MANIFEST_DOMAIN {
+                let manifest =
+                    engine_persist::ancestry_witness::AncestryWitnessManifest::decode(&bytes)
+                        .map_err(PipelineError::Format)?;
+                if record.idempotency_key.as_deref()
+                    != Some(
+                        &engine_persist::ancestry_witness::reclamation_witness_manifest_idempotency_key(
+                            &manifest.mk,
+                        )[..],
+                    )
+                {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "checkpoint-walk/witness-key-mismatch",
+                    });
+                }
+            } else {
+                let shard = engine_persist::ancestry_witness::AncestryWitnessShard::decode(&bytes)
+                    .map_err(PipelineError::Format)?;
+                if record.idempotency_key.as_deref()
+                    != Some(
+                        &engine_persist::ancestry_witness::reclamation_witness_shard_idempotency_key(
+                            &shard.mk,
+                            shard.shard_index,
+                        )[..],
+                    )
+                {
+                    return Err(TransitionError::InstallIncompatible {
+                        region: 0,
+                        detail: "checkpoint-walk/witness-key-mismatch",
+                    });
+                }
+            }
             walked.push(WalkedRecord {
                 record,
                 kind: RangeKind::Anchor,
@@ -4564,6 +4651,837 @@ mod oc_c1_reader_tests {
         )
         .unwrap();
         assert!(walk_checkpoint_range(&mut medium, record.id()).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// -------------------------------------------------------------
+// (V2X-CP3-A1-R) THE WITNESS-FAMILY RECOGNITION REGRESSIONS —
+// the manifest and shard revisions read as RETAINED EVIDENCE,
+// excluded from the retirement membership and digest, skipped
+// correctly over retiring snapshots, recognized manifestless,
+// and refusing every unsupported or malformed form. The
+// recognition grants NO completeness authority: the A1-3 public
+// verifier remains the installed-state authority.
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod a1r_reader_tests {
+    use super::*;
+    use engine_persist::ancestry_witness::{
+        WitnessEntry, construct_witness, publish_ancestry_witness,
+        reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
+    };
+    use engine_persist::local::LocalFileMedium;
+    use engine_persist::medium::CanonicalMedium;
+    use engine_persist::record::{AuthorityMode, RevisionRecord};
+    use engine_persist::{Hash, StoredObject};
+
+    fn temp_store(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "s7-a1r-reader-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn temp_journal(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-a1r-journal-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// An ordinary legacy session-snapshot object — the walk's
+    /// Publication classification and the generic append's allowed
+    /// /1 form.
+    fn snapshot_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-slice/session-snapshot/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    /// Appends one ordinary session-snapshot publication (the
+    /// reclaimable range member).
+    fn append_snapshot(medium: &mut dyn CanonicalMedium, payload: &[u8], tick: u64) -> Hash {
+        let object = snapshot_object(payload);
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record =
+            RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&record, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+        record.id()
+    }
+
+    /// The direct file-write record installation (the established
+    /// test-only construction for gated families — the generic
+    /// append's family gates make on-chain publication impossible,
+    /// so the record and object files are written directly into the
+    /// local store's content-addressed layout; the WALK follows the
+    /// parent chain from a given start, so the medium's HEAD
+    /// pointer is irrelevant to the walked range).
+    fn write_record_with_object(
+        medium: &mut LocalFileMedium,
+        parent: Hash,
+        key: Option<Vec<u8>>,
+        object: &StoredObject,
+        tick: u64,
+    ) -> Hash {
+        let parent_epoch = medium.read_record(&parent).unwrap().epoch;
+        let record = RevisionRecord::regular(parent, parent_epoch, tick)
+            .with_content_refs(vec![object.hash()]);
+        let record = match key {
+            Some(key) => record.with_idempotency_key(key),
+            None => record,
+        };
+        std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        record.id()
+    }
+
+    /// The epoch of the current top record (for the direct-write
+    /// parent chaining).
+    fn top_epoch(medium: &mut LocalFileMedium, top: Hash) -> u64 {
+        medium.read_record(&top).unwrap().epoch
+    }
+
+    /// The genuine CP2 campaign plus the accepted test-gated A1-2
+    /// witness publication: the founding, the bound journal, p1,
+    /// two retiring members, SK, the checkpoint metadata and MK,
+    /// the plan, every audit, the V2 begin, and the publisher's
+    /// shard + manifest above it. Returns (mk, manifest_record,
+    /// shard_record) — the campaign's checkpoint boundary and the
+    /// two witness revisions.
+    #[allow(clippy::type_complexity)]
+    fn genuine_witness_publication(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> (Hash, Hash, Hash) {
+        let shared = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"a1r-shared-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location =
+            engine_persist::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = engine_persist::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            engine_persist::reclaim::create_campaign_bound_journal(
+                medium,
+                journal_root,
+                &founding_id,
+            )
+            .unwrap(),
+        );
+        let (_binding, outcome) = engine_persist::reclaim::publish_journal_root_binding(
+            medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            engine_persist::reclaim::JournalRootBindingOutcome::Accepted { .. }
+        ));
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record =
+                RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let p1_id = step(medium, 2);
+        let mut member_ids = Vec::new();
+        for index in 0..2u32 {
+            let object = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(format!("a1r-{label}-member-{index}").as_bytes());
+                enc.into_bytes()
+            })
+            .unwrap();
+            let key = format!("a1r-{label}-member-key-{index}").into_bytes();
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(key)
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            member_ids.push(record.id());
+        }
+        let sk_id = step(medium, 4);
+        let seed = engine_persist::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(3);
+        for id in &member_ids {
+            let record = medium.read_record(id).unwrap();
+            digest = engine_persist::checkpoint::chain_range_digest_step(
+                &digest,
+                &record.canonical_bytes(),
+            );
+            index.push(engine_persist::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        index.push(engine_persist::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let metadata = engine_persist::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_ids[0],
+            vec![engine_persist::checkpoint::SkipEntry::new(
+                Hash::ZERO,
+                p1_id,
+            )],
+            index,
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk =
+            RevisionRecord::regular(head, epoch, 5).with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        engine_persist::reclaim::publish_reclamation_plan(medium, &mk_id, 10_000, journal_root, 6)
+            .unwrap();
+        let (_plan_id, plan) = engine_persist::reclaim::find_installed_plan(medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            engine_persist::reclaim::publish_reclamation_ledger_v2(medium, &mk_id, batch.index, 7)
+                .unwrap();
+        }
+        medium.begin_reclamation_v2(&mk_id, 8).unwrap();
+        let publication = publish_ancestry_witness(medium, &mk_id, 9).unwrap();
+        let shard_record = match publication.shard_outcomes[0] {
+            engine_persist::ancestry_witness::WitnessPublicationOutcome::Accepted {
+                record,
+                ..
+            } => record,
+            other => panic!("the genuine shard publishes: {other:?}"),
+        };
+        (mk_id, publication.manifest_record, shard_record)
+    }
+
+    /// (R1) The genuine ratified publication through the accepted
+    /// test-gated A1-2 mechanisms: both the manifest and the shard
+    /// revisions are recognized as RETAINED EVIDENCE (the anchor
+    /// kind), never as reclaimable publications, and the walk
+    /// terminates at the campaign's own MK checkpoint boundary.
+    #[test]
+    fn the_witness_manifest_and_shard_read_as_retained_evidence() {
+        let root = temp_store("retained");
+        let journal = temp_journal("retained");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let (mk, manifest_record, shard_record) =
+            genuine_witness_publication(&mut medium, "retained", &journal);
+        let (walked, boundary, _seed) =
+            walk_checkpoint_range(&mut medium, manifest_record).unwrap();
+        assert_eq!(boundary, mk, "the walk terminates at the campaign MK");
+        for record_id in [manifest_record, shard_record] {
+            let entry = walked
+                .iter()
+                .find(|entry| entry.record.id() == record_id)
+                .expect("the witness revision is walked");
+            assert!(
+                matches!(entry.kind, RangeKind::Anchor),
+                "the witness revision {record_id} is retained evidence, never a retiring publication"
+            );
+        }
+        assert!(
+            !walked
+                .iter()
+                .any(|entry| matches!(entry.kind, RangeKind::Publication)),
+            "the genuine campaign's witness range contains no reclaimable snapshot"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (R7) The SQLite twin: the genuine publication and the
+    /// recognition on the transactional provider.
+    #[test]
+    fn the_witness_sqlite_twin_reads_as_retained_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "s7-a1r-sqlite-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let journal = temp_journal("sqlite");
+        let mut medium = engine_persist::sqlite::SqliteMedium::open(&path).unwrap();
+        let (mk, manifest_record, shard_record) =
+            genuine_witness_publication(&mut medium, "sqlite", &journal);
+        let (walked, boundary, _seed) =
+            walk_checkpoint_range(&mut medium, manifest_record).unwrap();
+        assert_eq!(boundary, mk);
+        for record_id in [manifest_record, shard_record] {
+            let entry = walked
+                .iter()
+                .find(|entry| entry.record.id() == record_id)
+                .expect("the witness revision is walked");
+            assert!(matches!(entry.kind, RangeKind::Anchor));
+        }
+        drop(medium);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (R2) The checkpoint range separation: ordinary reclaimable
+    /// snapshot publications interleaved with retained witness
+    /// revisions — the retirement index (the caller's own
+    /// construction over the walked Publication kinds) contains
+    /// exactly the eligible snapshots and excludes every witness
+    /// revision, and the range digest folds over exactly the
+    /// snapshot-only membership.
+    #[test]
+    fn the_witness_exclusions_from_the_retirement_index_and_digest() {
+        let root = temp_store("separation");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"a1r-separation-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "separation", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let snap1 = append_snapshot(&mut medium, b"a1r-snap-1", 10);
+        let snap1_bytes = medium.read_record(&snap1).unwrap().canonical_bytes();
+        // The interleaved chain above the appended snapshot: the
+        // witness shard, an ordinary snapshot record, and the
+        // witness manifest — the witness records direct-written
+        // (the generic append's family gates refuse the witness
+        // objects; the walk follows the parent chain from the
+        // given start, so the HEAD pointer is irrelevant).
+        let witness_mk = engine_persist::hash::hash_object(b"a1r-separation-witness-mk");
+        let witness_plan = engine_persist::hash::hash_object(b"a1r-separation-witness-plan");
+        let witness_begin = engine_persist::hash::hash_object(b"a1r-separation-witness-begin");
+        let witness_metadata =
+            engine_persist::hash::hash_object(b"a1r-separation-witness-metadata");
+        let (manifest, shards) = construct_witness(
+            &witness_mk,
+            &witness_plan,
+            &witness_begin,
+            &witness_metadata,
+            vec![WitnessEntry {
+                member: snap1,
+                preimage: snap1_bytes.clone(),
+            }],
+        )
+        .unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        let shard_record = write_record_with_object(
+            &mut medium,
+            snap1,
+            Some(reclamation_witness_shard_idempotency_key(&witness_mk, 0)),
+            &shard_object,
+            11,
+        );
+        let snap2 = write_record_with_object(
+            &mut medium,
+            shard_record,
+            None,
+            &snapshot_object(b"a1r-snap-2"),
+            12,
+        );
+        let snap2_bytes = medium.read_record(&snap2).unwrap().canonical_bytes();
+        let manifest_record = write_record_with_object(
+            &mut medium,
+            snap2,
+            Some(reclamation_witness_manifest_idempotency_key(&witness_mk)),
+            &manifest_object,
+            13,
+        );
+        let (walked, boundary, seed) = walk_checkpoint_range(&mut medium, manifest_record).unwrap();
+        assert_eq!(boundary, founding_id);
+        // The classifications: the witness revisions are anchors
+        // and the ordinary snapshots are publications — interleaved
+        // in the walked range.
+        let is_anchor = |id: Hash| {
+            walked
+                .iter()
+                .find(|entry| entry.record.id() == id)
+                .expect("the record is walked")
+                .kind
+                .is_anchor()
+        };
+        assert!(is_anchor(manifest_record));
+        assert!(is_anchor(shard_record));
+        assert!(!is_anchor(snap2));
+        assert!(!is_anchor(snap1));
+        // The caller's own retirement-index construction over the
+        // walked Publication kinds: exactly the eligible snapshots,
+        // every witness revision excluded.
+        let mut range = Vec::new();
+        let mut index = Vec::new();
+        let mut chain_bytes = Vec::new();
+        for entry in &walked {
+            if matches!(entry.kind, RangeKind::Publication) {
+                range.push(entry.record.id());
+                index.push(engine_persist::checkpoint::ReclaimedIndexEntry::new(
+                    entry.record.idempotency_key.clone(),
+                    entry.record.id(),
+                    entry.record.epoch,
+                ));
+                chain_bytes.push(entry.record.canonical_bytes());
+            }
+        }
+        assert_eq!(range, vec![snap2, snap1], "the descent order");
+        assert!(!index.iter().any(|entry| entry.hash == manifest_record));
+        assert!(!index.iter().any(|entry| entry.hash == shard_record));
+        // The digest: the snapshot-only membership, oldest first —
+        // equal to the independently computed fold over exactly
+        // [snap1, snap2] (the witness bytes never enter it).
+        chain_bytes.reverse();
+        let range_digest = chain_range_digest(&seed, &chain_bytes);
+        let expected = chain_range_digest(&seed, &[snap1_bytes, snap2_bytes.clone()]);
+        assert_eq!(range_digest, expected);
+        let _ = manifest_record;
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (R3) The retained-ancestry and skip-table integrity: a
+    /// retained witness revision standing immediately above a
+    /// reclaimable snapshot receives the correct
+    /// nearest-retained-ancestor skip when its parent would be
+    /// retired, and a witness revision standing on another anchor
+    /// receives none — checked through the walk and the skip
+    /// computation, without executing any destructive retirement.
+    #[test]
+    fn the_witness_above_a_retiring_snapshot_receives_the_skip() {
+        let root = temp_store("skip");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"a1r-skip-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "skip", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let snap1 = append_snapshot(&mut medium, b"a1r-skip-snap-1", 10);
+        let snap1_bytes = medium.read_record(&snap1).unwrap().canonical_bytes();
+        let snap2 = append_snapshot(&mut medium, b"a1r-skip-snap-2", 11);
+        let witness_mk = engine_persist::hash::hash_object(b"a1r-skip-witness-mk");
+        let witness_plan = engine_persist::hash::hash_object(b"a1r-skip-witness-plan");
+        let witness_begin = engine_persist::hash::hash_object(b"a1r-skip-witness-begin");
+        let witness_metadata = engine_persist::hash::hash_object(b"a1r-skip-witness-metadata");
+        let (_manifest, shards) = construct_witness(
+            &witness_mk,
+            &witness_plan,
+            &witness_begin,
+            &witness_metadata,
+            vec![WitnessEntry {
+                member: snap1,
+                preimage: snap1_bytes,
+            }],
+        )
+        .unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        // The witness shard directly above the reclaimable snap2:
+        // its parent WOULD be retired, so it must receive the skip
+        // to its nearest retained ancestor (the founding, past the
+        // whole reclaim run).
+        let shard_record = write_record_with_object(
+            &mut medium,
+            snap2,
+            Some(reclamation_witness_shard_idempotency_key(&witness_mk, 0)),
+            &shard_object,
+            12,
+        );
+        let (walked, boundary, _seed) = walk_checkpoint_range(&mut medium, shard_record).unwrap();
+        assert_eq!(boundary, founding_id);
+        let skips = compute_checkpoint_skips(shard_record, &walked);
+        // The standing skip for the witness shard on the retiring
+        // snapshot: the target is the founding (the first
+        // non-publication record below the contiguous reclaim run
+        // snap2 → snap1).
+        assert!(skips.contains(&SkipEntry::new(shard_record, founding_id)));
+        // The self-entry targets the walk's start (an anchor, not a
+        // publication — SK's own parent is retained).
+        assert!(skips.contains(&SkipEntry::self_skip(shard_record)));
+        // A witness revision standing on another ANCHOR receives no
+        // standing skip: the begin anchor (appended through the
+        // accepted test-only facility) above the snapshot, with the
+        // shard above the begin.
+        let begin = engine_persist::reclaim::ReclamationBegin {
+            mk: founding_id,
+            source: founding_id,
+            range_digest: [0x03; 32],
+            seed: [0x04; 32],
+        };
+        let begin_id =
+            engine_persist::reclaim::test_only_install_begin_record(&mut medium, &begin, 13)
+                .unwrap();
+        let shard_on_anchor = write_record_with_object(
+            &mut medium,
+            begin_id,
+            Some(reclamation_witness_shard_idempotency_key(&witness_mk, 0)),
+            &shard_object,
+            14,
+        );
+        let (walked, boundary, _seed) =
+            walk_checkpoint_range(&mut medium, shard_on_anchor).unwrap();
+        assert_eq!(boundary, founding_id);
+        let skips = compute_checkpoint_skips(shard_on_anchor, &walked);
+        // The begin anchor standing on the retiring snapshot gets
+        // ITS skip; the witness shard standing on the begin gets
+        // NO standing skip (its parent is retained — the self
+        // entry's retained field is the zero marker, never the
+        // shard's identity).
+        assert!(skips.contains(&SkipEntry::new(begin_id, founding_id)));
+        assert!(
+            !skips.iter().any(|entry| entry.retained == shard_on_anchor),
+            "a witness standing on a retained anchor receives no standing skip"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (R4) The manifestless prefix: a valid installed shard without
+    /// any manifest is still classified as retained evidence — the
+    /// recognition requires no manifest and never claims
+    /// installation completeness.
+    #[test]
+    fn the_manifestless_shard_prefix_reads_as_retained_evidence() {
+        let root = temp_store("manifestless");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"a1r-manifestless-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "manifestless", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let snap1 = append_snapshot(&mut medium, b"a1r-manifestless-snap", 10);
+        let snap1_bytes = medium.read_record(&snap1).unwrap().canonical_bytes();
+        let witness_mk = engine_persist::hash::hash_object(b"a1r-manifestless-witness-mk");
+        let witness_plan = engine_persist::hash::hash_object(b"a1r-manifestless-witness-plan");
+        let witness_begin = engine_persist::hash::hash_object(b"a1r-manifestless-witness-begin");
+        let witness_metadata =
+            engine_persist::hash::hash_object(b"a1r-manifestless-witness-metadata");
+        let (_manifest, shards) = construct_witness(
+            &witness_mk,
+            &witness_plan,
+            &witness_begin,
+            &witness_metadata,
+            vec![WitnessEntry {
+                member: snap1,
+                preimage: snap1_bytes,
+            }],
+        )
+        .unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        // The manifestless shard prefix: no manifest record
+        // anywhere on the chain.
+        let shard_record = write_record_with_object(
+            &mut medium,
+            snap1,
+            Some(reclamation_witness_shard_idempotency_key(&witness_mk, 0)),
+            &shard_object,
+            11,
+        );
+        let (walked, boundary, _seed) = walk_checkpoint_range(&mut medium, shard_record).unwrap();
+        assert_eq!(boundary, founding_id);
+        let entry = walked
+            .iter()
+            .find(|entry| entry.record.id() == shard_record)
+            .expect("the manifestless shard is walked");
+        assert!(
+            matches!(entry.kind, RangeKind::Anchor),
+            "the manifestless shard prefix is retained evidence without any manifest"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (R5) The unsupported versions and malformed evidence: every
+    /// invalid witness-family state refuses the walk — never a
+    /// reclaimable publication, never an ignorable unknown record.
+    #[test]
+    fn the_witness_family_refuses_unsupported_versions_and_malformed_evidence() {
+        // The shared arm base: the founding plus one ordinary
+        // snapshot (the walk's start parent).
+        let arm_base = |label: &str| -> (std::path::PathBuf, LocalFileMedium, Hash, Hash, Vec<u8>) {
+            let root = temp_store(label);
+            let mut medium = LocalFileMedium::open(&root).unwrap();
+            let plain = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"a1r-arm-payload");
+                enc.into_bytes()
+            })
+            .unwrap();
+            let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+                .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&founding, std::slice::from_ref(&plain), None)
+                .unwrap();
+            let snap1 = append_snapshot(&mut medium, b"a1r-arm-snap", 10);
+            let snap1_bytes = medium.read_record(&snap1).unwrap().canonical_bytes();
+            (root, medium, founding.id(), snap1, snap1_bytes)
+        };
+        // The shared valid witness objects over the arm's snapshot
+        // member.
+        let arm_witness = |snap1: Hash, snap1_bytes: &[u8]| -> (Hash, StoredObject, StoredObject) {
+            let witness_mk = engine_persist::hash::hash_object(b"a1r-arm-witness-mk");
+            let witness_plan = engine_persist::hash::hash_object(b"a1r-arm-witness-plan");
+            let witness_begin = engine_persist::hash::hash_object(b"a1r-arm-witness-begin");
+            let witness_metadata = engine_persist::hash::hash_object(b"a1r-arm-witness-metadata");
+            let (manifest, shards) = construct_witness(
+                &witness_mk,
+                &witness_plan,
+                &witness_begin,
+                &witness_metadata,
+                vec![WitnessEntry {
+                    member: snap1,
+                    preimage: snap1_bytes.to_vec(),
+                }],
+            )
+            .unwrap();
+            (
+                witness_mk,
+                StoredObject::new(manifest.canonical_bytes()).unwrap(),
+                StoredObject::new(shards[0].canonical_bytes()).unwrap(),
+            )
+        };
+        // (a) THE UNSUPPORTED MANIFEST VERSION: a family-prefixed
+        // domain other than the ratified /1 refuses typed.
+        let (root, mut medium, _founding, snap1, _snap1_bytes) = arm_base("unsupported-manifest");
+        let unsupported = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-ancestry-witness/2");
+            enc.write_u32(1);
+            enc.write_bytes(&[0x01; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record = write_record_with_object(&mut medium, snap1, None, &unsupported, 20);
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the unsupported manifest version refuses, got {other:?}"),
+            Ok(_) => panic!("the unsupported manifest version never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/witness-unsupported-version");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (b) THE UNSUPPORTED SHARD VERSION.
+        let (root, mut medium, _founding, snap1, _) = arm_base("unsupported-shard");
+        let unsupported = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-ancestry-witness-shard/2");
+            enc.write_u32(1);
+            enc.write_bytes(&[0x01; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record = write_record_with_object(&mut medium, snap1, None, &unsupported, 20);
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the unsupported shard version refuses, got {other:?}"),
+            Ok(_) => panic!("the unsupported shard version never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/witness-unsupported-version");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (c) THE TRUNCATED MANIFEST: the strict decode refuses.
+        let (root, mut medium, _founding, snap1, snap1_bytes) = arm_base("truncated-manifest");
+        let (_mk, manifest_object, _shard_object) = arm_witness(snap1, &snap1_bytes);
+        let truncated = StoredObject::new(manifest_object.bytes()[..100].to_vec()).unwrap();
+        let record = write_record_with_object(&mut medium, snap1, None, &truncated, 20);
+        assert!(walk_checkpoint_range(&mut medium, record).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (d) THE MALFORMED SHARD: a shard-domain payload that fails
+        // the strict decode.
+        let (root, mut medium, _founding, snap1, _) = arm_base("malformed-shard");
+        let malformed = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-ancestry-witness-shard/1");
+            enc.write_u32(9);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record = write_record_with_object(&mut medium, snap1, None, &malformed, 20);
+        assert!(walk_checkpoint_range(&mut medium, record).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (e) THE WRONG MANIFEST KEY: a valid manifest object under
+        // a record whose idempotency key is not the deterministic
+        // MK-bound form.
+        let (root, mut medium, _founding, snap1, snap1_bytes) = arm_base("wrong-manifest-key");
+        let (_mk, manifest_object, _shard_object) = arm_witness(snap1, &snap1_bytes);
+        let record = write_record_with_object(
+            &mut medium,
+            snap1,
+            Some(b"a1r-wrong-manifest-key".to_vec()),
+            &manifest_object,
+            20,
+        );
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the wrong manifest key refuses, got {other:?}"),
+            Ok(_) => panic!("the wrong manifest key never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/witness-key-mismatch");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (f) THE WRONG SHARD KEY: the deterministic key of the
+        // WRONG shard index.
+        let (root, mut medium, _founding, snap1, snap1_bytes) = arm_base("wrong-shard-key");
+        let (witness_mk, _manifest_object, shard_object) = arm_witness(snap1, &snap1_bytes);
+        let record = write_record_with_object(
+            &mut medium,
+            snap1,
+            Some(reclamation_witness_shard_idempotency_key(&witness_mk, 1)),
+            &shard_object,
+            20,
+        );
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the wrong shard key refuses, got {other:?}"),
+            Ok(_) => panic!("the wrong shard key never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/witness-key-mismatch");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (g) THE INCORRECT REVISION SHAPE: a regular record with
+        // TWO content references (the manifest object plus a second
+        // payload chosen to sort after it, so the walk's first
+        // reference is the witness object).
+        let (root, mut medium, _founding, snap1, snap1_bytes) = arm_base("two-refs");
+        let (_mk, manifest_object, _shard_object) = arm_witness(snap1, &snap1_bytes);
+        let mut counter = 0u32;
+        let second = loop {
+            let candidate = StoredObject::new({
+                let mut enc = engine_core::Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(format!("a1r-two-refs-{counter}").as_bytes());
+                enc.into_bytes()
+            })
+            .unwrap();
+            if candidate.hash() > manifest_object.hash() {
+                break candidate;
+            }
+            counter += 1;
+        };
+        let head = snap1;
+        let epoch = top_epoch(&mut medium, head);
+        let record = RevisionRecord::regular(head, epoch, 20)
+            .with_content_refs(vec![manifest_object.hash(), second.hash()]);
+        std::fs::write(
+            medium.object_path_pub(&manifest_object.hash()),
+            manifest_object.bytes(),
+        )
+        .unwrap();
+        std::fs::write(medium.object_path_pub(&second.hash()), second.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let detail = match walk_checkpoint_range(&mut medium, record.id()) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            Err(other) => panic!("the two-reference shape refuses, got {other:?}"),
+            Ok(_) => panic!("the two-reference shape never walks"),
+        };
+        assert_eq!(detail, "checkpoint-walk/witness-shape-mismatch");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (h) THE MISSING CONTENT: the record references an object
+        // identity that was never stored.
+        let (root, mut medium, _founding, snap1, _) = arm_base("missing-content");
+        let fabricated = engine_persist::hash::hash_object(b"a1r-never-stored-object");
+        let epoch = top_epoch(&mut medium, snap1);
+        let record = RevisionRecord::regular(snap1, epoch, 20).with_content_refs(vec![fabricated]);
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        assert!(walk_checkpoint_range(&mut medium, record.id()).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        // (i) THE CORRUPTED CONTENT: different bytes written at the
+        // valid manifest object's content-addressed path.
+        let (root, mut medium, _founding, snap1, snap1_bytes) = arm_base("corrupted-content");
+        let (_mk, manifest_object, _shard_object) = arm_witness(snap1, &snap1_bytes);
+        let record = write_record_with_object(&mut medium, snap1, None, &manifest_object, 20);
+        std::fs::write(
+            medium.object_path_pub(&manifest_object.hash()),
+            b"a1r-corrupted-witness-content",
+        )
+        .unwrap();
+        assert!(walk_checkpoint_range(&mut medium, record).is_err());
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
