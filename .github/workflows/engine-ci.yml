@@ -62,16 +62,24 @@ jobs:
             echo "the feature-disabled build carries the adversarial marker publisher ($adversarial matches)"
             exit 1
           fi
-          # (V2X-CP3-A1-2) The ancestry-witness publisher and its
-          # internal installed-state kernel are equally compile-time
-          # isolated: a public Rust export alone is NOT an adequate
-          # activation barrier — the composite-test-fixture feature
-          # gate is, and the feature-disabled build must compile
-          # neither symbol at all.
+          # (V2X-CP3-A1-2/A1-3) The ancestry-witness PUBLISHER remains
+          # compile-time isolated: a public Rust export alone is NOT
+          # an adequate activation barrier — the
+          # composite-test-fixture feature gate is, and the
+          # feature-disabled build must not compile the publisher at
+          # all. The A1-3 read-only verifier
+          # (verify_installed_ancestry_witness) is the specifically
+          # authorized production surface: its PRESENCE in the
+          # feature-disabled rlib is asserted alongside — the
+          # isolation is the publisher's, never the verifier's.
           witness=$(nm "$rlib" | grep -c publish_ancestry_witness || true)
-          witness_kernel=$(nm "$rlib" | grep -c verify_installed_witness_internal || true)
-          if [ "$witness" != "0" ] || [ "$witness_kernel" != "0" ]; then
-            echo "the feature-disabled build carries the witness publisher ($witness matches) or kernel ($witness_kernel matches)"
+          if [ "$witness" != "0" ]; then
+            echo "the feature-disabled build carries the witness publisher ($witness matches)"
+            exit 1
+          fi
+          readonly_surface=$(nm "$rlib" | grep -c verify_installed_ancestry_witness || true)
+          if [ "$readonly_surface" == "0" ]; then
+            echo "the feature-disabled build is missing the authorized read-only witness verifier"
             exit 1
           fi
           # (T2-B) The crossing's crash-test seams are compile-time

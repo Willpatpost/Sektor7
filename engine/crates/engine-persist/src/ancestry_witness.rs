@@ -9,22 +9,26 @@
 //! the metadata-only ancestry insufficiency of the CP3 design
 //! reviews.
 //!
-//! **The A1 reachability boundary (V2X-CP3-A1-2, honest):** the
-//! wire codecs, the deterministic construction, and the standalone
-//! validation helpers remain library-reachable with NO production
-//! caller — no recovery, campaign-crossing, or consumer flow
-//! consults them (the A1-3 consumer remains separately gated). The
-//! family gate IS production-wired (the generic append refuses
-//! every witness-family object typed). The A1-2 publisher
-//! ([`publish_ancestry_witness`]) and the internal installed-state
-//! kernel ([`verify_installed_witness_internal`]) are TEST-ONLY:
-//! compile-time isolated under the `composite-test-fixture`
-//! feature — the production build does not compile them at all
-//! (the CI activation-isolation step nm-verifies the symbols'
-//! absence from the feature-disabled rlib; a public Rust export
-//! alone is NOT an adequate activation barrier — the feature gate
-//! is). There is NO production publication path, NO engine-slice
-//! recognition, and NO destructive connection.
+//! **The A1 reachability boundary (V2X-CP3-A1-3, honest):** the
+//! A1-3 public read-only installed-witness verifier
+//! ([`verify_installed_ancestry_witness`]) IS the production
+//! surface — the promoted A1-2 kernel, reusable through the normal
+//! library API in every build, establishing nothing but
+//! authenticated installed-state completeness (evidence, never a
+//! deletion permit; it installs nothing, reclaims nothing, and
+//! manufactures no authority). The A1-2 publisher
+//! ([`publish_ancestry_witness`]) remains TEST-ONLY: compile-time
+//! isolated under the `composite-test-fixture` feature — the
+//! production build does not compile it at all (the CI
+//! activation-isolation step nm-verifies the publisher symbol's
+//! absence from the feature-disabled rlib while verifying the
+//! read-only verifier's PRESENCE — the authorized surface; a
+//! public Rust export alone is NOT an adequate activation barrier
+//! — the feature gate is). The family gate remains
+//! production-wired (the generic append refuses every
+//! witness-family object typed). There is NO production
+//! publication path, NO engine-slice recognition (A1-R remains
+//! separately gated), and NO destructive connection.
 //!
 //! **The ratified wire contract:** two versioned domains under one
 //! recognized family; the 273-byte manifest (the MK / plan-revision
@@ -109,16 +113,15 @@ pub const RECLAMATION_WITNESS_SHARD_KEY_DOMAIN: &str =
 
 /// The manifest publication's deterministic MK-bound key (one
 /// witness manifest per checkpoint, ever — the established
-/// begin/plan key discipline). Dormant: defined for the future
-/// admission only.
-#[cfg_attr(not(test), allow(dead_code))]
+/// begin/plan key discipline). Consumed by the A1-3 read-only
+/// verifier's discovery and prefix classification in every build.
 pub fn reclamation_witness_manifest_idempotency_key(mk: &Hash) -> Vec<u8> {
     format!("{RECLAMATION_WITNESS_KEY_DOMAIN}:{}", mk.hex()).into_bytes()
 }
 
 /// The shard publications' deterministic keys (the MK and the shard
-/// index). Dormant: defined for the future admission only.
-#[cfg_attr(not(test), allow(dead_code))]
+/// index). Consumed by the A1-3 read-only verifier's discovery and
+/// prefix classification in every build.
 pub fn reclamation_witness_shard_idempotency_key(mk: &Hash, shard_index: u64) -> Vec<u8> {
     format!(
         "{RECLAMATION_WITNESS_SHARD_KEY_DOMAIN}:{}:{shard_index}",
@@ -1087,53 +1090,146 @@ fn verify_member_facts(
     Ok(())
 }
 
-/// (V2X-CP3-A1-2) THE INTERNAL INSTALLED-STATE COMPLETENESS
-/// VERIFICATION KERNEL — pub(crate), feature-gated with the
-/// publisher (A1-3 reuses it under its own authorized edit): under
-/// the provider's own coordination this establishes the COMPLETE
-/// installed witness — the CP2 plan-bound begin authority (the
-/// retained-evidence authentication and the tier policy), the
-/// installed plan revision, the manifest discovery with the strict
-/// bindings (the MK, the plan record, the begin record, and the
-/// metadata object), EVERY declared shard `0..shard_count`
-/// discovered (a missing one is the typed
-/// installed-state-integrity refusal — an installed manifest
-/// claims completeness), and the complete verification — the index
-/// shape, the structural decodes, the per-entry authentication,
-/// the parent-edge coherence, the exact coverage, census, digest,
-/// and greedy layout. A manifest-present degraded state therefore
-/// NEVER verifies; a manifestless shard prefix fails the manifest
-/// discovery here and remains resumable by the publisher.
+/// (V2X-CP3-A1-3) THE INSTALLED-WITNESS VERIFICATION OUTCOME — the
+/// truthful recovery-state classification. A `Verified` result
+/// means the ENTIRE installed witness has been independently
+/// authenticated — never merely that a valid manifest exists. The
+/// classification preserves the installation-versus-durability
+/// contract: the carried begin tier is the CP2 authority's
+/// truthfully established grade, evidence for the future
+/// separately authorized destructive gate — never a deletion
+/// permit. An integrity failure beneath an installed manifest is
+/// carried EXPLICITLY as [`InstalledWitnessVerification::
+/// ManifestPresentDegraded`] — never silently reinterpreted as
+/// normal incompleteness.
+#[derive(Debug)]
+pub enum InstalledWitnessVerification {
+    /// The complete installed witness, independently verified: the
+    /// CP2 plan-bound begin authority (with its truthful tier
+    /// grade), the installed plan revision identity, the MK's
+    /// canonical metadata binding, the strictly decoded manifest
+    /// with its bindings, every declared shard discovered and
+    /// authenticated, and the complete A0 invariant set — the
+    /// index shape, the entry identity/epoch/key authentication,
+    /// the parent-edge consistency, the coverage, census, digest,
+    /// ordering, shard-size limits, and greedy maximality.
+    Verified {
+        /// The manifest's canonical revision identity.
+        manifest_record: Hash,
+        /// The authenticated manifest.
+        manifest: AncestryWitnessManifest,
+        /// The CP2 begin authority's truthfully established
+        /// durability grade (evidence, never a deletion permit).
+        begin_tier: crate::medium::SyncTier,
+    },
+    /// No installed manifest. `shard_prefix_present` reports
+    /// whether the deterministic shard-0 key is occupied — the
+    /// publisher's deterministic order installs shard 0 first, so
+    /// an occupied key marks a manifestless, POTENTIALLY resumable
+    /// partial publication. The flag is key occupancy ONLY: it
+    /// never validates the prefix's content and never claims
+    /// completeness; the resumption (the test-gated publisher)
+    /// re-authenticates everything.
+    ManifestAbsent {
+        /// Whether the deterministic shard-0 idempotency key is
+        /// occupied.
+        shard_prefix_present: bool,
+    },
+    /// The manifest is installed but the evidence beneath it is
+    /// incomplete or corrupted — a declared shard missing, its
+    /// content absent, a substituted or incoherent shard, a
+    /// binding mismatch, or an A0 invariant violation. The typed
+    /// failure is carried explicitly: an installed manifest claims
+    /// completeness, so this is an INTEGRITY classification, never
+    /// normal incompleteness, and never resumable by re-publication
+    /// alone.
+    ManifestPresentDegraded {
+        /// The typed failure the complete verification raised.
+        failure: MediumError,
+    },
+}
+
+/// (V2X-CP3-A1-3) THE PUBLIC READ-ONLY INSTALLED-WITNESS
+/// VERIFIER — the A1-2 internal complete-verification kernel
+/// PROMOTED into the normal library API (the accepted
+/// implementation reused verbatim: the same authority-side
+/// establishment, the same multi-key family discovery, the same
+/// bounded streaming verification — no parallel verifier). The
+/// consumer is READ-ONLY: it installs nothing, reclaims nothing,
+/// and manufactures no authority; the A1-2 publisher remains
+/// test-gated and the generic append family fence remains
+/// mandatory.
 ///
-/// **(The A1-2 F1 corrective — the bounded form.)** The discovery
-/// is ONE multi-key descent that locates the manifest AND every
-/// declared shard in a single pass (the manifest's strict decode
-/// grows the key set to the declared shard keys at the match; the
-/// walk terminates as soon as the family is complete, bounded by
-/// the witness's own span) — never a separate full-chain descent
-/// per shard; at most one additional completion pass covers
-/// exactly the still-missing keys (an adversarial above-manifest
-/// placement the publisher's own layout never produces). Each
-/// shard is then re-read and hash-verified AS IT IS CONSUMED and
-/// verified streaming: the shard in hand is the only preimage
-/// retention, the per-entry facts (the indexed epoch and key, the
-/// parent-edge rules with their checked arithmetic) are checked
-/// with O(1) carry across the shard boundaries, the coverage
-/// sequence runs against the index-derived canonical order with a
-/// position counter, the census accumulates, the greedy
-/// maximality of each non-final shard is checked against the next
-/// shard's first entry, and the coverage digest folds over the
-/// collected identities through the canonical
-/// [`witness_coverage_digest`] recipe. The aggregate A0 standalone
-/// verifier is never invoked on the installed witness; no shard
-/// bytes survive a shard's own verification. The retained state is
-/// O(member count) identities and index references — never
-/// O(total witness bytes).
-#[cfg(feature = "composite-test-fixture")]
-pub(crate) fn verify_installed_witness_internal(
+/// Under the provider's own coordination this establishes, in the
+/// order that keeps every classification truthful: FIRST the
+/// witness-layer state (the multi-key family discovery — the
+/// witness evidence's own condition is established before any
+/// authority-side walk could be broken by its degradation: a
+/// missing or corrupted shard content surfaces HERE, classified
+/// by the manifest key's occupancy, never as a spurious
+/// authority error); then, under an installed manifest, the
+/// authority-side establishment — the CP2 plan-bound begin
+/// authority (the retained-evidence authentication and the
+/// applicable provider-tier policy), the installed plan revision,
+/// the MK's canonical metadata binding with its exactly-one
+/// content-reference shape, and the index shape — and finally the
+/// manifest bindings and the bounded streaming verification of
+/// every declared shard. A missing manifest classifies as
+/// [`InstalledWitnessVerification::ManifestAbsent`] (with the
+/// deterministic shard-0 prefix flag; the classification reports
+/// the WITNESS-LAYER fact — the authority is established for the
+/// `Verified` outcome, and the resumption re-authenticates
+/// everything); a discovery failure beneath an installed manifest
+/// classifies as [`InstalledWitnessVerification::
+/// ManifestPresentDegraded`]; a bindings or streaming failure
+/// beneath an installed manifest is likewise the degraded
+/// classification carrying the typed failure; the authority-side
+/// failures under an intact witness layer (authority, plan, MK,
+/// metadata) remain errors in the `Err` channel. The complete A0
+/// invariant set is enforced over the witness evidence ALONE —
+/// the original retiring revision records are never read (the
+/// retained-evidence property: a complete witness remains
+/// independently verifiable after their deletion).
+///
+/// **The resource contract (the F1 corrective preserved):** one
+/// multi-key family discovery (never a full-chain descent per
+/// shard), one-shard-at-a-time authenticated consumption with no
+/// aggregate preimage retention, indexed-member bookkeeping
+/// proportional to the member count, the aggregate A0 standalone
+/// verifier never invoked on the installed witness, and fail-closed
+/// behavior on malformed counts, missing entries, resource-limit
+/// violations, or impossible index relationships.
+pub fn verify_installed_ancestry_witness(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
-) -> Result<(Hash, AncestryWitnessManifest), MediumError> {
+) -> Result<InstalledWitnessVerification, MediumError> {
+    // ===== Phase 1 — THE WITNESS-LAYER STATE (the family
+    // discovery first, so the witness evidence's own degradation
+    // classifies truthfully rather than breaking the authority-side
+    // walks) =====
+    let discovery = match find_installed_witness_family(medium, mk) {
+        Ok(discovery) => discovery,
+        Err(failure) => return classify_discovery_failure(medium, mk, failure),
+    };
+    let Some((manifest_record, manifest)) = discovery.manifest else {
+        // THE MANIFESTLESS STATE — a recovery state, never an
+        // error: the deterministic shard-0 prefix probe (key
+        // occupancy only — the publisher's order installs shard 0
+        // first; the flag never validates the prefix). The
+        // classification reports the witness-layer fact; the
+        // authority is established for the Verified outcome and
+        // the resumption re-authenticates everything.
+        let shard_prefix_present =
+            find_witness_record_by_key(medium, &reclamation_witness_shard_idempotency_key(mk, 0))?
+                .is_some();
+        return Ok(InstalledWitnessVerification::ManifestAbsent {
+            shard_prefix_present,
+        });
+    };
+    // ===== Phase 2 — THE AUTHORITY-SIDE ESTABLISHMENT under an
+    // installed manifest (the witness layer is intact here: any
+    // failure in this phase is a genuine authority-side error,
+    // never a witness-evidence degradation) — the Err channel =====
     let authority = medium.verify_begin_authority_v2(mk)?;
     let Some((plan_record, _plan)) = crate::reclaim::find_installed_plan(medium, mk)? else {
         return Err(MediumError::Chain {
@@ -1160,30 +1256,52 @@ pub(crate) fn verify_installed_witness_internal(
     // helpers' boundary discipline, enforced independently of the
     // metadata decode's sorted-unique-HASH rule.
     validate_index_shape(&metadata.index).map_err(MediumError::Format)?;
-    // THE MULTI-KEY DISCOVERY: one bounded descent for the whole
-    // family (at most one completion pass over exactly the missing
-    // keys).
-    let discovery = find_installed_witness_family(medium, mk)?;
-    let Some((manifest_record, manifest)) = discovery.manifest else {
-        return Err(MediumError::Chain {
-            rule: "ancestry-witness/manifest-absent",
-        });
-    };
+    // ===== Phase 3 — the manifest bindings and the bounded
+    // streaming verification: any failure beneath the INSTALLED
+    // manifest is the degraded classification, carried explicitly =====
     if manifest.plan_record != plan_record
         || manifest.begin_record != authority.id()
         || manifest.metadata_object != metadata_object
     {
-        return Err(MediumError::Chain {
-            rule: "ancestry-witness/manifest-binding-mismatch",
+        return Ok(InstalledWitnessVerification::ManifestPresentDegraded {
+            failure: MediumError::Chain {
+                rule: "ancestry-witness/manifest-binding-mismatch",
+            },
         });
     }
-    verify_installed_witness_streaming(medium, &manifest, &discovery.shards, &metadata)?;
-    Ok((manifest_record, manifest))
+    if let Err(failure) =
+        verify_installed_witness_streaming(medium, &manifest, &discovery.shards, &metadata)
+    {
+        return Ok(InstalledWitnessVerification::ManifestPresentDegraded { failure });
+    }
+    Ok(InstalledWitnessVerification::Verified {
+        manifest_record,
+        manifest,
+        begin_tier: authority.tier(),
+    })
+}
+
+/// The discovery-failure classification: the truthful degraded
+/// boundary is the manifest key's OCCUPANCY — a discovery failure
+/// beneath an installed manifest (a corrupted manifest decode, a
+/// malformed or content-missing shard record encountered by the
+/// walk) is the degraded class; a failure with the manifest key
+/// unoccupied (or with the occupancy probe itself failing) is a
+/// genuine chain-level integrity error in the `Err` channel,
+/// never a recovery state.
+fn classify_discovery_failure(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    mk: &Hash,
+    failure: MediumError,
+) -> Result<InstalledWitnessVerification, MediumError> {
+    match find_witness_record_by_key(medium, &reclamation_witness_manifest_idempotency_key(mk)) {
+        Ok(Some(_)) => Ok(InstalledWitnessVerification::ManifestPresentDegraded { failure }),
+        _ => Err(failure),
+    }
 }
 
 /// The typed streaming-verification refusal (the A0 rule names,
-/// carried in the kernel's MediumError channel).
-#[cfg(feature = "composite-test-fixture")]
+/// carried in the verifier's MediumError channel).
 fn witness_integrity_refusal(rule: &'static str) -> MediumError {
     MediumError::Format(SaveError::Integrity(rule))
 }
@@ -1194,7 +1312,6 @@ fn witness_integrity_refusal(rule: &'static str) -> MediumError {
 /// declared shard's record identity with its single content
 /// object's identity (the bytes are NEVER retained here — each
 /// shard is re-read and hash-verified as it is consumed).
-#[cfg(feature = "composite-test-fixture")]
 struct WitnessFamilyDiscovery {
     manifest: Option<(Hash, AncestryWitnessManifest)>,
     shards: Vec<Option<(Hash, Hash)>>,
@@ -1218,7 +1335,6 @@ struct WitnessFamilyDiscovery {
 /// above-manifest placement the publisher's own manifest-LAST
 /// layout never produces; the legitimate layout always completes
 /// in the primary pass).
-#[cfg(feature = "composite-test-fixture")]
 fn find_installed_witness_family(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
@@ -1355,7 +1471,6 @@ fn find_installed_witness_family(
 /// shard's first entry; and the coverage digest over the collected
 /// identities through the canonical recipe. A missing declared
 /// shard refuses typed BEFORE any consumption.
-#[cfg(feature = "composite-test-fixture")]
 fn verify_installed_witness_streaming(
     medium: &mut dyn crate::medium::CanonicalMedium,
     manifest: &AncestryWitnessManifest,
@@ -1789,13 +1904,32 @@ pub fn publish_ancestry_witness(
         }
     };
     // The complete installed-state verification BEFORE any
-    // positive result.
-    let (discovered_record, discovered_manifest) = verify_installed_witness_internal(medium, mk)?;
-    if discovered_record != manifest_record {
-        return Err(MediumError::Chain {
-            rule: "ancestry-witness/manifest-record-divergence",
-        });
-    }
+    // positive result — the A1-3 public read-only verifier (the
+    // promoted A1-2 kernel) reused as the publisher's own final
+    // gate: only a fully Verified result whose manifest record
+    // equals this publication's completes the publication.
+    let discovered_manifest = match verify_installed_ancestry_witness(medium, mk)? {
+        InstalledWitnessVerification::Verified {
+            manifest_record: discovered_record,
+            manifest,
+            ..
+        } => {
+            if discovered_record != manifest_record {
+                return Err(MediumError::Chain {
+                    rule: "ancestry-witness/manifest-record-divergence",
+                });
+            }
+            manifest
+        }
+        InstalledWitnessVerification::ManifestAbsent { .. } => {
+            return Err(MediumError::Chain {
+                rule: "ancestry-witness/manifest-not-installed",
+            });
+        }
+        InstalledWitnessVerification::ManifestPresentDegraded { failure } => {
+            return Err(failure);
+        }
+    };
     Ok(CompleteWitnessPublication {
         manifest_record,
         manifest_outcome,
@@ -3621,11 +3755,33 @@ mod a12_tests {
         id
     }
 
-    struct A12Campaign {
-        mk: Hash,
-        members: Vec<Hash>,
+    pub(super) struct A12Campaign {
+        pub(super) mk: Hash,
+        pub(super) members: Vec<Hash>,
         #[cfg_attr(not(unix), allow(dead_code))]
-        sk: Hash,
+        pub(super) sk: Hash,
+    }
+
+    /// (A1-3) The sibling-module campaign accessor: the a13
+    /// regressions reuse the provider-neutral campaign fixture
+    /// through this narrow pub(super) form.
+    pub(super) fn a12_campaign_for_a13(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+        members: &[(usize, Vec<u8>)],
+    ) -> A12Campaign {
+        a12_campaign(medium, label, journal_root, members, 10_000)
+    }
+
+    /// (A1-3) The sibling-module in-crate install accessor.
+    pub(super) fn a12_install_under_key_for_a13(
+        medium: &mut dyn CanonicalMedium,
+        key: Vec<u8>,
+        object: &StoredObject,
+        tick: u64,
+    ) -> Hash {
+        a12_install_under_key(medium, key, object, tick)
     }
 
     /// The provider-neutral V2 campaign (the accepted
@@ -3865,7 +4021,9 @@ mod a12_tests {
     /// bounded retry then converges, or the typed refusal lands).
     /// The wrapper also COUNTS the record reads per identity (the
     /// F1 bounded-discovery regression observes the kernel's
-    /// descent discipline) and retains the last competitor's record
+    /// descent discipline), counts every MUTATING trait call (the
+    /// A1-3 read-only regression observes the public verifier's
+    /// write freedom), and retains the last competitor's record
     /// identity (the F2 arms install one beneath the publisher).
     struct A12Wrapped {
         inner: crate::SqliteMedium,
@@ -3873,6 +4031,7 @@ mod a12_tests {
         diverge_reads: u32,
         unverifiable_reconcile: bool,
         read_counts: std::collections::BTreeMap<Hash, u32>,
+        mutations: u32,
         last_competitor: Option<Hash>,
     }
 
@@ -3884,6 +4043,7 @@ mod a12_tests {
                 diverge_reads: 0,
                 unverifiable_reconcile: false,
                 read_counts: std::collections::BTreeMap::new(),
+                mutations: 0,
                 last_competitor: None,
             }
         }
@@ -3894,6 +4054,10 @@ mod a12_tests {
 
         fn read_count(&self, id: &Hash) -> u32 {
             self.read_counts.get(id).copied().unwrap_or(0)
+        }
+
+        fn mutation_count(&self) -> u32 {
+            self.mutations
         }
 
         fn competitor(&self) -> Hash {
@@ -3927,6 +4091,7 @@ mod a12_tests {
             admitted: crate::medium::AdmittedAppend,
             expected_parent: Option<Hash>,
         ) -> Result<crate::medium::AppendOutcome, MediumError> {
+            self.mutations += 1;
             // The read-divergence arm does not intercept appends.
             if matches!(&self.arm, A12Arm::DivergeMemberRead(_)) {
                 return self.inner.append_admitted(admitted, expected_parent);
@@ -4059,6 +4224,7 @@ mod a12_tests {
             &mut self,
             directive: &crate::reclaim::ReclaimDirective,
         ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+            self.mutations += 1;
             self.inner.reclaim(directive)
         }
 
@@ -4066,10 +4232,12 @@ mod a12_tests {
             &mut self,
             directive: &crate::reclaim::ReclaimDirective,
         ) -> Result<bool, MediumError> {
+            self.mutations += 1;
             self.inner.reclaim_pending(directive)
         }
 
         fn checkpoint(&mut self) -> Result<(), MediumError> {
+            self.mutations += 1;
             self.inner.checkpoint()
         }
 
@@ -4079,6 +4247,7 @@ mod a12_tests {
             mk: &Hash,
             tick: u64,
         ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.mutations += 1;
             self.inner.begin_reclamation(audit, mk, tick)
         }
 
@@ -4095,6 +4264,7 @@ mod a12_tests {
             mk: &Hash,
             tick: u64,
         ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.mutations += 1;
             self.inner.begin_reclamation_v2(mk, tick)
         }
 
@@ -4164,10 +4334,10 @@ mod a12_tests {
             "SK's preimage is witnessed with the members: {epochs:?}"
         );
         // The kernel and the fresh-handle restart discipline.
-        verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
         drop(medium);
         let mut reopened = crate::LocalFileMedium::open(root.clone()).unwrap();
-        verify_installed_witness_internal(&mut reopened, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap();
         drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4190,12 +4360,12 @@ mod a12_tests {
         }
         assert_eq!(medium.head().unwrap().unwrap(), publication.manifest_record);
         assert_eq!(publication.manifest.member_count, 3);
-        verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
         // The restart: a fresh handle re-verifies the complete
         // installed state.
         drop(medium);
         let mut reopened = crate::SqliteMedium::open(&path).unwrap();
-        verify_installed_witness_internal(&mut reopened, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap();
         drop(reopened);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4550,10 +4720,10 @@ mod a12_tests {
         assert!(shard0_size + next_framed > WITNESS_SHARD_PAYLOAD_CEILING);
         // The complete kernel (the census, the coverage, the
         // greedy, the digest) and the restart discipline.
-        verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
         drop(medium);
         let mut reopened = crate::LocalFileMedium::open(root.clone()).unwrap();
-        verify_installed_witness_internal(&mut reopened, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap();
         drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4589,7 +4759,7 @@ mod a12_tests {
         assert_eq!(medium.head().unwrap().unwrap(), head_after_first);
         assert_eq!(second.manifest_record, first.manifest_record);
         // The complete state still verifies.
-        verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4659,7 +4829,7 @@ mod a12_tests {
             other => panic!("the manifest must publish fresh: {other:?}"),
         }
         assert_eq!(publication.manifest, expected_manifest);
-        verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4687,7 +4857,7 @@ mod a12_tests {
         ));
         assert_eq!(publication.manifest.shard_count, 1);
         let mut inner = wrapped.into_inner();
-        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut inner, &campaign.mk).unwrap();
         drop(inner);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4709,7 +4879,7 @@ mod a12_tests {
             WitnessPublicationOutcome::Accepted { .. }
         ));
         let mut inner = wrapped.into_inner();
-        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut inner, &campaign.mk).unwrap();
         drop(inner);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4734,7 +4904,7 @@ mod a12_tests {
             other => panic!("the shard must be the reconciled installation: {other:?}"),
         }
         let mut inner = wrapped.into_inner();
-        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut inner, &campaign.mk).unwrap();
         drop(inner);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -4837,13 +5007,19 @@ mod a12_tests {
             .unwrap();
         let shard_object_hash = hash_object(&shard.canonical_bytes());
         std::fs::remove_file(medium.object_path_pub(&shard_object_hash)).unwrap();
-        // The kernel refuses the degraded state.
-        let kernel_error =
-            verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap_err();
-        assert!(
-            matches!(kernel_error, MediumError::MissingObject { .. }),
-            "the degraded shard is the integrity refusal: {kernel_error:?}"
-        );
+        // The verifier classifies the degraded state — the
+        // manifest-present integrity classification, never an
+        // error and never normal incompleteness.
+        let classification = verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap();
+        match classification {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(failure, MediumError::MissingObject { .. }),
+                    "the degraded shard is the integrity classification: {failure:?}"
+                );
+            }
+            other => panic!("the degraded state classifies degraded: {other:?}"),
+        }
         // The re-publish refuses: the occupied key's record is
         // present but its content is gone — the duplicate
         // discovery fails closed, never a false duplicate.
@@ -4905,10 +5081,12 @@ mod a12_tests {
                 other => panic!("every shard freshly accepted: {other:?}"),
             })
             .collect();
-        // The direct kernel invocation with the read counting.
+        // The direct verifier invocation with the read counting.
         let mut wrapped = A12Wrapped::armed(medium, A12Arm::None);
-        let (_record, _manifest) =
-            verify_installed_witness_internal(&mut wrapped, &campaign.mk).unwrap();
+        match verify_installed_ancestry_witness(&mut wrapped, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { .. } => {}
+            other => panic!("the complete witness verifies: {other:?}"),
+        }
         assert_eq!(
             wrapped.read_count(&publication.manifest_record),
             2,
@@ -4974,7 +5152,7 @@ mod a12_tests {
             publication.manifest_record
         );
         let mut inner = wrapped.into_inner();
-        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut inner, &campaign.mk).unwrap();
         drop(inner);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -5056,7 +5234,7 @@ mod a12_tests {
             other => panic!("the manifest publishes fresh: {other:?}"),
         }
         let mut inner = wrapped.into_inner();
-        verify_installed_witness_internal(&mut inner, &campaign.mk).unwrap();
+        verify_installed_ancestry_witness(&mut inner, &campaign.mk).unwrap();
         drop(inner);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
@@ -5353,7 +5531,7 @@ mod a12_tests {
             &manifest_object,
             9,
         );
-        let error = verify_installed_witness_internal(&mut medium, &campaign.mk).unwrap_err();
+        let error = verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -5537,6 +5715,502 @@ mod a12_tests {
                 .is_none()
         );
         drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (A1-3) The read-only guarantee: the public verifier performs
+    /// NO mutating medium call — no append, no reclaim, no begin,
+    /// no checkpoint — over a complete witness.
+    #[test]
+    fn the_public_verifier_is_read_only() {
+        let (path, mut medium) = a12_sqlite_store("readonly");
+        let journal = a12_journal_root("readonly");
+        let members = a12_small_members("readonly");
+        let campaign = a12_campaign(&mut medium, "readonly", &journal, &members, 10_000);
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        let mut wrapped = A12Wrapped::armed(medium, A12Arm::None);
+        match verify_installed_ancestry_witness(&mut wrapped, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { .. } => {}
+            other => panic!("the witness verifies through the wrapper: {other:?}"),
+        }
+        assert_eq!(
+            wrapped.mutation_count(),
+            0,
+            "the public verifier performs no mutating medium call"
+        );
+        drop(wrapped);
+        a12_sqlite_cleanup(&path);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+}
+
+// -------------------------------------------------------------
+// (V2X-CP3-A1-3) THE PUBLIC READ-ONLY VERIFIER REGRESSIONS — the
+// promoted kernel's recovery-state classification, the retained-
+// evidence property, and the read-only guarantee.
+// -------------------------------------------------------------
+
+#[cfg(all(test, feature = "composite-test-fixture"))]
+mod a13_tests {
+    use super::*;
+    use crate::medium::CanonicalMedium;
+
+    fn a13_local_store(_label: &str) -> (std::path::PathBuf, crate::LocalFileMedium) {
+        let root = std::env::temp_dir().join(format!(
+            "s7-a13-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        (root.clone(), crate::LocalFileMedium::open(root).unwrap())
+    }
+
+    fn a13_journal_root(_label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-a13-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn plain_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    fn a13_members(label: &str) -> Vec<(usize, Vec<u8>)> {
+        vec![
+            (48, format!("a13-{label}-payload-m0").into_bytes()),
+            (48, format!("a13-{label}-payload-m1").into_bytes()),
+        ]
+    }
+
+    /// The complete-witness classification on the genuine POSIX
+    /// LocalFile publication, with the fresh-handle restart.
+    #[cfg(unix)]
+    #[test]
+    fn the_public_verifier_classifies_the_complete_witness() {
+        let (root, mut medium) = a13_local_store("verified");
+        let journal = a13_journal_root("verified");
+        let members = a13_members("verified");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "verified",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let publication = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified {
+                manifest_record,
+                manifest,
+                begin_tier,
+            } => {
+                assert_eq!(manifest_record, publication.manifest_record);
+                assert_eq!(manifest, publication.manifest);
+                assert_eq!(begin_tier, crate::medium::SyncTier::FullPosixSequence);
+                assert_eq!(manifest.member_count, 3);
+                assert_eq!(manifest.shard_count, 1);
+            }
+            other => panic!("the complete witness classifies verified: {other:?}"),
+        }
+        // The fresh-handle restart: the retained evidence alone
+        // re-establishes the complete verification.
+        drop(medium);
+        let mut reopened = crate::LocalFileMedium::open(root.clone()).unwrap();
+        match verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { begin_tier, .. } => {
+                assert_eq!(begin_tier, crate::medium::SyncTier::FullPosixSequence);
+            }
+            other => panic!("the reopened handle re-verifies: {other:?}"),
+        }
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The SQLite twin: the classification and the restart on the
+    /// transactional provider.
+    #[test]
+    fn the_public_verifier_sqlite_twin_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "s7-a13-sqlite-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let journal = a13_journal_root("sqlite-verified");
+        let mut medium = crate::SqliteMedium::open(&path).unwrap();
+        let members = a13_members("sqlite-verified");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "sqlite-verified",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { begin_tier, .. } => {
+                assert_eq!(begin_tier, crate::medium::SyncTier::TransactionalWalFull);
+            }
+            other => panic!("the sqlite witness classifies verified: {other:?}"),
+        }
+        drop(medium);
+        let mut reopened = crate::SqliteMedium::open(&path).unwrap();
+        match verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { .. } => {}
+            other => panic!("the reopened sqlite handle re-verifies: {other:?}"),
+        }
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The manifestless classification: the never-published state
+    /// versus the manifestless shard prefix.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_absent_classification_distinguishes_the_prefix() {
+        let (root, mut medium) = a13_local_store("absent");
+        let journal = a13_journal_root("absent");
+        let members = a13_members("absent");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "absent",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        // The never-published state: no manifest, no prefix.
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: false,
+            } => {}
+            other => panic!("the never-published state classifies manifest-absent: {other:?}"),
+        }
+        // The manifestless shard prefix (the publisher's own exact
+        // shard object hand-installed under the deterministic key):
+        // the flag reports the prefix WITHOUT validating it.
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            crate::reclaim::BeginPublicationOutcome::DuplicateVerified { id } => id,
+            other => panic!("the begin admits idempotently: {other:?}"),
+        };
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (_manifest, shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &shard_object,
+            9,
+        );
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: true,
+            } => {}
+            other => panic!("the manifestless prefix classifies with the flag: {other:?}"),
+        }
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The substituted and incoherent shard evidence beneath an
+    /// installed manifest classifies degraded with the typed
+    /// failures.
+    #[cfg(unix)]
+    #[test]
+    fn the_substituted_and_incoherent_shards_classify_degraded() {
+        let (root, mut medium) = a13_local_store("substituted");
+        let journal = a13_journal_root("substituted");
+        let members = a13_members("substituted");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "substituted",
+            &journal,
+            &members,
+        );
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            other => panic!("the begin admits: {other:?}"),
+        };
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (manifest, _shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        // THE SUBSTITUTED SHARD: a plain payload object installed
+        // under the deterministic shard key — the streaming decode
+        // refuses the non-witness content.
+        let substituted = plain_object(b"a13-substituted-shard-content");
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &substituted,
+            9,
+        );
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            &manifest_object,
+            9,
+        );
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(failure, MediumError::Format(_)),
+                    "the substituted shard content refuses at the strict decode: {failure:?}"
+                );
+            }
+            other => panic!("the substituted shard classifies degraded: {other:?}"),
+        }
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+        // THE INCOHERENT SHARD (a fresh campaign — the deterministic
+        // keys are chain-unique): a structurally valid shard whose
+        // entries are in the REVERSED order — the coverage sequence
+        // refuses the non-canonical ordering.
+        let (root, mut medium) = a13_local_store("incoherent");
+        let journal = a13_journal_root("incoherent");
+        let members = a13_members("incoherent");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "incoherent",
+            &journal,
+            &members,
+        );
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            other => panic!("the begin admits: {other:?}"),
+        };
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (manifest, shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        let mut reversed = shards[0].clone();
+        reversed.entries.reverse();
+        let incoherent = StoredObject::new(reversed.canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &incoherent,
+            9,
+        );
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            &manifest_object,
+            9,
+        );
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(
+                        failure,
+                        MediumError::Format(engine_core::SaveError::Integrity(
+                            "ancestry-witness/coverage-sequence-mismatch"
+                        ))
+                    ),
+                    "the reversed shard entries refuse the coverage sequence: {failure:?}"
+                );
+            }
+            other => panic!("the incoherent shard classifies degraded: {other:?}"),
+        }
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The manifest binding mismatch beneath an installed manifest
+    /// classifies degraded with the typed refusal.
+    #[cfg(unix)]
+    #[test]
+    fn the_binding_mismatch_classifies_degraded() {
+        let (root, mut medium) = a13_local_store("binding");
+        let journal = a13_journal_root("binding");
+        let members = a13_members("binding");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "binding",
+            &journal,
+            &members,
+        );
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            other => panic!("the begin admits: {other:?}"),
+        };
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (mut manifest, shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        // THE DOCTORED BINDING: the manifest names a fabricated
+        // plan revision.
+        manifest.plan_record = hash_object(b"a13-fabricated-plan-record");
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        let manifest_object = StoredObject::new(manifest.canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &shard_object,
+            9,
+        );
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            &manifest_object,
+            9,
+        );
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(
+                        failure,
+                        MediumError::Chain {
+                            rule: "ancestry-witness/manifest-binding-mismatch"
+                        }
+                    ),
+                    "the doctored manifest binding refuses typed: {failure:?}"
+                );
+            }
+            other => panic!("the binding mismatch classifies degraded: {other:?}"),
+        }
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The retained-evidence property: the complete witness remains
+    /// independently verifiable after the ORIGINAL RETIRING RECORDS
+    /// are deleted (the full retirement the authenticated self-skip
+    /// covers) — the verifier never reads the member records.
+    #[cfg(unix)]
+    #[test]
+    fn the_verification_survives_the_retiring_records_deletion() {
+        let (root, mut medium) = a13_local_store("post-deletion");
+        let journal = a13_journal_root("post-deletion");
+        let members = a13_members("post-deletion");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "post-deletion",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        // The full retirement of the range: every member record's
+        // object file deleted (the state the authenticated
+        // checkpoint self-skip exists to cross).
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            std::fs::remove_file(medium.object_path_pub(id)).unwrap();
+        }
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { .. } => {}
+            other => panic!("the post-deletion witness still verifies: {other:?}"),
+        }
+        // The fresh handle after the deletion: the restart form.
+        drop(medium);
+        let mut reopened = crate::LocalFileMedium::open(root.clone()).unwrap();
+        match verify_installed_ancestry_witness(&mut reopened, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::Verified { .. } => {}
+            other => panic!("the reopened post-deletion witness still verifies: {other:?}"),
+        }
+        drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
     }

@@ -68,8 +68,8 @@ mod sqlite_tests;
 mod tests;
 
 pub use ancestry_witness::{
-    AncestryWitnessManifest, AncestryWitnessShard, MAX_WITNESS_MEMBER_PREIMAGE_BYTES,
-    RECLAMATION_WITNESS_FAMILY, RECLAMATION_WITNESS_KEY_DOMAIN,
+    AncestryWitnessManifest, AncestryWitnessShard, InstalledWitnessVerification,
+    MAX_WITNESS_MEMBER_PREIMAGE_BYTES, RECLAMATION_WITNESS_FAMILY, RECLAMATION_WITNESS_KEY_DOMAIN,
     RECLAMATION_WITNESS_MANIFEST_DOMAIN, RECLAMATION_WITNESS_MANIFEST_VERSION,
     RECLAMATION_WITNESS_SHARD_DOMAIN, RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
     RECLAMATION_WITNESS_SHARD_VERSION, WITNESS_ENTRY_FRAMING_BYTES, WITNESS_SHARD_HEADER_BYTES,
@@ -79,7 +79,7 @@ pub use ancestry_witness::{
     find_installed_witness_shard, is_reclamation_ancestry_witness_family,
     reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
     validate_index_shape, validate_parent_edges_standalone, verify_exact_coverage,
-    verify_witness_standalone, witness_coverage_digest,
+    verify_installed_ancestry_witness, verify_witness_standalone, witness_coverage_digest,
 };
 pub use checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,
