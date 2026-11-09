@@ -1351,9 +1351,12 @@ mod a2_tests {
 
 #[cfg(all(test, feature = "composite-test-fixture"))]
 mod a2f_tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use crate::medium::CanonicalMedium;
 
+    #[cfg(unix)]
     fn temp_dir_path(prefix: &str, label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "s7-a2f-{prefix}-{label}-{}-{}",
