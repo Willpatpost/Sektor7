@@ -303,10 +303,35 @@ pub fn walk_authenticated_history_bounded(
     let mut cursor = metadata.sk;
     let mut member_position = 0usize;
     let mut shard_cursor = 0u64;
-    let mut shard_entries: Vec<crate::ancestry_witness::WitnessEntry> = Vec::new();
+    // (F3) The sequential shard-entry consumption: a draining
+    // iterator — O(1) amortized per entry, never a front-removal
+    // shift.
+    let mut shard_entries: std::vec::IntoIter<crate::ancestry_witness::WitnessEntry> =
+        Vec::new().into_iter();
     let mut seen = std::collections::BTreeSet::new();
     let mut members = 0u64;
     let mut anchors = 0u64;
+    // (F2) The original-parent epoch discipline: every edge the
+    // walk follows — member-to-member, member-to-anchor,
+    // anchor-to-member, anchor-to-anchor, and the final boundary
+    // transition — must satisfy parent.epoch.checked_add(1) ==
+    // child.epoch (the checked arithmetic; a u64::MAX parent has
+    // no successor and refuses typed).
+    let mut child_epoch: Option<u64> = None;
+    // (F1) The complete-coverage proof at termination: every
+    // indexed member consumed in the exact canonical order AND the
+    // declared witness shard/entry sequence fully exhausted — a
+    // boundary reached before either holds is the typed
+    // premature-boundary refusal, never a successful summary.
+    let complete_coverage =
+        |member_position: usize,
+         shard_cursor: u64,
+         shard_entries: &std::vec::IntoIter<crate::ancestry_witness::WitnessEntry>|
+         -> bool {
+            member_position == order.len()
+                && shard_cursor == shard_count
+                && shard_entries.as_slice().is_empty()
+        };
     for _ in 0..bound {
         if !seen.insert(cursor) {
             return Err(MediumError::Chain {
@@ -330,7 +355,7 @@ pub fn walk_authenticated_history_bounded(
                     rule: "history/ancestry-order-contradiction",
                 });
             }
-            if shard_entries.is_empty() {
+            if shard_entries.as_slice().is_empty() {
                 // The next shard in the canonical order (the
                 // ancestry order equals the canonical order, so
                 // the stream is sequential).
@@ -347,10 +372,14 @@ pub fn walk_authenticated_history_bounded(
                 let bytes = medium.read_object(&object)?;
                 let shard = crate::ancestry_witness::AncestryWitnessShard::decode(&bytes)
                     .map_err(MediumError::Format)?;
-                shard_entries = shard.entries;
+                shard_entries = shard.entries.into_iter();
                 shard_cursor += 1;
             }
-            let entry = shard_entries.remove(0);
+            let Some(entry) = shard_entries.next() else {
+                return Err(MediumError::Chain {
+                    rule: "history/member-not-in-witness",
+                });
+            };
             // The preimage re-authentication at consumption: the
             // SHA-256 equality with the indexed identity, the
             // strict canonical REGULAR decode, and the index facts.
@@ -365,6 +394,16 @@ pub fn walk_authenticated_history_bounded(
                     rule: "history/member-facts-mismatch",
                 });
             }
+            // (F2) The member's epoch against the edge it arrived
+            // on.
+            if let Some(expected_child) = child_epoch
+                && record.epoch.checked_add(1) != Some(expected_child)
+            {
+                return Err(MediumError::Chain {
+                    rule: "history/epoch-incoherent",
+                });
+            }
+            child_epoch = Some(record.epoch);
             let batch = batch_by_identity
                 .get(&cursor)
                 .copied()
@@ -410,9 +449,40 @@ pub fn walk_authenticated_history_bounded(
                 }
                 None => String::new(),
             };
+            // (F2) The anchor/boundary record's epoch against the
+            // edge it arrived on.
+            if let Some(expected_child) = child_epoch
+                && record.epoch.checked_add(1) != Some(expected_child)
+            {
+                return Err(MediumError::Chain {
+                    rule: "history/epoch-incoherent",
+                });
+            }
             if first_domain == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN {
-                // The prior checkpoint's MK — the permanent
-                // boundary.
+                // (F2) THE PRIOR CHECKPOINT MK — the permanent
+                // boundary: a recognizable domain string alone is
+                // INSUFFICIENT. The revision must bind EXACTLY ONE
+                // content reference (the metadata object), and the
+                // metadata object must STRICTLY decode as a
+                // canonical checkpoint metadata.
+                if record.content_refs.len() != 1 {
+                    return Err(MediumError::Chain {
+                        rule: "history/boundary-metadata-binding",
+                    });
+                }
+                let meta_bytes = medium.read_object(&record.content_refs[0])?;
+                crate::checkpoint::CheckpointMetadata::decode(&meta_bytes)
+                    .map_err(MediumError::Format)?;
+                // (F1) The complete-coverage proof: every indexed
+                // member consumed in the exact canonical order and
+                // the witness shard/entry sequence exhausted — a
+                // boundary reached before that is the typed
+                // premature-boundary refusal, never a summary.
+                if !complete_coverage(member_position, shard_cursor, &shard_entries) {
+                    return Err(MediumError::Chain {
+                        rule: "history/premature-boundary",
+                    });
+                }
                 on_step(&HistoricalStep::Boundary {
                     identity: cursor,
                     prior_checkpoint: true,
@@ -424,8 +494,34 @@ pub fn walk_authenticated_history_bounded(
                     prior_checkpoint: true,
                 });
             }
+            // (F2) An unindexed SESSION-SNAPSHOT publication inside
+            // the checkpoint's retiring range refuses — it is a
+            // reclaimable publication misclassified as a retained
+            // anchor, never silently walked past.
+            if first_domain.starts_with(crate::composite_manifest::SESSION_SNAPSHOT_FAMILY) {
+                return Err(MediumError::Chain {
+                    rule: "history/unindexed-snapshot",
+                });
+            }
             let Some(parent) = record.parent else {
-                // The campaign founding — the root boundary.
+                // (F2) THE CAMPAIGN FOUNDING — the root boundary:
+                // the actual founding shape (the founding record
+                // kind) and the epoch-zero requirement, never a
+                // merely parentless record.
+                if !matches!(record.kind, crate::record::RecordKind::Founding { .. })
+                    || record.epoch != 0
+                {
+                    return Err(MediumError::Chain {
+                        rule: "history/founding-shape",
+                    });
+                }
+                // (F1) The complete-coverage proof at the founding
+                // boundary too.
+                if !complete_coverage(member_position, shard_cursor, &shard_entries) {
+                    return Err(MediumError::Chain {
+                        rule: "history/premature-boundary",
+                    });
+                }
                 on_step(&HistoricalStep::Boundary {
                     identity: cursor,
                     prior_checkpoint: false,
@@ -437,6 +533,7 @@ pub fn walk_authenticated_history_bounded(
                     prior_checkpoint: false,
                 });
             };
+            child_epoch = Some(record.epoch);
             on_step(&HistoricalStep::Anchor {
                 identity: cursor,
                 epoch: record.epoch,
@@ -1246,6 +1343,352 @@ mod a2_tests {
             journal_before,
             "the journal is untouched"
         );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+}
+
+#[cfg(all(test, feature = "composite-test-fixture"))]
+mod a2f_tests {
+    use super::*;
+    use crate::medium::CanonicalMedium;
+
+    fn temp_dir_path(prefix: &str, label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-a2f-{prefix}-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// The bespoke range campaign with a caller-chosen MIDDLE record
+    /// between p1 and m0 (appended genuinely — both the fake
+    /// checkpoint-metadata object and the session-snapshot object
+    /// pass the generic append's family gates): founding → binding
+    /// → p1 → middle → m0 → m1 → sk → the metadata over
+    /// [m0, m1, sk] → mk → plan → audits → begin → witness.
+    /// Returns (mk, m0, m1, sk).
+    #[cfg(unix)]
+    fn bespoke_middle_campaign(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+        middle_object: &StoredObject,
+        middle_after_m0: bool,
+    ) -> (Hash, Hash, Hash, Hash) {
+        let plain = {
+            use engine_core::Encoder;
+            StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("sektor7/save/1");
+                enc.write_bytes(b"a2f-payload");
+                enc.into_bytes()
+            })
+            .unwrap()
+        };
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            label,
+            0,
+        )
+        .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(medium, journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, _outcome) = crate::reclaim::publish_journal_root_binding(
+            medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, tick)
+                .with_content_refs(vec![plain.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&plain), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let p1_id = step(medium, 2);
+        let append_middle = |medium: &mut dyn CanonicalMedium| {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let middle = crate::record::RevisionRecord::regular(head, epoch, 3)
+                .with_content_refs(vec![middle_object.hash()]);
+            medium
+                .append(&middle, std::slice::from_ref(middle_object), Some(head))
+                .unwrap();
+        };
+        // The middle BEFORE m0 (between p1 and the range's bottom)
+        // when the caller chooses that placement.
+        if !middle_after_m0 {
+            append_middle(medium);
+        }
+        // The members m0 and m1 (the middle inserted between them
+        // when the caller chooses that placement).
+        let mut member_ids = Vec::new();
+        for index in 0..2u32 {
+            let object = {
+                use engine_core::Encoder;
+                StoredObject::new({
+                    let mut enc = Encoder::new();
+                    enc.write_str("sektor7/save/1");
+                    enc.write_bytes(format!("a2f-{label}-member-{index}").as_bytes());
+                    enc.into_bytes()
+                })
+                .unwrap()
+            };
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(format!("a2f-{label}-member-key-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            member_ids.push(record.id());
+            if middle_after_m0 && index == 0 {
+                append_middle(medium);
+            }
+        }
+        let sk_id = step(medium, 4);
+        // The metadata over [m0, m1, sk] with the self-skip to p1.
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::new();
+        for id in &member_ids {
+            let record = medium.read_record(id).unwrap();
+            digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let metadata = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_ids[0],
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1_id)],
+            index,
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        crate::reclaim::publish_reclamation_plan(medium, &mk_id, 10_000, journal_root, 6).unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(medium, &mk_id, batch.index, 7).unwrap();
+        }
+        medium.begin_reclamation_v2(&mk_id, 8).unwrap();
+        crate::ancestry_witness::publish_ancestry_witness(medium, &mk_id, 9).unwrap();
+        (mk_id, member_ids[0], member_ids[1], sk_id)
+    }
+
+    /// (F1) The complete-coverage proof at termination: a witness
+    /// and index that are INDEPENDENTLY complete (the A1-3
+    /// verifier returns Verified), but a checkpoint-metadata-carrying
+    /// record standing BETWEEN the indexed members — the historical
+    /// parent traversal reaches the boundary after only TWO of the
+    /// three members. The premature boundary refuses typed — never
+    /// a successful summary for incomplete historical coverage.
+    #[cfg(unix)]
+    #[test]
+    fn the_premature_boundary_refuses_incomplete_coverage() {
+        let root = temp_dir_path("store", "f1");
+        let journal = temp_dir_path("journal", "f1");
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        // The fake mid-range checkpoint-metadata record's object: a
+        // STRICTLY VALID checkpoint metadata (an empty index, a
+        // coherent shape) — the boundary authentication must PASS
+        // so that the PREMATURE-COVERAGE refusal is what fires.
+        let fake_meta = crate::checkpoint::CheckpointMetadata::new(
+            crate::hash::hash_object(b"a2f-fake-mk-sk"),
+            crate::hash::hash_object(b"a2f-fake-mk-sk-parent"),
+            Vec::new(),
+            Vec::new(),
+            [0x11; 32],
+            [0x12; 32],
+        );
+        let middle_object = StoredObject::new(fake_meta.canonical_bytes()).unwrap();
+        let (mk_id, m0_id, _m1_id, _sk_id) =
+            bespoke_middle_campaign(&mut medium, "f1", &journal, &middle_object, true);
+        // The A1-3 verifier independently confirms the witness
+        // complete and bound.
+        assert!(matches!(
+            crate::ancestry_witness::verify_installed_ancestry_witness(&mut medium, &mk_id)
+                .unwrap(),
+            crate::ancestry_witness::InstalledWitnessVerification::Verified { .. }
+        ));
+        // The walk: SK → m1 → the fake MK (m1's original parent)
+        // → the boundary path — with m0 never visited. The typed
+        // premature-boundary refusal, never a summary.
+        let mut steps = Vec::new();
+        let error = walk_authenticated_history(&mut medium, &mk_id, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "history/premature-boundary"
+                }
+            ),
+            "the premature boundary refuses typed: {error:?}"
+        );
+        // Only the two members above the fake MK were emitted —
+        // m0 (below it) never was.
+        assert_eq!(steps.len(), 2);
+        assert!(
+            !steps.iter().any(
+                |step| matches!(step, HistoricalStep::Member { identity, .. } if *identity == m0_id)
+            ),
+            "the member below the premature boundary is never emitted"
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (F2) The unindexed session-snapshot membership: a genuine
+    /// legacy session-snapshot publication standing INSIDE the
+    /// checkpoint's retiring range (between p1 and m0, unindexed)
+    /// — a reclaimable publication the anchor classification would
+    /// silently misclassify as retained evidence. The walk refuses
+    /// typed.
+    #[cfg(unix)]
+    #[test]
+    fn the_unindexed_snapshot_inside_the_range_refuses() {
+        let root = temp_dir_path("store", "f2");
+        let journal = temp_dir_path("journal", "f2");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let middle_object = {
+            use engine_core::Encoder;
+            StoredObject::new({
+                let mut enc = Encoder::new();
+                enc.write_str("engine-slice/session-snapshot/1");
+                enc.write_bytes(b"a2f-snapshot-payload");
+                enc.into_bytes()
+            })
+            .unwrap()
+        };
+        let (mk_id, _m0, _m1, _sk) =
+            bespoke_middle_campaign(&mut medium, "f2", &journal, &middle_object, false);
+        // The walk: all three members visited, then the snapshot
+        // record (m0's original parent) — the typed
+        // unindexed-snapshot refusal, never a silent anchor.
+        let mut steps = Vec::new();
+        let error = walk_authenticated_history(&mut medium, &mk_id, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "history/unindexed-snapshot"
+                }
+            ),
+            "the unindexed snapshot refuses typed: {error:?}"
+        );
+        assert_eq!(steps.len(), 3, "all three members were visited first");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (F3) The dense-shard sequential consumption: forty-one
+    /// indexed members in ONE witness shard — the draining-iterator
+    /// consumption (O(1) amortized per entry, never a front-removal
+    /// shift) walks the full dense history to the founding boundary
+    /// with every member in the exact canonical order and the
+    /// shard/entry sequence fully exhausted.
+    #[cfg(unix)]
+    #[test]
+    fn the_dense_shard_consumes_sequentially() {
+        let root = temp_dir_path("store", "f3");
+        let journal = temp_dir_path("journal", "f3");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let members: Vec<(usize, Vec<u8>)> = (0..40)
+            .map(|index| (48, format!("a2f-dense-payload-m{index}").into_bytes()))
+            .collect();
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_with_limit(
+            &mut medium,
+            "f3",
+            &journal,
+            &members,
+            10_000,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let publication =
+            crate::ancestry_witness::publish_ancestry_witness(&mut medium, &campaign.mk, 9)
+                .unwrap();
+        // One shard carrying all forty-one entries (the forty
+        // members plus the SK — the small preimages keep the
+        // payload far below the ceiling).
+        assert_eq!(publication.manifest.shard_count, 1);
+        let mut steps = Vec::new();
+        let summary = walk_authenticated_history(&mut medium, &campaign.mk, 0, &mut |step| {
+            steps.push(step.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.members, 41);
+        assert_eq!(summary.anchors, 2);
+        assert!(!summary.prior_checkpoint);
+        // The exact canonical order: the SK first, then the forty
+        // members in the index's descending-epoch order.
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let meta_bytes = medium.read_object(&mk_record.content_refs[0]).unwrap();
+        let index = crate::checkpoint::CheckpointMetadata::decode(&meta_bytes)
+            .unwrap()
+            .index;
+        let order = crate::ancestry_witness::canonical_member_order(&index);
+        let walked_members: Vec<Hash> = steps
+            .iter()
+            .filter_map(|step| match step {
+                HistoricalStep::Member { identity, .. } => Some(*identity),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<Hash> = order.iter().map(|entry| entry.hash).collect();
+        assert_eq!(walked_members, expected);
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
