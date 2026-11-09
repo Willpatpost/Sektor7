@@ -1213,14 +1213,16 @@ pub fn verify_installed_ancestry_witness(
     };
     let Some((manifest_record, manifest)) = discovery.manifest else {
         // THE MANIFESTLESS STATE — a recovery state, never an
-        // error: the deterministic shard-0 prefix probe (key
-        // occupancy only — the publisher's order installs shard 0
-        // first; the flag never validates the prefix). The
-        // classification reports the witness-layer fact; the
-        // authority is established for the Verified outcome and
-        // the resumption re-authenticates everything.
+        // error: the deterministic shard-0 prefix probe (the
+        // record-only key-occupancy form — the publisher's order
+        // installs shard 0 first; the flag never validates the
+        // prefix, and a damaged prefix content never masks its
+        // key's occupancy). The classification reports the
+        // witness-layer fact; the authority is established for the
+        // Verified outcome and the resumption re-authenticates
+        // everything.
         let shard_prefix_present =
-            find_witness_record_by_key(medium, &reclamation_witness_shard_idempotency_key(mk, 0))?
+            witness_key_occupied(medium, &reclamation_witness_shard_idempotency_key(mk, 0))?
                 .is_some();
         return Ok(InstalledWitnessVerification::ManifestAbsent {
             shard_prefix_present,
@@ -1281,20 +1283,107 @@ pub fn verify_installed_ancestry_witness(
     })
 }
 
+/// (The RC1 corrective) THE KEY-OCCUPANCY PROBE: a record-only
+/// keyed walk that establishes whether a deterministic witness
+/// key is occupied WITHOUT requiring that key's content object to
+/// be readable — the matched record's own hash-verified read
+/// (`read_record`) and its idempotency key are the occupancy
+/// facts. The first content objects of the records passed are
+/// read ONLY for the authenticated skip-table tracking, and a
+/// failed such read is TOLERATED (the record itself remains fully
+/// valid for the key check; the skip table is simply not extended
+/// by it): a missing or corrupted manifest content object — or
+/// any other witness-content degradation — therefore never masks
+/// the occupancy. The walk is canonical (the parent-following
+/// descent with the authenticated gap crossing and the cycle
+/// guard), hash-verified at every record, and FAIL-CLOSED where
+/// occupancy itself cannot be established (a missing parent
+/// record with no covering skip table, a cycle, or the descent
+/// bound — the typed refusal, never a silent absence). An
+/// occupancy result is NEVER a verification and never produces
+/// `Verified`: it only determines whether a witness-layer failure
+/// belongs in the manifest-present degraded class, or whether a
+/// manifestless prefix key is occupied.
+fn witness_key_occupied(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    key: &[u8],
+) -> Result<Option<Hash>, MediumError> {
+    let mut current = medium
+        .head()?
+        .ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
+    for _ in 0..WITNESS_DISCOVERY_DESCENT {
+        if !seen.insert(current) {
+            return Err(MediumError::Chain { rule: "cycle" });
+        }
+        let record = medium.read_record(&current)?;
+        // The skip-table tracking is BEST-EFFORT here: a failed
+        // first-object read (or a failed metadata decode of a
+        // readable one) is tolerated — this probe never consumes
+        // content, and the record-level walk below remains
+        // fail-closed on its own facts.
+        if let Some(object) = record.content_refs.first().copied()
+            && let Ok(bytes) = medium.read_object(&object)
+            && let Ok(stored) = StoredObject::new(bytes.clone())
+            && stored.domain() == crate::checkpoint::CHECKPOINT_METADATA_DOMAIN
+            && let Ok(metadata) = crate::checkpoint::CheckpointMetadata::decode(&bytes)
+        {
+            skip_table = Some(metadata);
+        }
+        if record.idempotency_key.as_deref() == Some(key) {
+            return Ok(Some(current));
+        }
+        // The founding terminates the walk — the definitive
+        // absence of the key on this chain.
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        match medium.read_record(&parent) {
+            Ok(_) => current = parent,
+            Err(MediumError::MissingObject { .. }) => {
+                let Some(table) = skip_table.as_ref() else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                let target = if table.sk == parent {
+                    table
+                        .self_skip()
+                        .map(|entry| entry.nearest_retained_ancestor)
+                } else {
+                    table
+                        .skip_for(&current)
+                        .map(|entry| entry.nearest_retained_ancestor)
+                };
+                let Some(target) = target else {
+                    return Err(MediumError::MissingObject { hash: parent });
+                };
+                current = target;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(MediumError::Chain {
+        rule: "ancestry-witness-discovery/descent-bound",
+    })
+}
+
 /// The discovery-failure classification: the truthful degraded
 /// boundary is the manifest key's OCCUPANCY — a discovery failure
 /// beneath an installed manifest (a corrupted manifest decode, a
 /// malformed or content-missing shard record encountered by the
 /// walk) is the degraded class; a failure with the manifest key
-/// unoccupied (or with the occupancy probe itself failing) is a
-/// genuine chain-level integrity error in the `Err` channel,
-/// never a recovery state.
+/// unoccupied (or with the occupancy itself impossible to
+/// establish) is a genuine chain-level integrity error in the
+/// `Err` channel, never a recovery state. The occupancy is
+/// established through the record-only key probe (the RC1
+/// corrective): a missing or corrupted manifest CONTENT object
+/// never masks the occupancy of its installed record.
 fn classify_discovery_failure(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
     failure: MediumError,
 ) -> Result<InstalledWitnessVerification, MediumError> {
-    match find_witness_record_by_key(medium, &reclamation_witness_manifest_idempotency_key(mk)) {
+    match witness_key_occupied(medium, &reclamation_witness_manifest_idempotency_key(mk)) {
         Ok(Some(_)) => Ok(InstalledWitnessVerification::ManifestPresentDegraded { failure }),
         _ => Err(failure),
     }
@@ -1312,6 +1401,7 @@ fn witness_integrity_refusal(rule: &'static str) -> MediumError {
 /// declared shard's record identity with its single content
 /// object's identity (the bytes are NEVER retained here — each
 /// shard is re-read and hash-verified as it is consumed).
+#[derive(Debug)]
 struct WitnessFamilyDiscovery {
     manifest: Option<(Hash, AncestryWitnessManifest)>,
     shards: Vec<Option<(Hash, Hash)>>,
@@ -1335,9 +1425,32 @@ struct WitnessFamilyDiscovery {
 /// above-manifest placement the publisher's own manifest-LAST
 /// layout never produces; the legitimate layout always completes
 /// in the primary pass).
+///
+/// **(The RC2 corrective)** The descent bound's EXHAUSTION is
+/// never a chain termination: an unfinished search never proves
+/// the manifest absent or a declared shard uninstalled, so the
+/// exhaustion refuses with the typed
+/// `ancestry-witness-discovery/descent-bound` error rather than
+/// returning an incomplete discovery. The only `Ok` exits are the
+/// complete-family early return and the definitive founding
+/// termination. The ratified production bound
+/// (`WITNESS_DISCOVERY_DESCENT`) is unchanged; the bounded form
+/// exists so the exhaustion is regressable at a test-controlled
+/// small bound.
 fn find_installed_witness_family(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
+) -> Result<WitnessFamilyDiscovery, MediumError> {
+    find_installed_witness_family_bounded(medium, mk, WITNESS_DISCOVERY_DESCENT)
+}
+
+/// The test-bound-parameterized family discovery (the production
+/// entry point above fixes the ratified limit; the RC2 regression
+/// drives a small bound).
+fn find_installed_witness_family_bounded(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    mk: &Hash,
+    descent_bound: u64,
 ) -> Result<WitnessFamilyDiscovery, MediumError> {
     let mut discovery = WitnessFamilyDiscovery {
         manifest: None,
@@ -1370,7 +1483,12 @@ fn find_installed_witness_family(
             .ok_or(MediumError::Chain { rule: "unfounded" })?;
         let mut seen = std::collections::BTreeSet::new();
         let mut skip_table: Option<crate::checkpoint::CheckpointMetadata> = None;
-        for _ in 0..WITNESS_DISCOVERY_DESCENT {
+        // The definitive-termination flag: set only by the founding
+        // record (a parentless record IS the chain's end); the
+        // loop's natural completion is the bound's EXHAUSTION,
+        // which refuses typed below.
+        let mut founding = false;
+        for _ in 0..descent_bound {
             if !seen.insert(current) {
                 return Err(MediumError::Chain { rule: "cycle" });
             }
@@ -1425,9 +1543,11 @@ fn find_installed_witness_family(
             {
                 return Ok(discovery);
             }
-            // The founding terminates this pass's descent (the
-            // family was not completed above it).
+            // The founding terminates this pass's descent — the
+            // definitive chain termination (the family was not
+            // completed above it).
             let Some(parent) = record.parent else {
+                founding = true;
                 break;
             };
             match medium.read_record(&parent) {
@@ -1452,6 +1572,14 @@ fn find_installed_witness_family(
                 }
                 Err(other) => return Err(other),
             }
+        }
+        // (RC2) The bound's EXHAUSTION is not a termination: the
+        // unfinished search never proves the manifest absent or a
+        // declared shard uninstalled — the typed refusal.
+        if !founding {
+            return Err(MediumError::Chain {
+                rule: "ancestry-witness-discovery/descent-bound",
+            });
         }
     }
     Ok(discovery)
@@ -6216,6 +6344,125 @@ mod a13_tests {
             other => panic!("the reopened post-deletion witness still verifies: {other:?}"),
         }
         drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (RC1) The manifest record installed with its CONTENT object
+    /// MISSING or CORRUPTED: the discovery fails on the unreadable
+    /// content, and the classification fallback establishes the
+    /// manifest-key occupancy WITHOUT reading that content — the
+    /// manifest-present degraded class, never an ordinary error.
+    /// The canonical keyed manifest revision remains installed
+    /// throughout (the record's identity unchanged at the head).
+    #[cfg(unix)]
+    #[test]
+    fn the_damaged_manifest_content_classifies_degraded() {
+        let (root, mut medium) = a13_local_store("rc1-manifest");
+        let journal = a13_journal_root("rc1-manifest");
+        let members = a13_members("rc1-manifest");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "rc1-manifest",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let publication = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        let manifest_content = hash_object(&publication.manifest.canonical_bytes());
+        // THE MISSING CONTENT: the manifest record's content object
+        // deleted (the record itself remains installed under the
+        // deterministic key at the head).
+        std::fs::remove_file(medium.object_path_pub(&manifest_content)).unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(failure, MediumError::MissingObject { .. }),
+                    "the missing manifest content classifies degraded: {failure:?}"
+                );
+            }
+            other => panic!("the missing manifest content classifies degraded: {other:?}"),
+        }
+        // The canonical keyed manifest revision retained: the
+        // record remains the chain's head.
+        assert_eq!(medium.head().unwrap().unwrap(), publication.manifest_record);
+        // THE CORRUPTED CONTENT: different bytes written at the
+        // content object's path — the record's reference names the
+        // original identity, so the read refuses the hash mismatch.
+        std::fs::write(
+            medium.object_path_pub(&manifest_content),
+            b"a13-corrupted-manifest-content",
+        )
+        .unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestPresentDegraded { ref failure } => {
+                assert!(
+                    matches!(failure, MediumError::HashMismatch { .. }),
+                    "the corrupted manifest content classifies degraded: {failure:?}"
+                );
+            }
+            other => panic!("the corrupted manifest content classifies degraded: {other:?}"),
+        }
+        assert_eq!(medium.head().unwrap().unwrap(), publication.manifest_record);
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (RC2) The descent bound's EXHAUSTION is never a chain
+    /// termination: an unfinished search refuses with the typed
+    /// descent-bound error — never an incomplete discovery that
+    /// would masquerade as a manifest absence or a missing shard.
+    /// The test-controlled small bound drives the exhaustion; a
+    /// generous bound completes the same family normally.
+    #[cfg(unix)]
+    #[test]
+    fn the_descent_bound_exhaustion_refuses_typed() {
+        let (root, mut medium) = a13_local_store("rc2-bound");
+        let journal = a13_journal_root("rc2-bound");
+        let members = a13_members("rc2-bound");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "rc2-bound",
+            &journal,
+            &members,
+        );
+        medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let publication = publish_ancestry_witness(&mut medium, &campaign.mk, 9).unwrap();
+        // A bound of ONE: the walk reads the head (the manifest
+        // record, matched, its key set grown) and exhausts before
+        // the shard below it — the typed refusal, never an
+        // incomplete Ok (the manifest is installed; the shard
+        // exists one record below).
+        let error =
+            find_installed_witness_family_bounded(&mut medium, &campaign.mk, 1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "ancestry-witness-discovery/descent-bound"
+                }
+            ),
+            "the exhaustion refuses typed: {error:?}"
+        );
+        // A generous bound: the same family completes normally —
+        // the manifest found and every declared shard discovered.
+        let discovery =
+            find_installed_witness_family_bounded(&mut medium, &campaign.mk, 1000).unwrap();
+        assert!(discovery.manifest.is_some());
+        assert!(discovery.shards.iter().all(|slot| slot.is_some()));
+        // The classification boundary on the exhaustion: the
+        // manifest key IS occupied (the canonical keyed revision),
+        // so a witness-layer failure of this class belongs in the
+        // degraded classification (the occupancy never produces
+        // Verified).
+        let occupied = witness_key_occupied(
+            &mut medium,
+            &reclamation_witness_manifest_idempotency_key(&campaign.mk),
+        )
+        .unwrap();
+        assert_eq!(occupied, Some(publication.manifest_record));
+        drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
     }
