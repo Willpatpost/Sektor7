@@ -1367,17 +1367,27 @@ fn witness_key_occupied(
     })
 }
 
-/// The discovery-failure classification: the truthful degraded
-/// boundary is the manifest key's OCCUPANCY — a discovery failure
-/// beneath an installed manifest (a corrupted manifest decode, a
-/// malformed or content-missing shard record encountered by the
-/// walk) is the degraded class; a failure with the manifest key
-/// unoccupied (or with the occupancy itself impossible to
-/// establish) is a genuine chain-level integrity error in the
-/// `Err` channel, never a recovery state. The occupancy is
-/// established through the record-only key probe (the RC1
-/// corrective): a missing or corrupted manifest CONTENT object
-/// never masks the occupancy of its installed record.
+/// The discovery-failure classification — the four truthful
+/// occupancy states (the RC1/RC3 correctives). The manifest key's
+/// occupancy first, through the record-only key probe: a
+/// discovery failure beneath an OCCUPIED manifest key (a corrupted
+/// manifest decode, a malformed or content-missing witness record
+/// encountered by the walk) is the degraded class carrying the
+/// typed failure. With the manifest key DEFINITIVELY absent (the
+/// occupancy probe reached the founding — the chain's
+/// authoritative record walk is complete), the manifestless state
+/// is a recovery state, never an error: the deterministic shard-0
+/// prefix flag is established through the SAME record-only
+/// occupancy probe — an occupied shard-0 key reports the prefix
+/// present (occupancy ONLY: never content validity, resumability
+/// certification, or a deletion permit — the damaged prefix
+/// content that made the family discovery fail never masks the
+/// key's occupancy), and a definitively absent one reports the
+/// plain manifestless outcome. Where either occupancy is itself
+/// unverifiable (a record gap without a covering skip table, a
+/// cycle, or the descent bound), the underlying typed error is
+/// returned — never a fabricated absence and never an unverified
+/// `Verified`.
 fn classify_discovery_failure(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
@@ -1385,7 +1395,15 @@ fn classify_discovery_failure(
 ) -> Result<InstalledWitnessVerification, MediumError> {
     match witness_key_occupied(medium, &reclamation_witness_manifest_idempotency_key(mk)) {
         Ok(Some(_)) => Ok(InstalledWitnessVerification::ManifestPresentDegraded { failure }),
-        _ => Err(failure),
+        Ok(None) => {
+            match witness_key_occupied(medium, &reclamation_witness_shard_idempotency_key(mk, 0)) {
+                Ok(prefix) => Ok(InstalledWitnessVerification::ManifestAbsent {
+                    shard_prefix_present: prefix.is_some(),
+                }),
+                Err(_) => Err(failure),
+            }
+        }
+        Err(_) => Err(failure),
     }
 }
 
@@ -6462,6 +6480,125 @@ mod a13_tests {
         )
         .unwrap();
         assert_eq!(occupied, Some(publication.manifest_record));
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// (RC3) The manifestless damaged shard-prefix occupancy: the
+    /// manifest definitively absent, the deterministic shard-0 key
+    /// occupied, and the shard-0 content object unreadable — the
+    /// family discovery fails on that content before the normal
+    /// manifestless branch, and the discovery-failure
+    /// classification establishes BOTH occupancies through the
+    /// record-only probes: `ManifestAbsent {
+    /// shard_prefix_present: true }` — occupancy ONLY, never
+    /// content validity, resumability certification, or a deletion
+    /// permit; no mutation (the head never moves, the damaged
+    /// content is never repaired); never an unverified `Verified`.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifestless_damaged_prefix_classifies_by_occupancy() {
+        let (root, mut medium) = a13_local_store("rc3-prefix");
+        let journal = a13_journal_root("rc3-prefix");
+        let members = a13_members("rc3-prefix");
+        let campaign = crate::ancestry_witness::a12_tests::a12_campaign_for_a13(
+            &mut medium,
+            "rc3-prefix",
+            &journal,
+            &members,
+        );
+        let begin = medium.begin_reclamation_v2(&campaign.mk, 8).unwrap();
+        let begin_id = match begin {
+            crate::reclaim::BeginPublicationOutcome::Accepted { id, .. } => id,
+            other => panic!("the begin admits: {other:?}"),
+        };
+        // The genuinely published manifestless shard-0 prefix: the
+        // publisher's own exact shard object (the deterministic
+        // construction over the same members) hand-installed under
+        // the deterministic key — the established partial-
+        // publication fixture form.
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(&mut medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let mk_record = medium.read_record(&campaign.mk).unwrap();
+        let metadata_object = mk_record.content_refs[0];
+        let mut entries = Vec::new();
+        for id in campaign.members.iter().chain(std::iter::once(&campaign.sk)) {
+            let bytes = medium.read_object(id).unwrap();
+            entries.push(WitnessEntry {
+                member: *id,
+                preimage: bytes,
+            });
+        }
+        let (_manifest, shards) = construct_witness(
+            &campaign.mk,
+            &plan_record,
+            &begin_id,
+            &metadata_object,
+            entries,
+        )
+        .unwrap();
+        let shard_object = StoredObject::new(shards[0].canonical_bytes()).unwrap();
+        crate::ancestry_witness::a12_tests::a12_install_under_key_for_a13(
+            &mut medium,
+            reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            &shard_object,
+            9,
+        );
+        let prefix_head = medium.head().unwrap().unwrap();
+        // The control: the intact manifestless prefix reports the
+        // occupancy flag through the normal branch.
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: true,
+            } => {}
+            other => panic!("the intact manifestless prefix reports the flag: {other:?}"),
+        }
+        // THE DELETED CONTENT: the shard-0 record's referenced
+        // content object removed — the family discovery fails on
+        // the unreadable content, and the classification falls to
+        // the record-only occupancy probes: the manifest key
+        // definitively absent (the founding reached), the shard-0
+        // key occupied (its record's own read and key, the damaged
+        // content never consulted).
+        let shard_content = hash_object(&shards[0].canonical_bytes());
+        std::fs::remove_file(medium.object_path_pub(&shard_content)).unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: true,
+            } => {}
+            other => panic!("the deleted prefix content classifies by occupancy: {other:?}"),
+        }
+        // No mutation: the head never moved and the damaged content
+        // was never repaired (the deletion stands).
+        assert_eq!(medium.head().unwrap().unwrap(), prefix_head);
+        assert!(!medium.object_path_pub(&shard_content).exists());
+        // THE CORRUPTED CONTENT: different bytes at the referenced
+        // content path — the same occupancy classification, the
+        // corruption tolerated by the record-only probe.
+        std::fs::write(
+            medium.object_path_pub(&shard_content),
+            b"a13-corrupted-prefix-content",
+        )
+        .unwrap();
+        match verify_installed_ancestry_witness(&mut medium, &campaign.mk).unwrap() {
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: true,
+            } => {}
+            other => panic!("the corrupted prefix content classifies by occupancy: {other:?}"),
+        }
+        assert_eq!(medium.head().unwrap().unwrap(), prefix_head);
+        // The manifest key remains definitively absent (the control
+        // for the classification's first boundary).
+        assert!(
+            witness_key_occupied(
+                &mut medium,
+                &reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            )
+            .unwrap()
+            .is_none()
+        );
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
