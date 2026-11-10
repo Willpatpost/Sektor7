@@ -1037,7 +1037,6 @@ fn read_digest(dec: &mut Decoder, section: &'static str) -> Result<[u8; 32], Sav
 /// only (the owner-ratified contract — the destructive consumer
 /// must independently establish provider-durable witness authority
 /// before any mutation).
-#[cfg(feature = "composite-test-fixture")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteWitnessPublication {
     /// The manifest's canonical revision identity (the discovered
@@ -1061,7 +1060,6 @@ pub struct CompleteWitnessPublication {
 /// IDENTITY is the provider's own content-addressed read
 /// (hash-verified); PASS 1 adds the explicit re-hash as the
 /// pass-divergence detector.
-#[cfg(feature = "composite-test-fixture")]
 fn verify_member_facts(
     entry: &ReclaimedIndexEntry,
     bytes: &[u8],
@@ -1824,7 +1822,6 @@ fn verify_installed_witness_streaming(
 /// one shard's payload at a time; the final kernel verification
 /// holds the discovered aggregate (O(total witness bytes)) — the
 /// A0 reference form; the bounded streaming consumer is A1-3.
-#[cfg(feature = "composite-test-fixture")]
 pub fn publish_ancestry_witness(
     medium: &mut dyn crate::medium::CanonicalMedium,
     mk: &Hash,
@@ -2101,7 +2098,6 @@ pub fn publish_ancestry_witness(
 /// different content is the typed conflict, and a still-free key
 /// retries. Unknown reconciliation remains exact (Installed
 /// carries no invented tier; Unverifiable refuses typed).
-#[cfg(feature = "composite-test-fixture")]
 fn publish_witness_object(
     medium: &mut dyn crate::medium::CanonicalMedium,
     key: &[u8],
@@ -2178,7 +2174,6 @@ fn publish_witness_object(
 /// key is a CANDIDATE only — byte-identical content is the
 /// tierless verified duplicate (never a fabricated durability),
 /// ANY difference the typed conflict.
-#[cfg(feature = "composite-test-fixture")]
 fn resolve_witness_duplicate(
     medium: &mut dyn crate::medium::CanonicalMedium,
     key: &[u8],
@@ -6615,5 +6610,542 @@ mod a13_tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&journal);
+    }
+}
+
+// -------------------------------------------------------------
+// (V2X-CP3-B P1) THE PRODUCTION-PATH PUBLISHER REGRESSIONS —
+// cfg(test) ONLY, never feature-gated: these exercise the REAL
+// production entry point (publish_ancestry_witness, now compiled
+// in the normal feature-disabled build) through genuine CP2
+// campaigns built entirely with production APIs. Running them
+// under `cargo test -p engine-persist --lib` (no --features flag)
+// is the proof that the publisher works without
+// composite-test-fixture; the campaign construction here
+// deliberately avoids every feature-gated fixture helper.
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod bp1_production_tests {
+    use super::*;
+    use crate::medium::CanonicalMedium;
+
+    fn temp_path(prefix: &str, label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-bp1-{prefix}-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn plain_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    fn sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
+        let path = temp_path("sqlite", label).with_extension("db");
+        let medium = crate::SqliteMedium::open(&path).unwrap();
+        (path, medium)
+    }
+
+    fn cleanup(paths: &[std::path::PathBuf]) {
+        for path in paths {
+            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// The genuine CP2 campaign over ANY provider, built entirely
+    /// with production APIs: the founding, the bound journal, p1,
+    /// two keyed retiring members, SK, the checkpoint metadata (the
+    /// TRUE epochs, the ascending digest over the members EXCLUDING
+    /// SK, the self-skip to p1), the MK, the plan, every audit, and
+    /// the V2 begin. The caller supplies the medium.
+    fn production_campaign(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> Hash {
+        let shared = plain_object(b"bp1-shared-payload");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            label,
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(medium, journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, _outcome) = crate::reclaim::publish_journal_root_binding(
+            medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, tick)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let p1 = step(medium, 2);
+        let mut member_ids = Vec::new();
+        for index in 0..2u32 {
+            let object = plain_object(format!("bp1-{label}-payload-{index}").as_bytes());
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = crate::record::RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(format!("bp1-{label}-member-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            member_ids.push(record.id());
+        }
+        let sk_id = step(medium, 4);
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(member_ids.len() + 1);
+        for id in &member_ids {
+            let record = medium.read_record(id).unwrap();
+            digest = crate::checkpoint::chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        let metadata = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_ids[0],
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1)],
+            index,
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        crate::reclaim::publish_reclamation_plan(medium, &mk_id, 10_000, journal_root, 6).unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(medium, &mk_id, batch.index, 7).unwrap();
+        }
+        medium.begin_reclamation_v2(&mk_id, 8).unwrap();
+        mk_id
+    }
+
+    /// (B-P1 §4.1) Fresh valid witness publication under SQLite —
+    /// the real production entry point, the feature-disabled build,
+    /// the complete CP2 admission chain, and the published witness
+    /// independently VERIFIED through the production A1-3 reader.
+    #[test]
+    fn the_sqlite_production_publication_verifies() {
+        let (path, mut medium) = sqlite_store("t1");
+        let journal = temp_path("journal", "t1");
+        let mk = production_campaign(&mut medium, "t1", &journal);
+        let publication = publish_ancestry_witness(&mut medium, &mk, 9).unwrap();
+        assert!(matches!(
+            publication.manifest_outcome,
+            WitnessPublicationOutcome::Accepted { .. }
+        ));
+        assert!(
+            matches!(
+                verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+                InstalledWitnessVerification::Verified { .. }
+            ),
+            "the production A1-3 reader independently verifies the publication"
+        );
+        drop(medium);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-P1 §4.2) Fresh valid publication under POSIX LocalFile.
+    #[cfg(unix)]
+    #[test]
+    fn the_localfile_production_publication_verifies() {
+        let root = temp_path("store", "t2");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t2");
+        let mk = production_campaign(&mut medium, "t2", &journal);
+        let publication = publish_ancestry_witness(&mut medium, &mk, 9).unwrap();
+        assert!(matches!(
+            publication.manifest_outcome,
+            WitnessPublicationOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+            InstalledWitnessVerification::Verified { .. }
+        ));
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-P1 §4.3) The duplicate: a second publication over the
+    /// installed witness resolves every deterministic key by the
+    /// EXACT complete verification — never a fabricated durability —
+    /// and the installed state remains Verified.
+    #[test]
+    fn the_duplicate_publication_verifies_exactly() {
+        let (path, mut medium) = sqlite_store("t3");
+        let journal = temp_path("journal", "t3");
+        let mk = production_campaign(&mut medium, "t3", &journal);
+        drop(publish_ancestry_witness(&mut medium, &mk, 9).unwrap());
+        let second = publish_ancestry_witness(&mut medium, &mk, 10).unwrap();
+        assert!(
+            matches!(
+                second.manifest_outcome,
+                WitnessPublicationOutcome::DuplicateVerified { .. }
+            ),
+            "the duplicate resolves by exact content: {:?}",
+            second.manifest_outcome
+        );
+        assert!(matches!(
+            verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+            InstalledWitnessVerification::Verified { .. }
+        ));
+        drop(medium);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-P1 §4.4/§4.5) The manifestless partial state (the shards
+    /// installed, the manifest record removed behind the open
+    /// medium's back) reconciles under the accepted incomplete-state
+    /// policy — the re-publication resolves the byte-identical
+    /// shards and reinstalls the manifest — and the manifest-present
+    /// CORRUPTION (the manifest object's bytes rewritten) refuses
+    /// the integrity-class success on both the publisher and the
+    /// A1-3 reader.
+    #[cfg(unix)]
+    #[test]
+    fn the_partial_and_corrupted_manifest_states_reconcile_and_refuse() {
+        let root = temp_path("store", "t4");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t4");
+        let mk = production_campaign(&mut medium, "t4", &journal);
+        let first = publish_ancestry_witness(&mut medium, &mk, 9).unwrap();
+        // (a) The genuine manifestless partial state: the manifest
+        // record's file removed AND the HEAD rewound to the last
+        // installed shard — exactly the crash shape between the
+        // shard publications and the manifest append (the HEAD file
+        // rewritten through the store's own framing; a test-only
+        // construction, the production entry untouched).
+        let last_shard = first
+            .shard_outcomes
+            .iter()
+            .rev()
+            .find_map(|outcome| match outcome {
+                WitnessPublicationOutcome::Accepted { record, .. }
+                | WitnessPublicationOutcome::DuplicateVerified { record } => Some(*record),
+                _ => None,
+            })
+            .expect("at least one installed shard");
+        std::fs::remove_file(medium.object_path_pub(&first.manifest_record)).unwrap();
+        {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(crate::local::HEAD_DOMAIN);
+            enc.write_u32(crate::local::HEAD_VERSION);
+            enc.write_bytes(last_shard.as_bytes());
+            std::fs::write(root.join("HEAD"), enc.into_bytes()).unwrap();
+        }
+        assert!(
+            matches!(
+                verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+                InstalledWitnessVerification::ManifestAbsent {
+                    shard_prefix_present: true
+                }
+            ),
+            "the classifier reports the manifestless shard prefix"
+        );
+        let resumed = publish_ancestry_witness(&mut medium, &mk, 10).unwrap();
+        assert!(matches!(
+            resumed.manifest_outcome,
+            WitnessPublicationOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+            InstalledWitnessVerification::Verified { .. }
+        ));
+        // (b) The manifest-present corruption: the manifest OBJECT
+        // bytes rewritten behind the open medium's back.
+        let manifest_object = medium
+            .read_record(&resumed.manifest_record)
+            .unwrap()
+            .content_refs[0];
+        std::fs::write(
+            medium.object_path_pub(&manifest_object),
+            b"corrupted-manifest-bytes",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+                InstalledWitnessVerification::ManifestPresentDegraded { .. }
+            ),
+            "the classifier reports the manifest-present degradation"
+        );
+        assert!(
+            publish_ancestry_witness(&mut medium, &mk, 11).is_err(),
+            "the corrupted manifest refuses the integrity-class success"
+        );
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-P1 §4.6) The prerequisite refusals: an uninstalled
+    /// checkpoint (PASS 0's begin authority refuses before any
+    /// witness work) and a genuine campaign without the V2 begin
+    /// (the begin authority's definite-absence refusal).
+    #[test]
+    fn the_wrong_checkpoint_and_absent_begin_refuse() {
+        let (path, mut store) = sqlite_store("t5");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t5");
+        // (a) The wrong checkpoint: a fabricated MK.
+        let bogus = hash_object(b"bp1-bogus-mk");
+        assert!(publish_ancestry_witness(medium, &bogus, 9).is_err());
+        // (b) The genuine campaign without the begin: build through
+        // the plan and audits, then attempt the publication.
+        let shared = plain_object(b"bp1-nobegin-shared");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "t5b",
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(medium, &journal, &founding_id).unwrap(),
+        );
+        let (_binding, _outcome) = crate::reclaim::publish_journal_root_binding(
+            medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let member = crate::record::RevisionRecord::regular(head, epoch, 2)
+            .with_idempotency_key(b"bp1-nobegin-member".to_vec())
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&member, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let member_id = member.id();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = crate::record::RevisionRecord::regular(head, epoch, 3)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let sk_id = sk.id();
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        let member_record = medium.read_record(&member_id).unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let digest =
+            crate::checkpoint::chain_range_digest(&seed, &[member_record.canonical_bytes()]);
+        let metadata = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_id,
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, founding_id)],
+            vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(
+                    member_record.idempotency_key.clone(),
+                    member_id,
+                    member_record.epoch,
+                ),
+                crate::checkpoint::ReclaimedIndexEntry::new(
+                    sk_record.idempotency_key.clone(),
+                    sk_id,
+                    sk_record.epoch,
+                ),
+            ],
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 4)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        crate::reclaim::publish_reclamation_plan(medium, &mk_id, 10_000, &journal, 5).unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(medium, &mk_id, batch.index, 6).unwrap();
+        }
+        // NO begin installation: the publication must refuse at
+        // PASS 0's begin authority.
+        assert!(publish_ancestry_witness(medium, &mk_id, 7).is_err());
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-P1 §4.7) Windows LocalFile remains refused: the
+    /// ProcessCrashOnly tier never grants the begin authority's
+    /// destructive-authorization grade, and PASS 0 refuses before
+    /// any witness work.
+    #[cfg(not(unix))]
+    #[test]
+    fn the_windows_localfile_tier_refuses() {
+        let root = temp_path("store", "t6");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t6");
+        let mk = production_campaign_without_begin(&mut medium, "t6", &journal);
+        assert!(
+            publish_ancestry_witness(&mut medium, &mk, 9).is_err(),
+            "the Windows ProcessCrashOnly tier refuses the publication"
+        );
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// The Windows arm's campaign: through the plan and audits but
+    /// WITHOUT the begin (the begin installation itself refuses on
+    /// the ProcessCrashOnly tier; the publication's PASS 0 refusal
+    /// is the assertion target).
+    #[cfg(not(unix))]
+    fn production_campaign_without_begin(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> Hash {
+        let shared = plain_object(b"bp1-win-shared");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            label,
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(medium, journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, _outcome) = crate::reclaim::publish_journal_root_binding(
+            medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let member = crate::record::RevisionRecord::regular(head, epoch, 2)
+            .with_idempotency_key(format!("bp1-{label}-member").into_bytes())
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&member, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let member_id = member.id();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let sk = crate::record::RevisionRecord::regular(head, epoch, 3)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&sk, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let sk_id = sk.id();
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        let member_record = medium.read_record(&member_id).unwrap();
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let digest =
+            crate::checkpoint::chain_range_digest(&seed, &[member_record.canonical_bytes()]);
+        let metadata = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_id,
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, founding_id)],
+            vec![
+                crate::checkpoint::ReclaimedIndexEntry::new(
+                    member_record.idempotency_key.clone(),
+                    member_id,
+                    member_record.epoch,
+                ),
+                crate::checkpoint::ReclaimedIndexEntry::new(
+                    sk_record.idempotency_key.clone(),
+                    sk_id,
+                    sk_record.epoch,
+                ),
+            ],
+            digest,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 4)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&metadata_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        crate::reclaim::publish_reclamation_plan(medium, &mk_id, 10_000, journal_root, 5).unwrap();
+        let (_plan_id, plan) = crate::reclaim::find_installed_plan(medium, &mk_id)
+            .unwrap()
+            .unwrap();
+        for batch in &plan.batches {
+            crate::reclaim::publish_reclamation_ledger_v2(medium, &mk_id, batch.index, 6).unwrap();
+        }
+        mk_id
     }
 }

@@ -62,32 +62,29 @@ jobs:
             echo "the feature-disabled build carries the adversarial marker publisher ($adversarial matches)"
             exit 1
           fi
-          # (V2X-CP3-A1-2/A1-3) The ancestry-witness PUBLISHER remains
-          # compile-time isolated: a public Rust export alone is NOT
-          # an adequate activation barrier — the
-          # composite-test-fixture feature gate is, and the
-          # feature-disabled build must not compile the publisher at
-          # all. The A1-3 read-only verifier
-          # (verify_installed_ancestry_witness) is the specifically
-          # authorized production surface: its PRESENCE in the
-          # feature-disabled rlib is asserted alongside — the
-          # isolation is the publisher's, never the verifier's.
-          witness=$(nm "$rlib" | grep -c publish_ancestry_witness || true)
-          if [ "$witness" != "0" ]; then
-            echo "the feature-disabled build carries the witness publisher ($witness matches)"
-            exit 1
-          fi
+          # (V2X-CP3-A1-3, superseded at CP3-B P1) The A1-3
+          # read-only verifier (verify_installed_ancestry_witness)
+          # is the specifically authorized production surface: its
+          # PRESENCE in the feature-disabled rlib is asserted. (The
+          # publisher's former absence assertion is superseded by
+          # the B-P1 PRESENCE assertion below — the owner's
+          # nondestructive activation GO.)
           readonly_surface=$(nm "$rlib" | grep -c verify_installed_ancestry_witness || true)
           if [ "$readonly_surface" == "0" ]; then
             echo "the feature-disabled build is missing the authorized read-only witness verifier"
             exit 1
           fi
-          # (V2X-CP3-A2/A3) The authenticated historical walker and
-          # the exact preservation accounting are the authorized
-          # read-only A2/A3 production surfaces: their PRESENCE in
-          # the feature-disabled rlib is asserted alongside the
-          # A1-3 verifier — the read-only lineage stays shippable
-          # while the publisher stays compile-time excluded.
+          # (V2X-CP3-A2/A3 + CP3-B P1) The authenticated historical
+          # walker and the exact preservation accounting are the
+          # authorized read-only A2/A3 production surfaces, and the
+          # ancestry-witness PUBLISHER is now the authorized
+          # nondestructive B-P1 production surface (the accepted A1-2
+          # publication contract, ungated from its test-only feature
+          # isolation): their PRESENCE in the feature-disabled rlib
+          # is asserted alongside the A1-3 verifier. The TEST-ONLY
+          # surfaces remain compile-time excluded: the composite
+          # activation helper, the adversarial completion-marker
+          # installer, and every destructive V2 execution symbol.
           walker_surface=$(nm "$rlib" | grep -c walk_authenticated_history || true)
           if [ "$walker_surface" == "0" ]; then
             echo "the feature-disabled build is missing the authorized read-only A2 historical walker"
@@ -96,6 +93,11 @@ jobs:
           a3_surface=$(nm "$rlib" | grep -c account_batch_retirement || true)
           if [ "$a3_surface" == "0" ]; then
             echo "the feature-disabled build is missing the authorized read-only A3 preservation accounting"
+            exit 1
+          fi
+          publisher_surface=$(nm "$rlib" | grep -c publish_ancestry_witness || true)
+          if [ "$publisher_surface" == "0" ]; then
+            echo "the feature-disabled build is missing the authorized nondestructive B-P1 witness publisher"
             exit 1
           fi
           # (T2-B) The crossing's crash-test seams are compile-time
