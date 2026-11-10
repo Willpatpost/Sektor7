@@ -116,6 +116,17 @@ jobs:
           echo "activation isolation verified: 0 activation symbols in the feature-disabled rlib"
       - name: Tests
         run: cargo test --workspace --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
+      # (V2X-CP3-B-P1 F3) The FEATURE-DISABLED production-path
+      # regression: the B-P1 production tests are cfg(test)-only
+      # (never feature-gated), and this step runs them WITHOUT the
+      # composite-test-fixture flag on every platform — the proof
+      # that the production publisher works in the normal build.
+      # The command must fail if any production-path test fails or
+      # if the module is silently absent (the exact-name filter
+      # reports zero-run as an error).
+      - name: Feature-disabled production-path tests (B-P1)
+        run: |
+          cargo test -p engine-persist --lib bp1_production_tests
       - name: Fingerprint self-test double run
         shell: bash
         run: |
@@ -279,6 +290,12 @@ jobs:
       # one-thread-per-process invariant SDL requires.
       - name: Tests (workspace, SDL-free suites)
         run: cargo test --workspace --exclude engine-shell --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
+      # (V2X-CP3-B-P1 F3) The feature-disabled production-path
+      # regression on macOS ARM64, identical to the matrix job's
+      # step: the B-P1 production tests run WITHOUT
+      # composite-test-fixture on every platform.
+      - name: Feature-disabled production-path tests (B-P1)
+        run: cargo test -p engine-persist --lib bp1_production_tests
       - name: Tests (engine-shell, one test per process)
         shell: bash
         run: |

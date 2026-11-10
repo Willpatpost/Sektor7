@@ -6745,14 +6745,53 @@ mod bp1_production_tests {
             sk_id,
             sk_record.epoch,
         ));
+        // (F1) sk_parent is SK's ACTUAL authenticated parent — the
+        // last member below SK on the constructed chain — never an
+        // arbitrary member identity.
+        let sk_parent = sk_record.parent.expect("the SK is a regular revision");
         let metadata = crate::checkpoint::CheckpointMetadata::new(
             sk_id,
-            member_ids[0],
+            sk_parent,
             vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1)],
             index,
             digest,
             seed,
         );
+        // (F1) The structural-validity assertions: the metadata's
+        // sk_parent equals SK's authenticated parent; the index
+        // matches the constructed member chain exactly (identity,
+        // key, and epoch, one entry per constructed record, compared
+        // under the codec's canonical hash-sorted normalization);
+        // and the range digest recomputes over the members
+        // EXCLUDING SK.
+        assert_eq!(metadata.sk_parent, sk_parent);
+        let mut expected_index: Vec<crate::checkpoint::ReclaimedIndexEntry> = member_ids
+            .iter()
+            .map(|id| {
+                let record = medium.read_record(id).unwrap();
+                crate::checkpoint::ReclaimedIndexEntry::new(
+                    record.idempotency_key.clone(),
+                    *id,
+                    record.epoch,
+                )
+            })
+            .collect();
+        expected_index.push(crate::checkpoint::ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk_id,
+            sk_record.epoch,
+        ));
+        expected_index.sort_unstable_by_key(|entry| entry.hash);
+        assert_eq!(
+            metadata.index, expected_index,
+            "the index matches the constructed chain under the canonical order"
+        );
+        let mut recomputed = seed;
+        for id in &member_ids {
+            let bytes = medium.read_record(id).unwrap().canonical_bytes();
+            recomputed = crate::checkpoint::chain_range_digest_step(&recomputed, &bytes);
+        }
+        assert_eq!(metadata.range_digest, recomputed);
         let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
         let head = medium.head().unwrap().unwrap();
         let epoch = medium.read_record(&head).unwrap().epoch;
@@ -7034,10 +7073,15 @@ mod bp1_production_tests {
         cleanup(&[path, journal]);
     }
 
-    /// (B-P1 §4.7) Windows LocalFile remains refused: the
-    /// ProcessCrashOnly tier never grants the begin authority's
-    /// destructive-authorization grade, and PASS 0 refuses before
-    /// any witness work.
+    /// (B-P1 §4.7 + F2) Windows LocalFile remains refused — with
+    /// the PRECISE evidence chain: the platform's ineligible
+    /// durability tier (ProcessCrashOnly), the production V2 begin
+    /// admission's exact tier refusal (no begin installed), and
+    /// the witness publisher's own PASS-0 refusal — which, absent
+    /// any begin, is the begin-authority refusal the platform tier
+    /// produces, never mislabeled as a tier-gate firing inside the
+    /// publisher itself. HEAD is unchanged and no witness manifest
+    /// or shard was published.
     #[cfg(not(unix))]
     #[test]
     fn the_windows_localfile_tier_refuses() {
@@ -7046,10 +7090,51 @@ mod bp1_production_tests {
         let mut medium = crate::LocalFileMedium::open(&root).unwrap();
         let journal = temp_path("journal", "t6");
         let mk = production_campaign_without_begin(&mut medium, "t6", &journal);
-        assert!(
-            publish_ancestry_witness(&mut medium, &mk, 9).is_err(),
-            "the Windows ProcessCrashOnly tier refuses the publication"
+        let head_before = medium.head().unwrap();
+        // (F2.2) The platform's honest tier.
+        assert_eq!(
+            medium.durability_tier().unwrap(),
+            crate::medium::SyncTier::ProcessCrashOnly,
+            "the Windows LocalFile platform reports ProcessCrashOnly"
         );
+        // (F2.3) The production V2 begin admission refuses at the
+        // tier gate — the precise rule.
+        let begin_error = match medium.begin_reclamation_v2(&mk, 8) {
+            Ok(_) => panic!("the Windows begin admission must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &begin_error,
+                crate::medium::MediumError::Chain { rule }
+                    if rule == "v2-begin-admission/tier-insufficient"
+            ),
+            "the begin admission refuses at the tier gate: {begin_error:?}"
+        );
+        // (F2.4) No begin was installed: the begin authority's
+        // verification still refuses (the definite absence, not a
+        // degraded installed state).
+        assert!(medium.verify_begin_authority_v2(&mk).is_err());
+        // (F2.5) The production witness publisher refuses — the
+        // actual typed outcome over the beginless campaign (the
+        // begin authority's absence/tier refusal surfaced at PASS 0).
+        let publish_error = match publish_ancestry_witness(&mut medium, &mk, 9) {
+            Ok(_) => panic!("the Windows publication must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(publish_error, crate::medium::MediumError::Chain { .. }),
+            "the publication refuses typed: {publish_error:?}"
+        );
+        // (F2.6) HEAD unchanged; no witness manifest or shard
+        // published.
+        assert_eq!(medium.head().unwrap(), head_before);
+        assert!(matches!(
+            verify_installed_ancestry_witness(&mut medium, &mk).unwrap(),
+            InstalledWitnessVerification::ManifestAbsent {
+                shard_prefix_present: false
+            }
+        ));
         drop(medium);
         cleanup(&[root, journal]);
     }
