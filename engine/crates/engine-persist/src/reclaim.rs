@@ -362,15 +362,26 @@ pub fn is_reclamation_ledger_family(domain: &str) -> bool {
 }
 
 /// The completion-marker domain gate for the GENERIC append (the
-/// P2-F4 correction): a completion-marker object may enter the
-/// chain ONLY through the admission-controlled
+/// P2-F4 correction, extended to the whole family by the C1-F1
+/// corrective): a completion-marker object may enter the chain
+/// ONLY through the admission-controlled
 /// [`publish_reclamation_complete`] boundary — a syntactically
 /// valid marker appended through the unrestricted generic path
 /// refuses typed, so no caller can install trusted terminal
-/// evidence merely by encoding correct bytes.
+/// evidence merely by encoding correct bytes. The gate covers
+/// EVERY versioned completion-marker family domain — the accepted
+/// V1 `/1`, the C1-delivered V2 `/2` Batch marker, and every
+/// unrecognized future family variant — through the
+/// [`crate::batch_completion::is_reclamation_complete_family`]
+/// classifier (the family prefix
+/// `engine-persist/reclamation-complete/` matches no other
+/// accepted domain: the key namespaces continue with `-key`, the
+/// witness family with `-ancestry-witness`), while unrelated
+/// content domains remain accepted and the V1 refusal rule and
+/// its typed error are preserved exactly.
 pub fn enforce_completion_marker_gate(objects: &[StoredObject]) -> Result<(), MediumError> {
     for object in objects {
-        if object.domain() == RECLAMATION_COMPLETE_DOMAIN {
+        if crate::batch_completion::is_reclamation_complete_family(object.domain()) {
             return Err(MediumError::Chain {
                 rule: "reclamation-complete/generic-append-refused",
             });
@@ -6618,6 +6629,196 @@ mod tests {
             ),
             "the completion gate remains enforced: {error:?}"
         );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_generic_append_refuses_every_completion_family_domain() {
+        // (The C1-F1 corrective) The completion-marker gate covers
+        // the WHOLE versioned family: the accepted V1 `/1`, the
+        // C1-delivered V2 `/2` Batch marker (a GENUINE valid
+        // marker — the committed classification fixture, never a
+        // fabricated domain string), and an unrecognized future
+        // family variant — all through the same typed refusal,
+        // while unrelated content domains remain accepted and the
+        // family classifier recognizes exactly the completion
+        // domains.
+        use crate::StoredObject;
+        use crate::ancestry_accounting::StorageRole;
+        use crate::batch_completion::{
+            BatchCompletionContext, BatchCompletionMarkerV2, ClassificationEntry,
+            EntryClassification, commit_classification,
+        };
+        use crate::hash::hash_object;
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-c1f1-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "c1f1", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        // The family classifier's exact scope (the pure boundary):
+        // every completion version is family, and no neighboring
+        // namespace is.
+        for domain in [
+            crate::reclaim::RECLAMATION_COMPLETE_DOMAIN,
+            crate::batch_completion::RECLAMATION_COMPLETE_V2_DOMAIN,
+            "engine-persist/reclamation-complete/3",
+        ] {
+            assert!(crate::batch_completion::is_reclamation_complete_family(
+                domain
+            ));
+        }
+        for unrelated in [
+            crate::reclaim::RECLAMATION_COMPLETE_KEY_DOMAIN,
+            crate::batch_completion::RECLAMATION_COMPLETE_V2_KEY_DOMAIN,
+            crate::reclaim::RECLAMATION_PLAN_DOMAIN,
+            crate::reclaim::RECLAMATION_LEDGER_V2_DOMAIN,
+            crate::reclaim::RECLAMATION_BEGIN_DOMAIN,
+            crate::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN,
+        ] {
+            assert!(!crate::batch_completion::is_reclamation_complete_family(
+                unrelated
+            ));
+        }
+        // The generic append refuses every family version with the
+        // same typed rule.
+        let mut refusal = |object: StoredObject, epoch_step: u64| {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, epoch_step)
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap_err()
+        };
+        // The accepted V1 `/1` batch marker.
+        let v1 = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: founding.id(),
+            batch: 0,
+            source: founding.id(),
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let error = refusal(StoredObject::new(v1.canonical_bytes()).unwrap(), 20);
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-complete/generic-append-refused"
+                }
+            ),
+            "the V1 /1 marker refuses the generic append: {error:?}"
+        );
+        // The GENUINE V2 `/2` Batch marker — the committed
+        // classification over the four-entry fixture (a valid
+        // marker by the C1 codec's own verification).
+        let context = BatchCompletionContext {
+            mk: hash_object(b"c1f1-mk"),
+            plan: hash_object(b"c1f1-plan"),
+            batch_index: 0,
+            audit: hash_object(b"c1f1-audit"),
+            begin: hash_object(b"c1f1-begin"),
+        };
+        let classification = vec![
+            ClassificationEntry {
+                identity: hash_object(b"c1f1-SK0"),
+                role: StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c1f1-m0a"),
+                role: StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c1f1-o0a"),
+                role: StorageRole::Object,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c1f1-os"),
+                role: StorageRole::Object,
+                classification: EntryClassification::Deferred,
+                conditional_on_prior_batch: false,
+            },
+        ];
+        let committed = commit_classification(&context, classification.clone()).unwrap();
+        let v2 = BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: committed.digest,
+            counters: committed.counters,
+        };
+        assert!(v2.verify_classification(classification).is_ok());
+        let error = refusal(StoredObject::new(v2.canonical_bytes()).unwrap(), 21);
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-complete/generic-append-refused"
+                }
+            ),
+            "the valid V2 /2 Batch marker refuses the generic append: {error:?}"
+        );
+        // An unrecognized future family variant (`/3`): equally
+        // refused — no future version can ride the generic path.
+        let future = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-complete/3");
+            enc.write_u32(3);
+            enc.write_bytes(&[0x01; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        let error = refusal(future, 22);
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "reclamation-complete/generic-append-refused"
+                }
+            ),
+            "the unrecognized future family variant refuses: {error:?}"
+        );
+        // The unrelated content domain still appends Accepted.
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, 23).with_content_refs(vec![plain.hash()]);
+        let outcome = medium
+            .append(&record, std::slice::from_ref(&plain), Some(head))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::medium::AppendOutcome::Accepted { .. }
+        ));
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }

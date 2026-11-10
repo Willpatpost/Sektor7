@@ -425,28 +425,44 @@ impl ClassificationCounters {
     /// classification non-empty (a batch retirement always
     /// involves at least its retiring members).
     pub fn validate(&self) -> Result<(), SaveError> {
+        self.validate_with(
+            MAX_ACCOUNTING_CLASSIFIED_LIST,
+            MAX_ACCOUNTING_CLASSIFIED_LIST,
+        )
+    }
+
+    /// The parameterized validation core (the C1-F2 corrective):
+    /// the SAME production counter-coherence logic with the
+    /// partition ceilings as parameters — the production
+    /// [`Self::validate`] pins the accepted A3 materialized-list
+    /// bound, and the builder's reduced-ceiling test seam drives
+    /// this same core deterministically without full-scale
+    /// hashing. The ceilings are never a caller authority in
+    /// production: only the pinned constants and the test seam
+    /// (bounded by the same constants) reach this function.
+    fn validate_with(&self, mandatory_max: u64, deferred_max: u64) -> Result<(), SaveError> {
         let mandatory = self
             .mandatory_records
             .checked_add(self.mandatory_objects)
             .ok_or(SaveError::Overflow { section: SECTION })?;
-        if mandatory > MAX_ACCOUNTING_CLASSIFIED_LIST {
+        if mandatory > mandatory_max {
             return Err(SaveError::Limit {
                 section: SECTION,
                 kind: "mandatory-identities",
                 value: mandatory,
-                max: MAX_ACCOUNTING_CLASSIFIED_LIST,
+                max: mandatory_max,
             });
         }
         let deferred = self
             .deferred_records
             .checked_add(self.deferred_objects)
             .ok_or(SaveError::Overflow { section: SECTION })?;
-        if deferred > MAX_ACCOUNTING_CLASSIFIED_LIST {
+        if deferred > deferred_max {
             return Err(SaveError::Limit {
                 section: SECTION,
                 kind: "deferred-identities",
                 value: deferred,
-                max: MAX_ACCOUNTING_CLASSIFIED_LIST,
+                max: deferred_max,
             });
         }
         if mandatory
@@ -498,6 +514,13 @@ pub struct ClassificationCommitmentBuilder {
     pushed: u64,
     declared: u64,
     counters: ClassificationCounters,
+    /// The Mandatory partition's streaming ceiling (the production
+    /// constructor pins the accepted A3 bound; the reduced-ceiling
+    /// test seam drives the SAME validation core with a small
+    /// deterministic bound).
+    mandatory_ceiling: u64,
+    /// The Deferred partition's streaming ceiling.
+    deferred_ceiling: u64,
 }
 
 impl ClassificationCommitmentBuilder {
@@ -505,8 +528,58 @@ impl ClassificationCommitmentBuilder {
     /// declared entry count: the context is validated, the count
     /// is bounded (and non-zero) BEFORE any hashing state is
     /// built, and the fixed-width preimage header (magic, scheme
-    /// version, the five context bindings, the count) is fed.
+    /// version, the five context bindings, the count) is fed. The
+    /// partition ceilings are the PRODUCTION constants (the
+    /// accepted A3 materialized-list bound).
     pub fn new(context: &BatchCompletionContext, entry_count: u64) -> Result<Self, SaveError> {
+        Self::new_inner(
+            context,
+            entry_count,
+            MAX_ACCOUNTING_CLASSIFIED_LIST,
+            MAX_ACCOUNTING_CLASSIFIED_LIST,
+        )
+    }
+
+    /// The reduced-ceiling test seam (the C1-F2 corrective,
+    /// cfg(test) ONLY): the SAME construction and the SAME
+    /// production counter-validation path with small deterministic
+    /// partition ceilings, so the boundary discipline (acceptance
+    /// AT the ceiling, the typed refusal one past it, with the
+    /// exact error category and bound) is exercised without
+    /// full-scale hashing. The production numerical ceiling stays
+    /// the hard maximum: a seam ceiling above it (or zero)
+    /// refuses, exactly as the production bound would.
+    #[cfg(test)]
+    fn new_with_ceilings(
+        context: &BatchCompletionContext,
+        entry_count: u64,
+        mandatory_ceiling: u64,
+        deferred_ceiling: u64,
+    ) -> Result<Self, SaveError> {
+        if mandatory_ceiling == 0
+            || mandatory_ceiling > MAX_ACCOUNTING_CLASSIFIED_LIST
+            || deferred_ceiling == 0
+            || deferred_ceiling > MAX_ACCOUNTING_CLASSIFIED_LIST
+        {
+            return Err(SaveError::Limit {
+                section: SECTION,
+                kind: "partition-ceiling",
+                value: mandatory_ceiling.max(deferred_ceiling),
+                max: MAX_ACCOUNTING_CLASSIFIED_LIST,
+            });
+        }
+        Self::new_inner(context, entry_count, mandatory_ceiling, deferred_ceiling)
+    }
+
+    /// The shared construction: the context and count gates, the
+    /// preimage header, and the ceiling fields the streaming
+    /// counter validation consumes.
+    fn new_inner(
+        context: &BatchCompletionContext,
+        entry_count: u64,
+        mandatory_ceiling: u64,
+        deferred_ceiling: u64,
+    ) -> Result<Self, SaveError> {
         context.validate()?;
         if entry_count == 0 {
             return Err(SaveError::Integrity("batch-completion/zero-classification"));
@@ -534,6 +607,8 @@ impl ClassificationCommitmentBuilder {
             pushed: 0,
             declared: entry_count,
             counters: ClassificationCounters::EMPTY,
+            mandatory_ceiling,
+            deferred_ceiling,
         })
     }
 
@@ -590,7 +665,8 @@ impl ClassificationCommitmentBuilder {
                     .ok_or(SaveError::Overflow { section: SECTION })?;
             }
         }
-        self.counters.validate()?;
+        self.counters
+            .validate_with(self.mandatory_ceiling, self.deferred_ceiling)?;
         let bytes = entry.canonical_bytes();
         self.hasher.update(bytes);
         self.prev = Some(key);
@@ -1385,36 +1461,171 @@ mod c1_tests {
             ClassificationCommitmentBuilder::new(&context, MAX_V2_BATCH_CLASSIFICATION_ENTRIES + 1),
             Err(SaveError::Limit { .. })
         ));
-        // A mid-stream partition-ceiling crossing refuses typed
-        // (the Mandatory partition exceeding the A3 materialized
-        // list bound): 2^24 mandatory entries on a declared count
-        // just above it — the crossing fires at the boundary push.
-        let mut builder =
-            ClassificationCommitmentBuilder::new(&context, MAX_ACCOUNTING_CLASSIFIED_LIST + 1)
-                .unwrap();
-        let mandatory = ClassificationEntry {
-            identity: sk0(),
-            role: StorageRole::Record,
-            classification: EntryClassification::Mandatory,
-            conditional_on_prior_batch: false,
-        };
-        // Distinct ascending identities up to the ceiling: the
-        // builder refuses at the 2^24+1'th mandatory entry, long
-        // before the declared count is reached.
-        let mut hit_ceiling = false;
-        for seq in 0..=MAX_ACCOUNTING_CLASSIFIED_LIST {
+        // The mid-stream partition-ceiling crossing is proven by
+        // the dedicated boundary test (the reduced-ceiling seam —
+        // the C1-F2 corrective replaced this block's broken
+        // full-scale form, whose first generated identity was the
+        // all-zero placeholder and whose assertion therefore
+        // passed on the WRONG refusal).
+    }
+
+    #[test]
+    fn the_partition_ceilings_refuse_at_the_boundary() {
+        // (The C1-F2 corrective) The partition-ceiling discipline
+        // over the SAME production counter-validation logic
+        // (validate_with), driven by the deterministic
+        // reduced-ceiling test seam so the boundary is reached
+        // without full-scale hashing. The production numerical
+        // ceiling is preserved as the hard maximum: the seam
+        // refuses any ceiling above it, and the pure-counter
+        // boundary AT the production constants is proven directly.
+        let context = fixture_context();
+        // Strictly increasing nonzero identities: the sequence
+        // number's big-endian form in the first 8 bytes, starting
+        // at 1 (never the all-zero placeholder — the C1 review's
+        // finding).
+        let entry = |seq: u64, classification: EntryClassification| {
             let mut identity = [0u8; 32];
             identity[..8].copy_from_slice(&seq.to_be_bytes());
-            let entry = ClassificationEntry {
+            ClassificationEntry {
                 identity: Hash::from_bytes(&identity).unwrap(),
-                ..mandatory
-            };
-            if builder.push_entry(entry).is_err() {
-                hit_ceiling = true;
-                break;
+                role: StorageRole::Object,
+                classification,
+                conditional_on_prior_batch: false,
             }
+        };
+        const SEAM_CEILING: u64 = 8;
+        // ACCEPTANCE at the boundary: exactly SEAM_CEILING
+        // mandatory entries stream and finish cleanly.
+        let mut builder = ClassificationCommitmentBuilder::new_with_ceilings(
+            &context,
+            SEAM_CEILING,
+            SEAM_CEILING,
+            SEAM_CEILING,
+        )
+        .unwrap();
+        for seq in 1..=SEAM_CEILING {
+            builder
+                .push_entry(entry(seq, EntryClassification::Mandatory))
+                .unwrap();
         }
-        assert!(hit_ceiling);
+        assert!(builder.finish().is_ok());
+        // REFUSAL one past the boundary: the next mandatory entry
+        // crosses the partition ceiling with the EXACT error
+        // category and bound (never a bare is_err).
+        let mut builder = ClassificationCommitmentBuilder::new_with_ceilings(
+            &context,
+            SEAM_CEILING + 1,
+            SEAM_CEILING,
+            SEAM_CEILING,
+        )
+        .unwrap();
+        for seq in 1..=SEAM_CEILING {
+            builder
+                .push_entry(entry(seq, EntryClassification::Mandatory))
+                .unwrap();
+        }
+        match builder.push_entry(entry(SEAM_CEILING + 1, EntryClassification::Mandatory)) {
+            Err(SaveError::Limit {
+                kind: "mandatory-identities",
+                value,
+                max,
+                ..
+            }) => {
+                assert_eq!(value, SEAM_CEILING + 1);
+                assert_eq!(max, SEAM_CEILING);
+            }
+            other => panic!("the ceiling crossing must refuse with the exact bound: {other:?}"),
+        }
+        // The DEFERRED ceiling independently (the same validation
+        // core's other parameter).
+        let mut builder = ClassificationCommitmentBuilder::new_with_ceilings(
+            &context,
+            SEAM_CEILING + 1,
+            SEAM_CEILING,
+            SEAM_CEILING,
+        )
+        .unwrap();
+        for seq in 1..=SEAM_CEILING {
+            builder
+                .push_entry(entry(seq, EntryClassification::Deferred))
+                .unwrap();
+        }
+        match builder.push_entry(entry(SEAM_CEILING + 1, EntryClassification::Deferred)) {
+            Err(SaveError::Limit {
+                kind: "deferred-identities",
+                value,
+                max,
+                ..
+            }) => {
+                assert_eq!(value, SEAM_CEILING + 1);
+                assert_eq!(max, SEAM_CEILING);
+            }
+            other => panic!("the deferred crossing must refuse with the exact bound: {other:?}"),
+        }
+        // The seam preserves the production numerical ceiling as
+        // the hard maximum: a ceiling above it (or zero) refuses.
+        assert!(matches!(
+            ClassificationCommitmentBuilder::new_with_ceilings(
+                &context,
+                1,
+                MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+                MAX_ACCOUNTING_CLASSIFIED_LIST
+            ),
+            Err(SaveError::Limit { .. })
+        ));
+        assert!(matches!(
+            ClassificationCommitmentBuilder::new_with_ceilings(
+                &context,
+                1,
+                MAX_ACCOUNTING_CLASSIFIED_LIST,
+                0
+            ),
+            Err(SaveError::Limit { .. })
+        ));
+        // The PRODUCTION boundary, proven purely (no hashing): the
+        // counters AT the accepted A3 materialized-list bound
+        // validate, and one past refuses with the exact bound.
+        let at_bound = ClassificationCounters {
+            mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST,
+            mandatory_objects: 0,
+            deferred_records: 0,
+            deferred_objects: 1,
+        };
+        assert!(at_bound.validate().is_ok());
+        let past_bound = ClassificationCounters {
+            mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+            ..at_bound
+        };
+        match past_bound.validate() {
+            Err(SaveError::Limit {
+                kind: "mandatory-identities",
+                value,
+                max,
+                ..
+            }) => {
+                assert_eq!(value, MAX_ACCOUNTING_CLASSIFIED_LIST + 1);
+                assert_eq!(max, MAX_ACCOUNTING_CLASSIFIED_LIST);
+            }
+            other => panic!("the production bound must refuse one past it: {other:?}"),
+        }
+        let deferred_past = ClassificationCounters {
+            deferred_objects: MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+            mandatory_records: 1,
+            ..at_bound
+        };
+        match deferred_past.validate() {
+            Err(SaveError::Limit {
+                kind: "deferred-identities",
+                value,
+                max,
+                ..
+            }) => {
+                assert_eq!(value, MAX_ACCOUNTING_CLASSIFIED_LIST + 1);
+                assert_eq!(max, MAX_ACCOUNTING_CLASSIFIED_LIST);
+            }
+            other => panic!("the deferred production bound must refuse: {other:?}"),
+        }
     }
 
     #[test]
