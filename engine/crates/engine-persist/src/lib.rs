@@ -104,8 +104,9 @@ pub use batch_completion::{
     CLASSIFICATION_ENTRY_BYTES, ClassificationCommitmentBuilder, ClassificationCounters,
     ClassificationEntry, EntryClassification, MAX_V2_BATCH_CLASSIFICATION_ENTRIES,
     RECLAMATION_COMPLETE_FAMILY, RECLAMATION_COMPLETE_V2_DOMAIN,
-    RECLAMATION_COMPLETE_V2_KEY_DOMAIN, RECLAMATION_COMPLETE_V2_VERSION, commit_classification,
-    is_reclamation_complete_family, reclamation_complete_v2_idempotency_key,
+    RECLAMATION_COMPLETE_V2_KEY_DOMAIN, RECLAMATION_COMPLETE_V2_VERSION, StructuralBatchCandidate,
+    commit_classification, is_reclamation_complete_family, read_structural_batch_candidate,
+    reclamation_complete_v2_idempotency_key,
 };
 pub use checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,

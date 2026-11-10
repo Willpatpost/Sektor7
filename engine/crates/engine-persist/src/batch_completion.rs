@@ -99,8 +99,10 @@ use engine_core::{Decoder, Encoder, SaveError};
 use sha2::{Digest, Sha256};
 
 use crate::ancestry_accounting::{MAX_ACCOUNTING_CLASSIFIED_LIST, StorageRole};
-use crate::hash::Hash;
+use crate::hash::{Hash, hash_object};
+use crate::medium::MediumError;
 use crate::reclaim::MAX_RECLAMATION_UNITS;
+use crate::record::{RecordKind, RevisionRecord};
 
 /// The error-section name every typed refusal in this module
 /// carries.
@@ -875,6 +877,142 @@ impl BatchCompletionMarkerV2 {
     }
 }
 
+// ------------------------- the read-only structural candidate reader (C2)
+
+/// The read-only structural candidate result (V2X-CP3-B-P2A-C2):
+/// a specifically identified candidate revision and the strictly
+/// decoded `/2` Batch marker it references, established over
+/// hash-verified bytes and matched against the caller-supplied
+/// expected context. **STRUCTURAL EVIDENCE ONLY — never an
+/// authority:** a positive result establishes well-formed,
+/// hash-consistent, correctly keyed, context-matching bytes, and
+/// NOTHING else. It does NOT establish canonical HEAD ancestry,
+/// unique installed publication, a trusted completion receipt,
+/// correct historical Mandatory/Deferred classification, successful
+/// physical deletion, provider-issued durability authority, or any
+/// permission to execute reclamation or skip retired records. The
+/// expected context is CALLER-SUPPLIED and may itself be untrusted —
+/// matching it is a structural comparison, not an authentication of
+/// its origin. The type deliberately exposes exactly the two
+/// structural facts (the revision identity and the decoded marker)
+/// and no boolean or verdict field of any kind: hash-verified bytes
+/// and authenticated canonical history remain distinct claims, and
+/// only the separately reviewed R5/R6 traversal and historical
+/// completion authority may make the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralBatchCandidate {
+    /// The candidate revision's identity — re-established over the
+    /// hash-verified canonical bytes (the caller-supplied identity
+    /// and the stored bytes agree).
+    pub revision: Hash,
+    /// The hash-verified, strictly decoded V2 Batch marker the
+    /// revision references (its five context bindings equal the
+    /// supplied expectations).
+    pub marker: BatchCompletionMarkerV2,
+}
+
+/// (V2X-CP3-B-P2A-C2) The read-only structural candidate reader:
+/// verifies that a SPECIFICALLY IDENTIFIED candidate revision and
+/// its referenced `/2` Batch marker object are structurally
+/// coherent and match the explicitly supplied expected Batch
+/// context — through the existing reader-generic
+/// [`crate::reclaim::BeginReads`] hash-verifying read seam (a
+/// provider transaction, a lock-held medium, or a synthetic
+/// reader), with NO HEAD lookup and NO chain traversal of any
+/// kind. The exact validation sequence, every step refusing typed:
+///
+/// 1. Read the candidate revision's canonical bytes and
+///    hash-verify them against the supplied identity (the
+///    adapter's contract re-established by the reader itself —
+///    the function's own hash check, so no implementation
+///    subtlety can smuggle unverified bytes past it).
+/// 2. Strictly decode the revision record.
+/// 3. Require [`RecordKind::Regular`] (a founding revision is
+///    never a completion candidate).
+/// 4. Require EXACTLY ONE directly referenced content object.
+/// 5. Require the EXACT deterministic V2 Batch idempotency key
+///    derived from the expected MK and batch index
+///    ([`reclamation_complete_v2_idempotency_key`]).
+/// 6. Read the referenced content object's bytes and hash-verify
+///    them against the referenced identity.
+/// 7. Strictly decode [`BatchCompletionMarkerV2`] (the `/2`
+///    domain gate refuses every other domain — the V1 `/1`
+///    completion marker included — and every C1 bound holds).
+/// 8. Compare ALL FIVE context bindings — MK, plan, batch index,
+///    audit, begin — against the supplied expectations.
+///
+/// Only after every check succeeds does the reader return the
+/// [`StructuralBatchCandidate`] — the structural facts alone,
+/// never a trusted retirement receipt (see the result type's
+/// authority boundary).
+pub fn read_structural_batch_candidate<R: crate::reclaim::BeginReads>(
+    reads: &mut R,
+    candidate: &Hash,
+    expected: &BatchCompletionContext,
+) -> Result<StructuralBatchCandidate, MediumError> {
+    // (1) The candidate revision: read, hash-verify against the
+    // supplied identity, strictly decode.
+    let record_bytes = reads.read_record_bytes(candidate)?;
+    if hash_object(&record_bytes) != *candidate {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/record-hash",
+        });
+    }
+    let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+    // (2) The regular shape — a founding revision is never a
+    // completion candidate.
+    if record.kind != RecordKind::Regular {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/not-regular",
+        });
+    }
+    // (3) Exactly one directly referenced content object.
+    if record.content_refs.len() != 1 {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/content-refs",
+        });
+    }
+    // (4) The exact deterministic V2 Batch key derived from the
+    // EXPECTED context — the record must carry this key and no
+    // other (a V1-keyed completion record refuses here).
+    let expected_key = reclamation_complete_v2_idempotency_key(&expected.mk, expected.batch_index);
+    if record.idempotency_key.as_deref() != Some(expected_key.as_slice()) {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/key-mismatch",
+        });
+    }
+    // (5) The referenced content object: read, hash-verify against
+    // the referenced identity, strictly decode as the /2 marker
+    // (the domain gate refuses every other domain).
+    let object_ref = record.content_refs[0];
+    let object_bytes = reads.read_object_bytes(&object_ref)?;
+    if hash_object(&object_bytes) != object_ref {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/object-hash",
+        });
+    }
+    let marker = BatchCompletionMarkerV2::decode(&object_bytes).map_err(MediumError::Format)?;
+    // (6) All five context bindings against the supplied
+    // expectations — a structural comparison over caller-supplied
+    // values, never an authentication of their origin.
+    if marker.mk != expected.mk
+        || marker.plan != expected.plan
+        || marker.batch_index != expected.batch_index
+        || marker.audit != expected.audit
+        || marker.begin != expected.begin
+    {
+        return Err(MediumError::Chain {
+            rule: "batch-candidate/context-mismatch",
+        });
+    }
+    // (7) The structural candidate — the two structural facts and
+    // nothing else.
+    Ok(StructuralBatchCandidate {
+        revision: *candidate,
+        marker,
+    })
+}
+
 // ============================================================== the C1 tests
 //
 // The owner's required adversarial matrix (A-G) plus the canonical
@@ -884,7 +1022,6 @@ impl BatchCompletionMarkerV2 {
 #[cfg(test)]
 mod c1_tests {
     use super::*;
-    use crate::hash::hash_object;
 
     fn fixture_context() -> BatchCompletionContext {
         BatchCompletionContext {
@@ -1703,5 +1840,578 @@ mod c1_tests {
             )
             .into_bytes()
         );
+    }
+}
+
+// ============================================================== the C2 tests
+//
+// The owner's required adversarial matrix (A-H) for the read-only
+// structural candidate reader — pure in-memory synthetic-reader
+// tests, no filesystem, no providers, no chain state, no
+// publication, no destructive execution of any kind.
+
+#[cfg(test)]
+mod c2_tests {
+    use super::*;
+    use crate::record::AuthorityMode;
+
+    fn c2_context() -> BatchCompletionContext {
+        BatchCompletionContext {
+            mk: hash_object(b"c2-mk"),
+            plan: hash_object(b"c2-plan"),
+            batch_index: 0,
+            audit: hash_object(b"c2-audit"),
+            begin: hash_object(b"c2-begin"),
+        }
+    }
+
+    fn c2_classification() -> Vec<ClassificationEntry> {
+        vec![
+            ClassificationEntry {
+                identity: hash_object(b"c2-SK0"),
+                role: StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c2-m0a"),
+                role: StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c2-o0a"),
+                role: StorageRole::Object,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: hash_object(b"c2-os"),
+                role: StorageRole::Object,
+                classification: EntryClassification::Deferred,
+                conditional_on_prior_batch: false,
+            },
+        ]
+    }
+
+    fn c2_marker_for(context: &BatchCompletionContext) -> BatchCompletionMarkerV2 {
+        let commitment = commit_classification(context, c2_classification()).unwrap();
+        BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: commitment.digest,
+            counters: commitment.counters,
+        }
+    }
+
+    /// The in-memory synthetic reader: two byte maps and NOTHING
+    /// else — no HEAD, no chain, no founding, no durability state
+    /// of any kind. It implements the reader-generic BeginReads
+    /// seam exactly as the provider adapters do (the bytes stored
+    /// at an identity are the bytes returned for it), which is the
+    /// whole point of the off-chain demonstration: the reader's
+    /// positive result is derivable from bytes alone.
+    struct SyntheticReads {
+        records: std::collections::BTreeMap<Hash, Vec<u8>>,
+        objects: std::collections::BTreeMap<Hash, Vec<u8>>,
+    }
+
+    impl SyntheticReads {
+        fn new() -> Self {
+            SyntheticReads {
+                records: std::collections::BTreeMap::new(),
+                objects: std::collections::BTreeMap::new(),
+            }
+        }
+
+        /// Installs a record under its TRUE content identity.
+        fn install_record(&mut self, record: &RevisionRecord) -> Hash {
+            let bytes = record.canonical_bytes();
+            let id = hash_object(&bytes);
+            self.records.insert(id, bytes);
+            id
+        }
+
+        /// Installs a record's bytes under a SUPPLIED identity (the
+        /// hash-mismatch adversary — the stored bytes do not hash
+        /// to the identity they are stored under).
+        fn install_record_under(&mut self, id: Hash, record: &RevisionRecord) {
+            self.records.insert(id, record.canonical_bytes());
+        }
+
+        /// Installs an object under its TRUE content identity.
+        fn install_object(&mut self, bytes: &[u8]) -> Hash {
+            let id = hash_object(bytes);
+            self.objects.insert(id, bytes.to_vec());
+            id
+        }
+
+        /// Installs an object's bytes under a SUPPLIED identity
+        /// (the hash-mismatch adversary).
+        fn install_object_under(&mut self, id: Hash, bytes: Vec<u8>) {
+            self.objects.insert(id, bytes);
+        }
+    }
+
+    impl crate::reclaim::BeginReads for SyntheticReads {
+        fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.records
+                .get(id)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *id })
+        }
+        fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.objects
+                .get(hash)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *hash })
+        }
+    }
+
+    /// The candidate fixture: a genuine regular revision carrying
+    /// the deterministic V2 Batch key derived from `key_context`,
+    /// referencing the `/2` marker encoded for `marker_context`.
+    /// The honest fixture passes the same context to both; the
+    /// lying-marker adversary splits them.
+    fn c2_candidate(
+        marker_context: &BatchCompletionContext,
+        key_context: &BatchCompletionContext,
+    ) -> (SyntheticReads, Hash) {
+        let mut reads = SyntheticReads::new();
+        let marker = c2_marker_for(marker_context);
+        let object_id = reads.install_object(&marker.canonical_bytes());
+        let key = reclamation_complete_v2_idempotency_key(&key_context.mk, key_context.batch_index);
+        let record = RevisionRecord::regular(hash_object(b"c2-parent"), 3, 7)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&record);
+        (reads, candidate)
+    }
+
+    #[test]
+    fn the_valid_structural_candidate_reads() {
+        let expected = c2_context();
+        let (mut reads, candidate) = c2_candidate(&expected, &expected);
+        let result = read_structural_batch_candidate(&mut reads, &candidate, &expected).unwrap();
+        // The two structural facts and nothing else.
+        assert_eq!(result.revision, candidate);
+        assert_eq!(result.marker.context(), expected);
+        assert_eq!(result.marker, c2_marker_for(&expected));
+    }
+
+    #[test]
+    fn the_off_chain_candidate_carries_no_authority() {
+        let expected = c2_context();
+        // The synthetic reader holds ONLY the candidate's two byte
+        // entries — no founding record, no chain, no HEAD, and the
+        // BeginReads seam exposes no primitive that could consult
+        // any of them. A fully valid, hash-consistent candidate
+        // that is NOT installed on any canonical chain still
+        // passes structural validation — by design, because the
+        // structural result is derivable from bytes alone.
+        let (mut reads, candidate) = c2_candidate(&expected, &expected);
+        let result = read_structural_batch_candidate(&mut reads, &candidate, &expected).unwrap();
+        // The result type carries exactly the two structural
+        // fields — there is no installation, durability, or
+        // permission field to read, and no boolean verdict of any
+        // kind (the destructure names everything the type holds).
+        let StructuralBatchCandidate { revision, marker } = result;
+        assert_eq!(revision, candidate);
+        assert_eq!(marker.context(), expected);
+        // The identical bytes under a FRESH reader instance (a
+        // different store with no shared state) yield the
+        // identical structural result — installation-independent
+        // by construction.
+        let (mut fresh, fresh_candidate) = c2_candidate(&expected, &expected);
+        assert_eq!(
+            read_structural_batch_candidate(&mut fresh, &fresh_candidate, &expected).unwrap(),
+            StructuralBatchCandidate {
+                revision: fresh_candidate,
+                marker: c2_marker_for(&expected)
+            }
+        );
+    }
+
+    #[test]
+    fn the_wrong_revision_shapes_refuse() {
+        let expected = c2_context();
+        let key = reclamation_complete_v2_idempotency_key(&expected.mk, expected.batch_index);
+        let marker_object = c2_marker_for(&expected).canonical_bytes();
+        let parent = hash_object(b"c2-parent");
+        // A founding revision is never a completion candidate.
+        let mut reads = SyntheticReads::new();
+        let object_id = reads.install_object(&marker_object);
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "c2-shape", 0)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&founding);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/not-regular"
+            })
+        ));
+        // Zero content references.
+        let mut reads = SyntheticReads::new();
+        let keyless = RevisionRecord::regular(parent, 3, 7).with_idempotency_key(key.clone());
+        let candidate = reads.install_record(&keyless);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/content-refs"
+            })
+        ));
+        // Multiple content references.
+        let mut reads = SyntheticReads::new();
+        let first = reads.install_object(&marker_object);
+        let second = reads.install_object(b"c2-unrelated-object");
+        let multi = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![first, second]);
+        let candidate = reads.install_record(&multi);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/content-refs"
+            })
+        ));
+        // No idempotency key at all.
+        let mut reads = SyntheticReads::new();
+        let object_id = reads.install_object(&marker_object);
+        let unkeyed = RevisionRecord::regular(parent, 3, 7).with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&unkeyed);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/key-mismatch"
+            })
+        ));
+        // The key derived from a DIFFERENT batch index.
+        let mut reads = SyntheticReads::new();
+        let object_id = reads.install_object(&marker_object);
+        let wrong_batch = reclamation_complete_v2_idempotency_key(&expected.mk, 1);
+        let miskeyed = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(wrong_batch)
+            .with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&miskeyed);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/key-mismatch"
+            })
+        ));
+    }
+
+    #[test]
+    fn the_context_mismatches_refuse() {
+        let expected = c2_context();
+        // The expected-side mutations of MK and batch index change
+        // the DERIVED KEY first, so the refusal fires at the key
+        // check (the reader's key discipline is itself
+        // context-derived — an honest defense in depth).
+        let (mut reads, candidate) = c2_candidate(&expected, &expected);
+        for mutated in [
+            BatchCompletionContext {
+                mk: hash_object(b"c2-other-mk"),
+                ..expected
+            },
+            BatchCompletionContext {
+                batch_index: 1,
+                ..expected
+            },
+        ] {
+            assert!(matches!(
+                read_structural_batch_candidate(&mut reads, &candidate, &mutated),
+                Err(MediumError::Chain {
+                    rule: "batch-candidate/key-mismatch"
+                })
+            ));
+        }
+        // The plan/audit/begin mutations leave the key untouched —
+        // the five-binding context comparison itself refuses.
+        for mutated in [
+            BatchCompletionContext {
+                plan: hash_object(b"c2-other-plan"),
+                ..expected
+            },
+            BatchCompletionContext {
+                audit: hash_object(b"c2-other-audit"),
+                ..expected
+            },
+            BatchCompletionContext {
+                begin: hash_object(b"c2-other-begin"),
+                ..expected
+            },
+        ] {
+            assert!(matches!(
+                read_structural_batch_candidate(&mut reads, &candidate, &mutated),
+                Err(MediumError::Chain {
+                    rule: "batch-candidate/context-mismatch"
+                })
+            ));
+        }
+        // The correctly-keyed but LYING-MARKER adversary: the
+        // record carries the key derived from each MUTATED
+        // expectation while the marker still binds the original
+        // context — EVERY one of the five bindings now refuses at
+        // the context comparison itself, independent of the key
+        // derivation.
+        for mutated in [
+            BatchCompletionContext {
+                mk: hash_object(b"c2-lying-mk"),
+                ..expected
+            },
+            BatchCompletionContext {
+                plan: hash_object(b"c2-lying-plan"),
+                ..expected
+            },
+            BatchCompletionContext {
+                batch_index: 1,
+                ..expected
+            },
+            BatchCompletionContext {
+                audit: hash_object(b"c2-lying-audit"),
+                ..expected
+            },
+            BatchCompletionContext {
+                begin: hash_object(b"c2-lying-begin"),
+                ..expected
+            },
+        ] {
+            let (mut reads, candidate) = c2_candidate(&expected, &mutated);
+            assert!(matches!(
+                read_structural_batch_candidate(&mut reads, &candidate, &mutated),
+                Err(MediumError::Chain {
+                    rule: "batch-candidate/context-mismatch"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_corrupt_or_missing_evidence_refuses() {
+        let expected = c2_context();
+        let key = reclamation_complete_v2_idempotency_key(&expected.mk, expected.batch_index);
+        let marker_bytes = c2_marker_for(&expected).canonical_bytes();
+        let marker_object = hash_object(&marker_bytes);
+        let parent = hash_object(b"c2-parent");
+        // A missing candidate record.
+        let mut reads = SyntheticReads::new();
+        let ghost = hash_object(b"c2-ghost-record");
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &ghost, &expected),
+            Err(MediumError::MissingObject { hash }) if hash == ghost
+        ));
+        // Record bytes that do not hash to the identity they are
+        // stored under.
+        let mut reads = SyntheticReads::new();
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![marker_object]);
+        let wrong_id = hash_object(b"c2-wrong-record-id");
+        reads.install_record_under(wrong_id, &record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &wrong_id, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/record-hash"
+            })
+        ));
+        // A missing referenced content object.
+        let mut reads = SyntheticReads::new();
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![hash_object(b"c2-ghost-object")]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::MissingObject { hash }) if hash == hash_object(b"c2-ghost-object")
+        ));
+        // Object bytes that do not hash to the referenced
+        // identity.
+        let mut reads = SyntheticReads::new();
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![marker_object]);
+        let candidate = reads.install_record(&record);
+        reads.install_object_under(marker_object, b"c2-impostor-bytes".to_vec());
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/object-hash"
+            })
+        ));
+        // Malformed marker content (the truncated /2 encoding
+        // under its own true hash — the strict decode refuses).
+        let mut reads = SyntheticReads::new();
+        let truncated = &marker_bytes[..marker_bytes.len() - 5];
+        let truncated_id = reads.install_object(truncated);
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![truncated_id]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Format(_))
+        ));
+        // An unsupported marker domain (a foreign-domain object
+        // under its own true hash — the /2 domain gate refuses).
+        let mut reads = SyntheticReads::new();
+        let foreign = {
+            let mut enc = Encoder::new();
+            enc.write_str("engine-persist/reclamation-complete/3");
+            enc.write_u32(3);
+            enc.write_bytes(&[0x01; 32]);
+            enc.into_bytes()
+        };
+        let foreign_id = reads.install_object(&foreign);
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![foreign_id]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn the_v1_marker_never_becomes_a_v2_candidate() {
+        let expected = c2_context();
+        let parent = hash_object(b"c2-parent");
+        let v1_marker = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: expected.mk,
+            batch: expected.batch_index,
+            source: hash_object(b"c2-v1-source"),
+            mandatory_count: 3,
+            deferred: vec![hash_object(b"c2-v1-deferred")],
+            journal_files: Vec::new(),
+        };
+        let v1_object_bytes = v1_marker.canonical_bytes();
+        // A genuine V1 completion RECORD — the V1 deterministic
+        // key — presented as a V2 candidate: the reader's V2 key
+        // discipline refuses before any marker work.
+        let mut reads = SyntheticReads::new();
+        let v1_object = reads.install_object(&v1_object_bytes);
+        let v1_key = crate::reclaim::reclamation_complete_idempotency_key(
+            &expected.mk,
+            Some(expected.batch_index),
+        );
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(v1_key)
+            .with_content_refs(vec![v1_object]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Chain {
+                rule: "batch-candidate/key-mismatch"
+            })
+        ));
+        // The V2-keyed record whose referenced object IS the V1
+        // marker: the /2 domain gate refuses the cross-generation
+        // presentation.
+        let mut reads = SyntheticReads::new();
+        let v1_object = reads.install_object(&v1_object_bytes);
+        let v2_key = reclamation_complete_v2_idempotency_key(&expected.mk, expected.batch_index);
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(v2_key)
+            .with_content_refs(vec![v1_object]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn the_publication_fence_still_refuses_the_family() {
+        // (G) The generic append's completion-family gate — the
+        // pure gate function the CanonicalMedium dispatch invokes
+        // — still refuses the /1, /2, and future family versions
+        // (the full append-path proof is the C1 corrective's
+        // the_generic_append_refuses_every_completion_family_domain,
+        // green in every battery run).
+        let expected = c2_context();
+        let marker = c2_marker_for(&expected);
+        let v2_object = crate::medium::StoredObject::new(marker.canonical_bytes()).unwrap();
+        let v1 = crate::reclaim::ReclamationComplete {
+            kind: crate::reclaim::CompletionKind::Batch,
+            mk: expected.mk,
+            batch: 0,
+            source: expected.mk,
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: Vec::new(),
+        };
+        let v1_object = crate::medium::StoredObject::new(v1.canonical_bytes()).unwrap();
+        let future_object = crate::medium::StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("engine-persist/reclamation-complete/3");
+            enc.write_u32(3);
+            enc.write_bytes(&[0x01; 32]);
+            enc.into_bytes()
+        })
+        .unwrap();
+        for refused in [&v2_object, &v1_object, &future_object] {
+            assert!(matches!(
+                crate::reclaim::enforce_completion_marker_gate(std::slice::from_ref(refused)),
+                Err(MediumError::Chain {
+                    rule: "reclamation-complete/generic-append-refused"
+                })
+            ));
+        }
+        // Unrelated content domains still pass the gate.
+        let plain = crate::medium::StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        assert!(
+            crate::reclaim::enforce_completion_marker_gate(std::slice::from_ref(&plain)).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_reader_preserves_the_c1_decoder_bounds() {
+        // (H) The C1 decoder's bounds hold THROUGH the reader
+        // path: the over-ceiling counter sum and the empty
+        // classification refuse via the strict decode exactly as
+        // the C1 suite proves directly.
+        let expected = c2_context();
+        let key = reclamation_complete_v2_idempotency_key(&expected.mk, expected.batch_index);
+        let parent = hash_object(b"c2-parent");
+        // The over-ceiling Mandatory partition sum.
+        let mut marker = c2_marker_for(&expected);
+        marker.counters.mandatory_records = MAX_ACCOUNTING_CLASSIFIED_LIST + 1;
+        let mut reads = SyntheticReads::new();
+        let object_id = reads.install_object(&marker.canonical_bytes());
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key.clone())
+            .with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Format(engine_core::SaveError::Limit { .. }))
+        ));
+        // The empty classification (all-zero counters).
+        let mut marker = c2_marker_for(&expected);
+        marker.counters = ClassificationCounters::EMPTY;
+        let mut reads = SyntheticReads::new();
+        let object_id = reads.install_object(&marker.canonical_bytes());
+        let record = RevisionRecord::regular(parent, 3, 7)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object_id]);
+        let candidate = reads.install_record(&record);
+        assert!(matches!(
+            read_structural_batch_candidate(&mut reads, &candidate, &expected),
+            Err(MediumError::Format(engine_core::SaveError::Integrity(
+                "batch-completion/zero-classification"
+            )))
+        ));
     }
 }
