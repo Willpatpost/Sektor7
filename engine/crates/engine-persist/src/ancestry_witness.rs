@@ -7093,7 +7093,7 @@ mod bp1_production_tests {
         let head_before = medium.head().unwrap();
         // (F2.2) The platform's honest tier.
         assert_eq!(
-            medium.durability_tier().unwrap(),
+            medium.durability_tier(),
             crate::medium::SyncTier::ProcessCrashOnly,
             "the Windows LocalFile platform reports ProcessCrashOnly"
         );
@@ -7107,7 +7107,7 @@ mod bp1_production_tests {
             matches!(
                 &begin_error,
                 crate::medium::MediumError::Chain { rule }
-                    if rule == "v2-begin-admission/tier-insufficient"
+                    if *rule == "v2-begin-admission/tier-insufficient"
             ),
             "the begin admission refuses at the tier gate: {begin_error:?}"
         );
