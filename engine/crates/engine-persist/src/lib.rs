@@ -56,6 +56,7 @@ pub mod local;
 pub mod medium;
 pub mod migrate;
 pub mod pipeline;
+pub mod range_completion;
 pub mod reclaim;
 pub mod record;
 pub mod recovery;
@@ -153,6 +154,15 @@ pub use pipeline::{
     CommitOutcome, CommitPipeline, CommitRequest, CommitVerifier, ConfirmationLabel,
     ConfirmationReceipt, ConfirmedEntry, ConfirmedView, ConsequenceBatch, KeyPhase, KeyStatus,
     PipelineError, ReconcileOutcome,
+};
+pub use range_completion::{
+    MAX_RANGE_AGGREGATE_PARTITION, RANGE_COVERAGE_COMMITMENT_MAGIC,
+    RANGE_COVERAGE_COMMITMENT_VERSION, RANGE_JOURNAL_OBLIGATION_COMMITMENT_MAGIC,
+    RANGE_JOURNAL_OBLIGATION_COMMITMENT_VERSION, RECLAMATION_COMPLETE_V3_DOMAIN,
+    RECLAMATION_COMPLETE_V3_KEY_DOMAIN, RECLAMATION_COMPLETE_V3_VERSION, RangeAggregateCounters,
+    RangeCompletionContext, RangeCompletionMarkerV3, RangeCoverageCommitment,
+    RangeCoverageCommitmentBuilder, RangeCoverageObservation, commit_journal_obligations,
+    commit_range_coverage, reclamation_complete_v3_range_idempotency_key,
 };
 pub use reclaim::{
     CompletionKind, PlanBatch, RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_COMPLETE_KEY_DOMAIN,
