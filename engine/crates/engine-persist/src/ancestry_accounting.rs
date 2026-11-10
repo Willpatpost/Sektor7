@@ -2097,11 +2097,13 @@ mod a3_tests {
             objects: Vec<StoredObject>,
         },
         /// A retained anchor (unindexed): its content objects.
+        #[cfg_attr(not(unix), allow(dead_code))]
         Anchor { objects: Vec<StoredObject> },
         /// The reintroduction anchor: a retained anchor whose single
         /// content reference is the PREVIOUS member's record
         /// identity, with the record's canonical bytes re-supplied
         /// as the ordinary object (the namespace-collision fixture).
+        #[cfg_attr(not(unix), allow(dead_code))]
         Reintroduce,
     }
 
@@ -2109,6 +2111,7 @@ mod a3_tests {
         A3Step::Member { key, objects }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn anchor_step(objects: Vec<StoredObject>) -> A3Step {
         A3Step::Anchor { objects }
     }
@@ -2135,6 +2138,7 @@ mod a3_tests {
         prior_mk: Option<Hash>,
         prior_m0: Option<Hash>,
         prior_sk: Option<Hash>,
+        #[cfg_attr(not(unix), allow(dead_code))]
         above_mk_composite: Option<Hash>,
     }
 
