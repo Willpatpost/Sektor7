@@ -962,6 +962,29 @@ impl IdentitySorter {
         })
     }
 
+    /// The SHARED, CHECKED, WORKSPACE-WIDE byte accounting: every
+    /// byte the computation writes into the scratch workspace —
+    /// the external-sort run files (their headers, entries, and
+    /// integrity trailers) AND the complete survivor-reference
+    /// spool (its record framing and its trailer) — is charged
+    /// through this single counter against the caller's
+    /// `max_scratch_bytes` ceiling, and the refusal lands BEFORE
+    /// the bytes are written. `ScratchReport.bytes_written` is
+    /// this total.
+    fn charge_bytes(&mut self, bytes: u64) -> Result<(), MediumError> {
+        if self
+            .bytes_written
+            .checked_add(bytes)
+            .is_none_or(|total| total > self.limits.max_scratch_bytes)
+        {
+            return Err(MediumError::Chain {
+                rule: "accounting/scratch-byte-limit",
+            });
+        }
+        self.bytes_written += bytes;
+        Ok(())
+    }
+
     fn spill(&mut self) -> Result<(), MediumError> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -973,10 +996,10 @@ impl IdentitySorter {
         }
         self.buffer.sort_unstable();
         // The CHECKED byte arithmetic: the entry payload and the
-        // total run size are computed with checked operations
-        // (the hard maxima keep these far from overflow; the
-        // checks are the defense-in-depth that no pathological
-        // input can wrap around).
+        // total run size (the header, the entries, and the
+        // integrity trailer) are computed with checked operations,
+        // then charged through the shared workspace-wide budget
+        // BEFORE the file is written.
         let entry_bytes = (self.buffer.len() as u64)
             .checked_mul(ACCOUNTING_ENTRY_BYTES as u64)
             .ok_or(MediumError::Chain {
@@ -987,15 +1010,7 @@ impl IdentitySorter {
             .ok_or(MediumError::Chain {
                 rule: "accounting/scratch-byte-limit",
             })?;
-        if self
-            .bytes_written
-            .checked_add(size)
-            .is_none_or(|total| total > self.limits.max_scratch_bytes)
-        {
-            return Err(MediumError::Chain {
-                rule: "accounting/scratch-byte-limit",
-            });
-        }
+        self.charge_bytes(size)?;
         let path = self.run_path(self.run_index);
         let mut bytes = Vec::with_capacity(
             ACCOUNTING_RUN_HEADER_BYTES + self.buffer.len() * ACCOUNTING_ENTRY_BYTES,
@@ -1026,7 +1041,6 @@ impl IdentitySorter {
         self.runs += 1;
         self.run_index += 1;
         self.entries_written += self.buffer.len() as u64;
-        self.bytes_written += size;
         self.buffer.clear();
         Ok(())
     }
@@ -1336,9 +1350,13 @@ impl SurvivorRefSpool {
         })
     }
 
-    /// Appends one survivor root's reference record.
+    /// Appends one survivor root's reference record — the record's
+    /// framing bytes are charged through the SHARED workspace-wide
+    /// budget BEFORE they are written (a zero-reference record is
+    /// the canonical empty-reference form and streams correctly).
     fn append(
         &mut self,
+        sorter: &mut IdentitySorter,
         root: Hash,
         kind: ProtectorKind,
         references: &[Hash],
@@ -1351,6 +1369,7 @@ impl SurvivorRefSpool {
         for reference in references {
             record.extend_from_slice(reference.as_bytes());
         }
+        sorter.charge_bytes(record.len() as u64)?;
         self.writer
             .write_all(&record)
             .map_err(|_| MediumError::Chain {
@@ -1360,10 +1379,15 @@ impl SurvivorRefSpool {
         Ok(())
     }
 
-    /// Closes the writer with the transport trailer and returns
-    /// the streaming reader over the completed file.
-    fn into_reader(mut self) -> Result<SurvivorRefReader, MediumError> {
+    /// Closes the writer with the transport trailer (charged
+    /// through the shared workspace-wide budget) and returns the
+    /// streaming reader over the completed file.
+    fn into_reader(
+        mut self,
+        sorter: &mut IdentitySorter,
+    ) -> Result<SurvivorRefReader, MediumError> {
         let trailer: [u8; 32] = self.mac.clone().finalize().into();
+        sorter.charge_bytes(ACCOUNTING_RUN_MAC_BYTES as u64)?;
         self.writer
             .write_all(&trailer)
             .and_then(|_| self.writer.flush())
@@ -1409,109 +1433,120 @@ impl SurvivorRefReader {
     }
 
     fn next_reference(&mut self) -> Result<Option<(Hash, ProtectorKind, Hash, bool)>, MediumError> {
-        if self.remaining == 0 && !self.finished {
-            // The next record header, or the transport trailer at
-            // the true end. The probe ACCUMULATES byte-by-byte so
-            // the end detection never consumes the trailer it must
-            // then read: a full 41-byte fill is a record header,
-            // an exact 32-byte fill at the end IS the trailer, and
-            // any other termination refuses the framing.
-            let mut header = [0u8; SPOOL_RECORD_HEADER_BYTES];
-            let mut filled = 0usize;
-            while filled < SPOOL_RECORD_HEADER_BYTES {
-                let read =
-                    self.reader
-                        .read(&mut header[filled..])
-                        .map_err(|_| MediumError::Chain {
+        loop {
+            if self.remaining == 0 && !self.finished {
+                // The next record header, or the transport trailer at
+                // the true end. The probe ACCUMULATES byte-by-byte so
+                // the end detection never consumes the trailer it must
+                // then read: a full 41-byte fill is a record header,
+                // an exact 32-byte fill at the end IS the trailer, and
+                // any other termination refuses the framing.
+                let mut header = [0u8; SPOOL_RECORD_HEADER_BYTES];
+                let mut filled = 0usize;
+                while filled < SPOOL_RECORD_HEADER_BYTES {
+                    let read = self.reader.read(&mut header[filled..]).map_err(|_| {
+                        MediumError::Chain {
                             rule: "accounting/scratch-io",
-                        })?;
-                if read == 0 {
-                    break;
-                }
-                filled += read;
-            }
-            if filled == SPOOL_RECORD_HEADER_BYTES {
-                self.mac.update(header);
-                let mut root_bytes = [0u8; 32];
-                root_bytes.copy_from_slice(&header[..32]);
-                let root = Hash::from_bytes(&root_bytes).ok_or(MediumError::Chain {
-                    rule: "accounting/scratch-framing",
-                })?;
-                if root == Hash::ZERO {
-                    return Err(MediumError::Chain {
-                        rule: "accounting/scratch-framing",
-                    });
-                }
-                let kind = decode_protector_kind(header[32])?;
-                let count = u64::from_be_bytes(header[33..].try_into().map_err(|_| {
-                    MediumError::Chain {
-                        rule: "accounting/scratch-framing",
+                        }
+                    })?;
+                    if read == 0 {
+                        break;
                     }
-                })?);
-                if count == 0 || count > MAX_SPOOL_RECORD_REFERENCES {
-                    return Err(MediumError::Chain {
+                    filled += read;
+                }
+                if filled == SPOOL_RECORD_HEADER_BYTES {
+                    self.mac.update(header);
+                    let mut root_bytes = [0u8; 32];
+                    root_bytes.copy_from_slice(&header[..32]);
+                    let root = Hash::from_bytes(&root_bytes).ok_or(MediumError::Chain {
                         rule: "accounting/scratch-framing",
-                    });
-                }
-                self.root = root;
-                self.kind = kind;
-                self.remaining = count;
-                self.first = true;
-            } else if filled == ACCOUNTING_RUN_MAC_BYTES {
-                // The accumulated bytes ARE the transport trailer.
-                let trailer: [u8; ACCOUNTING_RUN_MAC_BYTES] = header[..ACCOUNTING_RUN_MAC_BYTES]
-                    .try_into()
-                    .expect("the trailer width is the accumulated length");
-                let recomputed: [u8; 32] = self.mac.clone().finalize().into();
-                if trailer != recomputed {
-                    return Err(MediumError::Chain {
-                        rule: "accounting/scratch-integrity",
-                    });
-                }
-                let mut probe = [0u8; 1];
-                match self.reader.read(&mut probe) {
-                    Ok(0) => {}
-                    Ok(_) => {
+                    })?;
+                    if root == Hash::ZERO {
                         return Err(MediumError::Chain {
                             rule: "accounting/scratch-framing",
                         });
                     }
-                    Err(_) => {
+                    let kind = decode_protector_kind(header[32])?;
+                    let count = u64::from_be_bytes(header[33..].try_into().map_err(|_| {
+                        MediumError::Chain {
+                            rule: "accounting/scratch-framing",
+                        }
+                    })?);
+                    if count > MAX_SPOOL_RECORD_REFERENCES {
                         return Err(MediumError::Chain {
-                            rule: "accounting/scratch-io",
+                            rule: "accounting/scratch-framing",
                         });
                     }
+                    self.root = root;
+                    self.kind = kind;
+                    self.remaining = count;
+                    self.first = true;
+                    // The canonical revision format permits retained
+                    // records with an EMPTY content-reference list:
+                    // the zero-reference record carries the survivor's
+                    // identity protection only, and the reader
+                    // continues to the next record (or the trailer)
+                    // without yielding a reference.
+                    if count == 0 {
+                        continue;
+                    }
+                } else if filled == ACCOUNTING_RUN_MAC_BYTES {
+                    // The accumulated bytes ARE the transport trailer.
+                    let trailer: [u8; ACCOUNTING_RUN_MAC_BYTES] = header
+                        [..ACCOUNTING_RUN_MAC_BYTES]
+                        .try_into()
+                        .expect("the trailer width is the accumulated length");
+                    let recomputed: [u8; 32] = self.mac.clone().finalize().into();
+                    if trailer != recomputed {
+                        return Err(MediumError::Chain {
+                            rule: "accounting/scratch-integrity",
+                        });
+                    }
+                    let mut probe = [0u8; 1];
+                    match self.reader.read(&mut probe) {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            return Err(MediumError::Chain {
+                                rule: "accounting/scratch-framing",
+                            });
+                        }
+                        Err(_) => {
+                            return Err(MediumError::Chain {
+                                rule: "accounting/scratch-io",
+                            });
+                        }
+                    }
+                    self.finished = true;
+                    return Ok(None);
+                } else {
+                    return Err(MediumError::Chain {
+                        rule: "accounting/scratch-framing",
+                    });
                 }
-                self.finished = true;
+            }
+            if self.finished {
                 return Ok(None);
-            } else {
+            }
+            let mut reference_bytes = [0u8; 32];
+            self.reader
+                .read_exact(&mut reference_bytes)
+                .map_err(|_| MediumError::Chain {
+                    rule: "accounting/scratch-framing",
+                })?;
+            self.mac.update(reference_bytes);
+            let reference = Hash::from_bytes(&reference_bytes).ok_or(MediumError::Chain {
+                rule: "accounting/scratch-framing",
+            })?;
+            if reference == Hash::ZERO {
                 return Err(MediumError::Chain {
                     rule: "accounting/scratch-framing",
                 });
             }
+            let first = self.first;
+            self.first = false;
+            self.remaining -= 1;
+            return Ok(Some((self.root, self.kind, reference, first)));
         }
-        if self.finished {
-            return Ok(None);
-        }
-        let mut reference_bytes = [0u8; 32];
-        self.reader
-            .read_exact(&mut reference_bytes)
-            .map_err(|_| MediumError::Chain {
-                rule: "accounting/scratch-framing",
-            })?;
-        self.mac.update(reference_bytes);
-        let reference = Hash::from_bytes(&reference_bytes).ok_or(MediumError::Chain {
-            rule: "accounting/scratch-framing",
-        })?;
-        if reference == Hash::ZERO {
-            return Err(MediumError::Chain {
-                rule: "accounting/scratch-framing",
-            });
-        }
-        let first = self.first;
-        self.first = false;
-        self.remaining -= 1;
-        Ok(Some((self.root, self.kind, reference, first)))
     }
 }
 
@@ -1958,7 +1993,12 @@ pub fn account_batch_retirement(
                 } => match position {
                     crate::ancestry_history::BatchPosition::FutureBatch => {
                         future_ids.push(*identity);
-                        spool.append(*identity, ProtectorKind::FutureBatchMember, content_refs)?;
+                        spool.append(
+                            &mut sorter,
+                            *identity,
+                            ProtectorKind::FutureBatchMember,
+                            content_refs,
+                        )?;
                         sorter.push_protector(
                             *identity,
                             StorageRole::Record,
@@ -1978,7 +2018,12 @@ pub fn account_batch_retirement(
                     ..
                 } => {
                     anchor_ids.push(*identity);
-                    spool.append(*identity, ProtectorKind::RangeAnchor, content_refs)?;
+                    spool.append(
+                        &mut sorter,
+                        *identity,
+                        ProtectorKind::RangeAnchor,
+                        content_refs,
+                    )?;
                     sorter.push_protector(
                         *identity,
                         StorageRole::Record,
@@ -2027,7 +2072,7 @@ pub fn account_batch_retirement(
         // (never an aggregate), every reference read through the
         // hash-verifying read, the composite closure verified on
         // each record's first reference.
-        let mut spool_reader = spool.into_reader()?;
+        let mut spool_reader = spool.into_reader(&mut sorter)?;
         while let Some((root, kind, reference, first)) = spool_reader.next_reference()? {
             let bytes = reads.read_object_bytes(&reference)?;
             sorter.push_protector(reference, StorageRole::Object, kind, root)?;
@@ -2525,20 +2570,26 @@ mod a3_scratch_tests {
             max_scratch_bytes: 1 << 20,
             ..AccountingLimits::default()
         };
-        let sorter = IdentitySorter::new(&limits, &root).unwrap();
+        let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         spool
             .append(
+                &mut sorter,
                 fabricated(3),
                 ProtectorKind::FutureBatchMember,
                 &[fabricated(4), fabricated(5)],
             )
             .unwrap();
         let spool_key = sorter.key;
-        let mut reader = spool.into_reader().unwrap();
+        let mut reader = spool.into_reader(&mut sorter).unwrap();
         let mut observed = Vec::new();
         while let Some(item) = reader.next_reference().unwrap() {
             observed.push(item);
@@ -2550,10 +2601,15 @@ mod a3_scratch_tests {
         assert!(!observed[2].3);
         assert!(observed[0].3, "the first reference of each record");
         // The substituted spool: one reference byte flipped.
-        let sorter = IdentitySorter::new(&limits, &root).unwrap();
+        let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         let spool_path = sorter.dir.join(SURVIVOR_SPOOL_FILE);
         let trailer: [u8; 32] = spool.mac.clone().finalize().into();
@@ -2599,7 +2655,12 @@ mod a3_scratch_tests {
         let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         drop(spool);
         for seed in 0..3u8 {
@@ -2633,7 +2694,12 @@ mod a3_scratch_tests {
         let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         drop(spool);
         let mut pushed: Vec<AccountingEntry> = Vec::new();
@@ -2740,7 +2806,12 @@ mod a3_scratch_tests {
         let mut sorter = IdentitySorter::new(&extreme, &root.join("c")).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         drop(spool);
         sorter.push(candidate_entry(1, 0)).unwrap();
@@ -2759,7 +2830,12 @@ mod a3_scratch_tests {
         let mut sorter = IdentitySorter::new(&limits, &sub).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         drop(spool);
         for seed in 0..3u8 {
@@ -2775,20 +2851,30 @@ mod a3_scratch_tests {
             residual.is_empty(),
             "the failing path cleaned the workspace"
         );
-        // (e) The byte ceiling likewise.
+        // (e) The byte ceiling likewise — the SHARED
+        // workspace-wide accounting: the ceiling covers the spool
+        // (its record framing plus its trailer) AND one full run,
+        // so the second run's spill refuses.
+        let spool_bytes = (SPOOL_RECORD_HEADER_BYTES + std::mem::size_of::<Hash>()) as u64
+            + ACCOUNTING_RUN_MAC_BYTES as u64;
         let single_run = (ACCOUNTING_RUN_HEADER_BYTES + 2 * ACCOUNTING_ENTRY_BYTES) as u64
             + ACCOUNTING_RUN_MAC_BYTES as u64;
         let limits = AccountingLimits {
             run_entry_buffer: 2,
             max_runs: 64,
-            max_scratch_bytes: single_run,
+            max_scratch_bytes: spool_bytes + single_run,
             ..AccountingLimits::default()
         };
         let sub = root.join("e");
         let mut sorter = IdentitySorter::new(&limits, &sub).unwrap();
         let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
         spool
-            .append(fabricated(1), ProtectorKind::RangeAnchor, &[fabricated(2)])
+            .append(
+                &mut sorter,
+                fabricated(1),
+                ProtectorKind::RangeAnchor,
+                &[fabricated(2)],
+            )
             .unwrap();
         drop(spool);
         for seed in 0..3u8 {
@@ -2804,6 +2890,233 @@ mod a3_scratch_tests {
             residual.is_empty(),
             "the failing path cleaned the workspace"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (A3-S1) The total scratch-byte budget: the ceiling governs
+    /// the ENTIRE workspace — the runs AND the survivor-reference
+    /// spool, headers, framing, and trailers — through the shared
+    /// checked accounting. When the sorted runs alone would fit
+    /// but the combined runs-plus-spool exceed the limit, the
+    /// computation refuses typed before writing the exceeding
+    /// bytes and the workspace is cleaned; when the combined usage
+    /// fits, the accounting succeeds and
+    /// `ScratchReport.bytes_written` reports the exact total.
+    #[test]
+    fn the_workspace_byte_budget_refuses_and_fits() {
+        let root = scratch_root("budget");
+        // The exact per-piece costs: the spool record (41 + 32
+        // framing + the 32 trailer at close) and one full run (the
+        // 17 header + 2 x 66 entries + the 32 trailer).
+        let spool_bytes = (SPOOL_RECORD_HEADER_BYTES + std::mem::size_of::<Hash>()) as u64
+            + ACCOUNTING_RUN_MAC_BYTES as u64;
+        let single_run = (ACCOUNTING_RUN_HEADER_BYTES + 2 * ACCOUNTING_ENTRY_BYTES) as u64
+            + ACCOUNTING_RUN_MAC_BYTES as u64;
+        // (a) The runs fit, the combined runs-plus-spool do not:
+        // the ceiling covers the spool and ONE run, so the SECOND
+        // run's spill refuses mid-computation and the workspace is
+        // cleaned on the failing path.
+        {
+            let sub = root.join("refuse");
+            let limits = AccountingLimits {
+                run_entry_buffer: 2,
+                max_runs: 64,
+                max_scratch_bytes: spool_bytes + single_run,
+                ..AccountingLimits::default()
+            };
+            let mut sorter = IdentitySorter::new(&limits, &sub).unwrap();
+            let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(1),
+                    ProtectorKind::RangeAnchor,
+                    &[fabricated(2)],
+                )
+                .unwrap();
+            drop(spool);
+            for seed in 0..3u8 {
+                sorter.push(candidate_entry(seed, 0)).unwrap();
+            }
+            let error = match sorter.finish() {
+                Ok(_) => panic!("the combined budget must refuse"),
+                Err(error) => error,
+            };
+            assert_rule(error, "accounting/scratch-byte-limit");
+            let residual: Vec<_> = std::fs::read_dir(&sub).unwrap().collect();
+            assert!(
+                residual.is_empty(),
+                "the failing path cleaned the workspace"
+            );
+        }
+        // (b) The valid calculation: the combined usage fits and
+        // the report carries the EXACT total (the spool plus both
+        // runs).
+        {
+            let sub = root.join("fit");
+            let limits = AccountingLimits {
+                run_entry_buffer: 2,
+                max_runs: 64,
+                max_scratch_bytes: spool_bytes + 2 * single_run,
+                ..AccountingLimits::default()
+            };
+            let mut sorter = IdentitySorter::new(&limits, &sub).unwrap();
+            let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(1),
+                    ProtectorKind::RangeAnchor,
+                    &[fabricated(2)],
+                )
+                .unwrap();
+            // The real flow closes the spool with its trailer
+            // before the merge (the close is charged too).
+            drop(spool.into_reader(&mut sorter).unwrap());
+            for seed in 0..4u8 {
+                sorter.push(candidate_entry(seed, 0)).unwrap();
+            }
+            let mut merged = sorter.finish().unwrap();
+            assert_eq!(merged.facts().runs_written, 2);
+            assert_eq!(
+                merged.facts().bytes_written,
+                spool_bytes + 2 * single_run,
+                "the reported total covers the spool AND the runs"
+            );
+            while merged.next().unwrap().is_some() {}
+            assert!(merged.cleanup());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (A3-S2) The zero-reference survivor records: the canonical
+    /// revision format permits retained records with an EMPTY
+    /// content-reference list — the spool streams them at the
+    /// beginning, the middle, and the end (and a spool of ONLY
+    /// zero-reference records), preserving the record framing, the
+    /// transport MAC, the EOF integrity, and the bounded streaming.
+    #[test]
+    fn the_zero_reference_records_stream() {
+        let root = scratch_root("zero-refs");
+        let limits = AccountingLimits {
+            run_entry_buffer: 8,
+            max_runs: 64,
+            max_scratch_bytes: 1 << 20,
+            ..AccountingLimits::default()
+        };
+        // (a) Zero-reference records at the beginning, the middle,
+        // and the end, with nonempty records between.
+        {
+            let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
+            let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
+            spool
+                .append(&mut sorter, fabricated(1), ProtectorKind::RangeAnchor, &[])
+                .unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(2),
+                    ProtectorKind::RangeAnchor,
+                    &[fabricated(3)],
+                )
+                .unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(4),
+                    ProtectorKind::FutureBatchMember,
+                    &[],
+                )
+                .unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(5),
+                    ProtectorKind::FutureBatchMember,
+                    &[fabricated(6), fabricated(7)],
+                )
+                .unwrap();
+            spool
+                .append(&mut sorter, fabricated(8), ProtectorKind::RangeAnchor, &[])
+                .unwrap();
+            let mut reader = spool.into_reader(&mut sorter).unwrap();
+            let mut observed = Vec::new();
+            while let Some(item) = reader.next_reference().unwrap() {
+                observed.push(item);
+            }
+            // Only the nonempty records yield references; the
+            // zero-reference records contribute their identity
+            // protection through the walk's own record pushes.
+            assert_eq!(observed.len(), 3);
+            assert_eq!(observed[0].0, fabricated(2));
+            assert!(observed[0].3, "the nonempty record's first reference");
+            assert_eq!(observed[1].0, fabricated(5));
+            assert_eq!(observed[2].0, fabricated(5));
+            assert!(!observed[2].3);
+            drop(sorter);
+        }
+        // (b) A spool containing ONLY zero-reference records.
+        {
+            let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
+            let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
+            spool
+                .append(&mut sorter, fabricated(9), ProtectorKind::RangeAnchor, &[])
+                .unwrap();
+            spool
+                .append(
+                    &mut sorter,
+                    fabricated(10),
+                    ProtectorKind::FutureBatchMember,
+                    &[],
+                )
+                .unwrap();
+            let mut reader = spool.into_reader(&mut sorter).unwrap();
+            assert!(
+                reader.next_reference().unwrap().is_none(),
+                "the all-zero spool yields no references and completes at the trailer"
+            );
+            drop(sorter);
+        }
+        // (c) The malformed and tampered framing still refuses.
+        {
+            let mut sorter = IdentitySorter::new(&limits, &root).unwrap();
+            let mut spool = SurvivorRefSpool::create(&sorter).unwrap();
+            spool
+                .append(&mut sorter, fabricated(11), ProtectorKind::RangeAnchor, &[])
+                .unwrap();
+            let spool_path = sorter.dir.join(SURVIVOR_SPOOL_FILE);
+            let trailer: [u8; 32] = spool.mac.clone().finalize().into();
+            spool
+                .writer
+                .write_all(&trailer)
+                .and_then(|_| spool.writer.flush())
+                .unwrap();
+            drop(spool);
+            let mut bytes = std::fs::read(&spool_path).unwrap();
+            // The count field tampered upward: the declared
+            // reference collides with the trailer bytes and the
+            // transport MAC fails — every malformed form refuses
+            // closed.
+            bytes[33] = 0x01;
+            std::fs::write(&spool_path, &bytes).unwrap();
+            let mut reader = SurvivorRefReader::open(&spool_path, sorter.key).unwrap();
+            let error = match reader.next_reference() {
+                Ok(_) => panic!("the tampered count must refuse"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    MediumError::Chain {
+                        rule: "accounting/scratch-framing"
+                    } | MediumError::Chain {
+                        rule: "accounting/scratch-integrity"
+                    }
+                ),
+                "the tampered zero-record spool refuses closed: {error:?}"
+            );
+            drop(sorter);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -5440,6 +5753,86 @@ mod a3_tests {
         assert!(
             residual.is_empty(),
             "the failing path cleaned the workspace"
+        );
+        drop(medium);
+        cleanup(&[root, journal, scratch]);
+    }
+
+    /// (A3-S2) The genuine campaign with a retained anchor whose
+    /// content-reference list is EMPTY — the canonical revision
+    /// format permits it, the A2 walk emits the anchor, the spool
+    /// streams its zero-reference record, and the accounting
+    /// completes with the correct exact Mandatory/Deferred
+    /// partition. The anchor's record identity remains protected
+    /// (a survivor root, never a deletion candidate), and the
+    /// other survivors' protections are unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn the_zero_reference_anchor_campaign() {
+        let (root, mut medium) = a3_store("s2");
+        let journal = a3_journal("s2");
+        let scratch = a3_scratch("s2");
+        let facts = a3_campaign(
+            &mut medium,
+            "s2",
+            &journal,
+            &[
+                member_step(
+                    a3_member_key("s2", 0),
+                    vec![plain_object(b"a3-s2-payload-m0")],
+                ),
+                // The retained anchor with NO content references.
+                anchor_step(vec![]),
+                member_step(
+                    a3_member_key("s2", 1),
+                    vec![plain_object(b"a3-s2-payload-m1")],
+                ),
+            ],
+            10_000,
+            false,
+            None,
+        );
+        a3_complete(&mut medium, &facts.mk);
+        let result = account(
+            &mut medium,
+            &facts.mk,
+            0,
+            &AccountingLimits::default(),
+            &scratch,
+        );
+        let (_plan_record, plan) = crate::reclaim::find_installed_plan(&mut medium, &facts.mk)
+            .unwrap()
+            .unwrap();
+        // The exact partition against the independently
+        // constructed expectation (the zero-reference anchor
+        // contributes its identity protection and nothing else).
+        let (expected_mandatory, expected_deferred, expected_shared) =
+            derive_expected(&facts, &plan, 0);
+        assert_eq!(result.mandatory, expected_mandatory);
+        assert_eq!(result.deferred, expected_deferred);
+        assert_eq!(result.shared_references, expected_shared);
+        // The zero-reference anchor was walked, spooled, and
+        // counted as a survivor root.
+        assert_eq!(result.survivors.range_anchors, 3);
+        // Its record identity remains protected: it is never a
+        // deletion candidate of the accounted batch.
+        assert_eq!(
+            result.classification_of(&facts.anchors[0], StorageRole::Record),
+            None,
+            "the zero-reference anchor's identity is never a candidate"
+        );
+        // The other survivors' protections are unchanged (the
+        // shared object remains deferred under p1 and the
+        // founding).
+        assert_eq!(
+            result.classification_of(&facts.shared, StorageRole::Object),
+            Some(Classification::Deferred {
+                protectors: vec![
+                    prot(ProtectorKind::RangeAnchor, facts.p1),
+                    prot(ProtectorKind::RangeBoundary, facts.founding),
+                ],
+                namespace_collision: false,
+            })
         );
         drop(medium);
         cleanup(&[root, journal, scratch]);
