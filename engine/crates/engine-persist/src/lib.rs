@@ -59,6 +59,7 @@ pub mod pipeline;
 pub mod reclaim;
 pub mod record;
 pub mod recovery;
+pub mod recovery_discovery;
 pub mod rotation;
 pub mod session_anchor;
 pub mod sqlite;
@@ -171,6 +172,11 @@ pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
+};
+pub use recovery_discovery::{
+    CompletionCandidateObservation, CompletionStructural, CoveringCheckpoint, CoveringObservation,
+    DiscoveredFamily, DiscoveredPayload, DiscoveredRecord, DiscoveryBoundary, DiscoveryError,
+    DiscoveryLimits, MAX_DISCOVERY_RECORDS, RecoveryEvidenceDiscovery, discover_recovery_evidence,
 };
 pub use rotation::{
     GENERATIONS_IO_FAULT, JOURNAL_ACTIVE_SUFFIX, JournalRotation, POINTER_DIR_SYNC_FAULT,
