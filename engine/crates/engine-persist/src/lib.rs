@@ -40,6 +40,7 @@
 pub mod ancestry_accounting;
 pub mod ancestry_history;
 pub mod ancestry_witness;
+pub mod batch_completion;
 pub mod checkpoint;
 pub mod composite_append;
 pub mod composite_manifest;
@@ -96,6 +97,15 @@ pub use ancestry_witness::{
     reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
     validate_index_shape, validate_parent_edges_standalone, verify_exact_coverage,
     verify_installed_ancestry_witness, verify_witness_standalone, witness_coverage_digest,
+};
+pub use batch_completion::{
+    BATCH_CLASSIFICATION_COMMITMENT_MAGIC, BATCH_CLASSIFICATION_COMMITMENT_VERSION,
+    BatchClassificationCommitment, BatchCompletionContext, BatchCompletionMarkerV2,
+    CLASSIFICATION_ENTRY_BYTES, ClassificationCommitmentBuilder, ClassificationCounters,
+    ClassificationEntry, EntryClassification, MAX_V2_BATCH_CLASSIFICATION_ENTRIES,
+    RECLAMATION_COMPLETE_FAMILY, RECLAMATION_COMPLETE_V2_DOMAIN,
+    RECLAMATION_COMPLETE_V2_KEY_DOMAIN, RECLAMATION_COMPLETE_V2_VERSION, commit_classification,
+    is_reclamation_complete_family, reclamation_complete_v2_idempotency_key,
 };
 pub use checkpoint::{
     CHECKPOINT_METADATA_DOMAIN, CHECKPOINT_METADATA_VERSION, CHECKPOINT_MK_KEY_DOMAIN,
