@@ -72,9 +72,12 @@ mod tests;
 pub use ancestry_accounting::{
     AccountingCounts, AccountingLimitations, AccountingLimits, Classification,
     CollisionClassification, DeeperHistoryScope, DeferredIdentity, LiveCoordination,
-    MandatoryIdentity, NamespaceCollision, PriorBatchCompletionTrust, PriorBatchPremise,
-    ProtectorKind, ProtectorRef, RetirementAccounting, ScratchReport, SharedReference, StorageRole,
-    SurvivorRootSummary, account_batch_retirement,
+    MAX_ACCOUNTING_CLASSIFIED_LIST, MAX_ACCOUNTING_COLLISION_LIST, MAX_ACCOUNTING_PROTECTOR_LIST,
+    MAX_ACCOUNTING_RUN_BUFFER_ENTRIES, MAX_ACCOUNTING_RUN_COUNT,
+    MAX_ACCOUNTING_SCRATCH_BYTE_CEILING, MAX_ACCOUNTING_SHARED_LIST, MandatoryIdentity,
+    NamespaceCollision, PriorBatchCompletionTrust, PriorBatchPremise, ProtectorKind, ProtectorRef,
+    RetirementAccounting, ScratchReport, SharedReference, StorageRole, SurvivorRootSummary,
+    account_batch_retirement,
 };
 pub use ancestry_history::{
     BatchPosition, HistoricalStep, HistoryWalkSummary, walk_authenticated_history,
