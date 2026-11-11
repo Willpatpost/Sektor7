@@ -102,7 +102,8 @@ use std::fmt;
 
 use crate::ancestry_witness::{
     AncestryWitnessManifest, AncestryWitnessShard, RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
-    reclamation_witness_manifest_idempotency_key, validate_index_shape,
+    reclamation_witness_manifest_idempotency_key, reclamation_witness_shard_idempotency_key,
+    validate_index_shape,
 };
 use crate::checkpoint::{CheckpointMetadata, ReclaimedIndexEntry, checkpoint_mk_idempotency_key};
 use crate::hash::Hash;
@@ -445,6 +446,12 @@ pub enum EvidenceDegradation {
     /// it must bind to (the publication order makes an orphaned
     /// manifest incoherent retained evidence).
     OrphanedWitnessManifest { record: Hash },
+    /// A recognized reclamation-family record whose DECODED
+    /// payload binds the covering MK was observed carrying an
+    /// incorrect deterministic key — same-checkpoint evidence
+    /// with a wrong key is a contradiction, never an absence (the
+    /// family names the expected key's family).
+    SameCheckpointWrongKeyEvidence { record: Hash, family: &'static str },
 }
 
 // ==================================================== the witness evidence
@@ -512,6 +519,24 @@ pub enum WitnessDegradation {
     /// A shard's bindings disagree with the manifest (the rule
     /// names the field).
     ShardBindingMismatch { index: u64, rule: &'static str },
+    /// An observed shard record's key is not the exact canonical
+    /// deterministic key for its parsed index (a noncanonical
+    /// decimal spelling, a malformed suffix, or another
+    /// same-checkpoint key form) — refused without normalization,
+    /// never silently treated as absent.
+    ShardKeyNoncanonical { detail: String },
+    /// The accumulated shard census overflowed checked
+    /// arithmetic.
+    ShardCensusOverflow,
+    /// The accumulated per-shard member census disagrees with the
+    /// manifest's total member count (the census is the SUM of
+    /// the per-shard counts — an individual shard is never
+    /// required to carry the complete census).
+    ShardCensusMismatch { manifest: u64, accumulated: u64 },
+    /// The observed ancestry order does not preserve the accepted
+    /// publication order (the shards in ascending index order,
+    /// then the manifest LAST — the rule names the violation).
+    PublicationOrderViolation { rule: &'static str },
 }
 
 // ======================================================== the result
@@ -636,6 +661,7 @@ pub fn classify_recovery_evidence<R: BeginReads>(
         reads,
         &discovery,
         &key_records,
+        &positions,
         covering,
         plan_record,
         begin_record,
@@ -732,9 +758,21 @@ fn classify_state<R: BeginReads>(
                         record: begin.identity,
                     },
                 },
-                None => RecoveryState::NoRetirementEvidenceObserved {
-                    covering: Box::new(covering.clone()),
-                },
+                None => {
+                    // The same-MK wrong-key scan: recognized
+                    // reclamation-family evidence binding the
+                    // covering MK on an incorrect key is a
+                    // contradiction, never an absence — it must
+                    // not classify as "no retirement evidence".
+                    if let Err(reason) =
+                        scan_same_checkpoint_wrong_key_evidence(reads, discovery, covering, None)
+                    {
+                        return RecoveryState::EvidenceDegraded { reason };
+                    }
+                    RecoveryState::NoRetirementEvidenceObserved {
+                        covering: Box::new(covering.clone()),
+                    }
+                }
             }
         }
         (None, Some(v1)) => {
@@ -893,18 +931,74 @@ fn classify_v2_lane<R: BeginReads>(
 
     // ---- L4: the begin ----
     let Some(begin) = begin_record else {
-        // No begin observed: the per-batch audit observations
-        // (NOT degradations — the publication may legitimately be
-        // mid-flight).
+        // No begin observed: every OBSERVED plan-defined audit is
+        // still validated in full (an invalid observed audit is
+        // never a harmless publication-in-progress observation);
+        // missing audits remain not-observed (never degradations
+        // — the publication may legitimately be mid-flight).
+        let index_by_hash: BTreeMap<Hash, &ReclaimedIndexEntry> = metadata
+            .index
+            .iter()
+            .map(|entry| (entry.hash, entry))
+            .collect();
         let mut audits_observed = Vec::new();
         let mut audits_not_observed = Vec::new();
         for batch in &plan_observation.plan.batches {
             let audit_key = reclamation_ledger_v2_idempotency_key(&mk, batch.index);
-            if key_records.contains_key(audit_key.as_slice()) {
-                audits_observed.push(batch.index);
-            } else {
-                audits_not_observed.push(batch.index);
+            match key_records.get(audit_key.as_slice()).copied() {
+                Some(audit) => {
+                    if let Err(reason) = validate_observed_audit(
+                        reads,
+                        audit,
+                        covering,
+                        &plan_observation.plan,
+                        &index_by_hash,
+                        batch,
+                    ) {
+                        return RecoveryState::EvidenceDegraded { reason };
+                    }
+                    audits_observed.push(batch.index);
+                }
+                None => audits_not_observed.push(batch.index),
             }
+        }
+        // An observed covering-MK Batch marker whose context
+        // requires a begin that is not observed is a
+        // CONTRADICTION, never harmless incomplete publication.
+        for candidate in &discovery.completion_candidates {
+            let rule = match &candidate.structural {
+                CompletionStructural::V1Marker => continue,
+                CompletionStructural::NotBoundToCoveringCheckpoint => {
+                    String::from("not-bound-to-covering-checkpoint")
+                }
+                CompletionStructural::ContextIncomplete { .. } => {
+                    String::from("begin-not-observed")
+                }
+                CompletionStructural::StructuralRefusal { rule } => rule.clone(),
+                // Unreachable without an observed begin in the
+                // discovery's marker context — refused closed.
+                CompletionStructural::StructuralCandidate(_) => {
+                    String::from("structural-candidate-without-begin")
+                }
+            };
+            return RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MarkerContradicted {
+                    record: candidate.record,
+                    batch: candidate.batch_index,
+                    rule,
+                },
+            };
+        }
+        // The same-MK wrong-key scan: recognized reclamation-family
+        // evidence binding the covering MK on an incorrect key is
+        // a contradiction, never an absence.
+        if let Err(reason) = scan_same_checkpoint_wrong_key_evidence(
+            reads,
+            discovery,
+            covering,
+            Some(&plan_observation.plan),
+        ) {
+            return RecoveryState::EvidenceDegraded { reason };
         }
         return RecoveryState::PlanObservedWithoutBegin {
             covering: Box::new(covering.clone()),
@@ -979,7 +1073,10 @@ fn classify_v2_lane<R: BeginReads>(
         };
     }
 
-    // ---- L5: every plan batch's audit ----
+    // ---- L5: every plan batch's audit (the all-audits-required
+    // rule and the strict audit-before-begin temporal requirement
+    // are begin-lane-only; the payload validation itself is the
+    // shared per-batch helper) ----
     // The index lookup map (built once — no per-batch rescans).
     let index_by_hash: BTreeMap<Hash, &ReclaimedIndexEntry> = metadata
         .index
@@ -1002,98 +1099,15 @@ fn classify_v2_lane<R: BeginReads>(
                 },
             };
         }
-        let Some(audit_object) = audit.first_object else {
-            return RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::AuditEvidenceUnreadable {
-                    batch: batch.index,
-                    detail: String::from("no-first-object"),
-                },
-            };
-        };
-        let bytes = match reads.read_object_bytes(&audit_object) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return RecoveryState::EvidenceDegraded {
-                    reason: EvidenceDegradation::AuditEvidenceUnreadable {
-                        batch: batch.index,
-                        detail: format!("{error}"),
-                    },
-                };
-            }
-        };
-        if bytes.len() as u64 > decoded_plan.ledger_byte_limit {
-            return RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::AuditByteLimitExceeded {
-                    batch: batch.index,
-                    observed: bytes.len() as u64,
-                    limit: decoded_plan.ledger_byte_limit,
-                },
-            };
-        }
-        let ledger = match ReclamationLedgerV2::decode(&bytes) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                return RecoveryState::EvidenceDegraded {
-                    reason: EvidenceDegradation::MalformedAuditPayload {
-                        batch: batch.index,
-                        reason: format!("{error:?}"),
-                    },
-                };
-            }
-        };
-        if ledger.mk != mk
-            || ledger.sk != metadata.sk
-            || ledger.batch != batch.index
-            || ledger.range_digest != metadata.range_digest
-            || ledger.seed != metadata.seed
-        {
-            return RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::AuditBindingMismatch {
-                    batch: batch.index,
-                    rule: "bindings",
-                },
-            };
-        }
-        // The exact ordered unit-record membership.
-        let mut diverged: Option<usize> = None;
-        if ledger.units.len() != batch.records.len() {
-            diverged = Some(batch.records.len().min(ledger.units.len()));
-        } else {
-            for (position, (unit, record)) in ledger.units.iter().zip(&batch.records).enumerate() {
-                if unit.record != *record {
-                    diverged = Some(position);
-                    break;
-                }
-            }
-        }
-        if let Some(position) = diverged {
-            return RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::AuditUnitsMismatch {
-                    batch: batch.index,
-                    position,
-                },
-            };
-        }
-        // The recomputed retained key count (the accepted
-        // invariant): the keyed members of this batch according
-        // to the retained checkpoint index.
-        let expected_keys = batch
-            .records
-            .iter()
-            .filter(|record| {
-                index_by_hash
-                    .get(*record)
-                    .is_some_and(|entry| entry.key.is_some())
-            })
-            .count() as u64;
-        if ledger.reclaimed_keys != expected_keys {
-            return RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::AuditKeyedCountMismatch {
-                    batch: batch.index,
-                    observed: ledger.reclaimed_keys,
-                    expected: expected_keys,
-                },
-            };
+        if let Err(reason) = validate_observed_audit(
+            reads,
+            audit,
+            covering,
+            &plan_observation.plan,
+            &index_by_hash,
+            batch,
+        ) {
+            return RecoveryState::EvidenceDegraded { reason };
         }
     }
     let begin_observation = Box::new(ObservedBegin {
@@ -1196,6 +1210,201 @@ fn classify_v2_lane<R: BeginReads>(
     }
 }
 
+// -------------------------------------------- the shared audit validation
+
+/// The L5 audit validation for ONE observed plan batch — shared
+/// by the begin and no-begin lanes (every OBSERVED audit is
+/// validated in full regardless of the begin; only the
+/// all-audits-required rule and the strict audit-before-begin
+/// temporal requirement are begin-lane-only, enforced by the
+/// callers).
+fn validate_observed_audit<R: BeginReads>(
+    reads: &mut R,
+    audit: &DiscoveredRecord,
+    covering: &CoveringCheckpoint,
+    decoded_plan: &ReclaimPlan,
+    index_by_hash: &BTreeMap<Hash, &ReclaimedIndexEntry>,
+    batch: &crate::reclaim::PlanBatch,
+) -> Result<(), EvidenceDegradation> {
+    let mk = covering.record;
+    let metadata = &covering.metadata;
+    let Some(audit_object) = audit.first_object else {
+        return Err(EvidenceDegradation::AuditEvidenceUnreadable {
+            batch: batch.index,
+            detail: String::from("no-first-object"),
+        });
+    };
+    let bytes = match reads.read_object_bytes(&audit_object) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(EvidenceDegradation::AuditEvidenceUnreadable {
+                batch: batch.index,
+                detail: format!("{error}"),
+            });
+        }
+    };
+    if bytes.len() as u64 > decoded_plan.ledger_byte_limit {
+        return Err(EvidenceDegradation::AuditByteLimitExceeded {
+            batch: batch.index,
+            observed: bytes.len() as u64,
+            limit: decoded_plan.ledger_byte_limit,
+        });
+    }
+    let ledger = match ReclamationLedgerV2::decode(&bytes) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            return Err(EvidenceDegradation::MalformedAuditPayload {
+                batch: batch.index,
+                reason: format!("{error:?}"),
+            });
+        }
+    };
+    if ledger.mk != mk
+        || ledger.sk != metadata.sk
+        || ledger.batch != batch.index
+        || ledger.range_digest != metadata.range_digest
+        || ledger.seed != metadata.seed
+    {
+        return Err(EvidenceDegradation::AuditBindingMismatch {
+            batch: batch.index,
+            rule: "bindings",
+        });
+    }
+    // The exact ordered unit-record membership.
+    let mut diverged: Option<usize> = None;
+    if ledger.units.len() != batch.records.len() {
+        diverged = Some(batch.records.len().min(ledger.units.len()));
+    } else {
+        for (position, (unit, record)) in ledger.units.iter().zip(&batch.records).enumerate() {
+            if unit.record != *record {
+                diverged = Some(position);
+                break;
+            }
+        }
+    }
+    if let Some(position) = diverged {
+        return Err(EvidenceDegradation::AuditUnitsMismatch {
+            batch: batch.index,
+            position,
+        });
+    }
+    // The recomputed retained key count (the accepted invariant):
+    // the keyed members of this batch according to the retained
+    // checkpoint index.
+    let expected_keys = batch
+        .records
+        .iter()
+        .filter(|record| {
+            index_by_hash
+                .get(*record)
+                .is_some_and(|entry| entry.key.is_some())
+        })
+        .count() as u64;
+    if ledger.reclaimed_keys != expected_keys {
+        return Err(EvidenceDegradation::AuditKeyedCountMismatch {
+            batch: batch.index,
+            observed: ledger.reclaimed_keys,
+            expected: expected_keys,
+        });
+    }
+    Ok(())
+}
+
+// ------------------------------------------ the F5 same-MK wrong-key scan
+
+/// The same-MK wrong-key scan: recognized reclamation-family
+/// records whose DECODED payload binds the covering MK but whose
+/// record carries an incorrect deterministic key — a
+/// contradiction, never an absence. Foreign-checkpoint evidence
+/// (a payload binding another MK) is never promoted. `plan`, when
+/// present, names the expected audit keys to exclude (the
+/// correctly-keyed audits are validated by their own lane).
+fn scan_same_checkpoint_wrong_key_evidence<R: BeginReads>(
+    reads: &mut R,
+    discovery: &RecoveryEvidenceDiscovery,
+    covering: &CoveringCheckpoint,
+    plan: Option<&ReclaimPlan>,
+) -> Result<(), EvidenceDegradation> {
+    let mk = covering.record;
+    let plan_key = reclamation_plan_idempotency_key(&mk);
+    let begin_key = reclamation_begin_idempotency_key(&mk);
+    let expected_audit_keys: Vec<Vec<u8>> = plan
+        .map(|plan| {
+            plan.batches
+                .iter()
+                .map(|batch| reclamation_ledger_v2_idempotency_key(&mk, batch.index))
+                .collect()
+        })
+        .unwrap_or_default();
+    for record in &discovery.records {
+        let Some(key) = record.key.as_deref() else {
+            continue;
+        };
+        match record.family {
+            DiscoveredFamily::ReclamationPlan => {
+                if key == plan_key.as_slice() {
+                    continue;
+                }
+                if let DiscoveredPayload::Plan(decoded) = &record.payload
+                    && decoded.mk == mk
+                {
+                    return Err(EvidenceDegradation::SameCheckpointWrongKeyEvidence {
+                        record: record.identity,
+                        family: "plan",
+                    });
+                }
+            }
+            DiscoveredFamily::ReclamationBegin => {
+                if key == begin_key.as_slice() {
+                    continue;
+                }
+                if let DiscoveredPayload::Begin(decoded) = &record.payload
+                    && decoded.mk == mk
+                {
+                    return Err(EvidenceDegradation::SameCheckpointWrongKeyEvidence {
+                        record: record.identity,
+                        family: "begin",
+                    });
+                }
+            }
+            DiscoveredFamily::ReclamationAuditV2 => {
+                if expected_audit_keys
+                    .iter()
+                    .any(|expected| expected.as_slice() == key)
+                {
+                    continue;
+                }
+                // The audit payload is not decoded by the
+                // discovery — read and decode it (bounded by the
+                // accepted ceiling) solely to test the MK binding;
+                // an unreadable or undecodable foreign-keyed audit
+                // is not attributable to the covering checkpoint
+                // and is never promoted.
+                let Some(object) = record.first_object else {
+                    continue;
+                };
+                let Ok(bytes) = reads.read_object_bytes(&object) else {
+                    continue;
+                };
+                if bytes.len() as u64 > MAX_RECLAMATION_LEDGER_BYTES {
+                    continue;
+                }
+                let Ok(ledger) = ReclamationLedgerV2::decode(&bytes) else {
+                    continue;
+                };
+                if ledger.mk == mk {
+                    return Err(EvidenceDegradation::SameCheckpointWrongKeyEvidence {
+                        record: record.identity,
+                        family: "audit",
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // ------------------------------------------------- the L3 local partition
 
 /// The local plan-index membership comparison (the owner's
@@ -1243,6 +1452,7 @@ fn classify_witness_evidence<R: BeginReads>(
     reads: &mut R,
     discovery: &RecoveryEvidenceDiscovery,
     key_records: &BTreeMap<Vec<u8>, &DiscoveredRecord>,
+    positions: &BTreeMap<Hash, usize>,
     covering: &CoveringCheckpoint,
     plan: Option<&DiscoveredRecord>,
     begin: Option<&DiscoveredRecord>,
@@ -1251,8 +1461,15 @@ fn classify_witness_evidence<R: BeginReads>(
     let manifest_record = key_records
         .get(reclamation_witness_manifest_idempotency_key(&mk).as_slice())
         .copied();
-    // The observed shard records (by the parsed deterministic
-    // index relative to the covering MK).
+    // The observed shard records, keyed by the EXACT canonical
+    // deterministic key for the covering MK: the index is parsed
+    // and bounded WITHOUT lossy normalization, the canonical key
+    // is reconstructed, and byte equality is required — a
+    // noncanonical decimal spelling, a malformed suffix, or
+    // another same-checkpoint key form refuses typed (F2: a
+    // malformed observed shard is never silently treated as
+    // absent). A shard-family record keyed for ANOTHER checkpoint
+    // is foreign evidence — never promoted, never a degradation.
     let shard_prefix = format!("{RECLAMATION_WITNESS_SHARD_KEY_DOMAIN}:{}:", mk.hex());
     let mut observed_shards: Vec<(u64, &DiscoveredRecord)> = Vec::new();
     for record in &discovery.records {
@@ -1263,12 +1480,28 @@ fn classify_witness_evidence<R: BeginReads>(
             continue;
         };
         let key_str = String::from_utf8_lossy(key);
-        if let Some(index) = key_str
-            .strip_prefix(shard_prefix.as_str())
-            .and_then(|tail| tail.parse::<u64>().ok())
-        {
-            observed_shards.push((index, record));
+        let Some(tail) = key_str.strip_prefix(shard_prefix.as_str()) else {
+            continue;
+        };
+        let index = match tail.parse::<u64>() {
+            Ok(index) => index,
+            Err(_) => {
+                return WitnessEvidenceObservation::Degraded {
+                    reason: WitnessDegradation::ShardKeyNoncanonical {
+                        detail: format!("malformed shard index suffix: {tail}"),
+                    },
+                };
+            }
+        };
+        let canonical_key = reclamation_witness_shard_idempotency_key(&mk, index);
+        if key != canonical_key.as_slice() {
+            return WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical {
+                    detail: format!("noncanonical key spelling for shard index {index}"),
+                },
+            };
         }
+        observed_shards.push((index, record));
     }
     observed_shards.sort_by_key(|(index, _)| *index);
 
@@ -1365,9 +1598,15 @@ fn classify_witness_evidence<R: BeginReads>(
         };
     }
     // Every shard: read, strict-decode, bindings. One payload at
-    // a time (the accepted single-shard ceiling).
+    // a time (the accepted single-shard ceiling). The per-shard
+    // member count is the shard's OWN entry census (the strict
+    // decode enforces it against the entries) — an individual
+    // shard is never required to carry the manifest's complete
+    // census; the census is accumulated and compared ONCE at the
+    // end (F1).
+    let mut census: u64 = 0;
     let mut shard_records = Vec::new();
-    for (index, record) in observed_shards {
+    for &(index, record) in &observed_shards {
         let Some(object) = record.first_object else {
             return WitnessEvidenceObservation::Degraded {
                 reason: WitnessDegradation::ShardUnreadable {
@@ -1398,10 +1637,7 @@ fn classify_witness_evidence<R: BeginReads>(
                 };
             }
         };
-        if shard.mk != mk
-            || shard.shard_index != index
-            || shard.shard_count != decoded.shard_count
-            || shard.member_count != decoded.member_count
+        if shard.mk != mk || shard.shard_index != index || shard.shard_count != decoded.shard_count
         {
             return WitnessEvidenceObservation::Degraded {
                 reason: WitnessDegradation::ShardBindingMismatch {
@@ -1410,7 +1646,52 @@ fn classify_witness_evidence<R: BeginReads>(
                 },
             };
         }
+        census = match census.checked_add(shard.member_count) {
+            Some(sum) => sum,
+            None => {
+                return WitnessEvidenceObservation::Degraded {
+                    reason: WitnessDegradation::ShardCensusOverflow,
+                };
+            }
+        };
         shard_records.push(record.identity);
+    }
+    if census != decoded.member_count {
+        return WitnessEvidenceObservation::Degraded {
+            reason: WitnessDegradation::ShardCensusMismatch {
+                manifest: decoded.member_count,
+                accumulated: census,
+            },
+        };
+    }
+    // The accepted publication order (F3): the shard records are
+    // installed in ascending shard-index order, followed by the
+    // manifest LAST — on the newest-first discovery order, the
+    // manifest's position must be the smallest and the shard
+    // positions must strictly increase as the indices decrease.
+    // The bounded position map is used; nothing below the
+    // covering MK is ever read.
+    let manifest_position = positions[&manifest.identity];
+    let mut previous_shard_position: Option<usize> = None;
+    for (_, record) in &observed_shards {
+        let position = positions[&record.identity];
+        if position < manifest_position {
+            return WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::PublicationOrderViolation {
+                    rule: "manifest-not-newest",
+                },
+            };
+        }
+        if let Some(previous) = previous_shard_position
+            && position >= previous
+        {
+            return WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::PublicationOrderViolation {
+                    rule: "shards-out-of-order",
+                },
+            };
+        }
+        previous_shard_position = Some(position);
     }
     WitnessEvidenceObservation::CoherentlyObserved {
         record: manifest.identity,
@@ -1685,23 +1966,81 @@ mod classification_tests {
             }
         }
 
+        /// The accepted PRODUCTION order: the shard records in
+        /// ascending shard-index order, followed by the manifest
+        /// LAST (F3 — the positive fixtures must match it).
+        fn push_witness_family(
+            &mut self,
+            manifest: &AncestryWitnessManifest,
+            shards: &[AncestryWitnessShard],
+        ) -> Hash {
+            for shard in shards {
+                let shard_key = crate::ancestry_witness::reclamation_witness_shard_idempotency_key(
+                    &self.mk,
+                    shard.shard_index,
+                );
+                let _ = self.chain.push(Some(shard_key), &shard.canonical_bytes()).0;
+            }
+            let manifest_key =
+                crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&self.mk);
+            self.chain
+                .push(Some(manifest_key), &manifest.canonical_bytes())
+                .0
+        }
+
         fn push_witness(
             &mut self,
             manifest: &AncestryWitnessManifest,
             shard: &AncestryWitnessShard,
-        ) -> (Hash, Hash) {
-            let manifest_key =
-                crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&self.mk);
-            let manifest_record = self
-                .chain
-                .push(Some(manifest_key), &manifest.canonical_bytes())
-                .0;
-            let shard_key = crate::ancestry_witness::reclamation_witness_shard_idempotency_key(
-                &self.mk,
-                shard.shard_index,
-            );
-            let shard_record = self.chain.push(Some(shard_key), &shard.canonical_bytes()).0;
-            (manifest_record, shard_record)
+        ) -> Hash {
+            self.push_witness_family(manifest, std::slice::from_ref(shard))
+        }
+
+        /// The two-shard witness with UNEQUAL per-shard counts (the
+        /// F1 census fixture): shard 0 carries [sk, m0], shard 1
+        /// carries [m1] — the census accumulates 2 + 1 = 3 against
+        /// the manifest's total of 3.
+        fn default_two_shard_witness(
+            &self,
+            plan: Hash,
+            begin: Hash,
+        ) -> (AncestryWitnessManifest, Vec<AncestryWitnessShard>) {
+            let manifest = AncestryWitnessManifest {
+                mk: self.mk,
+                plan_record: plan,
+                begin_record: begin,
+                metadata_object: self.mk_object,
+                member_count: 3,
+                shard_count: 2,
+                coverage_digest: [9u8; 32],
+            };
+            let shard0 = AncestryWitnessShard {
+                mk: self.mk,
+                shard_index: 0,
+                shard_count: 2,
+                member_count: 2,
+                entries: vec![
+                    WitnessEntry {
+                        member: self.sk,
+                        preimage: self.sk_bytes.clone(),
+                    },
+                    WitnessEntry {
+                        member: self.m0,
+                        preimage: self.m0_bytes.clone(),
+                    },
+                ],
+            };
+            let shard1 = AncestryWitnessShard {
+                mk: self.mk,
+                shard_index: 1,
+                shard_count: 2,
+                member_count: 1,
+                entries: vec![WitnessEntry {
+                    member: self.m1,
+                    preimage: self.m1_bytes.clone(),
+                }],
+            };
+            (manifest, vec![shard0, shard1])
         }
 
         fn push_marker(&mut self, context: &BatchCompletionContext, key_batch: u64) -> Hash {
@@ -2974,5 +3313,584 @@ mod classification_tests {
             *older_checkpoints,
             OlderRangeStatus::UnresolvedBelowCoveringBoundary
         );
+    }
+
+    // (F1 + F3) The two-shard witness census with UNEQUAL
+    // per-shard counts, published in the accepted production
+    // order (the shards ascending, then the manifest LAST).
+    #[test]
+    fn the_two_shard_witness_census_accumulates_unequal_counts() {
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, shards) = covering.default_two_shard_witness(plan, begin);
+        let _manifest_record = covering.push_witness_family(&manifest, &shards);
+        let context0 = BatchCompletionContext {
+            mk: covering.mk,
+            plan,
+            batch_index: 0,
+            audit: audit0,
+            begin,
+        };
+        let _marker0 = covering.push_marker(&context0, 0);
+        let context1 = BatchCompletionContext {
+            mk: covering.mk,
+            plan,
+            batch_index: 1,
+            audit: audit1,
+            begin,
+        };
+        let _marker1 = covering.push_marker(&context1, 1);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::AllBatchMarkersStructurallyMatched { .. }
+        ));
+        let WitnessEvidenceObservation::CoherentlyObserved {
+            shard_records,
+            manifest: observed_manifest,
+            ..
+        } = &classification.witness
+        else {
+            panic!(
+                "expected CoherentlyObserved, got {:?}",
+                classification.witness
+            );
+        };
+        assert_eq!(observed_manifest.member_count, 3);
+        assert_eq!(observed_manifest.shard_count, 2);
+        assert_eq!(shard_records.len(), 2);
+    }
+
+    // (F1) The accumulated census below and above the manifest's
+    // total refuses typed.
+    #[test]
+    fn the_witness_census_mismatch_refuses_below_and_above() {
+        // Below: shard 0 carries only [sk] — the census
+        // accumulates 1 + 1 = 2 against the manifest's 3.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (mut manifest, mut shards) = covering.default_two_shard_witness(plan, begin);
+        shards[0] = AncestryWitnessShard {
+            mk: covering.mk,
+            shard_index: 0,
+            shard_count: 2,
+            member_count: 1,
+            entries: vec![WitnessEntry {
+                member: covering.sk,
+                preimage: covering.sk_bytes.clone(),
+            }],
+        };
+        let _ = &mut manifest;
+        let _manifest_record = covering.push_witness_family(&manifest, &shards);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardCensusMismatch { manifest, accumulated }
+            } if *manifest == 3 && *accumulated == 2
+        ));
+        // Above: shard 1 carries an additional genuine off-chain
+        // member — the census accumulates 2 + 2 = 4 against 3.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, mut shards) = covering.default_two_shard_witness(plan, begin);
+        let m9_record = crate::record::RevisionRecord::regular(covering.m1, 1, 1);
+        let m9_bytes = m9_record.canonical_bytes();
+        let m9 = crate::hash::hash_object(&m9_bytes);
+        shards[1] = AncestryWitnessShard {
+            mk: covering.mk,
+            shard_index: 1,
+            shard_count: 2,
+            member_count: 2,
+            entries: vec![
+                WitnessEntry {
+                    member: covering.m1,
+                    preimage: covering.m1_bytes.clone(),
+                },
+                WitnessEntry {
+                    member: m9,
+                    preimage: m9_bytes,
+                },
+            ],
+        };
+        let _manifest_record = covering.push_witness_family(&manifest, &shards);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardCensusMismatch { manifest, accumulated }
+            } if *manifest == 3 && *accumulated == 4
+        ));
+    }
+
+    // (F2) Noncanonical shard keys refuse without normalization;
+    // the key/payload-index disagreement refuses at the bindings.
+    #[test]
+    fn noncanonical_shard_keys_refuse_without_normalization() {
+        // A leading-zero index spelling under the covering MK.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        let leading_zero_key = Vec::from(
+            format!(
+                "{}:{}:00",
+                RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
+                covering.mk.hex()
+            )
+            .as_bytes(),
+        );
+        let _shard = covering
+            .chain
+            .push(
+                Some(leading_zero_key),
+                &domain_object(
+                    crate::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN,
+                    b"payload",
+                ),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+        // A malformed index suffix.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        let malformed_key = Vec::from(
+            format!(
+                "{}:{}:x",
+                RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
+                covering.mk.hex()
+            )
+            .as_bytes(),
+        );
+        let _shard = covering
+            .chain
+            .push(
+                Some(malformed_key),
+                &domain_object(
+                    crate::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN,
+                    b"payload",
+                ),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+        // A key/payload-index disagreement: the canonical key for
+        // index 1 carrying a payload that binds shard index 0 (a
+        // complete two-shard set so the binding check — not the
+        // set coherence — is what fires).
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, shards) = covering.default_two_shard_witness(plan, begin);
+        let shard_zero_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&covering.mk, 0);
+        let _genuine = covering
+            .chain
+            .push(Some(shard_zero_key), &shards[0].canonical_bytes())
+            .0;
+        let key_one =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&covering.mk, 1);
+        let _disagreeing = covering
+            .chain
+            .push(Some(key_one), &shards[0].canonical_bytes())
+            .0;
+        let manifest_key =
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&covering.mk);
+        let _manifest = covering
+            .chain
+            .push(Some(manifest_key), &manifest.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardBindingMismatch { index, rule }
+            } if *index == 1 && *rule == "bindings"
+        ));
+    }
+
+    // (F3) The publication order is enforced; the degradation is
+    // orthogonal (the retirement state stands).
+    #[test]
+    fn the_witness_publication_order_is_enforced() {
+        // The manifest published BEFORE the shard.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let manifest = covering.default_manifest(plan, begin);
+        let shard = covering.default_shard();
+        let manifest_key =
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&covering.mk);
+        let _manifest = covering
+            .chain
+            .push(Some(manifest_key), &manifest.canonical_bytes())
+            .0;
+        let shard_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&covering.mk, 0);
+        let _shard = covering
+            .chain
+            .push(Some(shard_key), &shard.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::V2BeginObserved { .. }
+        ));
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::PublicationOrderViolation { rule }
+            } if *rule == "manifest-not-newest"
+        ));
+        // The shards published in reversed order.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, shards) = covering.default_two_shard_witness(plan, begin);
+        let shard_one_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&covering.mk, 1);
+        let _reversed = covering
+            .chain
+            .push(Some(shard_one_key), &shards[1].canonical_bytes())
+            .0;
+        let shard_zero_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&covering.mk, 0);
+        let _reversed = covering
+            .chain
+            .push(Some(shard_zero_key), &shards[0].canonical_bytes())
+            .0;
+        let manifest_key =
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&covering.mk);
+        let _manifest = covering
+            .chain
+            .push(Some(manifest_key), &manifest.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::V2BeginObserved { .. }
+        ));
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::PublicationOrderViolation { rule }
+            } if *rule == "shards-out-of-order"
+        ));
+    }
+
+    // (F4) Observed audits validate in full without a begin.
+    #[test]
+    fn observed_audits_validate_without_a_begin() {
+        // Valid observed audits: the state stands with the exact
+        // observation lists.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        let RecoveryState::PlanObservedWithoutBegin {
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = &classification.state
+        else {
+            panic!(
+                "expected PlanObservedWithoutBegin, got {:?}",
+                classification.state
+            );
+        };
+        assert_eq!(audits_observed.as_slice(), &[0, 1]);
+        assert!(audits_not_observed.is_empty());
+        // A malformed observed audit degrades even without a
+        // begin.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let audit0_key = reclamation_ledger_v2_idempotency_key(&covering.mk, 0);
+        let _audit0 = covering
+            .chain
+            .push(
+                Some(audit0_key),
+                &domain_object(RECLAMATION_LEDGER_V2_DOMAIN, b"garbage"),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MalformedAuditPayload { batch, .. }
+            } if *batch == 0
+        ));
+        // A lying audit binding (batch 1 under the batch-0 key).
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let mut lying = covering.default_audit(0);
+        lying.batch = 1;
+        let lying_key = reclamation_ledger_v2_idempotency_key(&covering.mk, 0);
+        let _audit0 = covering
+            .chain
+            .push(Some(lying_key), &lying.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::AuditBindingMismatch { batch, .. }
+            } if *batch == 0
+        ));
+        // Reordered units.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let mut reordered = covering.default_audit(0);
+        reordered.units.reverse();
+        let _audit0 = covering.push_audit(&reordered);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::AuditUnitsMismatch { batch, position }
+            } if *batch == 0 && *position == 0
+        ));
+        // The reclaimed_keys miscount.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let mut miscounted = covering.default_audit(0);
+        miscounted.reclaimed_keys = 2;
+        let _audit0 = covering.push_audit(&miscounted);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::AuditKeyedCountMismatch {
+                    batch,
+                    observed,
+                    expected,
+                }
+            } if *batch == 0 && *observed == 2 && *expected == 1
+        ));
+        // The admitted ledger byte-limit violation.
+        let mut covering = covering_chain();
+        let audit0_probe = covering.default_audit(0);
+        let mut plan_payload = covering.default_plan();
+        plan_payload.ledger_byte_limit = audit0_probe.canonical_bytes().len() as u64 - 1;
+        let _plan = covering.push_plan(&plan_payload);
+        let _audit0 = covering.push_audit(&audit0_probe);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::AuditByteLimitExceeded { batch, .. }
+            } if *batch == 0
+        ));
+    }
+
+    // (F4) A marker requiring an unobserved begin contradicts the
+    // no-begin state — never harmless incomplete publication.
+    #[test]
+    fn a_marker_requiring_an_unobserved_begin_contradicts_the_no_begin_state() {
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let audit1 = covering.push_audit(&audit1);
+        // A genuine marker for batch 0 — but NO begin is ever
+        // pushed: the discovery's structural pass cannot assemble
+        // the context, and the classifier refuses the
+        // contradiction.
+        let context0 = BatchCompletionContext {
+            mk: covering.mk,
+            plan,
+            batch_index: 0,
+            audit: audit0,
+            begin: crate::hash::hash_object(b"b-r1a1-never-pushed-begin"),
+        };
+        let marker = covering.push_marker(&context0, 0);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        let RecoveryState::EvidenceDegraded { reason } = &classification.state else {
+            panic!("expected EvidenceDegraded, got {:?}", classification.state);
+        };
+        assert!(matches!(
+            reason,
+            EvidenceDegradation::MarkerContradicted { record, batch: _, rule }
+                if *record == marker && rule == "begin-not-observed"
+        ));
+        let _ = audit1;
+    }
+
+    // (F5) Same-checkpoint wrong-key evidence refuses; foreign
+    // evidence is never promoted.
+    #[test]
+    fn same_checkpoint_wrong_key_evidence_refuses() {
+        // A plan payload binding the covering MK on a foreign
+        // checkpoint's plan key — in the no-evidence lane.
+        let mut covering = covering_chain();
+        let foreign_mk = crate::hash::hash_object(b"b-r1a1-foreign-mk");
+        let wrong_key = reclamation_plan_idempotency_key(&foreign_mk);
+        let plan_payload = covering.default_plan();
+        let wrong_plan = covering
+            .chain
+            .push(Some(wrong_key), &plan_payload.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        let RecoveryState::EvidenceDegraded { reason } = &classification.state else {
+            panic!("expected EvidenceDegraded, got {:?}", classification.state);
+        };
+        assert!(matches!(
+            reason,
+            EvidenceDegradation::SameCheckpointWrongKeyEvidence { record, family }
+                if *record == wrong_plan && *family == "plan"
+        ));
+        // A begin payload binding the covering MK on a foreign
+        // begin key — in the plan-without-begin lane.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let foreign_begin_key = reclamation_begin_idempotency_key(&foreign_mk);
+        let begin_payload = ReclamationBegin {
+            mk: covering.mk,
+            source: plan,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+        };
+        let wrong_begin = covering
+            .chain
+            .push(Some(foreign_begin_key), &begin_payload.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::SameCheckpointWrongKeyEvidence { record, family }
+            } if *record == wrong_begin && *family == "begin"
+        ));
+        // An audit payload binding the covering MK on a foreign
+        // audit key — in the plan-without-begin lane (a wrong-key
+        // audit is never an innocent missing audit).
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let _plan = covering.push_plan(&plan_payload);
+        let foreign_audit_key = reclamation_ledger_v2_idempotency_key(&foreign_mk, 0);
+        let audit_payload = covering.default_audit(0);
+        let wrong_audit = covering
+            .chain
+            .push(Some(foreign_audit_key), &audit_payload.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::SameCheckpointWrongKeyEvidence { record, family }
+            } if *record == wrong_audit && *family == "audit"
+        ));
+        // Legitimate foreign-checkpoint evidence (the payload
+        // binding the FOREIGN MK) is never promoted: the state
+        // stands as the honest absence.
+        let mut covering = covering_chain();
+        let foreign_plan_payload = ReclaimPlan {
+            mk: foreign_mk,
+            sk: covering.sk,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            ledger_byte_limit: 512 * 1024,
+            batches: vec![PlanBatch {
+                index: 0,
+                records: vec![covering.sk],
+            }],
+            journal_files: Vec::new(),
+        };
+        let foreign_plan_key = reclamation_plan_idempotency_key(&foreign_mk);
+        let _foreign_plan = covering
+            .chain
+            .push(
+                Some(foreign_plan_key),
+                &foreign_plan_payload.canonical_bytes(),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::NoRetirementEvidenceObserved { .. }
+        ));
     }
 }
