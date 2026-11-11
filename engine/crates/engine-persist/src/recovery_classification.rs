@@ -97,7 +97,7 @@
 //! structures); memory O(R) plus one payload at a time (R =
 //! records consulted).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::ancestry_witness::{
@@ -525,6 +525,11 @@ pub enum WitnessDegradation {
     /// same-checkpoint key form) — refused without normalization,
     /// never silently treated as absent.
     ShardKeyNoncanonical { detail: String },
+    /// A recognized manifest-family record whose strictly decoded
+    /// payload binds the covering MK but whose record key differs
+    /// from the expected deterministic manifest key — a
+    /// same-checkpoint contradiction, never an absence (F6).
+    ManifestKeyNoncanonical { detail: String },
     /// The accumulated shard census overflowed checked
     /// arithmetic.
     ShardCensusOverflow,
@@ -1318,7 +1323,11 @@ fn validate_observed_audit<R: BeginReads>(
 /// contradiction, never an absence. Foreign-checkpoint evidence
 /// (a payload binding another MK) is never promoted. `plan`, when
 /// present, names the expected audit keys to exclude (the
-/// correctly-keyed audits are validated by their own lane).
+/// correctly-keyed audits are validated by their own lane). The
+/// expected audit keys are built ONCE into a bounded ordered set
+/// and tested by membership — the scan is O((B + R) log B) over
+/// B plan batches and R discovered records, never the
+/// batch-count × ancestry linear rescan (F7).
 fn scan_same_checkpoint_wrong_key_evidence<R: BeginReads>(
     reads: &mut R,
     discovery: &RecoveryEvidenceDiscovery,
@@ -1328,7 +1337,7 @@ fn scan_same_checkpoint_wrong_key_evidence<R: BeginReads>(
     let mk = covering.record;
     let plan_key = reclamation_plan_idempotency_key(&mk);
     let begin_key = reclamation_begin_idempotency_key(&mk);
-    let expected_audit_keys: Vec<Vec<u8>> = plan
+    let expected_audit_keys: BTreeSet<Vec<u8>> = plan
         .map(|plan| {
             plan.batches
                 .iter()
@@ -1368,10 +1377,7 @@ fn scan_same_checkpoint_wrong_key_evidence<R: BeginReads>(
                 }
             }
             DiscoveredFamily::ReclamationAuditV2 => {
-                if expected_audit_keys
-                    .iter()
-                    .any(|expected| expected.as_slice() == key)
-                {
+                if expected_audit_keys.contains(key) {
                     continue;
                 }
                 // The audit payload is not decoded by the
@@ -1458,19 +1464,61 @@ fn classify_witness_evidence<R: BeginReads>(
     begin: Option<&DiscoveredRecord>,
 ) -> WitnessEvidenceObservation {
     let mk = covering.record;
-    let manifest_record = key_records
-        .get(reclamation_witness_manifest_idempotency_key(&mk).as_slice())
-        .copied();
+    let manifest_key = reclamation_witness_manifest_idempotency_key(&mk);
+    let manifest_record = key_records.get(manifest_key.as_slice()).copied();
+    // The F6 same-MK manifest-family scan: a recognized
+    // manifest-family record whose strictly decoded payload binds
+    // the covering MK but whose key differs from the expected
+    // deterministic manifest key is a same-checkpoint
+    // contradiction — never a silent absence, never
+    // NoneObserved. A legitimate foreign-checkpoint manifest
+    // (the payload binding another MK) remains a foreign
+    // observation, never a covering-MK degradation. The payload
+    // is read and strictly decoded solely to test the MK binding
+    // (the manifest is a small fixed-width structure); an
+    // unreadable or undecodable foreign-keyed manifest is never
+    // attributed.
+    for record in &discovery.records {
+        if record.family != DiscoveredFamily::AncestryWitnessManifest {
+            continue;
+        }
+        let Some(key) = record.key.as_deref() else {
+            continue;
+        };
+        if key == manifest_key.as_slice() {
+            continue;
+        }
+        let Some(object) = record.first_object else {
+            continue;
+        };
+        let Ok(bytes) = reads.read_object_bytes(&object) else {
+            continue;
+        };
+        if let Ok(decoded) = AncestryWitnessManifest::decode(&bytes)
+            && decoded.mk == mk
+        {
+            return WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ManifestKeyNoncanonical {
+                    detail: String::from(
+                        "the same-checkpoint manifest payload is carried under an incorrect key",
+                    ),
+                },
+            };
+        }
+    }
     // The observed shard records, keyed by the EXACT canonical
     // deterministic key for the covering MK: the index is parsed
     // and bounded WITHOUT lossy normalization, the canonical key
     // is reconstructed, and byte equality is required — a
-    // noncanonical decimal spelling, a malformed suffix, or
-    // another same-checkpoint key form refuses typed (F2: a
+    // noncanonical decimal spelling, a malformed suffix (INCLUDING
+    // a same-MK key whose trailing `:<index>` portion is missing
+    // or otherwise not index-separable), an overflowing index, or
+    // another same-checkpoint key form refuses typed (F2/F6: a
     // malformed observed shard is never silently treated as
     // absent). A shard-family record keyed for ANOTHER checkpoint
     // is foreign evidence — never promoted, never a degradation.
     let shard_prefix = format!("{RECLAMATION_WITNESS_SHARD_KEY_DOMAIN}:{}:", mk.hex());
+    let shard_mk_binding = format!("{RECLAMATION_WITNESS_SHARD_KEY_DOMAIN}:{}", mk.hex());
     let mut observed_shards: Vec<(u64, &DiscoveredRecord)> = Vec::new();
     for record in &discovery.records {
         if record.family != DiscoveredFamily::AncestryWitnessShard {
@@ -1480,8 +1528,26 @@ fn classify_witness_evidence<R: BeginReads>(
             continue;
         };
         let key_str = String::from_utf8_lossy(key);
-        let Some(tail) = key_str.strip_prefix(shard_prefix.as_str()) else {
-            continue;
+        let tail = match key_str.strip_prefix(shard_prefix.as_str()) {
+            Some(tail) => tail,
+            None => {
+                // A same-MK shard-family key that does not carry
+                // the index separator is a malformed observed
+                // shard (the mk binding is exact — the fixed-width
+                // hex identities cannot be prefixes of one
+                // another, so a foreign checkpoint's key never
+                // matches this arm).
+                if key_str.starts_with(shard_mk_binding.as_str()) {
+                    return WitnessEvidenceObservation::Degraded {
+                        reason: WitnessDegradation::ShardKeyNoncanonical {
+                            detail: String::from(
+                                "the same-checkpoint shard key carries no index suffix",
+                            ),
+                        },
+                    };
+                }
+                continue;
+            }
         };
         let index = match tail.parse::<u64>() {
             Ok(index) => index,
@@ -3892,5 +3958,335 @@ mod classification_tests {
             &classification.state,
             RecoveryState::NoRetirementEvidenceObserved { .. }
         ));
+    }
+
+    // (F6.3 + F6.5) A same-MK shard key missing the `:<index>`
+    // suffix degrades — alone AND alongside an otherwise complete
+    // witness (never CoherentlyObserved, never a silent absence).
+    #[test]
+    fn same_mk_shard_keys_missing_the_index_suffix_degrade() {
+        // Alone.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        let missing_suffix_key = Vec::from(
+            format!(
+                "{}:{}",
+                RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
+                covering.mk.hex()
+            )
+            .as_bytes(),
+        );
+        let _shard = covering
+            .chain
+            .push(
+                Some(missing_suffix_key),
+                &domain_object(
+                    crate::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN,
+                    b"payload",
+                ),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+        // Alongside the complete two-shard witness: the malformed
+        // extra shard still degrades — never CoherentlyObserved.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, shards) = covering.default_two_shard_witness(plan, begin);
+        let missing_suffix_key = Vec::from(
+            format!(
+                "{}:{}",
+                RECLAMATION_WITNESS_SHARD_KEY_DOMAIN,
+                covering.mk.hex()
+            )
+            .as_bytes(),
+        );
+        let _malformed = covering
+            .chain
+            .push(
+                Some(missing_suffix_key),
+                &domain_object(
+                    crate::ancestry_witness::RECLAMATION_WITNESS_SHARD_DOMAIN,
+                    b"payload",
+                ),
+            )
+            .0;
+        let _manifest_record = covering.push_witness_family(&manifest, &shards);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+    }
+
+    // (F6.6) A same-MK manifest payload under an incorrect
+    // manifest key degrades — never a silent NoneObserved.
+    #[test]
+    fn same_mk_manifest_payloads_under_incorrect_keys_degrade() {
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let manifest = covering.default_manifest(plan, begin);
+        let foreign_mk = crate::hash::hash_object(b"b-r1a1-f6-foreign-mk");
+        let wrong_key =
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&foreign_mk);
+        let _wrong_manifest = covering
+            .chain
+            .push(Some(wrong_key), &manifest.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ManifestKeyNoncanonical { .. }
+            }
+        ));
+        // The same-MK payload under the correct key classifies
+        // normally (the control).
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let manifest = covering.default_manifest(plan, begin);
+        let shard = covering.default_shard();
+        let _manifest_record = covering.push_witness(&manifest, &shard);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::CoherentlyObserved { .. }
+        ));
+    }
+
+    // (F6.7 + F6.8) Foreign witness evidence stays foreign — never
+    // attributed to the covering MK — and the NoneObserved result
+    // is CORRECT there (the contrast: every same-MK form in the
+    // other F6 regressions degrades, so no genuinely-observed
+    // same-MK witness evidence ever remains NoneObserved).
+    #[test]
+    fn foreign_witness_evidence_is_never_attributed_to_the_covering_mk() {
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        let foreign_mk = crate::hash::hash_object(b"b-r1a1-f6-foreign-mk");
+        // A foreign shard: the payload binding the FOREIGN MK
+        // under the foreign checkpoint's own shard key.
+        let foreign_shard = AncestryWitnessShard {
+            mk: foreign_mk,
+            shard_index: 0,
+            shard_count: 1,
+            member_count: 1,
+            entries: vec![WitnessEntry {
+                member: crate::hash::hash_object(b"b-r1a1-foreign-member"),
+                preimage: crate::record::RevisionRecord::regular(
+                    crate::hash::hash_object(b"b-r1a1-foreign-parent"),
+                    1,
+                    1,
+                )
+                .canonical_bytes(),
+            }],
+        };
+        let foreign_shard_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&foreign_mk, 0);
+        let _foreign_shard = covering
+            .chain
+            .push(Some(foreign_shard_key), &foreign_shard.canonical_bytes())
+            .0;
+        // A foreign manifest: the payload binding the FOREIGN MK
+        // under the foreign checkpoint's own manifest key.
+        let foreign_manifest = AncestryWitnessManifest {
+            mk: foreign_mk,
+            plan_record: crate::hash::hash_object(b"b-r1a1-foreign-plan"),
+            begin_record: crate::hash::hash_object(b"b-r1a1-foreign-begin"),
+            metadata_object: crate::hash::hash_object(b"b-r1a1-foreign-metadata"),
+            member_count: 1,
+            shard_count: 1,
+            coverage_digest: [7u8; 32],
+        };
+        let foreign_manifest_key =
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&foreign_mk);
+        let _foreign_manifest = covering
+            .chain
+            .push(
+                Some(foreign_manifest_key),
+                &foreign_manifest.canonical_bytes(),
+            )
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.state,
+            RecoveryState::V2BeginObserved { .. }
+        ));
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::NoneObserved
+        ));
+    }
+
+    // (F7) The wrong-key scan classifies correctly across several
+    // batches and interleaved foreign audit-family records,
+    // independent of record order (the set-membership lookup).
+    #[test]
+    fn the_wrong_key_scan_classifies_across_interleaved_foreign_audits() {
+        let mut covering = covering_chain();
+        // A three-batch plan (the maximum partition of the
+        // three-member index): [sk], [m0], [m1] — newest first.
+        let mut plan_payload = covering.default_plan();
+        plan_payload.batches = vec![
+            PlanBatch {
+                index: 0,
+                records: vec![covering.sk],
+            },
+            PlanBatch {
+                index: 1,
+                records: vec![covering.m0],
+            },
+            PlanBatch {
+                index: 2,
+                records: vec![covering.m1],
+            },
+        ];
+        let plan = covering.push_plan(&plan_payload);
+        let foreign_mk = crate::hash::hash_object(b"b-r1a1-f7-foreign-mk");
+        // The first foreign audit, interleaved before the plan's
+        // own audits.
+        let foreign_audit = ReclamationLedgerV2 {
+            mk: foreign_mk,
+            sk: covering.sk,
+            batch: 0,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            units: vec![ReclaimUnit {
+                record: covering.sk,
+                objects: Vec::new(),
+            }],
+        };
+        let foreign_key = reclamation_ledger_v2_idempotency_key(&foreign_mk, 0);
+        let _foreign = covering
+            .chain
+            .push(Some(foreign_key), &foreign_audit.canonical_bytes())
+            .0;
+        // The three correctly-keyed one-unit audits (sk unkeyed,
+        // m0 keyed, m1 unkeyed per the retained index), with the
+        // second foreign audit interleaved between them.
+        let audit0 = ReclamationLedgerV2 {
+            mk: covering.mk,
+            sk: covering.sk,
+            batch: 0,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            units: vec![ReclaimUnit {
+                record: covering.sk,
+                objects: Vec::new(),
+            }],
+        };
+        let _audit0 = covering.push_audit(&audit0);
+        let foreign_audit_two = ReclamationLedgerV2 {
+            mk: foreign_mk,
+            sk: covering.sk,
+            batch: 1,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            units: vec![ReclaimUnit {
+                record: covering.m0,
+                objects: Vec::new(),
+            }],
+        };
+        let foreign_key_two = reclamation_ledger_v2_idempotency_key(&foreign_mk, 1);
+        let _foreign_two = covering
+            .chain
+            .push(Some(foreign_key_two), &foreign_audit_two.canonical_bytes())
+            .0;
+        let audit1 = ReclamationLedgerV2 {
+            mk: covering.mk,
+            sk: covering.sk,
+            batch: 1,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            records: 1,
+            reclaimed_keys: 1,
+            units: vec![ReclaimUnit {
+                record: covering.m0,
+                objects: vec![crate::hash::hash_object(b"b-r1a1-m0-obj")],
+            }],
+        };
+        let _audit1 = covering.push_audit(&audit1);
+        let audit2 = ReclamationLedgerV2 {
+            mk: covering.mk,
+            sk: covering.sk,
+            batch: 2,
+            range_digest: covering.range_digest,
+            seed: covering.seed,
+            records: 1,
+            reclaimed_keys: 0,
+            units: vec![ReclaimUnit {
+                record: covering.m1,
+                objects: Vec::new(),
+            }],
+        };
+        let _audit2 = covering.push_audit(&audit2);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        // The foreign audits are not attributed (no degradation)
+        // and the three correctly-keyed audits are all observed —
+        // the classification is correct independent of the
+        // interleaved record order.
+        let RecoveryState::PlanObservedWithoutBegin {
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = &classification.state
+        else {
+            panic!(
+                "expected PlanObservedWithoutBegin, got {:?}",
+                classification.state
+            );
+        };
+        assert_eq!(audits_observed.as_slice(), &[0, 1, 2]);
+        assert!(audits_not_observed.is_empty());
+        let _ = plan;
     }
 }
