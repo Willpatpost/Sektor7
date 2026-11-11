@@ -28,6 +28,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      # (CI-C1, the owner's 2026-11-11 Agent C GO — the workflow-only
+      # build-cache checkpoint) Rust dependency/build cache, placed
+      # AFTER the pinned toolchain install because rust-cache derives
+      # its cache key from the active rustc/cargo pair. Pinned to the
+      # immutable v2.9.3 commit (annotated GPG-signed tag, published
+      # 2026-10-20; node24 runtime). "engine -> target" follows the
+      # action's documented semantics — the target part is relative
+      # to the workspace part — matching this workflow's engine/
+      # working directory. Every other input stays at its default:
+      # ONLY dependency crates are cached (cache-workspace-crates is
+      # false, so workspace crates — including the engine-persist
+      # rlib the activation-isolation gate below inspects — are
+      # rebuilt from source by the current run's Build step, never
+      # restored from a cache); caches save from green jobs only.
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "engine -> target"
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
@@ -255,6 +273,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      # (CI-C1) Rust dependency/build cache, the identical pinned
+      # v2.9.3 configuration as the matrix job (engine -> target,
+      # dependency crates only, save on success), after the pinned
+      # toolchain install so the key derives from the active
+      # rustc/cargo pair. The per-test-process SDL strategy and every
+      # gate below are untouched — the cache only removes dependency
+      # recompilation, never test execution.
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "engine -> target"
       - name: Confirm ARM64 runner and Rust host
         shell: bash
         run: |
