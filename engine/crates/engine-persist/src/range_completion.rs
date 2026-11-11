@@ -87,7 +87,12 @@
 //! ownership obligations. The canonical order is the sorted
 //! ascending byte order of the names (the legitimate producer's
 //! list is sorted); duplicates, empty names, over-length names,
-//! and reordered input refuse typed. Names are committed
+//! and reordered input refuse typed. Every name obeys the
+//! PLAIN-FILE-NAME rule (matching the accepted
+//! journal-generation filename-safety discipline, plus the NUL
+//! refusal): the traversal forms `.` and `..`, any path separator
+//! (`/` or `\`), and any NUL byte refuse typed — never
+//! normalized, case-folded, or rewritten. Names are committed
 //! BYTE-EXACT — never silently reinterpreted or normalized. An
 //! empty obligation list is legitimate and produces the
 //! deterministic digest over its zero-count preimage (never the
@@ -100,13 +105,16 @@
 //! They are the CHECKED SUMS of the corresponding counters of the
 //! Batch markers covered by the Range terminal — NOT globally
 //! deduplicated distinct-identity counts. Each Mandatory or
-//! Deferred partition sum is bounded by 2^40 (the accepted 2^24
-//! per-batch classified-list ceiling times the 2^16 batch-count
-//! ceiling), and the combined aggregate is coherent with a
-//! nonempty sequence of nonempty Batch classifications: every
-//! covered batch marker's classification is nonempty by the `/2`
-//! codec's own refusal of zero-classification, so the aggregate
-//! total is at least the batch count.
+//! Deferred partition sum is bounded by the BATCH-COUNT-DEPENDENT
+//! effective ceiling — the declared batch count times the
+//! accepted 2^24 per-batch classified-list bound (checked
+//! arithmetic), whose maximally sized 2^16-batch value is exactly
+//! the ratified global 2^40 ceiling — and the combined aggregate
+//! is coherent with a nonempty sequence of nonempty Batch
+//! classifications: every covered batch marker's classification
+//! is nonempty by the `/2` codec's own refusal of
+//! zero-classification, so the aggregate total is at least the
+//! batch count.
 //!
 //! **The resource bounds:** every count is bounded BEFORE any
 //! allocation trusts it. The batch count reuses the plan family's
@@ -115,7 +123,9 @@
 //! the journal count reuses the plan family's journal-file
 //! ceiling, each journal name is bounded by the plan family's
 //! name-byte ceiling, and the aggregate partition sums are
-//! bounded by 2^40 with checked arithmetic throughout.
+//! bounded by the batch-count-dependent effective ceiling (the
+//! ratified global 2^40 at the maximum batch count) with checked
+//! arithmetic throughout.
 //!
 //! **The authority boundary (the owner's C3 GO):** a decoded
 //! Range marker or a matching pure commitment establishes ONLY
@@ -194,10 +204,13 @@ pub const RANGE_JOURNAL_OBLIGATION_COMMITMENT_MAGIC: &[u8; 16] = b"S7V2JOURNALOB
 /// INDEPENDENT of the marker wire version.
 pub const RANGE_JOURNAL_OBLIGATION_COMMITMENT_VERSION: u32 = 1;
 
-/// The aggregate partition bound: the accepted per-batch
-/// classified-list ceiling (2^24 — the A3 materialized-list bound
-/// each `/2` marker's counters obey) times the plan family's
-/// batch-count ceiling (2^16) — every Mandatory or Deferred
+/// The ratified GLOBAL aggregate partition bound: the accepted
+/// per-batch classified-list ceiling (2^24 — the A3
+/// materialized-list bound each `/2` marker's counters obey)
+/// times the plan family's batch-count ceiling (2^16). The
+/// effective per-marker ceiling is BATCH-COUNT-DEPENDENT (the
+/// declared batch count × 2^24, checked), and this constant is
+/// its maximally sized value — every Mandatory or Deferred
 /// aggregate partition sum over a maximally sized plan is exactly
 /// this bound, so any larger declared sum is structurally
 /// incoherent.
@@ -307,36 +320,60 @@ impl RangeAggregateCounters {
     }
 
     /// The pure aggregate coherence for a coverage of exactly
-    /// `batch_count` batches: each partition sum representable and
-    /// within the 2^40 aggregate bound, and the combined total
-    /// coherent with a NONEMPTY sequence of NONEMPTY batch
-    /// classifications — every covered `/2` marker's
-    /// classification is nonempty by that codec's own refusal of
-    /// zero-classification, so the aggregate total is at least the
-    /// batch count.
+    /// `batch_count` batches: the batch count itself within
+    /// [1, MAX_RECLAMATION_UNITS], each partition sum
+    /// representable and within the BATCH-COUNT-DEPENDENT
+    /// effective ceiling — the declared batch count times the
+    /// accepted per-batch classified-list bound (checked
+    /// arithmetic; the maximally sized 2^16-batch value is
+    /// exactly the ratified global 2^40 ceiling) — and the
+    /// combined total coherent with a NONEMPTY sequence of
+    /// NONEMPTY batch classifications: every covered `/2`
+    /// marker's classification is nonempty by that codec's own
+    /// refusal of zero-classification, so the aggregate total is
+    /// at least the batch count.
     pub fn validate_for(&self, batch_count: u64) -> Result<(), SaveError> {
+        if batch_count == 0 {
+            return Err(SaveError::Integrity("range-completion/empty-coverage"));
+        }
+        if batch_count > MAX_RECLAMATION_UNITS {
+            return Err(SaveError::Limit {
+                section: SECTION,
+                kind: "batch-count",
+                value: batch_count,
+                max: MAX_RECLAMATION_UNITS,
+            });
+        }
+        // The effective partition ceiling: the declared batches
+        // can together contribute at most batch_count × the
+        // per-batch classified-list bound (the checked product is
+        // provably within the ratified global 2^40 ceiling
+        // whenever the batch count is within range).
+        let effective_max = batch_count
+            .checked_mul(MAX_ACCOUNTING_CLASSIFIED_LIST)
+            .ok_or(SaveError::Overflow { section: SECTION })?;
         let mandatory = self
             .mandatory_records
             .checked_add(self.mandatory_objects)
             .ok_or(SaveError::Overflow { section: SECTION })?;
-        if mandatory > MAX_RANGE_AGGREGATE_PARTITION {
+        if mandatory > effective_max {
             return Err(SaveError::Limit {
                 section: SECTION,
                 kind: "mandatory-identities",
                 value: mandatory,
-                max: MAX_RANGE_AGGREGATE_PARTITION,
+                max: effective_max,
             });
         }
         let deferred = self
             .deferred_records
             .checked_add(self.deferred_objects)
             .ok_or(SaveError::Overflow { section: SECTION })?;
-        if deferred > MAX_RANGE_AGGREGATE_PARTITION {
+        if deferred > effective_max {
             return Err(SaveError::Limit {
                 section: SECTION,
                 kind: "deferred-identities",
                 value: deferred,
-                max: MAX_RANGE_AGGREGATE_PARTITION,
+                max: effective_max,
             });
         }
         let total = mandatory
@@ -512,15 +549,36 @@ pub fn commit_range_coverage(
 
 // ------------------------------------------------- the journal-obligation commitment
 
+/// The plain-file-name rule for journal-obligation names
+/// (matching the accepted journal-generation filename-safety
+/// discipline, plus the NUL refusal): a name is never a traversal
+/// form (`.` or `..`), never contains a path separator (`/` or
+/// `\`), and never carries a NUL byte. NO normalization, case
+/// folding, or filename rewriting of any kind — the name is
+/// committed byte-exact or refused.
+fn validate_journal_name(name: &str) -> Result<(), SaveError> {
+    if name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(SaveError::Integrity("range-completion/journal-name-unsafe"));
+    }
+    Ok(())
+}
+
 /// The pure journal-obligation commitment: a domain-separated
 /// SHA-256 over the exact obligation list bound by the installed
 /// plan — the names supplied BYTE-EXACT (never reinterpreted or
-/// normalized), in the sorted ascending canonical order (the
-/// legitimate producer's list is sorted; reordered input refuses
-/// typed, never silently reordered), each as its u64-LE byte
-/// length followed by its exact UTF-8 bytes, under the up-front
-/// declared count. An empty list is legitimate and produces the
-/// deterministic digest over its zero-count preimage.
+/// normalized), each obeying the plain-file-name rule (the
+/// traversal, separator, and NUL forms refuse typed), in the
+/// sorted ascending canonical order (the legitimate producer's
+/// list is sorted; reordered input refuses typed, never silently
+/// reordered), each as its u64-LE byte length followed by its
+/// exact UTF-8 bytes, under the up-front declared count. An empty
+/// list is legitimate and produces the deterministic digest over
+/// its zero-count preimage.
 ///
 /// This is a JOURNAL-OBLIGATION commitment — the precise set of
 /// obligations the plan defines — NOT proof of completed journal
@@ -554,6 +612,7 @@ pub fn commit_journal_obligations(
         if bytes.is_empty() {
             return Err(SaveError::Integrity("range-completion/journal-name-empty"));
         }
+        validate_journal_name(name)?;
         let name_len = u64::try_from(bytes.len()).expect("usize exceeds the u64 wire width");
         if name_len > MAX_RECLAMATION_JOURNAL_NAME {
             return Err(SaveError::Limit {
@@ -1200,9 +1259,43 @@ mod c3_tests {
     }
 
     #[test]
+    fn the_journal_commitment_refuses_unsafe_filename_forms() {
+        // The plain-file-name rule (the accepted
+        // journal-generation filename-safety discipline, plus the
+        // NUL refusal): every traversal, separator, and NUL form
+        // refuses with the typed rule — never normalized,
+        // case-folded, or rewritten.
+        let context = fixture_context();
+        for unsafe_name in [
+            ".".to_owned(),
+            "..".to_owned(),
+            "journal/../escape".to_owned(),
+            "sub/dir/journal.t1".to_owned(),
+            "journal.t1\\2".to_owned(),
+            "journal.t1\0".to_owned(),
+        ] {
+            let names = vec![unsafe_name.clone()];
+            assert!(
+                matches!(
+                    commit_journal_obligations(&context, &names),
+                    Err(SaveError::Integrity("range-completion/journal-name-unsafe"))
+                ),
+                "the unsafe name {unsafe_name:?} must refuse"
+            );
+        }
+        // A plain generation name — interior dots and a suffix,
+        // never an arbitrary character restriction — remains
+        // legitimate.
+        let legitimate = vec!["journal.t1.2".to_owned()];
+        assert!(commit_journal_obligations(&context, &legitimate).is_ok());
+    }
+
+    #[test]
     fn the_aggregate_counters_enforce_bounds_and_coherence() {
-        // A partition sum above the 2^40 aggregate bound refuses
-        // with the exact category and bound.
+        // A partition sum far above the batch-count-dependent
+        // effective bound (at ONE declared batch the effective
+        // bound is the per-batch 2^24 ceiling) refuses with the
+        // exact category.
         let over = RangeAggregateCounters {
             mandatory_records: MAX_RANGE_AGGREGATE_PARTITION + 1,
             ..RangeAggregateCounters::EMPTY
@@ -1260,6 +1353,120 @@ mod c3_tests {
             aggregate.accumulate(&batch_counters(1, 0, 0, 0)),
             Err(SaveError::Overflow { .. })
         ));
+    }
+
+    #[test]
+    fn the_aggregate_bound_is_batch_count_dependent() {
+        // One batch: the per-batch 2^24 classified-list ceiling
+        // accepts; one past refuses with the exact category,
+        // value, and maximum.
+        let at_one = RangeAggregateCounters {
+            mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST,
+            ..RangeAggregateCounters::EMPTY
+        };
+        assert!(at_one.validate_for(1).is_ok());
+        let beyond_one = RangeAggregateCounters {
+            mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+            ..RangeAggregateCounters::EMPTY
+        };
+        match beyond_one.validate_for(1) {
+            Err(SaveError::Limit {
+                kind, value, max, ..
+            }) => {
+                assert_eq!(kind, "mandatory-identities");
+                assert_eq!(value, MAX_ACCOUNTING_CLASSIFIED_LIST + 1);
+                assert_eq!(max, MAX_ACCOUNTING_CLASSIFIED_LIST);
+            }
+            other => panic!("expected the typed limit refusal, got {other:?}"),
+        }
+        // Two batches: 2 × 2^24 accepts on the Mandatory side, and
+        // the Deferred side mirrors the same effective ceiling.
+        let two_batches = 2 * MAX_ACCOUNTING_CLASSIFIED_LIST;
+        let at_two = RangeAggregateCounters {
+            mandatory_records: two_batches,
+            ..RangeAggregateCounters::EMPTY
+        };
+        assert!(at_two.validate_for(2).is_ok());
+        let deferred_beyond_two = RangeAggregateCounters {
+            deferred_objects: two_batches + 1,
+            ..RangeAggregateCounters::EMPTY
+        };
+        match deferred_beyond_two.validate_for(2) {
+            Err(SaveError::Limit {
+                kind, value, max, ..
+            }) => {
+                assert_eq!(kind, "deferred-identities");
+                assert_eq!(value, two_batches + 1);
+                assert_eq!(max, two_batches);
+            }
+            other => panic!("expected the typed limit refusal, got {other:?}"),
+        }
+        // The maximum batch count: the ratified 2^40 global
+        // ceiling accepts (the max-batch effective bound), and one
+        // past refuses.
+        let effective_at_max = MAX_RECLAMATION_UNITS * MAX_ACCOUNTING_CLASSIFIED_LIST;
+        assert_eq!(effective_at_max, MAX_RANGE_AGGREGATE_PARTITION);
+        let at_global = RangeAggregateCounters {
+            mandatory_records: MAX_RANGE_AGGREGATE_PARTITION,
+            ..RangeAggregateCounters::EMPTY
+        };
+        assert!(at_global.validate_for(MAX_RECLAMATION_UNITS).is_ok());
+        let beyond_global = RangeAggregateCounters {
+            mandatory_records: MAX_RANGE_AGGREGATE_PARTITION + 1,
+            ..RangeAggregateCounters::EMPTY
+        };
+        match beyond_global.validate_for(MAX_RECLAMATION_UNITS) {
+            Err(SaveError::Limit {
+                kind, value, max, ..
+            }) => {
+                assert_eq!(kind, "mandatory-identities");
+                assert_eq!(value, MAX_RANGE_AGGREGATE_PARTITION + 1);
+                assert_eq!(max, MAX_RANGE_AGGREGATE_PARTITION);
+            }
+            other => panic!("expected the typed limit refusal, got {other:?}"),
+        }
+        // Zero and over-maximum batch counts refuse (the same
+        // typed rules the decode path enforces).
+        assert!(matches!(
+            at_one.validate_for(0),
+            Err(SaveError::Integrity("range-completion/empty-coverage"))
+        ));
+        assert!(matches!(
+            at_one.validate_for(MAX_RECLAMATION_UNITS + 1),
+            Err(SaveError::Limit {
+                kind: "batch-count",
+                ..
+            })
+        ));
+        // The DECODER enforces the corrected rule: a structurally
+        // impossible ONE-batch aggregate (2^24 + 1 mandatory
+        // records under a single declared batch) refuses at decode
+        // through the same production validation path, not merely
+        // at the pure counter helper.
+        let context = fixture_context();
+        let impossible = RangeCompletionMarkerV3 {
+            mk: context.mk,
+            plan: context.plan,
+            begin: context.begin,
+            coverage: hash_object(b"c3-f2-coverage"),
+            journal: hash_object(b"c3-f2-journal"),
+            batch_count: 1,
+            journal_count: 0,
+            counters: RangeAggregateCounters {
+                mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+                ..RangeAggregateCounters::EMPTY
+            },
+        };
+        match RangeCompletionMarkerV3::decode(&impossible.canonical_bytes()) {
+            Err(SaveError::Limit {
+                kind, value, max, ..
+            }) => {
+                assert_eq!(kind, "mandatory-identities");
+                assert_eq!(value, MAX_ACCOUNTING_CLASSIFIED_LIST + 1);
+                assert_eq!(max, MAX_ACCOUNTING_CLASSIFIED_LIST);
+            }
+            other => panic!("expected the decoder's typed limit refusal, got {other:?}"),
+        }
     }
 
     #[test]
