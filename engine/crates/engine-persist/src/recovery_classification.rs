@@ -1546,6 +1546,35 @@ fn classify_witness_evidence<R: BeginReads>(
                         },
                     };
                 }
+                // F8: a shard-family record under a foreign-key
+                // form whose strictly decoded payload binds the
+                // COVERING MK is contradictory same-checkpoint
+                // evidence — never a silent absence. The payload
+                // is read and strictly decoded solely to test the
+                // MK binding (the strict decode enforces the
+                // accepted per-shard payload ceiling; one payload
+                // at a time, dropped immediately); a payload
+                // binding another MK remains legitimate foreign
+                // evidence, and an undecodable foreign-keyed
+                // payload is never attributed.
+                let Some(object) = record.first_object else {
+                    continue;
+                };
+                let Ok(bytes) = reads.read_object_bytes(&object) else {
+                    continue;
+                };
+                if let Ok(shard) = AncestryWitnessShard::decode(&bytes)
+                    && shard.mk == mk
+                {
+                    return WitnessEvidenceObservation::Degraded {
+                        reason: WitnessDegradation::ShardKeyNoncanonical {
+                            detail: String::from(
+                                "a foreign-keyed shard record carries a payload \
+                                 binding the covering checkpoint",
+                            ),
+                        },
+                    };
+                }
                 continue;
             }
         };
@@ -4288,5 +4317,107 @@ mod classification_tests {
         assert_eq!(audits_observed.as_slice(), &[0, 1, 2]);
         assert!(audits_not_observed.is_empty());
         let _ = plan;
+    }
+
+    // (F8) A shard-family record under a foreign-MK key form
+    // whose strictly decoded payload binds the COVERING MK is
+    // contradictory same-checkpoint evidence — alone (without a
+    // manifest), alongside an otherwise complete canonical
+    // witness, and never confused with genuine foreign evidence.
+    #[test]
+    fn foreign_keyed_shard_payloads_binding_the_covering_mk_degrade() {
+        // Alone, without a manifest: the payload inspection fires
+        // in the manifest-absent path.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        // A genuine covering-MK shard payload pushed under a
+        // FOREIGN checkpoint's shard key.
+        let foreign_mk = crate::hash::hash_object(b"b-r1a1-f8-foreign-mk");
+        let covering_shard = covering.default_shard();
+        let foreign_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&foreign_mk, 0);
+        let _contradictory = covering
+            .chain
+            .push(Some(foreign_key), &covering_shard.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+        // Alongside an otherwise complete canonical witness: the
+        // contradictory record prevents CoherentlyObserved.
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let begin = covering.push_begin(plan);
+        let (manifest, shards) = covering.default_two_shard_witness(plan, begin);
+        let covering_shard_payload = shards[0].canonical_bytes();
+        let foreign_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&foreign_mk, 0);
+        let _contradictory = covering
+            .chain
+            .push(Some(foreign_key), &covering_shard_payload)
+            .0;
+        let _manifest_record = covering.push_witness_family(&manifest, &shards);
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardKeyNoncanonical { .. }
+            }
+        ));
+        // A genuine foreign-keyed, foreign-MK shard remains
+        // foreign (the control — the payload binding the FOREIGN
+        // MK never degrades the covering observation).
+        let mut covering = covering_chain();
+        let plan_payload = covering.default_plan();
+        let plan = covering.push_plan(&plan_payload);
+        let audit0 = covering.default_audit(0);
+        let _audit0 = covering.push_audit(&audit0);
+        let audit1 = covering.default_audit(1);
+        let _audit1 = covering.push_audit(&audit1);
+        let _begin = covering.push_begin(plan);
+        let foreign_shard = AncestryWitnessShard {
+            mk: foreign_mk,
+            shard_index: 0,
+            shard_count: 1,
+            member_count: 1,
+            entries: vec![WitnessEntry {
+                member: crate::hash::hash_object(b"b-r1a1-f8-foreign-member"),
+                preimage: crate::record::RevisionRecord::regular(
+                    crate::hash::hash_object(b"b-r1a1-f8-foreign-parent"),
+                    1,
+                    1,
+                )
+                .canonical_bytes(),
+            }],
+        };
+        let foreign_key =
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&foreign_mk, 0);
+        let _foreign = covering
+            .chain
+            .push(Some(foreign_key), &foreign_shard.canonical_bytes())
+            .0;
+        let head = covering.push_head();
+        let classification = classify(&mut covering.chain.reads, &head);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::NoneObserved
+        ));
     }
 }
