@@ -59,6 +59,7 @@ pub mod pipeline;
 pub mod reclaim;
 pub mod record;
 pub mod recovery;
+pub mod recovery_classification;
 pub mod recovery_discovery;
 pub mod rotation;
 pub mod session_anchor;
@@ -172,6 +173,11 @@ pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
+};
+pub use recovery_classification::{
+    ClassificationError, EvidenceDegradation, NotEstablished, ObservedBegin, ObservedPlan,
+    ObservedV1Begin, OlderRangeStatus, RecoveryClassification, RecoveryState, UnresolvedAuthority,
+    WitnessDegradation, WitnessEvidenceObservation, classify_recovery_evidence,
 };
 pub use recovery_discovery::{
     CompletionCandidateObservation, CompletionStructural, CoveringCheckpoint, CoveringObservation,
