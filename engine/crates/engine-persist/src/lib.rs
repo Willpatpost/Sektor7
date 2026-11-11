@@ -161,8 +161,9 @@ pub use range_completion::{
     RANGE_JOURNAL_OBLIGATION_COMMITMENT_VERSION, RECLAMATION_COMPLETE_V3_DOMAIN,
     RECLAMATION_COMPLETE_V3_KEY_DOMAIN, RECLAMATION_COMPLETE_V3_VERSION, RangeAggregateCounters,
     RangeCompletionContext, RangeCompletionMarkerV3, RangeCoverageCommitment,
-    RangeCoverageCommitmentBuilder, RangeCoverageObservation, commit_journal_obligations,
-    commit_range_coverage, reclamation_complete_v3_range_idempotency_key,
+    RangeCoverageCommitmentBuilder, RangeCoverageObservation, StructuralRangeCandidate,
+    commit_journal_obligations, commit_range_coverage, read_structural_range_candidate,
+    reclamation_complete_v3_range_idempotency_key,
 };
 pub use reclaim::{
     CompletionKind, PlanBatch, RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_COMPLETE_KEY_DOMAIN,

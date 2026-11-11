@@ -141,16 +141,34 @@
 //! CALLER-SUPPLIED and may themselves be untrusted — matching
 //! them is a structural comparison, not an authentication of
 //! their origin.
+//!
+//! **The C4 structural candidate reader:** the module's one
+//! read-side surface, [`read_structural_range_candidate`] — the
+//! C2-parity reader over the reader-generic
+//! [`crate::reclaim::BeginReads`] hash-verifying seam. It
+//! validates the CALLER-SUPPLIED expected context first, then
+//! verifies a specifically identified candidate revision's
+//! hash-verified bytes, regular one-ref shape, exact
+//! deterministic `/3` key, referenced content object, strict `/3`
+//! marker decode, and all three context bindings — and NOTHING
+//! else: no HEAD lookup, no ancestry traversal, no skip-table
+//! crossing, and (the owner's ratified C4 boundary) NO commitment
+//! re-derivation — a marker carrying well-formed but otherwise
+//! arbitrary nonzero commitment digests passes the reader,
+//! intentionally. A structurally valid OFF-CHAIN candidate is a
+//! legitimate success case.
 
 use engine_core::{Decoder, Encoder, SaveError};
 use sha2::{Digest, Sha256};
 
 use crate::ancestry_accounting::MAX_ACCOUNTING_CLASSIFIED_LIST;
 use crate::batch_completion::ClassificationCounters;
-use crate::hash::Hash;
+use crate::hash::{Hash, hash_object};
+use crate::medium::MediumError;
 use crate::reclaim::{
     MAX_RECLAMATION_JOURNAL_FILES, MAX_RECLAMATION_JOURNAL_NAME, MAX_RECLAMATION_UNITS,
 };
+use crate::record::{RecordKind, RevisionRecord};
 
 /// The error-section name every typed refusal in this module
 /// carries.
@@ -829,6 +847,160 @@ impl RangeCompletionMarkerV3 {
         }
         Ok(())
     }
+}
+
+// ---------------------------- the read-only structural candidate reader (C4)
+
+/// The read-only structural Range-terminal candidate result
+/// (V2X-CP3-B-P2A-C4): a specifically identified candidate revision
+/// and the strictly decoded `/3` Range-terminal marker it references,
+/// established over hash-verified bytes and matched against the
+/// caller-supplied expected context. **STRUCTURAL EVIDENCE ONLY —
+/// never an authority:** a positive result establishes well-formed,
+/// hash-consistent, correctly keyed, context-matching bytes, and
+/// NOTHING else. It does NOT establish canonical HEAD membership,
+/// unique installed publication, provider-coordinated authority or
+/// durability, historical correctness of any Batch classification,
+/// physical deletion of Mandatory identities, preservation of
+/// Deferred identities, journal retirement or ownership updates,
+/// Range completion, recovery convergence, logical-retirement
+/// crossing permission, or startup safety. A structurally valid
+/// OFF-CHAIN candidate is a legitimate success case: the expected
+/// context is CALLER-SUPPLIED and may itself be untrusted — matching
+/// it is a structural comparison, not an authentication of its
+/// origin. The type deliberately exposes exactly the two structural
+/// facts (the revision identity and the decoded marker) and no
+/// boolean, verdict, or capability field of any kind; the marker's
+/// internal commitment digests remain its CLAIMS — never verified
+/// facts — until the separately authorized installed-chain
+/// verification layers say otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralRangeCandidate {
+    /// The candidate revision's identity — re-established over the
+    /// hash-verified canonical bytes (the caller-supplied identity
+    /// and the stored bytes agree).
+    pub revision: Hash,
+    /// The hash-verified, strictly decoded V3 Range-terminal marker
+    /// the revision references (its three context bindings equal the
+    /// supplied expectations).
+    pub marker: RangeCompletionMarkerV3,
+}
+
+/// (V2X-CP3-B-P2A-C4) The read-only structural Range-terminal
+/// candidate reader: verifies that a SPECIFICALLY IDENTIFIED
+/// candidate revision and its referenced `/3` Range-terminal marker
+/// object are structurally coherent and match the explicitly
+/// supplied expected Range context — through the existing
+/// reader-generic [`crate::reclaim::BeginReads`] hash-verifying read
+/// seam (a provider transaction, a lock-held medium, or a synthetic
+/// reader), with NO HEAD lookup and NO chain traversal of any kind.
+/// The exact validation sequence, every step refusing typed:
+///
+/// 0. The expected context's own validation (caller-input
+///    validation only — it does not authenticate the context's
+///    origin).
+/// 1. Read the candidate revision's canonical bytes and
+///    hash-verify them against the supplied identity (the
+///    function's own hash check, so no implementation subtlety
+///    can smuggle unverified bytes past it).
+/// 2. Strictly decode the revision record.
+/// 3. Require [`RecordKind::Regular`] (a founding revision is
+///    never a completion candidate).
+/// 4. Require EXACTLY ONE directly referenced content object.
+/// 5. Require the EXACT deterministic `/3` Range-terminal key
+///    derived from the expected MK (a keyless record, a foreign-MK
+///    key, and the genuine V1 Batch, V1 Range, and V2 Batch keys
+///    all refuse here).
+/// 6. Read the referenced content object's bytes and hash-verify
+///    them against the referenced identity.
+/// 7. Strictly decode [`RangeCompletionMarkerV3`] (the `/3`
+///    domain gate refuses every other domain — the V1 `/1` and V2
+///    `/2` markers included — and every accepted C3 decoder bound,
+///    including the F2 batch-count-dependent aggregate ceilings,
+///    holds through the reader path).
+/// 8. Compare ALL THREE context bindings — MK, plan, begin —
+///    against the supplied expectations.
+///
+/// **The owner's ratified C4 boundary:** this reader does NOT
+/// rederive the coverage or journal-obligation commitments — a
+/// marker carrying well-formed but otherwise arbitrary nonzero
+/// commitment digests PASSES this reader, intentionally.
+/// [`RangeCompletionMarkerV3::verify_coverage`] and
+/// [`RangeCompletionMarkerV3::verify_journal_obligations`] remain
+/// the caller's separate pure steps, and any successful comparison
+/// establishes only agreement with supplied evidence — never that
+/// the claimed Batch markers are installed, their classifications
+/// historically correct, or the journal-retirement obligations
+/// discharged. Only after every check succeeds does the reader
+/// return the [`StructuralRangeCandidate`] — the two structural
+/// facts alone, never a trusted Range completion (see the result
+/// type's authority boundary).
+pub fn read_structural_range_candidate<R: crate::reclaim::BeginReads>(
+    reads: &mut R,
+    candidate: &Hash,
+    expected: &RangeCompletionContext,
+) -> Result<StructuralRangeCandidate, MediumError> {
+    // (0) The expected context's own validation — caller-input
+    // validation only, never an authentication of its origin.
+    expected.validate().map_err(MediumError::Format)?;
+    // (1) The candidate revision: read, hash-verify against the
+    // supplied identity, strictly decode.
+    let record_bytes = reads.read_record_bytes(candidate)?;
+    if hash_object(&record_bytes) != *candidate {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/record-hash",
+        });
+    }
+    let record = RevisionRecord::decode(&record_bytes).map_err(MediumError::Format)?;
+    // (2) The regular shape — a founding revision is never a
+    // completion candidate.
+    if record.kind != RecordKind::Regular {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/not-regular",
+        });
+    }
+    // (3) Exactly one directly referenced content object.
+    if record.content_refs.len() != 1 {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/content-refs",
+        });
+    }
+    // (4) The exact deterministic /3 Range key derived from the
+    // EXPECTED context's MK — the record must carry this key and
+    // no other (a keyless record, a foreign-MK key, and the
+    // genuine V1 Batch, V1 Range, and V2 Batch keys all refuse).
+    let expected_key = reclamation_complete_v3_range_idempotency_key(&expected.mk);
+    if record.idempotency_key.as_deref() != Some(expected_key.as_slice()) {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/key-mismatch",
+        });
+    }
+    // (5) The referenced content object: read, hash-verify against
+    // the referenced identity, strictly decode as the /3 marker
+    // (the domain gate refuses every other domain, and every
+    // accepted C3 decoder bound holds through the reader path).
+    let object_ref = record.content_refs[0];
+    let object_bytes = reads.read_object_bytes(&object_ref)?;
+    if hash_object(&object_bytes) != object_ref {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/object-hash",
+        });
+    }
+    let marker = RangeCompletionMarkerV3::decode(&object_bytes).map_err(MediumError::Format)?;
+    // (6) All three context bindings against the supplied
+    // expectations — a structural comparison over caller-supplied
+    // values, never an authentication of their origin.
+    if marker.mk != expected.mk || marker.plan != expected.plan || marker.begin != expected.begin {
+        return Err(MediumError::Chain {
+            rule: "range-candidate/context-mismatch",
+        });
+    }
+    // (7) The structural candidate — the two structural facts and
+    // nothing else.
+    Ok(StructuralRangeCandidate {
+        revision: *candidate,
+        marker,
+    })
 }
 
 // ============================================================== the C3 tests
@@ -1934,5 +2106,677 @@ mod c3_tests {
             empty_marker
         );
         empty_marker.verify_journal_obligations(&[]).unwrap();
+    }
+}
+
+// ============================================================== the C4 tests
+//
+// The owner's required adversarial matrix — pure synthetic-reader
+// tests over genuine canonical record/object codecs (no
+// filesystem, no providers, no chain state, no publication, no
+// destructive execution of any kind). The matrix point "C2's
+// structural Batch reader continuing to refuse /3" is covered by
+// the accepted C3 test above
+// (the_c2_structural_reader_refuses_the_v3_marker, preserved
+// unchanged); every other point is proven here.
+
+#[cfg(test)]
+mod c4_tests {
+    use super::*;
+    use crate::ancestry_accounting::StorageRole;
+    use crate::batch_completion::{
+        BatchCompletionContext, BatchCompletionMarkerV2, ClassificationEntry, EntryClassification,
+        commit_classification, reclamation_complete_v2_idempotency_key,
+    };
+    use crate::hash::hash_object;
+    use crate::reclaim::{
+        CompletionKind, ReclamationComplete, reclamation_complete_idempotency_key,
+    };
+    use crate::record::AuthorityMode;
+
+    struct SyntheticReads {
+        records: std::collections::BTreeMap<Hash, Vec<u8>>,
+        objects: std::collections::BTreeMap<Hash, Vec<u8>>,
+    }
+    impl crate::reclaim::BeginReads for SyntheticReads {
+        fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.records
+                .get(id)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *id })
+        }
+        fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.objects
+                .get(hash)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *hash })
+        }
+    }
+
+    fn empty_reads() -> SyntheticReads {
+        SyntheticReads {
+            records: std::collections::BTreeMap::new(),
+            objects: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn fixture_context() -> RangeCompletionContext {
+        RangeCompletionContext {
+            mk: hash_object(b"c3-fixture-mk"),
+            plan: hash_object(b"c3-fixture-plan"),
+            begin: hash_object(b"c3-fixture-begin"),
+        }
+    }
+
+    fn marker_records() -> Vec<Hash> {
+        (0..3)
+            .map(|index| hash_object(format!("c3-fixture-marker-{index}").as_bytes()))
+            .collect()
+    }
+
+    fn batch_counters(
+        mandatory_records: u64,
+        deferred_records: u64,
+        mandatory_objects: u64,
+        deferred_objects: u64,
+    ) -> ClassificationCounters {
+        ClassificationCounters {
+            mandatory_records,
+            deferred_records,
+            mandatory_objects,
+            deferred_objects,
+        }
+    }
+
+    fn observation(
+        batch_index: u64,
+        marker_record: Hash,
+        counters: ClassificationCounters,
+    ) -> RangeCoverageObservation {
+        RangeCoverageObservation {
+            batch_index,
+            marker_record,
+            counters,
+        }
+    }
+
+    fn fixture_observations() -> Vec<RangeCoverageObservation> {
+        let records = marker_records();
+        vec![
+            observation(0, records[0], batch_counters(2, 0, 1, 1)),
+            observation(1, records[1], batch_counters(1, 1, 0, 0)),
+            observation(2, records[2], batch_counters(0, 0, 3, 0)),
+        ]
+    }
+
+    fn fixture_journal_names() -> Vec<String> {
+        vec!["journal.t1.0".to_owned(), "journal.t1.2".to_owned()]
+    }
+
+    fn committed_marker() -> RangeCompletionMarkerV3 {
+        let context = fixture_context();
+        let coverage = commit_range_coverage(&context, &fixture_observations()).unwrap();
+        let journal = commit_journal_obligations(&context, &fixture_journal_names()).unwrap();
+        RangeCompletionMarkerV3 {
+            mk: context.mk,
+            plan: context.plan,
+            begin: context.begin,
+            coverage: coverage.digest,
+            journal,
+            batch_count: coverage.batch_count,
+            journal_count: fixture_journal_names().len() as u64,
+            counters: coverage.aggregate,
+        }
+    }
+
+    /// A regular one-ref revision carrying the exact deterministic
+    /// `/3` key for the given MK, referencing the given object
+    /// bytes.
+    fn keyed_record(mk: &Hash, object_bytes: &[u8]) -> RevisionRecord {
+        RevisionRecord::regular(hash_object(b"c4-fixture-parent"), 0, 0)
+            .with_idempotency_key(reclamation_complete_v3_range_idempotency_key(mk))
+            .with_content_refs(vec![hash_object(object_bytes)])
+    }
+
+    /// The synthetic reader holding the record AND its referenced
+    /// object, with the record's identity.
+    fn reader_with(record: RevisionRecord, object_bytes: &[u8]) -> (SyntheticReads, Hash) {
+        let record_id = record.id();
+        let object_hash = hash_object(object_bytes);
+        (
+            SyntheticReads {
+                records: [(record_id, record.canonical_bytes())]
+                    .into_iter()
+                    .collect(),
+                objects: [(object_hash, object_bytes.to_vec())].into_iter().collect(),
+            },
+            record_id,
+        )
+    }
+
+    /// The genuine candidate: the correctly keyed record over the
+    /// genuine committed marker's bytes.
+    fn installed_candidate() -> (SyntheticReads, Hash) {
+        let marker = committed_marker();
+        let object_bytes = marker.canonical_bytes();
+        reader_with(keyed_record(&marker.mk, &object_bytes), &object_bytes)
+    }
+
+    /// A `/3`-keyed record over arbitrary object bytes.
+    fn keyed_over(object_bytes: &[u8]) -> (SyntheticReads, Hash) {
+        reader_with(
+            keyed_record(&fixture_context().mk, object_bytes),
+            object_bytes,
+        )
+    }
+
+    /// A genuine V2 `/2` Batch marker encoding (a real committed
+    /// classification, never a fabricated domain string).
+    fn v2_batch_marker_bytes() -> Vec<u8> {
+        let context = BatchCompletionContext {
+            mk: fixture_context().mk,
+            plan: fixture_context().plan,
+            batch_index: 0,
+            audit: hash_object(b"c4-fixture-audit"),
+            begin: fixture_context().begin,
+        };
+        let commitment = commit_classification(
+            &context,
+            vec![
+                ClassificationEntry {
+                    identity: hash_object(b"c4-fixture-sk0"),
+                    role: StorageRole::Record,
+                    classification: EntryClassification::Mandatory,
+                    conditional_on_prior_batch: false,
+                },
+                ClassificationEntry {
+                    identity: hash_object(b"c4-fixture-o0a"),
+                    role: StorageRole::Object,
+                    classification: EntryClassification::Deferred,
+                    conditional_on_prior_batch: false,
+                },
+            ],
+        )
+        .unwrap();
+        BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: commitment.digest,
+            counters: commitment.counters,
+        }
+        .canonical_bytes()
+    }
+
+    /// A genuine V1 Range completion marker encoding.
+    fn v1_range_marker_bytes() -> Vec<u8> {
+        ReclamationComplete {
+            kind: CompletionKind::Range,
+            mk: fixture_context().mk,
+            batch: 0,
+            source: hash_object(b"c4-fixture-plan"),
+            mandatory_count: 0,
+            deferred: Vec::new(),
+            journal_files: vec!["journal.t1.2".to_owned()],
+        }
+        .canonical_bytes()
+    }
+
+    #[test]
+    fn the_valid_structural_range_candidate_reads() {
+        let (mut reads, record_id) = installed_candidate();
+        let context = fixture_context();
+        let result = read_structural_range_candidate(&mut reads, &record_id, &context).unwrap();
+        let StructuralRangeCandidate { revision, marker } = result;
+        assert_eq!(revision, record_id);
+        assert_eq!(marker, committed_marker());
+    }
+
+    #[test]
+    fn the_expected_context_is_validated_before_any_read() {
+        // Each placeholder identity in the expected context refuses
+        // through the existing typed mapping — caller-input
+        // validation only, never an authentication of the origin.
+        let (mut reads, record_id) = installed_candidate();
+        for invalid in [
+            RangeCompletionContext {
+                mk: Hash::ZERO,
+                ..fixture_context()
+            },
+            RangeCompletionContext {
+                plan: Hash::ZERO,
+                ..fixture_context()
+            },
+            RangeCompletionContext {
+                begin: Hash::ZERO,
+                ..fixture_context()
+            },
+        ] {
+            assert!(matches!(
+                read_structural_range_candidate(&mut reads, &record_id, &invalid),
+                Err(MediumError::Format(SaveError::Integrity(
+                    "range-completion/zero-identity"
+                )))
+            ));
+        }
+        // And the validation precedes ANY candidate read: a reader
+        // with NO entries at all still refuses at the context,
+        // never at the missing record (the ordering proof).
+        let mut empty = empty_reads();
+        assert!(matches!(
+            read_structural_range_candidate(
+                &mut empty,
+                &record_id,
+                &RangeCompletionContext {
+                    mk: Hash::ZERO,
+                    ..fixture_context()
+                }
+            ),
+            Err(MediumError::Format(SaveError::Integrity(
+                "range-completion/zero-identity"
+            )))
+        ));
+    }
+
+    #[test]
+    fn the_off_chain_candidate_carries_no_authority() {
+        // A structurally valid OFF-CHAIN candidate: the synthetic
+        // readers hold ONLY the two byte entries each — no
+        // founding, no chain, no HEAD, and the BeginReads seam
+        // exposes no primitive that could consult them.
+        let (mut reads_a, id_a) = installed_candidate();
+        let (mut reads_b, id_b) = installed_candidate();
+        assert_eq!(id_a, id_b);
+        let a = read_structural_range_candidate(&mut reads_a, &id_a, &fixture_context()).unwrap();
+        let b = read_structural_range_candidate(&mut reads_b, &id_b, &fixture_context()).unwrap();
+        // The identical bytes under a FRESH reader instance yield
+        // the identical result — installation-independent by
+        // construction.
+        assert_eq!(a, b);
+        // The destructure names EVERY field the result holds — the
+        // two structural facts; no installation, durability, or
+        // verdict field exists.
+        let StructuralRangeCandidate {
+            revision,
+            marker: _,
+        } = &a;
+        assert_eq!(*revision, id_a);
+        // The separately supplied FABRICATED observations (pure
+        // fixtures, never any chain) match the marker's pure
+        // commitment — agreement only, never installation
+        // authority.
+        a.marker.verify_coverage(&fixture_observations()).unwrap();
+        a.marker
+            .verify_journal_obligations(&fixture_journal_names())
+            .unwrap();
+    }
+
+    #[test]
+    fn the_wrong_revision_shapes_refuse() {
+        let context = fixture_context();
+        let object_bytes = committed_marker().canonical_bytes();
+        // The founding record presented as a candidate.
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "c4shape", 0)
+            .with_content_refs(vec![hash_object(&object_bytes)]);
+        let (mut reads, id) = reader_with(founding, &object_bytes);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/not-regular"
+            })
+        ));
+        // Zero content references.
+        let zero_refs = RevisionRecord::regular(hash_object(b"c4-fixture-parent"), 0, 0)
+            .with_idempotency_key(reclamation_complete_v3_range_idempotency_key(&context.mk));
+        let (mut reads, id) = reader_with(zero_refs, &object_bytes);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/content-refs"
+            })
+        ));
+        // Multiple distinct content references (the normalized
+        // builder keeps two distinct identities).
+        let multi = RevisionRecord::regular(hash_object(b"c4-fixture-parent"), 0, 0)
+            .with_idempotency_key(reclamation_complete_v3_range_idempotency_key(&context.mk))
+            .with_content_refs(vec![
+                hash_object(&object_bytes),
+                hash_object(b"c4-second-object"),
+            ]);
+        let (mut reads, id) = reader_with(multi, &object_bytes);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/content-refs"
+            })
+        ));
+        // The missing idempotency key.
+        let keyless = RevisionRecord::regular(hash_object(b"c4-fixture-parent"), 0, 0)
+            .with_content_refs(vec![hash_object(&object_bytes)]);
+        let (mut reads, id) = reader_with(keyless, &object_bytes);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/key-mismatch"
+            })
+        ));
+    }
+
+    #[test]
+    fn the_wrong_keys_refuse() {
+        let context = fixture_context();
+        let object_bytes = committed_marker().canonical_bytes();
+        // The foreign-MK /3 key, the genuine V1 Range key, the
+        // genuine V1 Batch key, and the genuine V2 Batch key —
+        // every wrong namespace refuses identically.
+        let wrong_keys = [
+            reclamation_complete_v3_range_idempotency_key(&hash_object(b"c4-foreign-mk")),
+            reclamation_complete_idempotency_key(&context.mk, None),
+            reclamation_complete_idempotency_key(&context.mk, Some(0)),
+            reclamation_complete_v2_idempotency_key(&context.mk, 0),
+        ];
+        for wrong in wrong_keys {
+            let record = RevisionRecord::regular(hash_object(b"c4-fixture-parent"), 0, 0)
+                .with_idempotency_key(wrong)
+                .with_content_refs(vec![hash_object(&object_bytes)]);
+            let (mut reads, id) = reader_with(record, &object_bytes);
+            assert!(matches!(
+                read_structural_range_candidate(&mut reads, &id, &context),
+                Err(MediumError::Chain {
+                    rule: "range-candidate/key-mismatch"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_context_mismatches_refuse() {
+        let context = fixture_context();
+        let object_bytes = committed_marker().canonical_bytes();
+        // The wrong expected MK refuses at the KEY first (the key
+        // discipline is itself context-derived — honest defense in
+        // depth).
+        let wrong_mk = RangeCompletionContext {
+            mk: hash_object(b"c4-fixture-mk-2"),
+            ..context
+        };
+        let (mut reads, id) = reader_with(keyed_record(&context.mk, &object_bytes), &object_bytes);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &wrong_mk),
+            Err(MediumError::Chain {
+                rule: "range-candidate/key-mismatch"
+            })
+        ));
+        // The wrong plan and begin refuse at the context
+        // comparison.
+        for mutated in [
+            RangeCompletionContext {
+                plan: hash_object(b"c4-fixture-plan-2"),
+                ..context
+            },
+            RangeCompletionContext {
+                begin: hash_object(b"c4-fixture-begin-2"),
+                ..context
+            },
+        ] {
+            let (mut reads, id) =
+                reader_with(keyed_record(&context.mk, &object_bytes), &object_bytes);
+            assert!(matches!(
+                read_structural_range_candidate(&mut reads, &id, &mutated),
+                Err(MediumError::Chain {
+                    rule: "range-candidate/context-mismatch"
+                })
+            ));
+        }
+        // The correctly keyed LYING-MARKER adversary: the record
+        // keyed FOR each mutated expectation while the marker binds
+        // the original — every binding refuses at the context
+        // comparison itself.
+        for mutated in [
+            wrong_mk,
+            RangeCompletionContext {
+                plan: hash_object(b"c4-fixture-plan-2"),
+                ..context
+            },
+            RangeCompletionContext {
+                begin: hash_object(b"c4-fixture-begin-2"),
+                ..context
+            },
+        ] {
+            let (mut reads, id) =
+                reader_with(keyed_record(&mutated.mk, &object_bytes), &object_bytes);
+            assert!(matches!(
+                read_structural_range_candidate(&mut reads, &id, &mutated),
+                Err(MediumError::Chain {
+                    rule: "range-candidate/context-mismatch"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_corrupt_or_missing_evidence_refuses() {
+        let context = fixture_context();
+        let object_bytes = committed_marker().canonical_bytes();
+        let record = keyed_record(&context.mk, &object_bytes);
+        let record_id = record.id();
+        // The missing candidate record.
+        let mut empty = empty_reads();
+        assert!(matches!(
+            read_structural_range_candidate(&mut empty, &record_id, &context),
+            Err(MediumError::MissingObject { .. })
+        ));
+        // The record bytes stored under an incorrect identity (the
+        // reader's own hash check re-establishes the adapter
+        // contract).
+        let wrong_slot = hash_object(b"c4-wrong-slot");
+        let mut misfiled = SyntheticReads {
+            records: [(wrong_slot, record.canonical_bytes())]
+                .into_iter()
+                .collect(),
+            objects: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(
+            read_structural_range_candidate(&mut misfiled, &wrong_slot, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/record-hash"
+            })
+        ));
+        // The missing referenced content object.
+        let mut no_object = SyntheticReads {
+            records: [(record_id, record.canonical_bytes())]
+                .into_iter()
+                .collect(),
+            objects: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(
+            read_structural_range_candidate(&mut no_object, &record_id, &context),
+            Err(MediumError::MissingObject { .. })
+        ));
+        // The impostor object bytes (stored under the referenced
+        // identity but not hashing to it).
+        let object_hash = hash_object(&object_bytes);
+        let mut impostor = SyntheticReads {
+            records: [(record_id, record.canonical_bytes())]
+                .into_iter()
+                .collect(),
+            objects: [(object_hash, b"impostor".to_vec())].into_iter().collect(),
+        };
+        assert!(matches!(
+            read_structural_range_candidate(&mut impostor, &record_id, &context),
+            Err(MediumError::Chain {
+                rule: "range-candidate/object-hash"
+            })
+        ));
+    }
+
+    #[test]
+    fn the_foreign_markers_never_become_range_candidates() {
+        // The genuine /2 Batch marker under a /3-keyed record —
+        // refuses at the /3 domain gate.
+        let (mut reads, id) = keyed_over(&v2_batch_marker_bytes());
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &fixture_context()),
+            Err(MediumError::Format(_))
+        ));
+        // The genuine V1 Range completion marker likewise.
+        let (mut reads, id) = keyed_over(&v1_range_marker_bytes());
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &fixture_context()),
+            Err(MediumError::Format(_))
+        ));
+        // The corrupted domain and the wrong wire version.
+        let genuine = committed_marker().canonical_bytes();
+        let mut bad_domain = genuine.clone();
+        bad_domain[8 + RECLAMATION_COMPLETE_V3_DOMAIN.len() - 1] = b'9';
+        let (mut reads, id) = keyed_over(&bad_domain);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &fixture_context()),
+            Err(MediumError::Format(_))
+        ));
+        let mut bad_version = genuine.clone();
+        let at = 8 + RECLAMATION_COMPLETE_V3_DOMAIN.len();
+        bad_version[at..at + 4].copy_from_slice(&4u32.to_le_bytes());
+        let (mut reads, id) = keyed_over(&bad_version);
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &fixture_context()),
+            Err(MediumError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn the_reader_preserves_the_c3_decoder_bounds() {
+        // Truncation at every byte boundary and trailing data
+        // refuse through the reader's strict decode.
+        let genuine = committed_marker().canonical_bytes();
+        for cut in 0..genuine.len() {
+            let (mut reads, id) = keyed_over(&genuine[..cut]);
+            assert!(
+                read_structural_range_candidate(&mut reads, &id, &fixture_context()).is_err(),
+                "truncation at {cut} must refuse"
+            );
+        }
+        let mut trailing = genuine.clone();
+        trailing.push(0);
+        let (mut reads, id) = keyed_over(&trailing);
+        assert!(read_structural_range_candidate(&mut reads, &id, &fixture_context()).is_err());
+        // The F2-impossible one-batch aggregate (from the accepted
+        // C3 regression), the zero batch count, and the
+        // over-maximum journal count refuse through the reader's
+        // decode — every accepted C3 bound holds through the
+        // reader path.
+        let context = fixture_context();
+        let impossible = RangeCompletionMarkerV3 {
+            mk: context.mk,
+            plan: context.plan,
+            begin: context.begin,
+            coverage: hash_object(b"c4-f2-coverage"),
+            journal: hash_object(b"c4-f2-journal"),
+            batch_count: 1,
+            journal_count: 0,
+            counters: RangeAggregateCounters {
+                mandatory_records: MAX_ACCOUNTING_CLASSIFIED_LIST + 1,
+                ..RangeAggregateCounters::EMPTY
+            },
+        };
+        let (mut reads, id) = keyed_over(&impossible.canonical_bytes());
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Format(_))
+        ));
+        let zero_batches = RangeCompletionMarkerV3 {
+            batch_count: 0,
+            ..impossible
+        };
+        let (mut reads, id) = keyed_over(&zero_batches.canonical_bytes());
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Format(_))
+        ));
+        let over_journals = RangeCompletionMarkerV3 {
+            batch_count: 3,
+            journal_count: MAX_RECLAMATION_JOURNAL_FILES + 1,
+            counters: commit_range_coverage(&context, &fixture_observations())
+                .unwrap()
+                .aggregate,
+            ..zero_batches
+        };
+        let (mut reads, id) = keyed_over(&over_journals.canonical_bytes());
+        assert!(matches!(
+            read_structural_range_candidate(&mut reads, &id, &context),
+            Err(MediumError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn the_reader_does_not_verify_commitments() {
+        // A marker whose commitment digests are well-formed but
+        // ARBITRARY nonzero values (never the committed ones)
+        // PASSES the structural read — the reader computes no
+        // commitment, by the owner's ratified C4 boundary.
+        let context = fixture_context();
+        let arbitrary = RangeCompletionMarkerV3 {
+            mk: context.mk,
+            plan: context.plan,
+            begin: context.begin,
+            coverage: hash_object(b"c4-arbitrary-coverage"),
+            journal: hash_object(b"c4-arbitrary-journal"),
+            batch_count: 3,
+            journal_count: 2,
+            counters: commit_range_coverage(&context, &fixture_observations())
+                .unwrap()
+                .aggregate,
+        };
+        let (mut reads, id) = keyed_over(&arbitrary.canonical_bytes());
+        let result = read_structural_range_candidate(&mut reads, &id, &context).unwrap();
+        assert_eq!(result.marker, arbitrary);
+        // And the caller's separate pure verification over the
+        // genuine fixtures REFUSES the arbitrary digests — the
+        // commitments remain the caller's steps, never the
+        // reader's.
+        assert!(
+            result
+                .marker
+                .verify_coverage(&fixture_observations())
+                .is_err()
+        );
+        assert!(
+            result
+                .marker
+                .verify_journal_obligations(&fixture_journal_names())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_callers_separate_pure_verification_refuses() {
+        // The caller-side pure steps (never the reader's): reordered
+        // Batch observations refuse on the coverage digest; omitted
+        // observations refuse; counter-only tampering refuses on
+        // the counters; altered journal obligations refuse on the
+        // journal digest.
+        let marker = committed_marker();
+        let records = marker_records();
+        let swapped = vec![
+            observation(0, records[1], batch_counters(2, 0, 1, 1)),
+            observation(1, records[0], batch_counters(1, 1, 0, 0)),
+            observation(2, records[2], batch_counters(0, 0, 3, 0)),
+        ];
+        assert!(marker.verify_coverage(&swapped).is_err());
+        assert!(
+            marker
+                .verify_coverage(&fixture_observations()[..1])
+                .is_err()
+        );
+        let counter_tampered = vec![
+            observation(0, records[0], batch_counters(3, 0, 1, 1)),
+            observation(1, records[1], batch_counters(1, 1, 0, 0)),
+            observation(2, records[2], batch_counters(0, 0, 3, 0)),
+        ];
+        assert!(marker.verify_coverage(&counter_tampered).is_err());
+        let mutated_names = vec!["journal.t1.0".to_owned(), "journal.t1.3".to_owned()];
+        assert!(marker.verify_journal_obligations(&mutated_names).is_err());
     }
 }
