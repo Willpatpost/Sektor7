@@ -132,8 +132,43 @@ jobs:
             echo "crash-seam isolation verified: 0 ARM_RECLAIM_BEFORE_COMPLETION symbols in the feature-disabled engine-slice rlib"
           fi
           echo "activation isolation verified: 0 activation symbols in the feature-disabled rlib"
+      # (CI-C2, the owner's 2026-11-11 GO — the F1-corrected package
+      # sharding) The workspace feature battery is split by package:
+      # this job runs every package EXCEPT engine-slice; the parallel
+      # heavy-tests job runs the COMPLETE engine-slice battery. The
+      # command is the F1-verified form — composite-test-fixture
+      # explicitly for engine-persist (which also selects its two
+      # required-features integration binaries composite_append and
+      # composite_reader), engine-slice excluded here and carrying
+      # crash-test-seams only in its own job, where its
+      # dev-dependency edge enables engine-persist/composite-test-
+      # fixture (cargo tree -f '{p} {f}' verified both sides). The
+      # partition is exact at the accepted CI-C1 baseline: this shard
+      # executes 792 tests on Linux / 742 on Windows, heavy supplies
+      # 442 / 441, and the two sum to the original unsharded battery
+      # (1234 / 1183; the test-name inventories are multiset-equal,
+      # verified by local execution and by parsing run 42934990684).
+      # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
+      # legitimate tests to any package requires updating the pinned
+      # counts in this step and the heavy job's step in the same
+      # change — a deliberate reviewed touchpoint, never a silent
+      # pass-through. The main job's later simulation, Vulkan, and
+      # integrated-soak commands are separate acceptance checks, not
+      # duplicated test suites, and remain mandatory.
       - name: Tests
-        run: cargo test --workspace --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
+          expected=792
+          if [ "$(uname -s)" != "Linux" ]; then expected=742; fi
+          passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
+          ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
+          results=$(grep -c 'test result:' tests-main.log || true)
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 1 / 30)"
+          [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
+          [ "$ignored" -eq 1 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 1"; exit 1; }
+          [ "$results" -eq 30 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 30"; exit 1; }
       # (V2X-CP3-B-P1 F3) The FEATURE-DISABLED production-path
       # regression: the B-P1 production tests are cfg(test)-only
       # (never feature-gated), and this step runs them WITHOUT the
@@ -403,3 +438,85 @@ jobs:
             esac
             grep -Fq "stage4=$pinned" <<< "$a" || { echo "Stage 4 $scenario fingerprint changed (expected stage4=$pinned)"; exit 1; }
           done
+
+  # (CI-C2, the owner's 2026-11-11 GO — the package-level sharding's
+  # second half) The COMPLETE engine-slice test battery, in parallel
+  # with the main validation job. engine-slice is the measured
+  # execution-mass leader (s6_soak, pp_b3_reclaim, pp_b3_rotation —
+  # the crash-seam suites that re-execute their own test binaries as
+  # child processes with env-var roles and process-id-keyed scratch
+  # roots); a separate runner guarantees those binaries never share
+  # a machine with simultaneously-running tests, preserving the
+  # accepted sequential-harness semantics exactly. This job claims
+  # NO feature-disabled artifact isolation (that gate lives in the
+  # main job, after Build, before its feature-enabled Tests) and
+  # runs no fmt/clippy/build/selftests — every one of those
+  # acceptance checks remains exactly once, in the main job. The
+  # feature string is the F1-verified form: crash-test-seams for the
+  # selected package, with engine-persist/composite-test-fixture
+  # arriving through engine-slice's own dev-dependency edge. Cache:
+  # the accepted CI-C1 rust-cache step verbatim — a NEW job-scoped
+  # cache key per OS (first execution cold, then warm restores); no
+  # cross-job shared keys, no workspace-crate caching, the pinned
+  # action unchanged.
+  heavy-tests:
+    name: heavy-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "engine -> target"
+      # (CI-C2 §6) The workspace-membership guard: the sharding
+      # partition is package-exact, so the package set itself is the
+      # coverage contract. Exactly the five authorized members — a
+      # NEW package REFUSES here by name (an explicit inventory
+      # review, never a silent omission); new test targets inside
+      # existing packages run automatically but shift the pinned
+      # counts below (the documented maintenance obligation).
+      - name: Workspace inventory guard (exactly the five authorized packages)
+        shell: bash
+        run: |
+          # Package ids are "<path>#<version>" (the pinned toolchain's
+          # cargo metadata format), so the member name is the final
+          # path segment before the #version suffix.
+          members=$(cargo metadata --no-deps --format-version 1 | grep -oE '"workspace_members":\[[^]]*\]' | grep -oE '[A-Za-z0-9_-]+#[0-9][0-9.]*' | sed 's/#.*//' | sort)
+          count=$(printf '%s\n' "$members" | wc -l)
+          echo "workspace members ($count): $(printf '%s\n' "$members" | tr '\n' ' ')"
+          [ "$count" -eq 5 ] || { echo "WORKSPACE INVENTORY CHANGED: $count members, expected exactly 5 — the package sharding requires an explicit inventory review"; exit 1; }
+          for pkg in engine-core engine-persist engine-renderer engine-shell engine-slice; do
+            printf '%s\n' "$members" | grep -qx "$pkg" || { echo "MISSING EXPECTED PACKAGE: $pkg"; exit 1; }
+          done
+          echo "inventory guard: exactly the five authorized packages"
+      # (CI-C2 F2) The heavy-shard battery and its exact-count gates.
+      # Expected executed totals (established at the accepted CI-C1
+      # baseline from real inventories — locally executed AND parsed
+      # from run 42934990684): 442 Linux / 441 Windows passed, 3
+      # ignored, 44 cargo test-result lines (the slice lib + bin +
+      # the 42 integration binaries + the doc section). Together
+      # with the main shard's 792 / 742 these sum to the original
+      # unsharded battery (1234 / 1183). MAINTENANCE OBLIGATION:
+      # legitimate new tests require updating these pins in the same
+      # change. A shard that unexpectedly executes no tests fails
+      # here — compilation success is never counted as coverage.
+      - name: Tests (heavy shard — the complete engine-slice battery)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
+          expected=442
+          if [ "$(uname -s)" != "Linux" ]; then expected=441; fi
+          passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
+          ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
+          results=$(grep -c 'test result:' tests-heavy.log || true)
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 44)"
+          [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
+          [ "$ignored" -eq 3 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 3"; exit 1; }
+          [ "$results" -eq 44 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 44"; exit 1; }
