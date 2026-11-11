@@ -57,6 +57,7 @@ pub mod medium;
 pub mod migrate;
 pub mod pipeline;
 pub mod range_completion;
+pub mod range_installation;
 pub mod reclaim;
 pub mod record;
 pub mod recovery;
@@ -164,6 +165,11 @@ pub use range_completion::{
     RangeCoverageCommitmentBuilder, RangeCoverageObservation, StructuralRangeCandidate,
     commit_journal_obligations, commit_range_coverage, read_structural_range_candidate,
     reclamation_complete_v3_range_idempotency_key,
+};
+pub use range_installation::{
+    MAX_OBSERVATION_RECORDS, NotEstablished, NotObservedTerminus, RangeInstallationLimits,
+    RangeInstallationObservation, UnresolvedObligations,
+    verify_range_terminal_on_observed_ancestry,
 };
 pub use reclaim::{
     CompletionKind, PlanBatch, RECLAMATION_COMPLETE_DOMAIN, RECLAMATION_COMPLETE_KEY_DOMAIN,
