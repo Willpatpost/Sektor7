@@ -6328,4 +6328,205 @@ mod r1a3_degradation_tests {
             cleanup(&[path, journal]);
         }
     }
+
+    /// The genuine-shaped begin payload (the V2X install-begin
+    /// pattern: the exact bindings the admission would publish).
+    fn genuine_begin_payload(campaign: &Campaign, plan_record: Hash) -> Vec<u8> {
+        crate::reclaim::ReclamationBegin {
+            mk: campaign.mk,
+            source: plan_record,
+            range_digest: campaign.metadata.range_digest,
+            seed: campaign.metadata.seed,
+        }
+        .canonical_bytes()
+    }
+
+    /// (B-R1a3 §5) The begin installed BELOW the audits degrades
+    /// with the strict temporal violation: a genuine-shaped begin
+    /// under the exact begin key (the in-crate seam) followed by
+    /// the GENUINE audit publications above it — the L4 bindings
+    /// all hold, the L5 audit-before-begin ordering refuses
+    /// (audit-above-begin; the all-audits-first admission is
+    /// exactly what this shape circumvents).
+    #[test]
+    fn the_begin_below_the_audits_degrades() {
+        let (path, mut store) = sqlite_store("d5");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d5");
+        let campaign = stage_prefix(medium, "d5", &journal);
+        publish_reclamation_plan(
+            medium,
+            &campaign.mk,
+            R1A3_LEDGER_BYTE_LIMIT,
+            &journal,
+            6,
+        )
+        .unwrap();
+        let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let record = install_keyed_object_record(
+            medium,
+            reclamation_begin_idempotency_key(&campaign.mk),
+            genuine_begin_payload(&campaign, plan_record),
+            7,
+        );
+        for batch in &plan.batches {
+            publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 8).unwrap();
+        }
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::BeginTemporalViolation {
+                    record,
+                    rule: "audit-above-begin",
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §6) The begin observed with a MISSING plan audit
+    /// degrades with the all-audits-first invariant: a
+    /// genuine-shaped begin under the exact begin key over a plan
+    /// whose LAST batch's audit was never published (the admission
+    /// refuses this shape at the gate — the in-crate seam is the
+    /// only route, and the classifier independently refuses it).
+    #[test]
+    fn the_begin_with_a_missing_audit_degrades() {
+        let (path, mut store) = sqlite_store("d6");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d6");
+        let campaign = stage_prefix(medium, "d6", &journal);
+        publish_reclamation_plan(
+            medium,
+            &campaign.mk,
+            R1A3_LEDGER_BYTE_LIMIT,
+            &journal,
+            6,
+        )
+        .unwrap();
+        let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let n = plan.batches.len();
+        assert!(n >= 2, "the missing-audit arm needs multiple batches: {n}");
+        for batch in &plan.batches {
+            if batch.index == n as u64 - 1 {
+                continue;
+            }
+            publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+        }
+        let record = install_keyed_object_record(
+            medium,
+            reclamation_begin_idempotency_key(&campaign.mk),
+            genuine_begin_payload(&campaign, plan_record),
+            8,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::RequiredAuditNotObserved {
+                    batch: n as u64 - 1,
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §7) A correctly keyed C1 marker over a batch index
+    /// BEYOND the plan's membership degrades with the
+    /// context-incomplete contradiction: every genuine audit is
+    /// published and the begin is observed (the L5 lane passes),
+    /// but the discovery's marker pass finds no audit for the
+    /// marker's out-of-membership batch and the L6 lane refuses
+    /// the marker as contradictory evidence, never a harmless
+    /// partial publication — the honest terminal for both this
+    /// shape and a missing-audit marker (the standalone
+    /// outside-membership arm is unreachable through the
+    /// discovery's context construction: a batch without an audit
+    /// refuses as context-incomplete first).
+    #[test]
+    fn the_marker_over_a_missing_audit_degrades() {
+        let (path, mut store) = sqlite_store("d7");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d7");
+        let campaign = stage_prefix(medium, "d7", &journal);
+        publish_reclamation_plan(
+            medium,
+            &campaign.mk,
+            R1A3_LEDGER_BYTE_LIMIT,
+            &journal,
+            6,
+        )
+        .unwrap();
+        let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        let n = plan.batches.len();
+        assert!(n >= 2, "the marker arm needs multiple batches: {n}");
+        for batch in &plan.batches {
+            publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+        }
+        let begin = install_keyed_object_record(
+            medium,
+            reclamation_begin_idempotency_key(&campaign.mk),
+            genuine_begin_payload(&campaign, plan_record),
+            8,
+        );
+        // The marker keyed for batch n — one beyond the plan's
+        // membership — under the exact (mk, n) key, the C1
+        // commitment over the campaign's genuine SK entry (the
+        // payload is never structurally read: the missing audit
+        // for the out-of-membership batch refuses first).
+        let context = crate::batch_completion::BatchCompletionContext {
+            mk: campaign.mk,
+            plan: plan_record,
+            batch_index: n as u64,
+            audit: campaign.mk,
+            begin,
+        };
+        let commitment = crate::batch_completion::commit_classification(
+            &context,
+            vec![crate::batch_completion::ClassificationEntry {
+                identity: campaign.sk,
+                role: crate::ancestry_accounting::StorageRole::Record,
+                classification: crate::batch_completion::EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            }],
+        )
+        .unwrap();
+        let marker = crate::batch_completion::BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: commitment.digest,
+            counters: commitment.counters,
+        };
+        let record = install_keyed_object_record(
+            medium,
+            crate::batch_completion::reclamation_complete_v2_idempotency_key(&campaign.mk, n as u64),
+            marker.canonical_bytes(),
+            9,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MarkerContradicted {
+                    record,
+                    batch: Some(n as u64),
+                    rule: String::from("context-incomplete"),
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
 }
