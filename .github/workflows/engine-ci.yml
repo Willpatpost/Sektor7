@@ -155,10 +155,12 @@ jobs:
       # rc=0; the Windows count derived from BOTH lines' MEASURED
       # CI-confirmed deltas: the C5b run's 846 and the B-R1a2 run's
       # 843, cross-checked two ways: 846 + 11 == 843 + 14 == 857),
-      # heavy supplies 442 / 441 (UNCHANGED — MEASURED at the
-      # consolidated tree: the C5b store/worker routing and the
-      # B-R1a2 package add no engine-slice tests), and the two sum
-      # to the consolidated battery (1350 / 1298; the Linux count
+      # heavy supplies 448 / 447 (RECOMPUTED at the C5c branch —
+      # MEASURED at the consolidated tree 442 / 441, then the six
+      # platform-uniform crossing::c5c_reader_tests added on top;
+      # see the heavy job's comment for the measured provenance),
+      # and the two sum
+      # to the consolidated battery (1356 / 1304; the Linux count
       # locally executed, the Windows count from the measured
       # deltas, verified by the cold CI run).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
@@ -520,8 +522,15 @@ jobs:
       # the 42 integration binaries + the doc section) — UNCHANGED at
       # the integrated Stage 6 tree (engine-slice untouched by the
       # A/B lines; locally re-executed at the integrated tree).
-      # Together with the main shard's 908 / 857 these sum to the
-      # consolidated battery (1350 / 1298). MAINTENANCE OBLIGATION:
+      # RECOMPUTED at the C5c completion-crossing-recognition branch
+      # (the new-main f3f03bb + the six platform-uniform
+      # crossing::c5c_reader_tests): 448 Linux MEASURED with this
+      # shard's own command (448 passed / 0 failed / 3 ignored / 44
+      # result lines, the workflow's own awk); 447 Windows = the
+      # prior 441 + the same six platform-uniform tests (no cfg
+      # gates). Together with the main shard's 908 / 857 (unchanged —
+      # C5c adds no main-shard tests) these sum to the consolidated
+      # battery (1356 / 1304). MAINTENANCE OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
@@ -530,8 +539,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=442
-          if [ "$(uname -s)" != "Linux" ]; then expected=441; fi
+          expected=448
+          if [ "$(uname -s)" != "Linux" ]; then expected=447; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
