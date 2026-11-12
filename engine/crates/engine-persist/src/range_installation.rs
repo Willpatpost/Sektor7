@@ -300,6 +300,92 @@ pub enum RangeInstallationObservation {
     },
 }
 
+// ------------------------------------------- the provider-coordinated observation (C5b)
+
+/// The provider-coordinated not-established obligations — the eleven
+/// C5a authorities PLUS the head-currency limitation. Every field is
+/// a NAMED ABSENCE of authority, never a capability, never a
+/// verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatedUnresolvedObligations {
+    /// The provider-coordinated canonical HEAD (established only
+    /// within the coordination window).
+    pub provider_canonical_head: NotEstablished,
+    /// The begin's provider durability authority.
+    pub begin_durability_authority: NotEstablished,
+    /// The founding-derived seed's authenticity (below the MK).
+    pub founding_derived_seed_authenticity: NotEstablished,
+    /// The original range digest's historical correctness.
+    pub original_range_digest_historical_correctness: NotEstablished,
+    /// The original object closures below the MK.
+    pub original_object_closures: NotEstablished,
+    /// The Batch markers' historical classification correctness.
+    pub batch_classification_historical_correctness: NotEstablished,
+    /// The physical retirement of any identity.
+    pub physical_retirement: NotEstablished,
+    /// The journal retirement and ownership updates.
+    pub journal_retirement_and_ownership: NotEstablished,
+    /// The recovery convergence of any range.
+    pub recovery_convergence: NotEstablished,
+    /// Any checkpoint-crossing permission.
+    pub crossing_permission: NotEstablished,
+    /// Any startup-safety permission.
+    pub startup_safety: NotEstablished,
+    /// The HEAD's CURRENCY BEYOND THE COORDINATION SCOPE: after the
+    /// scope closes, a later publication may supersede the head —
+    /// the observation is an honest instant-in-time snapshot, never
+    /// a currency certificate.
+    pub head_currency_beyond_scope: NotEstablished,
+}
+
+impl CoordinatedUnresolvedObligations {
+    /// The complete list — a coordinated observation carries every
+    /// not-established authority explicitly.
+    pub fn all() -> Self {
+        CoordinatedUnresolvedObligations {
+            provider_canonical_head: NotEstablished,
+            begin_durability_authority: NotEstablished,
+            founding_derived_seed_authenticity: NotEstablished,
+            original_range_digest_historical_correctness: NotEstablished,
+            original_object_closures: NotEstablished,
+            batch_classification_historical_correctness: NotEstablished,
+            physical_retirement: NotEstablished,
+            journal_retirement_and_ownership: NotEstablished,
+            recovery_convergence: NotEstablished,
+            crossing_permission: NotEstablished,
+            startup_safety: NotEstablished,
+            head_currency_beyond_scope: NotEstablished,
+        }
+    }
+}
+
+/// The provider-coordinated Range-terminal observation (C5b): the
+/// accepted C5a observation over a head that was read UNDER the
+/// provider's own coordination scope, with the whole walk inside
+/// that scope. **The promoted claim, exactly:** at a definite
+/// instant inside a coordinated read scope, the coordinated head
+/// was the provider's authoritative HEAD, and the `/3` Range
+/// terminal with its retained evidence was observed on that head's
+/// ancestry — NOTHING more. It does NOT establish retirement or
+/// discharge of any obligation (physical, journal, ownership),
+/// historical classification correctness, the founding-derived
+/// facts below the MK, durability grades, or any deletion,
+/// crossing, or startup permission — and the head's currency
+/// beyond the coordination window is explicitly NOT established
+/// (see [`CoordinatedUnresolvedObligations`]). No authorization
+/// token, deletion permit, skip permit, canonical-head certificate,
+/// or startup verdict exists anywhere in this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedObservation {
+    /// The head as read INSIDE the coordination scope — the walk's
+    /// seed (every nested `observed_head` equals this identity).
+    pub coordinated_head: Hash,
+    /// The C5a observation, unchanged.
+    pub observation: RangeInstallationObservation,
+    /// Every authority this result does NOT establish.
+    pub unresolved: CoordinatedUnresolvedObligations,
+}
+
 // ------------------------------------------------------- the expected key set
 
 /// The precomputed deterministic keys and prefixes for the expected
@@ -970,6 +1056,35 @@ fn complete_observation<R: crate::reclaim::BeginReads>(
         begin_record,
         batch_markers,
         unresolved: UnresolvedObligations::all(),
+    })
+}
+
+/// (V2X-CP3-B-P2A-C5b) The shared coordinated core: the accepted C5a
+/// verifier run over a head that the CALLER read under the
+/// provider's own coordination scope, with this whole walk inside
+/// that same scope (the provider's locked-reads or
+/// transaction-scoped adapter supplies `reads`). The invariant is
+/// by construction: the coordinated head IS the walk's seed, so
+/// every result variant's `observed_head` equals the
+/// `coordinated_head`. Read-only; no publication, no mutation, no
+/// new authority beyond the head-relative observation's own
+/// contract (see [`CoordinatedObservation`]).
+pub(crate) fn observe_coordinated<R: crate::reclaim::BeginReads>(
+    reads: &mut R,
+    coordinated_head: &Hash,
+    expected: &RangeCompletionContext,
+    limits: &RangeInstallationLimits,
+) -> Result<CoordinatedObservation, MediumError> {
+    let observation = verify_range_terminal_on_observed_ancestry(
+        reads,
+        coordinated_head,
+        expected,
+        limits,
+    )?;
+    Ok(CoordinatedObservation {
+        coordinated_head: *coordinated_head,
+        observation,
+        unresolved: CoordinatedUnresolvedObligations::all(),
     })
 }
 
