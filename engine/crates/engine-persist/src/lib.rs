@@ -61,6 +61,8 @@ pub mod range_installation;
 pub mod reclaim;
 pub mod record;
 pub mod recovery;
+pub mod recovery_classification;
+pub mod recovery_discovery;
 pub mod rotation;
 pub mod session_anchor;
 pub mod sqlite;
@@ -167,8 +169,8 @@ pub use range_completion::{
     reclamation_complete_v3_range_idempotency_key,
 };
 pub use range_installation::{
-    MAX_OBSERVATION_RECORDS, NotEstablished, NotObservedTerminus, RangeInstallationLimits,
-    RangeInstallationObservation, UnresolvedObligations,
+    MAX_OBSERVATION_RECORDS, NotEstablished as RangeInstallNotEstablished, NotObservedTerminus,
+    RangeInstallationLimits, RangeInstallationObservation, UnresolvedObligations,
     verify_range_terminal_on_observed_ancestry,
 };
 pub use reclaim::{
@@ -188,6 +190,16 @@ pub use recovery::{
     AppliedEffect, ConfirmedEvidence, RecoveredParticipant, RecoveryAnchor, RecoveryError,
     RecoveryOutcome, RecoveryReport, TransitionClassification, reconcile,
     reconstruct_episode_frontier,
+};
+pub use recovery_classification::{
+    ClassificationError, EvidenceDegradation, NotEstablished, ObservedBegin, ObservedPlan,
+    ObservedV1Begin, OlderRangeStatus, RecoveryClassification, RecoveryState, UnresolvedAuthority,
+    WitnessDegradation, WitnessEvidenceObservation, classify_recovery_evidence,
+};
+pub use recovery_discovery::{
+    CompletionCandidateObservation, CompletionStructural, CoveringCheckpoint, CoveringObservation,
+    DiscoveredFamily, DiscoveredPayload, DiscoveredRecord, DiscoveryBoundary, DiscoveryError,
+    DiscoveryLimits, MAX_DISCOVERY_RECORDS, RecoveryEvidenceDiscovery, discover_recovery_evidence,
 };
 pub use rotation::{
     GENERATIONS_IO_FAULT, JOURNAL_ACTIVE_SUFFIX, JournalRotation, POINTER_DIR_SYNC_FAULT,
