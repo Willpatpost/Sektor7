@@ -1084,6 +1084,238 @@ pub(crate) fn observe_coordinated<R: crate::reclaim::BeginReads>(
     })
 }
 
+// ===================================================== the C5d composite
+//
+// (V2X-CP3-B-P2A-C5d) The discovery-derived coordinated
+// Range-terminal observation — the startup prerequisite. C5a
+// verifies an EXPECTED context; C5b coordinates the head under
+// the provider's scope; C5d removes the last caller-supplied
+// input: the context itself, derived from the retained evidence
+// the recovery discovery observes on the inspected segment.
+//
+// **The two-provenance discipline.** Stage one is the accepted
+// recovery discovery ([`crate::recovery_discovery`]) run
+// UNCOORDINATED from a caller-supplied head — the discovery's own
+// documented seed semantics ("the head is an observation seed,
+// never an authority"). The derivation consumes hash-verified
+// structural identities only: the covering checkpoint's MK
+// record, the newest plan revision, and the newest begin
+// revision above it. Stage three is the accepted C5b coordinated
+// observation over the DERIVED context — the provider-scoped,
+// authoritative installation answer FOR THAT CONTEXT. The
+// composite never claims the discovered range is THE active
+// range: if the head moved between the stages, the observation
+// still answers truthfully for the derived context on the
+// coordinated head's ancestry (the same snapshot semantics as
+// [`CoordinatedUnresolvedObligations::head_currency_beyond_scope`]).
+//
+// **What this composite may NOT establish — by construction:** a
+// canonical-head claim beyond the coordination window; recovery
+// or retirement verdicts (the classifier's states own those);
+// V1-evidence disposition (the existing V1 verifiers own it);
+// any capability, permission, cursor, or destructive authority.
+// The not-derivable ladder below is an honest classification of
+// what the discovery observed, never an invented obligation.
+
+/// The typed two-stage refusals of the composite — the discovery
+/// stage's and the observation stage's own errors, propagated
+/// separately and never collapsed.
+#[derive(Debug)]
+pub enum DiscoveredObservationError {
+    /// The discovery stage's typed refusal (a missing head record,
+    /// a missing parent, a corrupt record, a cycle, or an
+    /// exhausted traversal bound — see
+    /// [`crate::recovery_discovery::DiscoveryError`]).
+    Discovery(crate::recovery_discovery::DiscoveryError),
+    /// The coordinated observation stage's typed refusal (the
+    /// C5b surface's own error, verbatim).
+    Observation(MediumError),
+}
+
+/// What the derivation stage established about the candidate V2
+/// range context — the honest ladder over the discovery's
+/// structural observations. Every variant names what was
+/// OBSERVED; none is a verdict about execution, installation
+/// canonicity, durability, or retirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveredRangeContext {
+    /// The full V2 context derived: the covering MK record, the
+    /// newest plan revision, and the newest begin whose source
+    /// binds that plan (the V2 shape — the V1 begin binds an
+    /// audit). All identities are the discovery's hash-verified
+    /// structural observations; the coordinated observation stage
+    /// owns every binding and temporal check on them.
+    V2Context {
+        /// The derived context (the C5b observation's input).
+        context: RangeCompletionContext,
+        /// The covering checkpoint's MK record identity (the
+        /// derivation's anchor).
+        covering_mk: Hash,
+        /// How many records the discovery consulted for this
+        /// derivation (the seed-relative walk's own accounting).
+        records_consulted: u64,
+    },
+    /// The inspected ancestry reached the founding record with no
+    /// covering checkpoint — no range context can be anchored
+    /// head-relatively.
+    NoCoveringCheckpoint {
+        /// The founding record the discovery reached.
+        founding: Hash,
+    },
+    /// A covering checkpoint was identified but no V2 plan
+    /// revision was observed above it — no V2 reclamation was
+    /// ever begun on the inspected segment.
+    NoPlanAboveCovering {
+        /// The covering checkpoint's MK record identity.
+        covering_mk: Hash,
+    },
+    /// A plan was observed but no begin revision was observed
+    /// above the covering checkpoint — the reclamation never
+    /// began on the inspected segment (or its begin lies below
+    /// the boundary, which the discovery never reads).
+    NoBeginAbovePlan {
+        /// The covering checkpoint's MK record identity.
+        covering_mk: Hash,
+        /// The newest observed plan revision's identity.
+        plan: Hash,
+    },
+    /// A begin was observed whose source binds an audit revision,
+    /// not the plan (the V1 shape) — the V2 Range-terminal
+    /// observation does not apply; the existing V1 verifiers own
+    /// this evidence.
+    V1BeginObserved {
+        /// The covering checkpoint's MK record identity.
+        covering_mk: Hash,
+        /// The newest observed plan revision's identity.
+        plan: Hash,
+        /// The observed begin revision's identity.
+        begin: Hash,
+    },
+}
+
+/// The composite result: the derivation ladder plus, when a V2
+/// context was derived, the C5b coordinated observation for that
+/// context. The destructuring names everything held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredRangeObservation {
+    /// What the derivation stage established.
+    pub derivation: DiscoveredRangeContext,
+    /// The coordinated observation — present only for the derived
+    /// V2 context (the not-derivable shapes carry no observation;
+    /// they are honest classifications, never errors).
+    pub observation: Option<CoordinatedObservation>,
+}
+
+/// (V2X-CP3-B-P2A-C5d) The discovery-derived coordinated
+/// Range-terminal observation. Read-only over the supplied
+/// medium; no publication, no mutation, no new authority beyond
+/// the two composed stages' own contracts.
+///
+/// Stage one runs the accepted recovery discovery from the
+/// caller-supplied `head` (the discovery's seed semantics —
+/// uncoordinated, head-relative). Stage two derives the V2 range
+/// context from the discovered evidence (or classifies the
+/// not-derivable shape honestly). Stage three runs the accepted
+/// C5b coordinated observation for the derived context under the
+/// provider's own coordination scope.
+pub fn observe_discovered_range_terminal_under_coordination(
+    medium: &mut dyn crate::medium::CanonicalMedium,
+    head: &Hash,
+    discovery_limits: &crate::recovery_discovery::DiscoveryLimits,
+    installation_limits: &RangeInstallationLimits,
+) -> Result<DiscoveredRangeObservation, DiscoveredObservationError> {
+    // Stage one — the discovery (the seed-relative structural
+    // walk; the generic-medium adapter supplies the hash-verifying
+    // reads without any provider coordination, per the discovery's
+    // own documented contract).
+    let mut reads = crate::reclaim::MediumReads::new(medium);
+    let discovery =
+        crate::recovery_discovery::discover_recovery_evidence(&mut reads, head, discovery_limits)
+            .map_err(DiscoveredObservationError::Discovery)?;
+    drop(reads);
+    // Stage two — the context derivation.
+    let derivation = derive_range_completion_context(&discovery);
+    // Stage three — the coordinated observation for the derived
+    // context (the C5b surface opens the provider's own scope).
+    let observation = match &derivation {
+        DiscoveredRangeContext::V2Context { context, .. } => Some(
+            medium
+                .observe_range_terminal_under_coordination(context, installation_limits)
+                .map_err(DiscoveredObservationError::Observation)?,
+        ),
+        _ => None,
+    };
+    Ok(DiscoveredRangeObservation {
+        derivation,
+        observation,
+    })
+}
+
+/// The pure derivation: the covering MK, the newest plan, and the
+/// newest plan-bound (V2) begin from the discovery's structural
+/// observations — or the honest not-derivable classification. The
+/// temporal order and every binding on the derived identities are
+/// the observation stage's own checks (fail-closed); this
+/// derivation performs no verification of its own beyond the V2
+/// source-binding shape that selects which verifier owns the
+/// evidence.
+pub(crate) fn derive_range_completion_context(
+    discovery: &crate::recovery_discovery::RecoveryEvidenceDiscovery,
+) -> DiscoveredRangeContext {
+    let covering_mk = match &discovery.covering {
+        crate::recovery_discovery::CoveringObservation::Identified(checkpoint) => checkpoint.record,
+        crate::recovery_discovery::CoveringObservation::NoneOnAncestry { founding } => {
+            return DiscoveredRangeContext::NoCoveringCheckpoint {
+                founding: *founding,
+            };
+        }
+    };
+    // The discovery order is newest → oldest: the FIRST plan and
+    // the FIRST begin are the newest of each.
+    let Some(plan) = discovery.records.iter().find(|record| {
+        matches!(
+            record.family,
+            crate::recovery_discovery::DiscoveredFamily::ReclamationPlan
+        )
+    }) else {
+        return DiscoveredRangeContext::NoPlanAboveCovering { covering_mk };
+    };
+    let Some(begin) = discovery.records.iter().find(|record| {
+        matches!(
+            record.family,
+            crate::recovery_discovery::DiscoveredFamily::ReclamationBegin
+        )
+    }) else {
+        return DiscoveredRangeContext::NoBeginAbovePlan {
+            covering_mk,
+            plan: plan.identity,
+        };
+    };
+    // The V2 shape: the begin's source binds the plan (the V1
+    // begin binds an audit revision).
+    let v2_shape = matches!(
+        &begin.payload,
+        crate::recovery_discovery::DiscoveredPayload::Begin(begin_payload)
+            if begin_payload.source == plan.identity
+    );
+    if !v2_shape {
+        return DiscoveredRangeContext::V1BeginObserved {
+            covering_mk,
+            plan: plan.identity,
+            begin: begin.identity,
+        };
+    }
+    DiscoveredRangeContext::V2Context {
+        context: RangeCompletionContext {
+            mk: covering_mk,
+            plan: plan.identity,
+            begin: begin.identity,
+        },
+        covering_mk,
+        records_consulted: discovery.records_consulted,
+    }
+}
+
 // ============================================================== the C5a tests
 //
 // The owner's required adversarial matrix — pure synthetic-reader
