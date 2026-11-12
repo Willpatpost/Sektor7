@@ -5573,3 +5573,422 @@ mod a1r_reader_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// ============================================================== the C5c tests
+//
+// (C5c) The completion-family crossing recognition: the /2 Batch
+// marker and the /3 Range-terminal marker as RETAINED Anchors (the
+// A1-R discipline — the reader arms before any writer, the shape +
+// strict-decode + key-binding checks, the unsupported-version family
+// refusal, and the retained-evidence exclusions from the reclaimable
+// publications).
+
+#[cfg(test)]
+mod c5c_reader_tests {
+    use super::*;
+    use engine_persist::batch_completion::{
+        BatchCompletionContext, BatchCompletionMarkerV2, ClassificationCounters,
+        ClassificationEntry, EntryClassification, commit_classification,
+        reclamation_complete_v2_idempotency_key,
+    };
+    use engine_persist::local::LocalFileMedium;
+    use engine_persist::medium::CanonicalMedium;
+    use engine_persist::range_completion::{
+        RangeCompletionContext, RangeCompletionMarkerV3, RangeCoverageObservation,
+        commit_journal_obligations, commit_range_coverage,
+        reclamation_complete_v3_range_idempotency_key,
+    };
+    use engine_persist::record::{AuthorityMode, RevisionRecord};
+    use engine_persist::{Hash, StoredObject};
+
+    fn temp_store(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "s7-c5c-reader-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn snapshot_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-slice/session-snapshot/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    fn append_snapshot(medium: &mut dyn CanonicalMedium, payload: &[u8], tick: u64) -> Hash {
+        let object = snapshot_object(payload);
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record =
+            RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![object.hash()]);
+        medium
+            .append(&record, std::slice::from_ref(&object), Some(head))
+            .unwrap();
+        record.id()
+    }
+
+    /// Founds the store (the adversary tests' prerequisite —
+    /// `append_snapshot` requires a live HEAD).
+    fn found_store(medium: &mut dyn CanonicalMedium, label: &str) -> Hash {
+        let shared = snapshot_object(b"c5c-founding");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        founding.id()
+    }
+
+    /// The direct file-write record installation (the established
+    /// test-only construction for gated families — the generic
+    /// append's completion-family fence makes on-chain publication
+    /// impossible, so the record and object files are written
+    /// directly into the local store's content-addressed layout).
+    fn write_record_with_object(
+        medium: &mut LocalFileMedium,
+        parent: Hash,
+        key: Option<Vec<u8>>,
+        object: &StoredObject,
+        tick: u64,
+    ) -> Hash {
+        let parent_epoch = medium.read_record(&parent).unwrap().epoch;
+        let record = RevisionRecord::regular(parent, parent_epoch, tick)
+            .with_content_refs(vec![object.hash()]);
+        let record = match key {
+            Some(key) => record.with_idempotency_key(key),
+            None => record,
+        };
+        std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        record.id()
+    }
+
+    fn a_hash(label: &[u8]) -> Hash {
+        engine_persist::hash::hash_object(label)
+    }
+
+    /// A genuine V2 `/2` Batch completion marker object (a real C1
+    /// classification commitment — never a fabricated domain
+    /// string).
+    fn v2_marker_object() -> StoredObject {
+        let context = BatchCompletionContext {
+            mk: a_hash(b"c5c-mk"),
+            plan: a_hash(b"c5c-plan"),
+            batch_index: 0,
+            audit: a_hash(b"c5c-audit"),
+            begin: a_hash(b"c5c-begin"),
+        };
+        let entries = vec![
+            ClassificationEntry {
+                identity: a_hash(b"c5c-sk0"),
+                role: engine_persist::ancestry_accounting::StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: a_hash(b"c5c-m0a"),
+                role: engine_persist::ancestry_accounting::StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: a_hash(b"c5c-o0a"),
+                role: engine_persist::ancestry_accounting::StorageRole::Object,
+                classification: EntryClassification::Deferred,
+                conditional_on_prior_batch: false,
+            },
+        ];
+        let commitment = commit_classification(&context, entries).unwrap();
+        let marker = BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: commitment.digest,
+            counters: commitment.counters,
+        };
+        StoredObject::new(marker.canonical_bytes()).unwrap()
+    }
+
+    /// A genuine V3 `/3` Range-terminal marker object (the real C3
+    /// commitments over the supplied batch observation).
+    fn v3_terminal_object(
+        context: &RangeCompletionContext,
+        marker_record: Hash,
+        counters: ClassificationCounters,
+    ) -> StoredObject {
+        let observations = vec![RangeCoverageObservation {
+            batch_index: 0,
+            marker_record,
+            counters,
+        }];
+        let coverage = commit_range_coverage(context, &observations).unwrap();
+        let journal = commit_journal_obligations(context, &["journal.t1.0".to_owned()]).unwrap();
+        let marker = RangeCompletionMarkerV3 {
+            mk: context.mk,
+            plan: context.plan,
+            begin: context.begin,
+            coverage: coverage.digest,
+            journal,
+            batch_count: 1,
+            journal_count: 1,
+            counters: coverage.aggregate,
+        };
+        StoredObject::new(marker.canonical_bytes()).unwrap()
+    }
+
+    /// The founded two-snapshot chain with the genuine /2 and /3
+    /// markers direct-written above it: founding → snap1 → snap2 →
+    /// the /2 Batch marker (correctly keyed) → the /3 Range
+    /// terminal (correctly keyed). Returns (the walked-range start
+    /// = the terminal, the founding identity, the two snapshots,
+    /// the observation counters).
+    fn marker_chain(
+        medium: &mut LocalFileMedium,
+    ) -> (Hash, Hash, Hash, Hash, ClassificationCounters) {
+        let shared = snapshot_object(b"c5c-founding");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "c5c-reader", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let snap1 = append_snapshot(medium, b"c5c-snap-1", 2);
+        let snap2 = append_snapshot(medium, b"c5c-snap-2", 3);
+        // The genuine /2 marker, correctly keyed.
+        let marker_object = v2_marker_object();
+        let marker_key = reclamation_complete_v2_idempotency_key(&a_hash(b"c5c-mk"), 0);
+        let marker2_id =
+            write_record_with_object(medium, snap2, Some(marker_key), &marker_object, 4);
+        // The genuine /3 terminal over the /2 observation, correctly
+        // keyed.
+        let context = RangeCompletionContext {
+            mk: a_hash(b"c5c-mk"),
+            plan: a_hash(b"c5c-plan"),
+            begin: a_hash(b"c5c-begin"),
+        };
+        let counters = {
+            let batch_context = BatchCompletionContext {
+                mk: a_hash(b"c5c-mk"),
+                plan: a_hash(b"c5c-plan"),
+                batch_index: 0,
+                audit: a_hash(b"c5c-audit"),
+                begin: a_hash(b"c5c-begin"),
+            };
+            let _ = batch_context;
+            // The /2 marker's own counters (the fixture's committed
+            // classification: 2 mandatory records, 1 deferred object).
+            ClassificationCounters {
+                mandatory_records: 2,
+                deferred_records: 0,
+                mandatory_objects: 0,
+                deferred_objects: 1,
+            }
+        };
+        let terminal_object = v3_terminal_object(&context, marker2_id, counters);
+        let terminal_key = reclamation_complete_v3_range_idempotency_key(&a_hash(b"c5c-mk"));
+        let terminal_id =
+            write_record_with_object(medium, marker2_id, Some(terminal_key), &terminal_object, 5);
+        (terminal_id, founding_id, snap1, snap2, counters)
+    }
+
+    #[test]
+    fn the_genuine_v2_and_v3_markers_read_as_retained_anchors() {
+        let root = temp_store("anchors");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let (terminal_id, founding_id, snap1, snap2, _) = marker_chain(&mut medium);
+        let (walked, boundary, _seed) = walk_checkpoint_range(&mut medium, terminal_id).unwrap();
+        // Both markers are RETAINED Anchors — never reclaimable
+        // publications, never ignorable unknowns. The walked list
+        // carries the four in-range records (the founding is the
+        // boundary, returned separately, never pushed).
+        assert_eq!(walked.len(), 4);
+        let mut anchors = Vec::new();
+        let mut publications = Vec::new();
+        for entry in &walked {
+            match entry.kind {
+                RangeKind::Anchor => anchors.push(entry.record.id()),
+                RangeKind::Publication => publications.push(entry.record.id()),
+            }
+        }
+        assert_eq!(anchors.len(), 2, "the /2 and /3 markers are the anchors");
+        assert!(
+            anchors.contains(&walked[0].record.id()) && anchors.contains(&walked[1].record.id()),
+            "the two walked anchors are the /3 terminal and the /2 marker"
+        );
+        // The caller's index construction over the Publication kinds
+        // = EXACTLY the two snapshots (the retained-evidence
+        // exclusion — the markers never enter the reclaimable
+        // membership).
+        assert_eq!(publications, vec![snap2, snap1]);
+        // The boundary is the founding (the walk stops there).
+        assert_eq!(boundary, founding_id);
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_markers_receive_the_standing_skips() {
+        // The skip-table participation (the A1-R shape verbatim):
+        // the Anchor standing on a walked Publication (the /2 marker
+        // on snap2) receives the standing skip entry jumping to its
+        // NEAREST RETAINED ancestor (the founding, past the whole
+        // reclaim run); the walk's start (the /3 terminal, a
+        // retained anchor) receives the SELF skip; and no STANDING
+        // skip exists for an Anchor standing on another Anchor (the
+        // /3 terminal on the /2 marker).
+        let root = temp_store("skips");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let (terminal_id, founding_id, _snap1, _snap2, _) = marker_chain(&mut medium);
+        let (walked, boundary, _seed) = walk_checkpoint_range(&mut medium, terminal_id).unwrap();
+        assert_eq!(boundary, founding_id);
+        let skips = compute_checkpoint_skips(terminal_id, &walked);
+        // Walked (newest first): /3 (Anchor), /2 (Anchor), snap2
+        // (Pub), snap1 (Pub).
+        let marker2_id = walked[1].record.id();
+        // The standing skip for the /2 marker on the retiring
+        // snapshot: the target is the founding (the first
+        // non-publication record below the contiguous reclaim run).
+        assert!(skips.contains(&SkipEntry::new(marker2_id, founding_id)));
+        // The self-entry targets the walk's start (an anchor, not a
+        // publication — retained).
+        assert!(skips.contains(&SkipEntry::self_skip(terminal_id)));
+        // No STANDING skip for the /3 terminal (its parent is the
+        // /2 marker — an anchor, not a publication; the self entry
+        // carries the ZERO retained marker and is excluded by this
+        // check by construction).
+        assert!(
+            !skips
+                .iter()
+                .any(|entry| entry.retained == terminal_id && !entry.is_self())
+        );
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_unsupported_family_variant_refuses() {
+        let root = temp_store("unsupported");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        found_store(&mut medium, "c5c-unsupported");
+        let snap = append_snapshot(&mut medium, b"c5c-unsupported-snap", 2);
+        let future_object = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("engine-persist/reclamation-complete/4");
+            enc.write_bytes(b"c5c-future-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let record = write_record_with_object(
+            &mut medium,
+            snap,
+            Some(b"c5c-future-key".to_vec()),
+            &future_object,
+            3,
+        );
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            _ => panic!("the future variant must refuse (a non-refusal result)"),
+        };
+        assert_eq!(detail, "checkpoint-walk/completion-unsupported-version");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_malformed_marker_refuses() {
+        let root = temp_store("malformed");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        found_store(&mut medium, "c5c-malformed");
+        let snap = append_snapshot(&mut medium, b"c5c-malformed-snap", 2);
+        // The genuine /2 marker bytes, truncated (the leading domain
+        // tag survives intact — the walk classifies by the domain,
+        // then the strict decode refuses the truncated payload).
+        let full = v2_marker_object();
+        let bytes = full.bytes();
+        let truncated = StoredObject::new(bytes[..bytes.len() - 10].to_vec()).unwrap();
+        let key = reclamation_complete_v2_idempotency_key(&a_hash(b"c5c-mk"), 0);
+        let record = write_record_with_object(&mut medium, snap, Some(key), &truncated, 3);
+        assert!(walk_checkpoint_range(&mut medium, record).is_err());
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_wrong_key_refuses() {
+        let root = temp_store("wrongkey");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        found_store(&mut medium, "c5c-wrongkey");
+        let snap = append_snapshot(&mut medium, b"c5c-wrongkey-snap", 2);
+        // The GENUINE /2 marker object under a WRONG deterministic
+        // key (the record keyed for a different batch): the strict
+        // decode succeeds, the key binding refuses.
+        let marker_object = v2_marker_object();
+        let wrong_key = reclamation_complete_v2_idempotency_key(&a_hash(b"c5c-mk"), 7);
+        let record =
+            write_record_with_object(&mut medium, snap, Some(wrong_key), &marker_object, 3);
+        let detail = match walk_checkpoint_range(&mut medium, record) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            _ => panic!("the wrong key must refuse (a non-refusal result)"),
+        };
+        assert_eq!(detail, "checkpoint-walk/completion-key-mismatch");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_wrong_shape_refuses() {
+        let root = temp_store("wrongshape");
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        found_store(&mut medium, "c5c-shape");
+        let snap = append_snapshot(&mut medium, b"c5c-shape-snap", 2);
+        // A REGULAR record with TWO content references (the /2
+        // marker object first, a distinct second object whose hash
+        // sorts above it) — the authorized shape is exactly one
+        // marker content reference.
+        let marker_object = v2_marker_object();
+        let mut second = snapshot_object(b"c5c-shape-second");
+        let mut attempt = 0u32;
+        while second.hash() < marker_object.hash() {
+            attempt += 1;
+            second = snapshot_object(format!("c5c-shape-second-{attempt}").as_bytes());
+        }
+        let parent_epoch = medium.read_record(&snap).unwrap().epoch;
+        let key = reclamation_complete_v2_idempotency_key(&a_hash(b"c5c-mk"), 0);
+        let record = RevisionRecord::regular(snap, parent_epoch, 3)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![marker_object.hash(), second.hash()]);
+        std::fs::write(
+            medium.object_path_pub(&marker_object.hash()),
+            marker_object.bytes(),
+        )
+        .unwrap();
+        std::fs::write(medium.object_path_pub(&second.hash()), second.bytes()).unwrap();
+        std::fs::write(
+            medium.object_path_pub(&record.id()),
+            record.canonical_bytes(),
+        )
+        .unwrap();
+        let detail = match walk_checkpoint_range(&mut medium, record.id()) {
+            Err(TransitionError::InstallIncompatible { detail, .. }) => detail,
+            _ => panic!("the wrong shape must refuse (a non-refusal result)"),
+        };
+        assert_eq!(detail, "checkpoint-walk/completion-shape-mismatch");
+        drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
