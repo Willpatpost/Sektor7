@@ -4124,6 +4124,89 @@ fn walk_checkpoint_range(
                 record,
                 kind: RangeKind::Anchor,
             });
+        } else if domain == engine_persist::batch_completion::RECLAMATION_COMPLETE_V2_DOMAIN {
+            // (C5c, the A1-R discipline: the reader arm ships BEFORE
+            // any writer — no V2 marker-bearing history can exist
+            // until the future completion publisher) The V2 `/2`
+            // Batch completion marker: RETAINED EVIDENCE —
+            // strict-decoded with the authorized revision shape (a
+            // REGULAR revision with EXACTLY ONE marker content
+            // reference) and the deterministic idempotency-key
+            // binding derived from the DECODED payload (the MK and
+            // the plan-defined batch index). Recognition is NOT
+            // completion authority: encountering a Batch marker
+            // never licenses reclamation, retirement attribution, or
+            // crossing relaxation (the authority checks belong to
+            // the later separately authorized checkpoints).
+            if !matches!(record.kind, engine_persist::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/completion-shape-mismatch",
+                });
+            }
+            let marker = engine_persist::batch_completion::BatchCompletionMarkerV2::decode(&bytes)
+                .map_err(PipelineError::Format)?;
+            if record.idempotency_key.as_deref()
+                != Some(
+                    &engine_persist::batch_completion::reclamation_complete_v2_idempotency_key(
+                        &marker.mk,
+                        marker.batch_index,
+                    )[..],
+                )
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/completion-key-mismatch",
+                });
+            }
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if domain == engine_persist::range_completion::RECLAMATION_COMPLETE_V3_DOMAIN {
+            // (C5c, the same A1-R discipline) The V2 `/3`
+            // Range-terminal marker: RETAINED EVIDENCE — the same
+            // shape and key discipline over the terminal payload
+            // (the deterministic RANGE key derived from the decoded
+            // MK). Recognition is NOT Range-completion authority.
+            if !matches!(record.kind, engine_persist::record::RecordKind::Regular)
+                || record.content_refs.len() != 1
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/completion-shape-mismatch",
+                });
+            }
+            let marker = engine_persist::range_completion::RangeCompletionMarkerV3::decode(&bytes)
+                .map_err(PipelineError::Format)?;
+            if record.idempotency_key.as_deref()
+                != Some(
+                    &engine_persist::range_completion::reclamation_complete_v3_range_idempotency_key(
+                        &marker.mk,
+                    )[..],
+                )
+            {
+                return Err(TransitionError::InstallIncompatible {
+                    region: 0,
+                    detail: "checkpoint-walk/completion-key-mismatch",
+                });
+            }
+            walked.push(WalkedRecord {
+                record,
+                kind: RangeKind::Anchor,
+            });
+        } else if engine_persist::batch_completion::is_reclamation_complete_family(&domain) {
+            // (C5c) A recognized completion-FAMILY domain with an
+            // unrecognized version (a future `/4` and beyond):
+            // UNSUPPORTED, never ignorable content and never a
+            // reclaimable snapshot publication — the typed
+            // incompatibility (the A1-R family discipline).
+            return Err(TransitionError::InstallIncompatible {
+                region: 0,
+                detail: "checkpoint-walk/completion-unsupported-version",
+            });
         } else if engine_persist::reclaim::is_reclamation_begin_family(&domain) {
             // The OC-C1 ratified begin-record reader arm: RETAINED
             // EVIDENCE (the durable execution-authorization record),
