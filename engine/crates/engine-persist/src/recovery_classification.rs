@@ -6012,4 +6012,320 @@ mod r1a3_degradation_tests {
             cleanup(&[path, journal]);
         }
     }
+
+    /// A plan payload over the campaign's genuine bindings with
+    /// the caller's digest, ledger byte limit, and batch
+    /// membership (every doctored form stays wire-decodable; the
+    /// codec refuses an empty batch set, so the binding and limit
+    /// arms carry the minimal one-batch membership their
+    /// earlier-firing checks never reach).
+    fn plan_payload(
+        campaign: &Campaign,
+        range_digest: [u8; 32],
+        ledger_byte_limit: u64,
+        batches: Vec<PlanBatch>,
+    ) -> Vec<u8> {
+        ReclaimPlan {
+            mk: campaign.mk,
+            sk: campaign.sk,
+            range_digest,
+            seed: campaign.metadata.seed,
+            ledger_byte_limit,
+            batches,
+            journal_files: Vec::new(),
+        }
+        .canonical_bytes()
+    }
+
+    /// The minimal decodable membership (one single-record batch).
+    fn minimal_batches(campaign: &Campaign) -> Vec<PlanBatch> {
+        vec![PlanBatch {
+            index: 0,
+            records: vec![campaign.sk],
+        }]
+    }
+
+    /// (B-R1a3 §3) The doctored plan payloads degrade: a TRUNCATED
+    /// payload (MalformedPlanPayload), a binding-incorrect digest
+    /// (PlanBindingMismatch{range-digest}), an over-ceiling ledger
+    /// byte limit (PlanLedgerByteLimitInvalid), and a reordered
+    /// batch membership (PlanMembershipMismatch) — each under the
+    /// exact plan key through the in-crate receipt seam (the
+    /// publication gates would refuse every doctored form).
+    #[test]
+    fn the_doctored_plan_payloads_degrade() {
+        // (a) The truncated payload.
+        {
+            let (path, mut store) = sqlite_store("d3a");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d3a");
+            let campaign = stage_prefix(medium, "d3a", &journal);
+            let mut payload = plan_payload(
+                &campaign,
+                campaign.metadata.range_digest,
+                R1A3_LEDGER_BYTE_LIMIT,
+                vec![],
+            );
+            payload.truncate(payload.len() - 8);
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_plan_idempotency_key(&campaign.mk),
+                payload,
+                6,
+            );
+            let classification = classify_via_medium(medium);
+            let RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MalformedPlanPayload { record: observed, .. },
+            } = classification.state
+            else {
+                panic!("the truncated plan payload must degrade as MalformedPlanPayload")
+            };
+            assert_eq!(observed, record);
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (b) The binding-incorrect digest.
+        {
+            let (path, mut store) = sqlite_store("d3b");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d3b");
+            let campaign = stage_prefix(medium, "d3b", &journal);
+            let mut wrong_digest = campaign.metadata.range_digest;
+            wrong_digest[0] ^= 0xff;
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_plan_idempotency_key(&campaign.mk),
+                plan_payload(&campaign, wrong_digest, R1A3_LEDGER_BYTE_LIMIT, minimal_batches(&campaign)),
+                6,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::PlanBindingMismatch {
+                        record,
+                        rule: "range-digest",
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (c) The over-ceiling ledger byte limit.
+        {
+            let (path, mut store) = sqlite_store("d3c");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d3c");
+            let campaign = stage_prefix(medium, "d3c", &journal);
+            let over_limit = crate::reclaim::MAX_RECLAMATION_LEDGER_BYTES + 1;
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_plan_idempotency_key(&campaign.mk),
+                plan_payload(
+                    &campaign,
+                    campaign.metadata.range_digest,
+                    over_limit,
+                    minimal_batches(&campaign),
+                ),
+                6,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::PlanLedgerByteLimitInvalid {
+                        record,
+                        limit: over_limit,
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (d) The reordered batch membership.
+        {
+            let (path, mut store) = sqlite_store("d3d");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d3d");
+            let campaign = stage_prefix(medium, "d3d", &journal);
+            // The index-derived newest-first order is
+            // [sk, members[1], members[0]]; the doctored plan
+            // flattens to a different first position.
+            let reordered = vec![
+                PlanBatch {
+                    index: 0,
+                    records: vec![campaign.members[0]],
+                },
+                PlanBatch {
+                    index: 1,
+                    records: vec![campaign.sk, campaign.members[1]],
+                },
+            ];
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_plan_idempotency_key(&campaign.mk),
+                plan_payload(
+                    &campaign,
+                    campaign.metadata.range_digest,
+                    R1A3_LEDGER_BYTE_LIMIT,
+                    reordered,
+                ),
+                6,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::PlanMembershipMismatch {
+                        record,
+                        position: 0,
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+    }
+
+    /// (B-R1a3 §4) The doctored begin payloads degrade over a
+    /// genuinely published plan: a TRUNCATED payload
+    /// (MalformedBeginPayload), a source that is not the observed
+    /// plan record (BeginBindingMismatch{source-is-not-the-plan-
+    /// record}), and a seed that disagrees with the covering
+    /// metadata (BeginBindingMismatch{seed}) — each under the
+    /// exact begin key through the in-crate receipt seam (the
+    /// admission would refuse every doctored form; the genuine
+    /// begin publication is B-R1a2's territory).
+    #[test]
+    fn the_doctored_begin_payloads_degrade() {
+        // (a) The truncated payload.
+        {
+            let (path, mut store) = sqlite_store("d4a");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d4a");
+            let campaign = stage_prefix(medium, "d4a", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, _plan) =
+                crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                    .unwrap()
+                    .unwrap();
+            let mut payload = crate::reclaim::ReclamationBegin {
+                mk: campaign.mk,
+                source: plan_record,
+                range_digest: campaign.metadata.range_digest,
+                seed: campaign.metadata.seed,
+            }
+            .canonical_bytes();
+            payload.truncate(payload.len() - 4);
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                payload,
+                7,
+            );
+            let classification = classify_via_medium(medium);
+            let RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MalformedBeginPayload { record: observed, .. },
+            } = classification.state
+            else {
+                panic!("the truncated begin payload must degrade as MalformedBeginPayload")
+            };
+            assert_eq!(observed, record);
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (b) The source that is not the plan record.
+        {
+            let (path, mut store) = sqlite_store("d4b");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d4b");
+            let campaign = stage_prefix(medium, "d4b", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let payload = crate::reclaim::ReclamationBegin {
+                mk: campaign.mk,
+                source: campaign.mk,
+                range_digest: campaign.metadata.range_digest,
+                seed: campaign.metadata.seed,
+            }
+            .canonical_bytes();
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                payload,
+                7,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::BeginBindingMismatch {
+                        record,
+                        rule: "source-is-not-the-plan-record",
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (c) The seed that disagrees with the covering metadata.
+        {
+            let (path, mut store) = sqlite_store("d4c");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d4c");
+            let campaign = stage_prefix(medium, "d4c", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, _plan) =
+                crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                    .unwrap()
+                    .unwrap();
+            let mut wrong_seed = campaign.metadata.seed;
+            wrong_seed[0] ^= 0xff;
+            let payload = crate::reclaim::ReclamationBegin {
+                mk: campaign.mk,
+                source: plan_record,
+                range_digest: campaign.metadata.range_digest,
+                seed: wrong_seed,
+            }
+            .canonical_bytes();
+            let record = install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                payload,
+                7,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::BeginBindingMismatch {
+                        record,
+                        rule: "seed",
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+    }
 }
