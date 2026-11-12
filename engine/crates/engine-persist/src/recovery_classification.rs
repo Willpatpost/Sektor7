@@ -5619,3 +5619,397 @@ mod r1a2_production_tests {
         cleanup(&[path, journal]);
     }
 }
+
+// ===================================================================
+// (B-R1a3) The production-path retained-evidence DEGRADATION
+// MATRIX — the standing delegation's next recovery-classification
+// package: the EvidenceDegradation arms not yet exercised over
+// genuine published evidence. B-R1a1 proved the classifier over
+// the synthetic reader; B-R1a2 proved the POSITIVE production
+// ladder plus the lying-marker, foreign-shard, manifestless, and
+// corrupted-object arms; this package drives the REMAINING
+// fail-closed arms through the same production adapters and the
+// sanctioned in-crate receipt seam (AdmittedAppend::generic — the
+// adversarial installs the chain-unique keys would otherwise
+// refuse). ZERO production-code changes; every degradation below
+// is a TEST-side construction over genuine campaign facts.
+// ===================================================================
+
+#[cfg(test)]
+mod r1a3_degradation_tests {
+    use super::*;
+    use crate::checkpoint::{SkipEntry, chain_range_digest_step, compute_digest_seed};
+    use crate::medium::{AdmittedAppend, CanonicalMedium, StoredObject};
+    use crate::reclaim::{
+        MediumReads, PlanBatch, ReclaimPlan, ReclaimUnit, ReclamationLedger, ReclamationLedgerV2,
+        create_campaign_bound_journal, journal_root_id, publish_journal_root_binding,
+        publish_reclamation_ledger, publish_reclamation_ledger_v2, publish_reclamation_plan,
+        reclamation_begin_idempotency_key, reclamation_ledger_idempotency_key,
+        reclamation_ledger_v2_idempotency_key, reclamation_plan_idempotency_key,
+    };
+    use crate::record::{AuthorityMode, RevisionRecord};
+
+    fn temp_path(prefix: &str, label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-r1a3-{prefix}-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn plain_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    fn sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
+        let path = temp_path("sqlite", label).with_extension("db");
+        let medium = crate::SqliteMedium::open(&path).unwrap();
+        (path, medium)
+    }
+
+    fn cleanup(paths: &[std::path::PathBuf]) {
+        for path in paths {
+            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// The pre-MK campaign facts: the founding, the bound journal,
+    /// p1, the two keyed members, SK, and the checkpoint metadata
+    /// (built over the actual chain) — everything but the MK
+    /// publication, which the caller performs (genuinely keyed, or
+    /// doctored for the degradation arms).
+    struct PreMk {
+        members: Vec<Hash>,
+        sk: Hash,
+        metadata: CheckpointMetadata,
+    }
+
+    /// (Phase A of the B-R1a2 staged ladder, compactly rebuilt —
+    /// the accepted r1a2 module is left untouched.)
+    fn stage_pre_mk(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> PreMk {
+        let shared = plain_object(b"r1a3-shared-payload");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = journal_root_id(&founding_id, &location);
+        drop(create_campaign_bound_journal(medium, journal_root, &founding_id).unwrap());
+        let (_binding, _outcome) =
+            publish_journal_root_binding(medium, &founding_id, &root_id, &location, 1).unwrap();
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record =
+                RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let _p1 = step(medium, 2);
+        let mut members = Vec::new();
+        for index in 0..2u32 {
+            let object = plain_object(format!("r1a3-{label}-payload-{index}").as_bytes());
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(format!("r1a3-{label}-member-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            members.push(record.id());
+        }
+        let sk = step(medium, 4);
+        let sk_record = medium.read_record(&sk).unwrap();
+        let seed = compute_digest_seed(&founding_id);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(members.len() + 1);
+        for id in &members {
+            let record = medium.read_record(id).unwrap();
+            digest = chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        index.push(ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            sk,
+            sk_record.epoch,
+        ));
+        let sk_parent = sk_record.parent.expect("the SK is a regular revision");
+        let metadata = CheckpointMetadata::new(
+            sk,
+            sk_parent,
+            vec![SkipEntry::new(Hash::ZERO, _p1)],
+            index,
+            digest,
+            seed,
+        );
+        PreMk {
+            members,
+            sk,
+            metadata,
+        }
+    }
+
+    /// The pre-plan campaign facts every degradation arm builds
+    /// from: the founding, the bound journal, p1, the two keyed
+    /// members, SK, the checkpoint metadata, and the KEYED MK
+    /// (publish_checkpoint_mk — the production route; the B-R1a2
+    /// finding that the classifier's L2 requires exactly this
+    /// key).
+    struct Campaign {
+        members: Vec<Hash>,
+        sk: Hash,
+        mk: Hash,
+        metadata: CheckpointMetadata,
+    }
+
+    /// The full prefix with the genuine keyed MK publication.
+    fn stage_prefix(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> Campaign {
+        let pre = stage_pre_mk(medium, label, journal_root);
+        let sk_epoch = medium.read_record(&pre.sk).unwrap().epoch;
+        let (mk, _outcome) =
+            crate::checkpoint::publish_checkpoint_mk(medium, pre.sk, sk_epoch, &pre.metadata, 5)
+                .unwrap();
+        Campaign {
+            members: pre.members,
+            sk: pre.sk,
+            mk,
+            metadata: pre.metadata,
+        }
+    }
+
+    /// The in-crate receipt installation (the B-R1a2 seam helper):
+    /// a regular revision under the supplied deterministic key,
+    /// carrying the payload as its single content object, appended
+    /// above the current head — the route for every adversarial
+    /// install the chain-unique keys or the publication gates
+    /// would otherwise refuse.
+    fn install_keyed_object_record(
+        medium: &mut dyn CanonicalMedium,
+        key: Vec<u8>,
+        payload: Vec<u8>,
+        tick: u64,
+    ) -> Hash {
+        let object = StoredObject::new(payload).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, tick)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object.hash()]);
+        let id = record.id();
+        medium
+            .append_admitted(
+                AdmittedAppend::generic(&record, std::slice::from_ref(&object)),
+                Some(head),
+            )
+            .unwrap();
+        id
+    }
+
+    fn classify_via_medium(medium: &mut dyn CanonicalMedium) -> RecoveryClassification {
+        let head = medium.head().unwrap().unwrap();
+        let mut reads = MediumReads::new(medium);
+        classify_recovery_evidence(&mut reads, &head, &DiscoveryLimits::default_limits()).unwrap()
+    }
+
+    /// The ledger byte limit (the B-R1a2 measured value over the
+    /// identical campaign shape — at least two single-unit
+    /// batches).
+    const R1A3_LEDGER_BYTE_LIMIT: u64 = 400;
+
+    // ======================================================= the tests
+
+    /// (B-R1a3 §1) The unkeyed checkpoint record degrades with the
+    /// typed key mismatch — the B-R1a2 finding (a) pinned as a
+    /// regression: EVERY production route keys the MK
+    /// (checkpoint.rs, ancestry_history, ancestry_accounting all
+    /// use checkpoint_mk_idempotency_key), so a metadata record
+    /// without the deterministic key is contradictory evidence,
+    /// never an unrecognized absence (the bp1 fixture's own
+    /// hand-appended unkeyed shape is exactly this arm).
+    #[test]
+    fn the_unkeyed_checkpoint_record_degrades() {
+        let (path, mut store) = sqlite_store("d1");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d1");
+        // The prefix through SK, then the metadata object carried
+        // by an UNKEYED regular record (the bp1 fixture's shape).
+        let shared = plain_object(b"r1a3-d1-shared");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "d1", 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let member = RevisionRecord::regular(head, epoch, 1)
+            .with_idempotency_key(b"r1a3-d1-member".to_vec())
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&member, std::slice::from_ref(&shared), Some(head))
+            .unwrap();
+        let sk_id = {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let sk = RevisionRecord::regular(head, epoch, 2)
+                .with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&sk, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            sk.id()
+        };
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        let seed = compute_digest_seed(&founding.id());
+        let metadata = CheckpointMetadata::new(
+            sk_id,
+            sk_record.parent.expect("the SK is a regular revision"),
+            vec![],
+            vec![ReclaimedIndexEntry::new(
+                sk_record.idempotency_key.clone(),
+                sk_id,
+                sk_record.epoch,
+            )],
+            seed,
+            seed,
+        );
+        let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let unkeyed = RevisionRecord::regular(head, epoch, 3)
+            .with_content_refs(vec![metadata_object.hash()]);
+        medium
+            .append(
+                &unkeyed,
+                std::slice::from_ref(&metadata_object),
+                Some(head),
+            )
+            .unwrap();
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::CheckpointKeyMismatch {
+                    record: unkeyed.id(),
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §2) The invalid index shapes degrade: an EMPTY
+    /// retirement index and a duplicate-epoch index (the struct
+    /// literal bypassing CheckpointMetadata::new's normalization —
+    /// the wire decode accepts both, the classifier's L2 refuses)
+    /// — both published through the genuine keyed route as the
+    /// campaign's FIRST MK (publish_checkpoint_mk requires head ==
+    /// sk exactly, so the doctored metadata must be the only MK).
+    #[test]
+    fn the_invalid_index_shapes_degrade() {
+        // (a) The empty index.
+        {
+            let (path, mut store) = sqlite_store("d2a");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d2a");
+            let pre = stage_pre_mk(medium, "d2a", &journal);
+            let empty = CheckpointMetadata {
+                sk: pre.sk,
+                sk_parent: pre.metadata.sk_parent,
+                skips: Vec::new(),
+                index: Vec::new(),
+                range_digest: pre.metadata.range_digest,
+                seed: pre.metadata.seed,
+                range_records: 0,
+            };
+            let sk_epoch = medium.read_record(&pre.sk).unwrap().epoch;
+            let (mk, _outcome) =
+                crate::checkpoint::publish_checkpoint_mk(medium, pre.sk, sk_epoch, &empty, 5)
+                    .unwrap();
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::EmptyRetirementIndex { record: mk }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (b) The duplicate-epoch index.
+        {
+            let (path, mut store) = sqlite_store("d2b");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d2b");
+            let pre = stage_pre_mk(medium, "d2b", &journal);
+            let first_member = medium.read_record(&pre.members[0]).unwrap();
+            let second_member = medium.read_record(&pre.members[1]).unwrap();
+            let sk_epoch = medium.read_record(&pre.sk).unwrap().epoch;
+            // The duplicate-epoch index under the decode's
+            // canonical ascending-hash order (the wire accepts any
+            // epochs; the classifier's L2 refuses the duplicate).
+            let mut duplicate_index = vec![
+                ReclaimedIndexEntry::new(
+                    first_member.idempotency_key.clone(),
+                    pre.members[0],
+                    first_member.epoch,
+                ),
+                ReclaimedIndexEntry::new(
+                    second_member.idempotency_key.clone(),
+                    pre.members[1],
+                    first_member.epoch,
+                ),
+                ReclaimedIndexEntry::new(None, pre.sk, sk_epoch),
+            ];
+            duplicate_index.sort_unstable_by_key(|entry| entry.hash);
+            let duplicate = CheckpointMetadata {
+                sk: pre.sk,
+                sk_parent: pre.metadata.sk_parent,
+                skips: Vec::new(),
+                index: duplicate_index,
+                range_digest: pre.metadata.range_digest,
+                seed: pre.metadata.seed,
+                range_records: 3,
+            };
+            let (mk, _outcome) =
+                crate::checkpoint::publish_checkpoint_mk(medium, pre.sk, sk_epoch, &duplicate, 5)
+                    .unwrap();
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::IndexShapeInvalid { record: mk }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+    }
+}
