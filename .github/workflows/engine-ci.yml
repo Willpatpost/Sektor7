@@ -143,26 +143,23 @@ jobs:
       # crash-test-seams only in its own job, where its
       # dev-dependency edge enables engine-persist/composite-test-
       # fixture (cargo tree -f '{p} {f}' verified both sides). The
-      # partition is exact at the CONSOLIDATED Stage 6 tree (the
-      # STAGE6 night consolidation of the C5b Option A line AND the
-      # B-R1a2 production-path package, both from 4bd57f0; recomputed
-      # from executed runs — never estimates): this shard executes
-      # 908 tests on Linux / 857 on Windows (the integrated baseline
-      # 882 / 832 plus the C5b line's 14 cross-platform tests and
-      # the B-R1a2 package's 12 Linux / 11 Windows tests — the Linux
-      # count MEASURED at this exact shard command on the
-      # consolidated tree: 908 passed / 1 ignored / 30 result lines,
-      # rc=0; the Windows count derived from BOTH lines' MEASURED
-      # CI-confirmed deltas: the C5b run's 846 and the B-R1a2 run's
-      # 843, cross-checked two ways: 846 + 11 == 843 + 14 == 857),
-      # heavy supplies 448 / 447 (RECOMPUTED at the C5c branch —
-      # MEASURED at the consolidated tree 442 / 441, then the six
-      # platform-uniform crossing::c5c_reader_tests added on top;
-      # see the heavy job's comment for the measured provenance),
-      # and the two sum
-      # to the consolidated battery (1356 / 1304; the Linux count
-      # locally executed, the Windows count from the measured
-      # deltas, verified by the cold CI run).
+      # partition is exact at the CYCLE-2 CONSOLIDATED tree (the
+      # STAGE6 night consolidation baseline f3f03bb, plus Agent A's
+      # C5c completion-crossing-recognition AND Agent B's B-R1a3
+      # degradation matrix, both from the new main; recomputed from
+      # executed runs — never estimates): this shard executes 921
+      # tests on Linux / 870 on Windows (the consolidated baseline
+      # 908 / 857 plus the B-R1a3 package's 13 FULLY CROSS-PLATFORM
+      # engine-persist lib tests — no cfg gates, platform-uniform
+      # deltas; the Linux count MEASURED at this exact shard command
+      # on the B-R1a3 worktree: 921 passed / 1 ignored / 30 result
+      # lines, rc=0, CI-verified; the Windows count the exact
+      # uniform delta 857 + 13); heavy supplies 448 / 447 (the C5c
+      # six platform-uniform crossing::c5c_reader_tests on top of
+      # the consolidated 442 / 441 — MEASURED at the C5c branch,
+      # see the heavy job's comment for the provenance); the two
+      # shards sum to the cycle-2 battery (1369 / 1317; both counts
+      # re-MEASURED at this consolidated tree before the commit).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -175,8 +172,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=908
-          if [ "$(uname -s)" != "Linux" ]; then expected=857; fi
+          expected=921
+          if [ "$(uname -s)" != "Linux" ]; then expected=870; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -528,9 +525,10 @@ jobs:
       # shard's own command (448 passed / 0 failed / 3 ignored / 44
       # result lines, the workflow's own awk); 447 Windows = the
       # prior 441 + the same six platform-uniform tests (no cfg
-      # gates). Together with the main shard's 908 / 857 (unchanged —
-      # C5c adds no main-shard tests) these sum to the consolidated
-      # battery (1356 / 1304). MAINTENANCE OBLIGATION:
+      # gates). Together with the main shard's 921 / 870 (the
+      # B-R1a3 +13; C5c adds no main-shard tests) these sum to the
+      # cycle-2 consolidated battery (1369 / 1317; both re-MEASURED
+      # at this tree before the commit). MAINTENANCE OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
