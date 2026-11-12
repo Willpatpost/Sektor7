@@ -2346,16 +2346,14 @@ mod c5b_core_tests {
         let mut records = std::collections::BTreeMap::new();
         records.insert(founding_id, founding.canonical_bytes());
         let mut head = founding_id;
-        let mut head_epoch = 0u64;
         for index in 0..2u64 {
             let payload = plain_object(format!("c5b-pub-{index}").as_bytes());
             let payload_hash = hash_object(&payload);
-            let record = RevisionRecord::regular(head, head_epoch, index + 1)
+            let record = RevisionRecord::regular(head, index, index + 1)
                 .with_content_refs(vec![payload_hash]);
             let id = record.id();
             records.insert(id, record.canonical_bytes());
             head = id;
-            head_epoch += 1;
         }
         (TinyReads { records }, head, founding_id)
     }

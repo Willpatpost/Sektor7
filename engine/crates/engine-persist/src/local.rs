@@ -12294,8 +12294,8 @@ mod c5b_local_tests {
     use super::*;
     use crate::ancestry_accounting::StorageRole;
     use crate::batch_completion::{
-        BatchCompletionMarkerV2, ClassificationCounters, ClassificationEntry, EntryClassification,
-        commit_classification, reclamation_complete_v2_idempotency_key,
+        BatchCompletionMarkerV2, ClassificationEntry, EntryClassification, commit_classification,
+        reclamation_complete_v2_idempotency_key,
     };
     use crate::checkpoint::{
         CheckpointMetadata, ReclaimedIndexEntry, checkpoint_mk_idempotency_key,
@@ -12819,11 +12819,7 @@ mod c5b_local_tests {
             record.canonical_bytes(),
         )
         .unwrap();
-        std::fs::write(
-            medium.object_path_pub(&object.hash()),
-            object.bytes().to_vec(),
-        )
-        .unwrap();
+        std::fs::write(medium.object_path_pub(&object.hash()), object.bytes()).unwrap();
         {
             let bytes = {
                 let mut enc = engine_core::Encoder::new();

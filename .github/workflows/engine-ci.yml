@@ -143,19 +143,22 @@ jobs:
       # crash-test-seams only in its own job, where its
       # dev-dependency edge enables engine-persist/composite-test-
       # fixture (cargo tree -f '{p} {f}' verified both sides). The
-      # partition is exact at the INTEGRATED Stage 6 tree (the
-      # STAGE6-INTEGRATION recomputation, from executed runs — never
-      # estimates): this shard executes 882 tests on Linux / 832 on
-      # Windows (the accepted CI-C2 baseline 792 / 742 plus the
-      # A-line's 44 and the B-line's 46 cross-platform engine-persist
-      # lib tests — both deltas measured on BOTH platforms: the C5a
-      # run 42961213098 and the R1a1 run 43073270525), heavy supplies
-      # 442 / 441 (UNCHANGED — engine-slice untouched by the A/B
-      # lines), and the two sum to the integrated battery
-      # (1324 / 1273; the Linux count locally executed at the
-      # integrated tree, the Windows count derived from the two
-      # accepted runs' measured deltas and verified by the cold CI
-      # run).
+      # partition is exact at the INTEGRATED Stage 6 tree + the C5b
+      # Option A line (the C5b pin recompute, from the executed
+      # local shard run — never estimates): this shard executes 896
+      # tests on Linux / 846 on Windows (the integrated baseline 882
+      # / 832 plus the C5b line's 14 cross-platform engine-persist
+      # lib tests — the Linux count locally executed at the C5b tree:
+      # 896 passed, 0 failed, 0 ignored, rc=0; the Windows count
+      # derived from the measured platform-uniform delta: all 14 C5b
+      # tests are cross-platform with zero cfg gates — the no-tier-
+      # gate finding: the OC-P2 tier gates BEGIN ADMISSIONS, not
+      # read-only observations), heavy supplies 442 / 441 (UNCHANGED
+      # — engine-slice's test count untouched by the C5b line: the
+      # store/worker routing additions are production dispatch
+      # surface, not tests), and the two sum to the C5b battery
+      # (1338 / 1287; the Linux count locally executed at the C5b
+      # tree).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -168,8 +171,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=882
-          if [ "$(uname -s)" != "Linux" ]; then expected=832; fi
+          expected=896
+          if [ "$(uname -s)" != "Linux" ]; then expected=846; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
