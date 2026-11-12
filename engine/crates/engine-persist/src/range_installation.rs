@@ -2295,3 +2295,201 @@ mod c5a_tests {
         ));
     }
 }
+
+// ============================================================== the C5b tests
+//
+// The coordinated-core wrapper's semantics (the synthetic level).
+// The full genuine-campaign positives, the concurrency adversaries,
+// and the read-only proofs live in the provider files' test suites
+// (local.rs and sqlite.rs), where the real coordination scopes and
+// the direct-write fixture machinery exist.
+
+#[cfg(test)]
+mod c5b_core_tests {
+    use super::*;
+    use crate::record::AuthorityMode;
+
+    /// A compact record-only synthetic reader (the wrapper-semantics
+    /// chains carry no keyed evidence, so no object reads occur).
+    struct TinyReads {
+        records: std::collections::BTreeMap<Hash, Vec<u8>>,
+    }
+    impl crate::reclaim::BeginReads for TinyReads {
+        fn read_record_bytes(&mut self, id: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.records
+                .get(id)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *id })
+        }
+        fn read_object_bytes(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.records
+                .get(hash)
+                .cloned()
+                .ok_or(MediumError::MissingObject { hash: *hash })
+        }
+    }
+
+    fn plain_object(payload: &[u8]) -> Vec<u8> {
+        let mut enc = engine_core::Encoder::new();
+        enc.write_str("sektor7/save/1");
+        enc.write_bytes(payload);
+        enc.into_bytes()
+    }
+
+    /// A founded plain chain of two publications.
+    fn tiny_chain() -> (TinyReads, Hash, Hash) {
+        let object = plain_object(b"c5b-founding");
+        let object_hash = hash_object(&object);
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "c5b-core", 0)
+            .with_content_refs(vec![object_hash]);
+        let founding_id = founding.id();
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(founding_id, founding.canonical_bytes());
+        let mut head = founding_id;
+        let mut head_epoch = 0u64;
+        for index in 0..2u64 {
+            let payload = plain_object(format!("c5b-pub-{index}").as_bytes());
+            let payload_hash = hash_object(&payload);
+            let record = RevisionRecord::regular(head, head_epoch, index + 1)
+                .with_content_refs(vec![payload_hash]);
+            let id = record.id();
+            records.insert(id, record.canonical_bytes());
+            head = id;
+            head_epoch += 1;
+        }
+        (TinyReads { records }, head, founding_id)
+    }
+
+    fn an_expected() -> RangeCompletionContext {
+        RangeCompletionContext {
+            mk: hash_object(b"c5b-unrelated-mk"),
+            plan: hash_object(b"c5b-unrelated-plan"),
+            begin: hash_object(b"c5b-unrelated-begin"),
+        }
+    }
+
+    #[test]
+    fn the_wrapper_binds_every_result_to_the_coordinated_head() {
+        let expected = an_expected();
+        let limits = RangeInstallationLimits::default();
+        // (a) The complete plain chain: the founding-terminated
+        // absence, bound to the coordinated head.
+        let (mut reads, head, _) = tiny_chain();
+        let coordinated = observe_coordinated(&mut reads, &head, &expected, &limits).unwrap();
+        let CoordinatedObservation {
+            coordinated_head,
+            observation,
+            unresolved: _,
+        } = &coordinated;
+        assert_eq!(*coordinated_head, head);
+        match observation {
+            RangeInstallationObservation::NotObservedOnAncestry {
+                observed_head,
+                terminus: NotObservedTerminus::Founding { .. },
+            } => assert_eq!(*observed_head, *coordinated_head),
+            other => panic!("the plain chain must classify: {other:?}"),
+        }
+        // (b) The mid-chain record removed: the unresolved gap,
+        // bound to the coordinated head (never an absence).
+        let (mut reads, head, founding) = tiny_chain();
+        reads.records.remove(&founding);
+        let coordinated = observe_coordinated(&mut reads, &head, &expected, &limits).unwrap();
+        let CoordinatedObservation {
+            coordinated_head,
+            observation,
+            unresolved: _,
+        } = &coordinated;
+        assert_eq!(*coordinated_head, head);
+        match observation {
+            RangeInstallationObservation::AncestryGapUnresolved { observed_head, at } => {
+                assert_eq!(*observed_head, *coordinated_head);
+                assert_eq!(*at, founding);
+            }
+            other => panic!("the gap must classify: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_wrapper_validates_inputs_before_any_read() {
+        let expected = an_expected();
+        let (mut reads, head, _) = tiny_chain();
+        // The zero limit refuses before any read.
+        assert!(matches!(
+            observe_coordinated(
+                &mut reads,
+                &head,
+                &expected,
+                &RangeInstallationLimits { max_records: 0 }
+            ),
+            Err(MediumError::Chain {
+                rule: "range-observation/zero-limit"
+            })
+        ));
+        // The placeholder expected context refuses through the C5a
+        // step-0 validation.
+        let invalid = RangeCompletionContext {
+            mk: Hash::ZERO,
+            plan: hash_object(b"c5b-plan"),
+            begin: hash_object(b"c5b-begin"),
+        };
+        assert!(matches!(
+            observe_coordinated(
+                &mut reads,
+                &head,
+                &invalid,
+                &RangeInstallationLimits::default()
+            ),
+            Err(MediumError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn the_coordinated_unresolved_destructure_names_every_field() {
+        // R8 at the coordinated level: the exhaustive destructure —
+        // twelve named NotEstablished absences (the eleven C5a
+        // obligations PLUS the head-currency limitation), never a
+        // capability.
+        let CoordinatedUnresolvedObligations {
+            provider_canonical_head: NotEstablished,
+            begin_durability_authority: NotEstablished,
+            founding_derived_seed_authenticity: NotEstablished,
+            original_range_digest_historical_correctness: NotEstablished,
+            original_object_closures: NotEstablished,
+            batch_classification_historical_correctness: NotEstablished,
+            physical_retirement: NotEstablished,
+            journal_retirement_and_ownership: NotEstablished,
+            recovery_convergence: NotEstablished,
+            crossing_permission: NotEstablished,
+            startup_safety: NotEstablished,
+            head_currency_beyond_scope: NotEstablished,
+        } = CoordinatedUnresolvedObligations::all();
+    }
+
+    #[test]
+    fn the_coordinated_type_exposes_exactly_three_fields() {
+        // The type-level proof: the coordinated observation holds
+        // exactly the coordinated head, the C5a observation, and the
+        // unresolved obligations — no verdict, capability, or
+        // certificate field exists.
+        let expected = an_expected();
+        let (mut reads, head, _) = tiny_chain();
+        let coordinated = observe_coordinated(
+            &mut reads,
+            &head,
+            &expected,
+            &RangeInstallationLimits::default(),
+        )
+        .unwrap();
+        let CoordinatedObservation {
+            coordinated_head,
+            observation,
+            unresolved,
+        } = coordinated;
+        assert_eq!(coordinated_head, head);
+        assert!(matches!(
+            observation,
+            RangeInstallationObservation::NotObservedOnAncestry { .. }
+        ));
+        assert_eq!(unresolved, CoordinatedUnresolvedObligations::all());
+    }
+}
