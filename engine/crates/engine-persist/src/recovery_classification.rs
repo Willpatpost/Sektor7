@@ -7550,4 +7550,263 @@ mod r1a4_witness_tests {
             cleanup(&[path, journal]);
         }
     }
+
+    /// (B-R1a4 §4) The manifest's member count disagreeing with
+    /// the retained checkpoint index degrades with
+    /// ManifestCountIncoherent (a decodable, correctly bound
+    /// manifest under the exact key declaring the wrong census —
+    /// refused before any shard is consulted).
+    #[test]
+    fn the_manifest_count_incoherence_degrades() {
+        let (path, mut store) = sqlite_store("w4");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w4");
+        let campaign = stage_campaign(medium, "w4", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 5, 1),
+            9,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ManifestCountIncoherent {
+                    manifest: 5,
+                    index: 3,
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// The shard payload over a caller-selected member subset (the
+    /// census arms need shards whose entry counts do not sum to
+    /// the manifest's census; the strict decode binds the shard's
+    /// member_count to its own entry census).
+    fn shard_payload_with(
+        medium: &mut dyn CanonicalMedium,
+        campaign: &Campaign,
+        shard_index: u64,
+        shard_count: u64,
+        members: &[Hash],
+    ) -> Vec<u8> {
+        let entries = members
+            .iter()
+            .map(|id| crate::ancestry_witness::WitnessEntry {
+                member: *id,
+                preimage: medium.read_record(id).unwrap().canonical_bytes(),
+            })
+            .collect();
+        crate::ancestry_witness::AncestryWitnessShard {
+            mk: campaign.mk,
+            shard_index,
+            shard_count,
+            member_count: members.len() as u64,
+            entries,
+        }
+        .canonical_bytes()
+    }
+
+    /// (B-R1a4 §5) The observed shard set disagreeing with the
+    /// manifest's declared count degrades with
+    /// ShardSetIncoherent (a manifest declaring two shards with
+    /// only index 0 installed — a missing shard is a set
+    /// incoherence, never a silent absence).
+    #[test]
+    fn the_shard_set_incoherence_degrades() {
+        let (path, mut store) = sqlite_store("w5");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w5");
+        let campaign = stage_campaign(medium, "w5", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 3, 2),
+            9,
+        );
+        let shard0 = shard_payload_with(medium, &campaign, 0, 2, &[campaign.sk]);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            shard0,
+            10,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardSetIncoherent {
+                    expected_count: 2,
+                    observed: vec![0],
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a4 §6) The objectless shard-keyed record: the shard
+    /// recognition is FAMILY-BY-DOMAIN (the record's first content
+    /// object's domain tag), so a record under the exact canonical
+    /// shard key with NO content object never enters the shard
+    /// scan — the manifest's declared set is simply not observed
+    /// and the witness degrades with ShardSetIncoherent (the
+    /// empty observed set). This pins the honest boundary: the
+    /// ShardUnreadable variant is UNREACHABLE through the
+    /// production scan (an objectless record is never a shard; a
+    /// corrupt or absent object refuses at the L0 discovery's
+    /// hash-verifying read before the witness scan runs) — unlike
+    /// the manifest, which is located by its deterministic KEY and
+    /// therefore CAN be observed unreadable (§1).
+    #[test]
+    fn the_objectless_shard_key_degrades_as_a_set_incoherence() {
+        let (path, mut store) = sqlite_store("w6");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w6");
+        let campaign = stage_campaign(medium, "w6", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 3, 1),
+            9,
+        );
+        install_keyed_empty_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            10,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardSetIncoherent {
+                    expected_count: 1,
+                    observed: vec![],
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a4 §7) The shard record under the exact key with a
+    /// TRUNCATED shard payload degrades with
+    /// MalformedShardPayload (the strict decode's refusal).
+    #[test]
+    fn the_malformed_shard_payload_degrades() {
+        let (path, mut store) = sqlite_store("w7");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w7");
+        let campaign = stage_campaign(medium, "w7", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 3, 1),
+            9,
+        );
+        let mut payload = shard_payload_with(medium, &campaign, 0, 1, &[campaign.sk]);
+        payload.truncate(payload.len() - 5);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            payload,
+            10,
+        );
+        let classification = classify_via_medium(medium);
+        assert!(matches!(
+            &classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::MalformedShardPayload { index, .. }
+            } if *index == 0
+        ));
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a4 §8) A decodable shard under the exact key whose own
+    /// bindings disagree with the manifest degrades with
+    /// ShardBindingMismatch (the shard declaring a different
+    /// shard_count than the manifest — the set check passes, the
+    /// per-shard binding comparison refuses).
+    #[test]
+    fn the_shard_binding_mismatch_degrades() {
+        let (path, mut store) = sqlite_store("w8");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w8");
+        let campaign = stage_campaign(medium, "w8", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 3, 1),
+            9,
+        );
+        let shard0 = shard_payload_with(medium, &campaign, 0, 2, &[campaign.sk]);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            shard0,
+            10,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardBindingMismatch {
+                    index: 0,
+                    rule: "bindings",
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a4 §9) The accumulated per-shard census disagreeing
+    /// with the manifest's member count degrades with
+    /// ShardCensusMismatch (two one-entry shards under a
+    /// three-member manifest: the census is the SUM of the
+    /// per-shard entry counts — an individual shard is never
+    /// required to carry the complete census).
+    #[test]
+    fn the_shard_census_mismatch_degrades() {
+        let (path, mut store) = sqlite_store("w9");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "w9");
+        let campaign = stage_campaign(medium, "w9", &journal, R1A4_LEDGER_BYTE_LIMIT);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest_payload(&campaign, 3, 2),
+            9,
+        );
+        let shard0 = shard_payload_with(medium, &campaign, 0, 2, &[campaign.sk]);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 0),
+            shard0,
+            10,
+        );
+        let shard1 = shard_payload_with(medium, &campaign, 1, 2, &[campaign.members[0]]);
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&campaign.mk, 1),
+            shard1,
+            11,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.witness,
+            WitnessEvidenceObservation::Degraded {
+                reason: WitnessDegradation::ShardCensusMismatch {
+                    manifest: 3,
+                    accumulated: 2,
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
 }
