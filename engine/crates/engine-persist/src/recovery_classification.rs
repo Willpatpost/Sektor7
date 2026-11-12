@@ -985,6 +985,12 @@ fn classify_v2_lane<R: BeginReads>(
                 CompletionStructural::StructuralCandidate(_) => {
                     String::from("structural-candidate-without-begin")
                 }
+                // The same unreachability for the /3 Range-terminal
+                // structural pass (its context requires the
+                // discovered begin) — refused closed.
+                CompletionStructural::RangeStructuralCandidate(_) => {
+                    String::from("range-terminal-structural-candidate-without-begin")
+                }
             };
             return RecoveryState::EvidenceDegraded {
                 reason: EvidenceDegradation::MarkerContradicted {
@@ -1135,6 +1141,15 @@ fn classify_v2_lane<R: BeginReads>(
                 // The V1 marker family in a V2-lane store: observed
                 // and carried by the discovery; the existing V1
                 // verifiers own it. No V2 counting.
+            }
+            CompletionStructural::RangeStructuralCandidate(_) => {
+                // The /3 Range-terminal structural candidate:
+                // observed and carried by the discovery; the
+                // Range-terminal observation line owns its
+                // interpretation (the C5d composite and the future
+                // authenticated range authority). No V2 batch
+                // counting — the ladder's states deliberately stop
+                // at the batch markers.
             }
             CompletionStructural::NotBoundToCoveringCheckpoint => {
                 return RecoveryState::EvidenceDegraded {

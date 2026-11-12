@@ -1340,7 +1340,7 @@ mod c5a_tests {
     use crate::reclaim::{PlanBatch, ReclaimUnit, reclamation_ledger_v2_idempotency_key};
     use crate::record::AuthorityMode;
 
-    struct SyntheticReads {
+    pub(super) struct SyntheticReads {
         records: std::collections::BTreeMap<Hash, Vec<u8>>,
         objects: std::collections::BTreeMap<Hash, Vec<u8>>,
     }
@@ -1359,7 +1359,7 @@ mod c5a_tests {
         }
     }
 
-    fn plain_object(payload: &[u8]) -> Vec<u8> {
+    pub(super) fn plain_object(payload: &[u8]) -> Vec<u8> {
         let mut enc = engine_core::Encoder::new();
         enc.write_str("sektor7/save/1");
         enc.write_bytes(payload);
@@ -1372,16 +1372,16 @@ mod c5a_tests {
     /// walk never reads below the covering MK); `founded` starts at
     /// a genuine founding record.
     #[derive(Clone)]
-    struct ChainBuilder {
+    pub(super) struct ChainBuilder {
         records: std::collections::BTreeMap<Hash, Vec<u8>>,
         objects: std::collections::BTreeMap<Hash, Vec<u8>>,
-        head: Hash,
+        pub(super) head: Hash,
         head_epoch: u64,
         tick: u64,
     }
 
     impl ChainBuilder {
-        fn seeded(seed: Hash, seed_epoch: u64) -> Self {
+        pub(super) fn seeded(seed: Hash, seed_epoch: u64) -> Self {
             ChainBuilder {
                 records: std::collections::BTreeMap::new(),
                 objects: std::collections::BTreeMap::new(),
@@ -1391,7 +1391,7 @@ mod c5a_tests {
             }
         }
 
-        fn founded(campaign: &str) -> Self {
+        pub(super) fn founded(campaign: &str) -> Self {
             let mut builder = ChainBuilder::seeded(Hash::ZERO, 0);
             let object_bytes = plain_object(b"c5a-founding");
             let object_hash = hash_object(&object_bytes);
@@ -1407,7 +1407,7 @@ mod c5a_tests {
             builder
         }
 
-        fn append(&mut self, key: Option<Vec<u8>>, object_bytes: Vec<u8>) -> Hash {
+        pub(super) fn append(&mut self, key: Option<Vec<u8>>, object_bytes: Vec<u8>) -> Hash {
             let object_hash = hash_object(&object_bytes);
             self.tick += 1;
             let record = RevisionRecord::regular(self.head, self.head_epoch, self.tick)
@@ -1424,7 +1424,7 @@ mod c5a_tests {
             id
         }
 
-        fn reader(&self) -> SyntheticReads {
+        pub(super) fn reader(&self) -> SyntheticReads {
             SyntheticReads {
                 records: self.records.clone(),
                 objects: self.objects.clone(),
@@ -1434,22 +1434,22 @@ mod c5a_tests {
 
     /// The retained-evidence facts of one genuine retirement
     /// campaign (the members, the digests, the plan, the audits).
-    struct Facts {
-        mk: Hash,
+    pub(super) struct Facts {
+        pub(super) mk: Hash,
+        pub(super) plan_record: Hash,
+        pub(super) audit_records: Vec<Hash>,
+        pub(super) range_digest: [u8; 32],
+        pub(super) seed: [u8; 32],
         plan: ReclaimPlan,
-        plan_record: Hash,
-        audit_records: Vec<Hash>,
         sk: Hash,
         m1: Hash,
         m2: Hash,
         m3: Hash,
         m4: Hash,
-        range_digest: [u8; 32],
-        seed: [u8; 32],
     }
 
     impl Facts {
-        fn expected_context(&self, begin_record: Hash) -> RangeCompletionContext {
+        pub(super) fn expected_context(&self, begin_record: Hash) -> RangeCompletionContext {
             RangeCompletionContext {
                 mk: self.mk,
                 plan: self.plan_record,
@@ -1458,7 +1458,7 @@ mod c5a_tests {
         }
     }
 
-    fn the_members() -> [Hash; 5] {
+    pub(super) fn the_members() -> [Hash; 5] {
         [
             hash_object(b"c5a-sk"),
             hash_object(b"c5a-m1"),
@@ -1468,14 +1468,14 @@ mod c5a_tests {
         ]
     }
 
-    fn the_digests() -> ([u8; 32], [u8; 32]) {
+    pub(super) fn the_digests() -> ([u8; 32], [u8; 32]) {
         ([7u8; 32], [9u8; 32])
     }
 
     /// The genuine index: SK plus four members, epoch-descending,
     /// with two carrying idempotency keys (the reclaimed_keys
     /// recomputation's input).
-    fn the_index(members: &[Hash; 5]) -> Vec<ReclaimedIndexEntry> {
+    pub(super) fn the_index(members: &[Hash; 5]) -> Vec<ReclaimedIndexEntry> {
         vec![
             ReclaimedIndexEntry::new(None, members[0], 60),
             ReclaimedIndexEntry::new(Some(b"key-m1".to_vec()), members[1], 50),
@@ -1492,7 +1492,7 @@ mod c5a_tests {
     /// can mutate them; the ledger payloads are constructed with
     /// the REAL facts (the MK identity and digests are known only
     /// after the MK append).
-    fn campaign_prefix(
+    pub(super) fn campaign_prefix(
         batches: Vec<PlanBatch>,
         audit0_units: Vec<ReclaimUnit>,
         audit0_keys: u64,
@@ -1576,7 +1576,7 @@ mod c5a_tests {
     /// The genuine audit unit lists (the records in the plan's
     /// batch order; the reclaimed_keys are 1 per batch — m1 and m3
     /// carry the index keys).
-    fn genuine_units(members: &[Hash; 5]) -> (Vec<ReclaimUnit>, Vec<ReclaimUnit>) {
+    pub(super) fn genuine_units(members: &[Hash; 5]) -> (Vec<ReclaimUnit>, Vec<ReclaimUnit>) {
         (
             vec![
                 ReclaimUnit {
@@ -1605,7 +1605,7 @@ mod c5a_tests {
         )
     }
 
-    fn append_begin(builder: &mut ChainBuilder, facts: &Facts) -> Hash {
+    pub(super) fn append_begin(builder: &mut ChainBuilder, facts: &Facts) -> Hash {
         let begin = ReclamationBegin {
             mk: facts.mk,
             source: facts.plan_record,
@@ -1663,7 +1663,7 @@ mod c5a_tests {
         }
     }
 
-    fn append_marker(
+    pub(super) fn append_marker(
         builder: &mut ChainBuilder,
         facts: &Facts,
         begin_record: Hash,
@@ -1696,7 +1696,7 @@ mod c5a_tests {
         (record, commitment.counters)
     }
 
-    fn append_terminal(
+    pub(super) fn append_terminal(
         builder: &mut ChainBuilder,
         facts: &Facts,
         begin_record: Hash,
@@ -1757,7 +1757,7 @@ mod c5a_tests {
         facts: Facts,
     }
 
-    fn genuine_batches() -> Vec<PlanBatch> {
+    pub(super) fn genuine_batches() -> Vec<PlanBatch> {
         let members = the_members();
         vec![
             PlanBatch {
@@ -2721,5 +2721,224 @@ mod c5b_core_tests {
             RangeInstallationObservation::NotObservedOnAncestry { .. }
         ));
         assert_eq!(unresolved, CoordinatedUnresolvedObligations::all());
+    }
+}
+
+#[cfg(test)]
+mod c5d_core_tests {
+    use super::c5a_tests::{
+        ChainBuilder, append_begin, append_marker, append_terminal, campaign_prefix,
+        genuine_batches, genuine_units, plain_object, the_digests, the_index, the_members,
+    };
+    use super::*;
+    use crate::range_completion::RangeCoverageObservation;
+    use crate::reclaim::{ReclamationBegin, reclamation_begin_idempotency_key};
+    use crate::recovery_discovery::{DiscoveryLimits, discover_recovery_evidence};
+
+    /// Runs the discovery over the builder's chain from its head
+    /// and applies the derivation — stages one and two of the
+    /// composite over the synthetic reader.
+    fn derive(builder: &ChainBuilder) -> DiscoveredRangeContext {
+        let mut reads = builder.reader();
+        let discovery =
+            discover_recovery_evidence(&mut reads, &builder.head, &DiscoveryLimits::default())
+                .unwrap();
+        derive_range_completion_context(&discovery)
+    }
+
+    /// The genuine prefix arguments (the C5a fixture's own).
+    fn genuine_prefix() -> (ChainBuilder, crate::range_installation::c5a_tests::Facts) {
+        let members = the_members();
+        let (audit0_units, audit1_units) = genuine_units(&members);
+        campaign_prefix(genuine_batches(), audit0_units, 1, audit1_units, 1)
+    }
+
+    #[test]
+    fn the_genuine_campaign_derives_the_full_context() {
+        let (mut builder, facts) = genuine_prefix();
+        let begin = append_begin(&mut builder, &facts);
+        let (marker0, counters0) = append_marker(&mut builder, &facts, begin, 0);
+        let (marker1, counters1) = append_marker(&mut builder, &facts, begin, 1);
+        let observations = vec![
+            RangeCoverageObservation {
+                batch_index: 0,
+                marker_record: marker0,
+                counters: counters0,
+            },
+            RangeCoverageObservation {
+                batch_index: 1,
+                marker_record: marker1,
+                counters: counters1,
+            },
+        ];
+        let _terminal = append_terminal(&mut builder, &facts, begin, observations);
+        // The derived context is EXACTLY the fixture's expected
+        // context — the derivation's three identities (the covering
+        // MK, the plan, the begin) are the same facts the C5a
+        // verifier's callers supply by hand.
+        match derive(&builder) {
+            DiscoveredRangeContext::V2Context {
+                context,
+                covering_mk,
+                records_consulted,
+            } => {
+                assert_eq!(context, facts.expected_context(begin));
+                assert_eq!(covering_mk, facts.mk);
+                assert!(records_consulted > 0);
+            }
+            other => panic!("the genuine campaign must derive (a non-V2 ladder result: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_in_flight_range_without_a_terminal_still_derives() {
+        // The startup's live case: the reclamation began (the plan
+        // and the begin published, the batch markers landing) but
+        // the /3 terminal is not yet published. The derivation
+        // needs only the MK, the plan, and the begin — the terminal
+        // is the OBSERVATION stage's subject, never a derivation
+        // input.
+        let (mut builder, facts) = genuine_prefix();
+        let begin = append_begin(&mut builder, &facts);
+        let _ = append_marker(&mut builder, &facts, begin, 0);
+        match derive(&builder) {
+            DiscoveredRangeContext::V2Context { context, .. } => {
+                assert_eq!(context, facts.expected_context(begin));
+            }
+            other => panic!("the in-flight range must derive (a non-V2 ladder result: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_segment_without_a_begin_classifies() {
+        let (builder, facts) = genuine_prefix();
+        match derive(&builder) {
+            DiscoveredRangeContext::NoBeginAbovePlan { covering_mk, plan } => {
+                assert_eq!(covering_mk, facts.mk);
+                assert_eq!(plan, facts.plan_record);
+            }
+            other => panic!("the begin-less segment must classify (got: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_segment_without_a_plan_classifies() {
+        // The covering MK alone: no V2 reclamation was ever begun
+        // above it.
+        let members = the_members();
+        let (range_digest, seed) = the_digests();
+        let mut builder = ChainBuilder::seeded(members[0], 60);
+        let metadata = CheckpointMetadata::new(
+            members[0],
+            hash_object(b"c5d-sk-parent"),
+            vec![],
+            the_index(&members),
+            range_digest,
+            seed,
+        );
+        let mk = builder.append(
+            Some(checkpoint_mk_idempotency_key(&members[0])),
+            metadata.canonical_bytes(),
+        );
+        match derive(&builder) {
+            DiscoveredRangeContext::NoPlanAboveCovering { covering_mk } => {
+                assert_eq!(covering_mk, mk);
+            }
+            other => panic!("the plan-less segment must classify (got: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_founded_chain_without_any_checkpoint_classifies() {
+        let mut builder = ChainBuilder::founded("c5d-core");
+        let founding = builder.head;
+        let _ = builder.append(None, plain_object(b"c5d-pub-0"));
+        let _ = builder.append(None, plain_object(b"c5d-pub-1"));
+        match derive(&builder) {
+            DiscoveredRangeContext::NoCoveringCheckpoint { founding: observed } => {
+                assert_eq!(observed, founding);
+            }
+            other => panic!("the checkpoint-less chain must classify (got: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_v1_begin_shape_classifies() {
+        // A begin whose source binds an AUDIT revision (the V1
+        // shape) — the V2 Range-terminal observation does not
+        // apply; the derivation names the evidence for the existing
+        // V1 verifiers.
+        let (mut builder, facts) = genuine_prefix();
+        let v1_begin = ReclamationBegin {
+            mk: facts.mk,
+            source: facts.audit_records[0],
+            range_digest: facts.range_digest,
+            seed: facts.seed,
+        };
+        let begin = builder.append(
+            Some(reclamation_begin_idempotency_key(&facts.mk)),
+            v1_begin.canonical_bytes(),
+        );
+        match derive(&builder) {
+            DiscoveredRangeContext::V1BeginObserved {
+                covering_mk,
+                plan,
+                begin: observed_begin,
+            } => {
+                assert_eq!(covering_mk, facts.mk);
+                assert_eq!(plan, facts.plan_record);
+                assert_eq!(observed_begin, begin);
+            }
+            other => panic!("the V1 begin shape must classify (got: {other:?})"),
+        }
+    }
+
+    #[test]
+    fn the_composite_types_expose_exactly_the_documented_fields() {
+        // The type-level proof: the composite result holds the
+        // derivation ladder and — only for the derived V2 context —
+        // the coordinated observation. No verdict, capability, or
+        // certificate field exists on either type.
+        let result = DiscoveredRangeObservation {
+            derivation: DiscoveredRangeContext::NoPlanAboveCovering {
+                covering_mk: Hash::ZERO,
+            },
+            observation: None,
+        };
+        let DiscoveredRangeObservation {
+            derivation,
+            observation,
+        } = result;
+        assert!(matches!(
+            derivation,
+            DiscoveredRangeContext::NoPlanAboveCovering { .. }
+        ));
+        assert!(observation.is_none());
+        let full = DiscoveredRangeObservation {
+            derivation: DiscoveredRangeContext::V2Context {
+                context: RangeCompletionContext {
+                    mk: Hash::ZERO,
+                    plan: Hash::ZERO,
+                    begin: Hash::ZERO,
+                },
+                covering_mk: Hash::ZERO,
+                records_consulted: 1,
+            },
+            observation: None,
+        };
+        let DiscoveredRangeObservation {
+            derivation,
+            observation,
+        } = full;
+        let DiscoveredRangeContext::V2Context {
+            context,
+            covering_mk: _,
+            records_consulted: _,
+        } = derivation
+        else {
+            panic!("the constructed V2 ladder must destructure");
+        };
+        assert_eq!(context.mk, Hash::ZERO);
+        assert!(observation.is_none());
     }
 }

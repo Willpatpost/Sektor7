@@ -305,6 +305,9 @@ pub enum DiscoveredFamily {
     ReclamationCompleteV2,
     /// A V1 completion marker record (`…/reclamation-complete/1`).
     ReclamationCompleteV1,
+    /// A V3 Range-terminal completion marker record
+    /// (`…/reclamation-complete/3`).
+    ReclamationCompleteV3,
     /// Any non-reclamation content — observed and carried, never
     /// interpreted (its first-object domain string is preserved
     /// in [`DiscoveredRecord::first_object_domain`]).
@@ -434,6 +437,12 @@ pub enum CompletionStructural {
     /// V1 completion verifiers own it. No V2 structural read
     /// applies.
     V1Marker,
+    /// The V3 `/3` Range-terminal structural read succeeded
+    /// against the discovered context (the accepted C4 reader).
+    /// STRUCTURAL ONLY: hash-verified, context-matching bytes —
+    /// never an authenticated Range completion receipt, never a
+    /// terminal-count fact, never a permission of any kind.
+    RangeStructuralCandidate(Box<crate::range_completion::StructuralRangeCandidate>),
     /// The record's key does not bind it to the covering
     /// checkpoint (a foreign MK or an unparseable batch index) —
     /// not attempted against the covering context.
@@ -845,6 +854,54 @@ pub fn discover_recovery_evidence<R: BeginReads>(
                         structural,
                     });
                 }
+                DiscoveredFamily::ReclamationCompleteV3 => {
+                    // The /3 Range-terminal marker: one terminal per
+                    // range — the covering-bound key carries no
+                    // batch index. The accepted C4 structural pass
+                    // runs against the discovered context when the
+                    // plan and the begin are keyed to the covering
+                    // MK; the pass's result is structural only,
+                    // never a completion receipt.
+                    let terminal_key =
+                        crate::range_completion::reclamation_complete_v3_range_idempotency_key(&mk);
+                    if record.key.as_deref() != Some(terminal_key.as_slice()) {
+                        completion_candidates.push(CompletionCandidateObservation {
+                            record: record.identity,
+                            batch_index: None,
+                            structural: CompletionStructural::NotBoundToCoveringCheckpoint,
+                        });
+                        continue;
+                    }
+                    let structural = match (plan_record, begin_record) {
+                        (Some(plan), Some(begin)) => {
+                            let context =
+                                crate::range_completion::RangeCompletionContext { mk, plan, begin };
+                            match crate::range_completion::read_structural_range_candidate(
+                                reads,
+                                &record.identity,
+                                &context,
+                            ) {
+                                Ok(candidate) => CompletionStructural::RangeStructuralCandidate(
+                                    Box::new(candidate),
+                                ),
+                                Err(error) => CompletionStructural::StructuralRefusal {
+                                    rule: structural_rule(&error),
+                                },
+                            }
+                        }
+                        (Some(_), None) => CompletionStructural::ContextIncomplete {
+                            missing: vec!["begin"],
+                        },
+                        (None, _) => CompletionStructural::ContextIncomplete {
+                            missing: vec!["plan"],
+                        },
+                    };
+                    completion_candidates.push(CompletionCandidateObservation {
+                        record: record.identity,
+                        batch_index: None,
+                        structural,
+                    });
+                }
                 _ => {}
             }
         }
@@ -884,6 +941,9 @@ fn classify_family(domain: &str) -> FamilyClassification {
         }
         if domain == RECLAMATION_COMPLETE_DOMAIN {
             return FamilyClassification::Public(DiscoveredFamily::ReclamationCompleteV1);
+        }
+        if domain == crate::range_completion::RECLAMATION_COMPLETE_V3_DOMAIN {
+            return FamilyClassification::Public(DiscoveredFamily::ReclamationCompleteV3);
         }
         return FamilyClassification::Unsupported;
     }
@@ -1928,18 +1988,20 @@ mod discovery_tests {
     // conclusions.
     #[test]
     fn unsupported_future_evidence_variants_fail_closed_where_interpretation_matters() {
-        // A future completion version refuses.
+        // A future completion version refuses (the /3
+        // Range-terminal marker is a SUPPORTED family member since
+        // C5d — the next version beyond it is the future variant).
         let mut covering = covering_chain();
         let head = covering.chain.push(
             Some(reclamation_complete_v2_idempotency_key(&covering.mk, 0)),
-            &domain_object("engine-persist/reclamation-complete/3", b"future"),
+            &domain_object("engine-persist/reclamation-complete/4", b"future"),
         );
         let error = discover_recovery_evidence(&mut covering.chain.reads, &head, &default_limits())
             .unwrap_err();
         assert!(matches!(
             &error,
             DiscoveryError::UnsupportedEvidenceVariant { domain, .. }
-                if domain == "engine-persist/reclamation-complete/3"
+                if domain == "engine-persist/reclamation-complete/4"
         ));
         // A future begin version refuses.
         let mut covering = covering_chain();
