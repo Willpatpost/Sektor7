@@ -267,6 +267,23 @@ impl CanonicalMedium for SessionStore {
         }
     }
 
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &engine_persist::range_completion::RangeCompletionContext,
+        limits: &engine_persist::range_installation::RangeInstallationLimits,
+    ) -> Result<engine_persist::range_installation::CoordinatedObservation, MediumError> {
+        // (V2X-CP3-B-P2A-C5b) The direct-source routing of the
+        // provider-coordinated Range-terminal observation.
+        match self {
+            SessionStore::Local(medium) => {
+                medium.observe_range_terminal_under_coordination(expected, limits)
+            }
+            SessionStore::Sqlite(medium) => {
+                medium.observe_range_terminal_under_coordination(expected, limits)
+            }
+        }
+    }
+
     fn verify_begin_authority(
         &mut self,
         audit: &engine_persist::Hash,

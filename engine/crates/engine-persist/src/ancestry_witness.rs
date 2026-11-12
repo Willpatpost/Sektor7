@@ -4430,6 +4430,16 @@ pub(crate) mod a12_tests {
         ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
             self.inner.verify_begin_authority_v2(mk)
         }
+
+        fn observe_range_terminal_under_coordination(
+            &mut self,
+            expected: &crate::range_completion::RangeCompletionContext,
+            limits: &crate::range_installation::RangeInstallationLimits,
+        ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+            // (V2X-CP3-B-P2A-C5b) The double's plain delegation.
+            self.inner
+                .observe_range_terminal_under_coordination(expected, limits)
+        }
     }
 
     // ------------------------------------------------ the tests

@@ -116,6 +116,13 @@ pub enum MediumOp {
     VerifyBeginAuthorityV2 {
         mk: Hash,
     },
+    /// (V2X-CP3-B-P2A-C5b) The provider-coordinated Range-terminal
+    /// observation through the queue — the expected context and
+    /// limits values only (both Copy; the observation is read-only).
+    ObserveRangeTerminal {
+        expected: engine_persist::range_completion::RangeCompletionContext,
+        limits: engine_persist::range_installation::RangeInstallationLimits,
+    },
     Checkpoint,
     /// The maintenance FIFO barrier (PP-B4 checkpoint 4): a no-op
     /// job whose reply, by FIFO position, proves every previously
@@ -140,6 +147,7 @@ pub enum WorkerReply {
     VerifyBeginAuthority(engine_persist::reclaim::BeginAuthority),
     BeginReclamationV2(engine_persist::reclaim::BeginPublicationOutcome),
     VerifyBeginAuthorityV2(engine_persist::reclaim::BeginAuthority),
+    ObserveRangeTerminal(engine_persist::range_installation::CoordinatedObservation),
     Checkpoint,
     /// A queued job was canceled before it started (the optional-
     /// publication token, PP-B4 checkpoint 3) — a definite non-event:
@@ -575,6 +583,9 @@ fn execute(store: &mut SessionStore, op: MediumOp) -> Result<WorkerReply, Medium
         MediumOp::VerifyBeginAuthorityV2 { mk } => store
             .verify_begin_authority_v2(&mk)
             .map(WorkerReply::VerifyBeginAuthorityV2),
+        MediumOp::ObserveRangeTerminal { expected, limits } => store
+            .observe_range_terminal_under_coordination(&expected, &limits)
+            .map(WorkerReply::ObserveRangeTerminal),
         MediumOp::Checkpoint => store.checkpoint().map(|()| WorkerReply::Checkpoint),
         MediumOp::Barrier => Ok(WorkerReply::Barrier),
     }
@@ -882,6 +893,50 @@ impl CanonicalMedium for WorkerMedium {
             },
             Err(_) => Err(MediumError::Chain {
                 rule: "v2-begin-authority/worker-reply-uncertain",
+            }),
+        }
+    }
+
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &engine_persist::range_completion::RangeCompletionContext,
+        limits: &engine_persist::range_installation::RangeInstallationLimits,
+    ) -> Result<engine_persist::range_installation::CoordinatedObservation, MediumError> {
+        // (V2X-CP3-B-P2A-C5b) The queue-backed provider-coordinated
+        // observation — the same discipline (a lost reply is the
+        // uncertain class, never a guessed observation).
+        if !self.health.alive() {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker is unavailable (poisoned or exited) — observation refused"
+                    .to_owned(),
+            });
+        }
+        let op = MediumOp::ObserveRangeTerminal {
+            expected: *expected,
+            limits: *limits,
+        };
+        let (reply, slot) = completion_slot();
+        if self
+            .tx
+            .send(Job {
+                op,
+                cancel: None,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(MediumError::WorkerUnavailable {
+                detail: "the I/O worker's queue is closed (the worker exited)".to_owned(),
+            });
+        }
+        match slot.recv() {
+            Ok(result) => match result {
+                Ok(WorkerReply::ObserveRangeTerminal(observation)) => Ok(observation),
+                Ok(other) => unreachable!("the observation request returned {other:?}"),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err(MediumError::Chain {
+                rule: "range-observation/worker-reply-uncertain",
             }),
         }
     }

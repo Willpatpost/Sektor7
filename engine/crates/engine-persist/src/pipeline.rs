@@ -3114,6 +3114,18 @@ mod tests {
             // (V2X-CP2) The counting wrapper's plain delegation.
             self.inner.verify_begin_authority_v2(mk)
         }
+
+        fn observe_range_terminal_under_coordination(
+            &mut self,
+            expected: &crate::range_completion::RangeCompletionContext,
+            limits: &crate::range_installation::RangeInstallationLimits,
+        ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+            // (V2X-CP3-B-P2A-C5b) The counting wrapper's plain
+            // delegation (read-only; no read-accounting on the
+            // observation path).
+            self.inner
+                .observe_range_terminal_under_coordination(expected, limits)
+        }
     }
 
     /// One publication revision's content object: a well-formed

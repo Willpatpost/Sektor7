@@ -1879,6 +1879,16 @@ impl CanonicalMedium for CoveringRaceMedium {
         // (V2X-CP2) The race double's plain delegation.
         self.inner.verify_begin_authority_v2(mk)
     }
+
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &engine_persist::range_completion::RangeCompletionContext,
+        limits: &engine_persist::range_installation::RangeInstallationLimits,
+    ) -> Result<engine_persist::range_installation::CoordinatedObservation, MediumError> {
+        // (V2X-CP3-B-P2A-C5b) The race double's plain delegation.
+        self.inner
+            .observe_range_terminal_under_coordination(expected, limits)
+    }
 }
 
 /// §6 case 1 + the uncertain refusal: the covering's append lost its

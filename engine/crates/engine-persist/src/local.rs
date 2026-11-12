@@ -1538,6 +1538,21 @@ impl CanonicalMedium for LocalFileMedium {
         result
     }
 
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &crate::range_completion::RangeCompletionContext,
+        limits: &crate::range_installation::RangeInstallationLimits,
+    ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+        // (V2X-CP3-B-P2A-C5b) The provider-coordinated observation
+        // under the exclusive HEAD.lock: the head read AND the whole
+        // walk inside one lock scope (the capture-then-unlock
+        // discipline — an error path never leaks the OS lock).
+        self.lock()?;
+        let result = self.observe_range_terminal_under_coordination_locked(expected, limits);
+        let _ = self.unlock();
+        result
+    }
+
     fn head(&mut self) -> Result<Option<Hash>, MediumError> {
         self.lock()?;
         // Capture-then-unlock (the reviewed open() discipline): no
@@ -2324,6 +2339,34 @@ impl LocalFileMedium {
             id: evidence.begin_id,
             tier: crate::medium::SyncTier::FullPosixSequence,
         })
+    }
+
+    /// (V2X-CP3-B-P2A-C5b) The provider-coordinated observation
+    /// under the HELD HEAD.lock: the authoritative head read from
+    /// the HEAD file INSIDE the lock scope, then the accepted C5a
+    /// observation walk over the internal hash-verifying reads —
+    /// the head read and the whole walk inside ONE coordination
+    /// scope. READ-ONLY: no publication, no mutation, no cursor
+    /// change — nothing but the walk's own reads. An unfounded
+    /// campaign refuses typed; the promoted claim is the
+    /// coordinated-scope observation only (see the
+    /// [`crate::range_installation::CoordinatedObservation`]
+    /// contract).
+    fn observe_range_terminal_under_coordination_locked(
+        &self,
+        expected: &crate::range_completion::RangeCompletionContext,
+        limits: &crate::range_installation::RangeInstallationLimits,
+    ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+        let coordinated_head = self
+            .read_head_file()?
+            .ok_or(MediumError::Chain { rule: "unfounded" })?;
+        let mut reads = LocalLockedReads { medium: self };
+        crate::range_installation::observe_coordinated(
+            &mut reads,
+            &coordinated_head,
+            expected,
+            limits,
+        )
     }
 
     /// (OC-C3 CP-1) The reaffirmation synchronization sequence under
@@ -6248,6 +6291,17 @@ mod exclusion_tests {
                 // (V2X-CP2) The wrapper's plain delegation.
                 self.inner.verify_begin_authority_v2(mk)
             }
+
+            fn observe_range_terminal_under_coordination(
+                &mut self,
+                expected: &crate::range_completion::RangeCompletionContext,
+                limits: &crate::range_installation::RangeInstallationLimits,
+            ) -> Result<crate::range_installation::CoordinatedObservation, MediumError>
+            {
+                // (V2X-CP3-B-P2A-C5b) The wrapper's plain delegation.
+                self.inner
+                    .observe_range_terminal_under_coordination(expected, limits)
+            }
         }
         for inject in [
             V2Inject::Installed,
@@ -10151,6 +10205,17 @@ mod exclusion_tests {
                 // (V2X-CP2) The double's plain delegation.
                 self.inner.verify_begin_authority_v2(mk)
             }
+
+            fn observe_range_terminal_under_coordination(
+                &mut self,
+                expected: &crate::range_completion::RangeCompletionContext,
+                limits: &crate::range_installation::RangeInstallationLimits,
+            ) -> Result<crate::range_installation::CoordinatedObservation, MediumError>
+            {
+                // (V2X-CP3-B-P2A-C5b) The double's plain delegation.
+                self.inner
+                    .observe_range_terminal_under_coordination(expected, limits)
+            }
         }
         let mut interleaved = InterleavingMedium {
             inner: &mut medium,
@@ -10668,6 +10733,17 @@ mod exclusion_tests {
             ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
                 // (V2X-CP2) The double's plain delegation.
                 self.inner.verify_begin_authority_v2(mk)
+            }
+
+            fn observe_range_terminal_under_coordination(
+                &mut self,
+                expected: &crate::range_completion::RangeCompletionContext,
+                limits: &crate::range_installation::RangeInstallationLimits,
+            ) -> Result<crate::range_installation::CoordinatedObservation, MediumError>
+            {
+                // (V2X-CP3-B-P2A-C5b) The double's plain delegation.
+                self.inner
+                    .observe_range_terminal_under_coordination(expected, limits)
             }
         }
         let marker_domain_records = |medium: &mut LocalFileMedium| -> usize {

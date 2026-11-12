@@ -169,8 +169,9 @@ pub use range_completion::{
     reclamation_complete_v3_range_idempotency_key,
 };
 pub use range_installation::{
-    MAX_OBSERVATION_RECORDS, NotEstablished as RangeInstallNotEstablished, NotObservedTerminus,
-    RangeInstallationLimits, RangeInstallationObservation, UnresolvedObligations,
+    CoordinatedObservation, CoordinatedUnresolvedObligations, MAX_OBSERVATION_RECORDS,
+    NotEstablished as RangeInstallNotEstablished, NotObservedTerminus, RangeInstallationLimits,
+    RangeInstallationObservation, UnresolvedObligations,
     verify_range_terminal_on_observed_ancestry,
 };
 pub use reclaim::{

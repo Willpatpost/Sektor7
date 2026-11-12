@@ -650,6 +650,28 @@ impl CanonicalMedium for SqliteMedium {
         result
     }
 
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &crate::range_completion::RangeCompletionContext,
+        limits: &crate::range_installation::RangeInstallationLimits,
+    ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+        // (V2X-CP3-B-P2A-C5b) ONE consistent read snapshot for the
+        // whole coordinated observation: the head read and the
+        // entire C5a walk inside a single read transaction whose
+        // snapshot binds at its first statement (a concurrent
+        // writer's commit is either wholly visible before the
+        // snapshot or wholly invisible after it — internal
+        // consistency by the snapshot semantics, no new machinery).
+        // Read-only: the transaction is dropped, never committed.
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| sqlite_err("range observation transaction", e))?;
+        let result = observe_range_terminal_tx(&tx, expected, limits);
+        drop(tx);
+        result
+    }
+
     fn checkpoint(&mut self) -> Result<(), MediumError> {
         self.checkpoint_truncate()
     }
@@ -1517,6 +1539,22 @@ fn begin_reclamation_v2_tx(
         },
         Some(record_id),
     ))
+}
+
+/// (V2X-CP3-B-P2A-C5b) The transaction-scoped coordinated
+/// observation: the authoritative head read from the meta table
+/// INSIDE the caller's transaction, then the accepted C5a
+/// observation walk over the transaction-scoped hash-verifying
+/// reads — the head read and the whole walk inside ONE snapshot.
+/// READ-ONLY. An unfounded campaign refuses typed.
+fn observe_range_terminal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    expected: &crate::range_completion::RangeCompletionContext,
+    limits: &crate::range_installation::RangeInstallationLimits,
+) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+    let coordinated_head = read_meta_head(tx)?.ok_or(MediumError::Chain { rule: "unfounded" })?;
+    let mut reads = SqliteTxReads { tx };
+    crate::range_installation::observe_coordinated(&mut reads, &coordinated_head, expected, limits)
 }
 
 /// (V2X-CP2) The transaction-scoped retained-evidence V2 begin

@@ -1075,12 +1075,8 @@ pub(crate) fn observe_coordinated<R: crate::reclaim::BeginReads>(
     expected: &RangeCompletionContext,
     limits: &RangeInstallationLimits,
 ) -> Result<CoordinatedObservation, MediumError> {
-    let observation = verify_range_terminal_on_observed_ancestry(
-        reads,
-        coordinated_head,
-        expected,
-        limits,
-    )?;
+    let observation =
+        verify_range_terminal_on_observed_ancestry(reads, coordinated_head, expected, limits)?;
     Ok(CoordinatedObservation {
         coordinated_head: *coordinated_head,
         observation,

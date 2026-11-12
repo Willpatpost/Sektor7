@@ -804,4 +804,28 @@ pub trait CanonicalMedium {
         &mut self,
         mk: &Hash,
     ) -> Result<crate::reclaim::BeginAuthority, MediumError>;
+
+    /// (V2X-CP3-B-P2A-C5b) The provider-coordinated Range-terminal
+    /// observation: the accepted C5a observation verifier run over
+    /// a head read UNDER this provider's own coordination scope,
+    /// with the whole walk inside that scope (the local
+    /// implementation under the held HEAD.lock; the SQLite
+    /// implementation inside ONE consistent read transaction whose
+    /// snapshot binds at its first statement). READ-ONLY — no
+    /// publication, no mutation, no new authority beyond the
+    /// head-relative observation's own contract: the result's
+    /// promoted claim is that, at a definite instant inside the
+    /// coordinated scope, the head was the provider's authoritative
+    /// HEAD and the `/3` Range terminal with its retained evidence
+    /// was observed on its ancestry — never retirement, durability,
+    /// deletion, crossing, or startup authority, and never head
+    /// currency beyond the coordination window (see
+    /// [`crate::range_installation::CoordinatedObservation`]). An
+    /// unfounded campaign refuses typed; every failure is typed and
+    /// fail-closed.
+    fn observe_range_terminal_under_coordination(
+        &mut self,
+        expected: &crate::range_completion::RangeCompletionContext,
+        limits: &crate::range_installation::RangeInstallationLimits,
+    ) -> Result<crate::range_installation::CoordinatedObservation, MediumError>;
 }
