@@ -143,23 +143,26 @@ jobs:
       # crash-test-seams only in its own job, where its
       # dev-dependency edge enables engine-persist/composite-test-
       # fixture (cargo tree -f '{p} {f}' verified both sides). The
-      # partition is exact at the CYCLE-2 CONSOLIDATED tree (the
-      # STAGE6 night consolidation baseline f3f03bb, plus Agent A's
-      # C5c completion-crossing-recognition AND Agent B's B-R1a3
-      # degradation matrix, both from the new main; recomputed from
-      # executed runs — never estimates): this shard executes 921
-      # tests on Linux / 870 on Windows (the consolidated baseline
-      # 908 / 857 plus the B-R1a3 package's 13 FULLY CROSS-PLATFORM
+      # partition is exact at the CYCLE-2 CONSOLIDATED tree + B-R1a4
+      # (the STAGE6 night consolidation baseline f3f03bb, plus Agent
+      # A's C5c completion-crossing-recognition AND Agent B's B-R1a3
+      # degradation matrix, both from the new main, plus the B-R1a4
+      # witness-degradation matrix from the cycle-2 main 2ea7622;
+      # recomputed from executed runs — never estimates): this shard
+      # executes 933
+      # tests on Linux / 882 on Windows (the cycle-2 baseline
+      # 921 / 870 plus the B-R1a4 package's 12 FULLY CROSS-PLATFORM
       # engine-persist lib tests — no cfg gates, platform-uniform
       # deltas; the Linux count MEASURED at this exact shard command
-      # on the B-R1a3 worktree: 921 passed / 1 ignored / 30 result
-      # lines, rc=0, CI-verified; the Windows count the exact
-      # uniform delta 857 + 13); heavy supplies 448 / 447 (the C5c
+      # on the B-R1a4 worktree: 933 passed / 1 ignored / 30 result
+      # lines, rc=0; the Windows count the exact
+      # uniform delta 870 + 12, to be verified by the cold CI run);
+      # heavy supplies 448 / 447 (the C5c
       # six platform-uniform crossing::c5c_reader_tests on top of
       # the consolidated 442 / 441 — MEASURED at the C5c branch,
       # see the heavy job's comment for the provenance); the two
-      # shards sum to the cycle-2 battery (1369 / 1317; both counts
-      # re-MEASURED at this consolidated tree before the commit).
+      # shards sum to the cycle-3 battery (1381 / 1329; the Linux
+      # count re-MEASURED at this tree before the commit).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -172,8 +175,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=921
-          if [ "$(uname -s)" != "Linux" ]; then expected=870; fi
+          expected=933
+          if [ "$(uname -s)" != "Linux" ]; then expected=882; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -525,10 +528,11 @@ jobs:
       # shard's own command (448 passed / 0 failed / 3 ignored / 44
       # result lines, the workflow's own awk); 447 Windows = the
       # prior 441 + the same six platform-uniform tests (no cfg
-      # gates). Together with the main shard's 921 / 870 (the
-      # B-R1a3 +13; C5c adds no main-shard tests) these sum to the
-      # cycle-2 consolidated battery (1369 / 1317; both re-MEASURED
-      # at this tree before the commit). MAINTENANCE OBLIGATION:
+      # gates). Together with the main shard's 933 / 882 (the
+      # B-R1a3 +13 and the B-R1a4 +12; C5c adds no main-shard
+      # tests) these sum to the
+      # cycle-3 battery (1381 / 1329; the Linux count re-MEASURED
+      # at the B-R1a4 tree before the commit). MAINTENANCE OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
