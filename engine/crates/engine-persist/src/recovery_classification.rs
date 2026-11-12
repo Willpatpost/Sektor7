@@ -4421,3 +4421,1201 @@ mod classification_tests {
         ));
     }
 }
+
+// ===================================================================
+// (B-R1a2) The production-path verification package — the owner's
+// 2026-11-12 GO under the standing engineering delegation: the
+// classifier exercised over GENUINE published evidence through the
+// production provider adapters and publication APIs (the
+// bound-journal campaign, the keyed checkpoint publication, the V2
+// plan/audit/begin ladder, the B-P1 ancestry witness, and the C1
+// batch markers through the in-crate admitted receipt), with ZERO
+// production-code changes — every fixture below is a test-side
+// composition of existing public and pub(crate) seams, and nothing
+// here grants, weakens, or extends any authority.
+// ===================================================================
+
+#[cfg(test)]
+mod r1a2_production_tests {
+    use super::*;
+    use crate::ancestry_accounting::StorageRole;
+    use crate::ancestry_witness::{WitnessPublicationOutcome, publish_ancestry_witness};
+    use crate::batch_completion::{
+        BatchCompletionContext, BatchCompletionMarkerV2, ClassificationEntry, EntryClassification,
+        commit_classification, reclamation_complete_v2_idempotency_key,
+    };
+    use crate::checkpoint::{
+        SkipEntry, chain_range_digest_step, compute_digest_seed, publish_checkpoint_mk,
+    };
+    use crate::medium::{AdmittedAppend, CanonicalMedium, StoredObject};
+    use crate::reclaim::{
+        BeginPublicationOutcome, MediumReads, ReclaimUnit, ReclamationLedger,
+        create_campaign_bound_journal, find_installed_plan, find_installed_v2_audit,
+        journal_root_id, publish_journal_root_binding, publish_reclamation_ledger,
+        publish_reclamation_ledger_v2, publish_reclamation_plan,
+    };
+    use crate::record::{AuthorityMode, RevisionRecord};
+
+    // ------------------------------------------------------ the stores
+
+    fn temp_path(prefix: &str, label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "s7-r1a2-{prefix}-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn plain_object(payload: &[u8]) -> StoredObject {
+        StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(payload);
+            enc.into_bytes()
+        })
+        .unwrap()
+    }
+
+    fn sqlite_store(label: &str) -> (std::path::PathBuf, crate::SqliteMedium) {
+        let path = temp_path("sqlite", label).with_extension("db");
+        let medium = crate::SqliteMedium::open(&path).unwrap();
+        (path, medium)
+    }
+
+    fn cleanup(paths: &[std::path::PathBuf]) {
+        for path in paths {
+            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// The complete sorted file inventory of a store root (every
+    /// file with its size) — the read-only proof's observation
+    /// subject. Unix-only like its sole caller (the LocalFile
+    /// read-only proof): a Windows build must not carry the orphan.
+    #[cfg(unix)]
+    fn store_inventory(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<(std::path::PathBuf, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push((path, entry.metadata().unwrap().len()));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        files.sort();
+        files
+    }
+
+    // ------------------------------------------------ the campaign facts
+
+    /// Phase A's products: the founding, p1, the two keyed retiring
+    /// members, SK, and the shared content object's identity.
+    struct StagedPrefix {
+        founding: Hash,
+        p1: Hash,
+        members: Vec<Hash>,
+        sk: Hash,
+        shared_object: Hash,
+    }
+
+    /// The staged V2 campaign's retained facts — every identity a
+    /// later phase or assertion needs, all from genuine production
+    /// returns.
+    struct StagedCampaign {
+        members: Vec<Hash>,
+        sk: Hash,
+        shared_object: Hash,
+        mk: Hash,
+        plan_record: Hash,
+        plan: ReclaimPlan,
+        audits: Vec<Hash>,
+        begin: Hash,
+    }
+
+    fn assemble_campaign(
+        prefix: StagedPrefix,
+        mk: Hash,
+        plan_record: Hash,
+        plan: ReclaimPlan,
+        audits: Vec<Hash>,
+        begin: Hash,
+    ) -> StagedCampaign {
+        StagedCampaign {
+            members: prefix.members,
+            sk: prefix.sk,
+            shared_object: prefix.shared_object,
+            mk,
+            plan_record,
+            plan,
+            audits,
+            begin,
+        }
+    }
+
+    // ------------------------------------------------- the staged phases
+
+    /// (Phase A) The founding, the bound journal with its root
+    /// binding, p1, two keyed retiring members, and SK — the bp1
+    /// fixture shape, entirely through the production append path.
+    fn stage_pre_checkpoint(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> StagedPrefix {
+        let shared = plain_object(b"r1a2-shared-payload");
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, label, 0)
+            .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        let location = crate::reclaim::JournalRootBinding::normalize_location(journal_root);
+        let root_id = journal_root_id(&founding_id, &location);
+        drop(create_campaign_bound_journal(medium, journal_root, &founding_id).unwrap());
+        let (_binding, _outcome) =
+            publish_journal_root_binding(medium, &founding_id, &root_id, &location, 1).unwrap();
+        let step = |medium: &mut dyn CanonicalMedium, tick: u64| -> Hash {
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record =
+                RevisionRecord::regular(head, epoch, tick).with_content_refs(vec![shared.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&shared), Some(head))
+                .unwrap();
+            record.id()
+        };
+        let p1 = step(medium, 2);
+        let mut members = Vec::new();
+        for index in 0..2u32 {
+            let object = plain_object(format!("r1a2-{label}-payload-{index}").as_bytes());
+            let head = medium.head().unwrap().unwrap();
+            let epoch = medium.read_record(&head).unwrap().epoch;
+            let record = RevisionRecord::regular(head, epoch, 3)
+                .with_idempotency_key(format!("r1a2-{label}-member-{index}").into_bytes())
+                .with_content_refs(vec![object.hash()]);
+            medium
+                .append(&record, std::slice::from_ref(&object), Some(head))
+                .unwrap();
+            members.push(record.id());
+        }
+        let sk = step(medium, 4);
+        StagedPrefix {
+            founding: founding_id,
+            p1,
+            members,
+            sk,
+            shared_object: shared.hash(),
+        }
+    }
+
+    /// (Phase B) The checkpoint metadata over the actual chain and
+    /// the KEYED MK publication — the production route
+    /// (`publish_checkpoint_mk` installs the deterministic
+    /// checkpoint key the classifier's L2 covering check requires;
+    /// an unkeyed hand-appended MK would never classify as
+    /// covering).
+    fn stage_checkpoint(
+        medium: &mut dyn CanonicalMedium,
+        prefix: &StagedPrefix,
+        tick: u64,
+    ) -> (Hash, CheckpointMetadata) {
+        let sk_record = medium.read_record(&prefix.sk).unwrap();
+        let seed = compute_digest_seed(&prefix.founding);
+        let mut digest = seed;
+        let mut index = Vec::with_capacity(prefix.members.len() + 1);
+        for id in &prefix.members {
+            let record = medium.read_record(id).unwrap();
+            digest = chain_range_digest_step(&digest, &record.canonical_bytes());
+            index.push(ReclaimedIndexEntry::new(
+                record.idempotency_key.clone(),
+                *id,
+                record.epoch,
+            ));
+        }
+        index.push(ReclaimedIndexEntry::new(
+            sk_record.idempotency_key.clone(),
+            prefix.sk,
+            sk_record.epoch,
+        ));
+        let sk_parent = sk_record.parent.expect("the SK is a regular revision");
+        let metadata = CheckpointMetadata::new(
+            prefix.sk,
+            sk_parent,
+            vec![SkipEntry::new(Hash::ZERO, prefix.p1)],
+            index,
+            digest,
+            seed,
+        );
+        // (bp1's F1 structural assertions, restated over this
+        // campaign: the digest recomputes over the members
+        // EXCLUDING SK.)
+        let mut recomputed = seed;
+        for id in &prefix.members {
+            let bytes = medium.read_record(id).unwrap().canonical_bytes();
+            recomputed = chain_range_digest_step(&recomputed, &bytes);
+        }
+        assert_eq!(metadata.range_digest, recomputed);
+        let (mk, _outcome) =
+            publish_checkpoint_mk(medium, prefix.sk, sk_record.epoch, &metadata, tick).unwrap();
+        (mk, metadata)
+    }
+
+    /// (Phase C) The V2 plan publication with the authoritative
+    /// read-back (the plan RECORD identity is what the begin and
+    /// the markers bind to).
+    fn stage_plan(
+        medium: &mut dyn CanonicalMedium,
+        mk: &Hash,
+        journal_root: &std::path::Path,
+        ledger_byte_limit: u64,
+        tick: u64,
+    ) -> (Hash, ReclaimPlan) {
+        let (_candidate, _outcome) =
+            publish_reclamation_plan(medium, mk, ledger_byte_limit, journal_root, tick).unwrap();
+        let (plan_record, plan) = find_installed_plan(medium, mk).unwrap().unwrap();
+        (plan_record, plan)
+    }
+
+    /// (Phase D) One audit per plan batch — each publication's
+    /// returned record identity verified through the authoritative
+    /// read-back.
+    fn stage_audits(
+        medium: &mut dyn CanonicalMedium,
+        mk: &Hash,
+        plan: &ReclaimPlan,
+        tick: u64,
+    ) -> Vec<Hash> {
+        let mut audits = Vec::with_capacity(plan.batches.len());
+        for batch in &plan.batches {
+            let (audit, _outcome) =
+                publish_reclamation_ledger_v2(medium, mk, batch.index, tick).unwrap();
+            let (installed, ledger) = find_installed_v2_audit(medium, mk, batch.index)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                audit, installed,
+                "the audit publication installs exactly the returned record"
+            );
+            assert_eq!(ledger.batch, batch.index);
+            audits.push(audit);
+        }
+        audits
+    }
+
+    /// (Phase E) The V2 begin — the plan-bound admission.
+    fn stage_begin(medium: &mut dyn CanonicalMedium, mk: &Hash, tick: u64) -> Hash {
+        let outcome = medium.begin_reclamation_v2(mk, tick).unwrap();
+        let BeginPublicationOutcome::Accepted { id, .. } = outcome else {
+            panic!("the production begin over the genuine campaign must be Accepted")
+        };
+        id
+    }
+
+    /// (Phase F) The B-P1 ancestry witness publication.
+    fn stage_witness(medium: &mut dyn CanonicalMedium, mk: &Hash, tick: u64) -> Hash {
+        let publication = publish_ancestry_witness(medium, mk, tick).unwrap();
+        assert!(
+            matches!(
+                publication.manifest_outcome,
+                WitnessPublicationOutcome::Accepted { .. }
+            ),
+            "the genuine campaign publishes a fresh witness"
+        );
+        publication.manifest_record
+    }
+
+    /// The C1 marker's classification entries — genuine campaign
+    /// identities (SK and the keyed members as records, the
+    /// founding's shared content as deferred storage).
+    fn campaign_entries(campaign: &StagedCampaign) -> Vec<ClassificationEntry> {
+        let mut entries = vec![
+            ClassificationEntry {
+                identity: campaign.sk,
+                role: StorageRole::Record,
+                classification: EntryClassification::Mandatory,
+                conditional_on_prior_batch: false,
+            },
+            ClassificationEntry {
+                identity: campaign.shared_object,
+                role: StorageRole::Object,
+                classification: EntryClassification::Deferred,
+                conditional_on_prior_batch: false,
+            },
+        ];
+        entries.extend(campaign.members.iter().map(|id| ClassificationEntry {
+            identity: *id,
+            role: StorageRole::Record,
+            classification: EntryClassification::Mandatory,
+            conditional_on_prior_batch: false,
+        }));
+        entries
+    }
+
+    /// The in-crate receipt installation (the same seam the V1
+    /// publication rides): a regular revision under the supplied
+    /// deterministic key, carrying the payload as its single
+    /// content object, appended above the current head.
+    fn install_keyed_object_record(
+        medium: &mut dyn CanonicalMedium,
+        key: Vec<u8>,
+        payload: Vec<u8>,
+        tick: u64,
+    ) -> Hash {
+        let object = StoredObject::new(payload).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let record = RevisionRecord::regular(head, epoch, tick)
+            .with_idempotency_key(key)
+            .with_content_refs(vec![object.hash()]);
+        let id = record.id();
+        medium
+            .append_admitted(
+                AdmittedAppend::generic(&record, std::slice::from_ref(&object)),
+                Some(head),
+            )
+            .unwrap();
+        id
+    }
+
+    /// The marker installation shared by the honest and the
+    /// adversarial forms: the record is ALWAYS keyed by the
+    /// (mk, key_batch) deterministic key while the payload commits
+    /// the SUPPLIED context (the honest markers pass the matching
+    /// context; the lying form binds a mutated one).
+    fn install_marker(
+        medium: &mut dyn CanonicalMedium,
+        campaign: &StagedCampaign,
+        context: &BatchCompletionContext,
+        key_batch: u64,
+        tick: u64,
+    ) -> Hash {
+        let commitment = commit_classification(context, campaign_entries(campaign)).unwrap();
+        let marker = BatchCompletionMarkerV2 {
+            mk: context.mk,
+            plan: context.plan,
+            batch_index: context.batch_index,
+            audit: context.audit,
+            begin: context.begin,
+            commitment: commitment.digest,
+            counters: commitment.counters,
+        };
+        install_keyed_object_record(
+            medium,
+            reclamation_complete_v2_idempotency_key(&campaign.mk, key_batch),
+            marker.canonical_bytes(),
+            tick,
+        )
+    }
+
+    /// (Phase G) One honest C1 batch marker per plan batch — the
+    /// genuine context bindings committed over the campaign's
+    /// entry set and installed through the in-crate admitted
+    /// receipt (the only /2 installation route; no /2 publication
+    /// route exists).
+    fn stage_marker(
+        medium: &mut dyn CanonicalMedium,
+        campaign: &StagedCampaign,
+        batch: u64,
+        tick: u64,
+    ) -> Hash {
+        let context = BatchCompletionContext {
+            mk: campaign.mk,
+            plan: campaign.plan_record,
+            batch_index: batch,
+            audit: campaign.audits[batch as usize],
+            begin: campaign.begin,
+        };
+        install_marker(medium, campaign, &context, batch, tick)
+    }
+
+    // -------------------------------------------- the observation helpers
+
+    fn classify_via_medium(medium: &mut dyn CanonicalMedium) -> RecoveryClassification {
+        let head = medium.head().unwrap().unwrap();
+        let mut reads = MediumReads::new(medium);
+        classify_recovery_evidence(&mut reads, &head, &DiscoveryLimits::default_limits()).unwrap()
+    }
+
+    fn discover_via_medium(medium: &mut dyn CanonicalMedium) -> RecoveryEvidenceDiscovery {
+        let head = medium.head().unwrap().unwrap();
+        let mut reads = MediumReads::new(medium);
+        discover_recovery_evidence(&mut reads, &head, &DiscoveryLimits::default_limits()).unwrap()
+    }
+
+    /// The ledger byte limit that splits the three-unit retirement
+    /// range into multiple single-unit batches (the CP2 campaign's
+    /// measured value over the identical shape).
+    const R1A2_LEDGER_BYTE_LIMIT: u64 = 400;
+
+    /// The complete staged V2 campaign with a classification
+    /// checkpoint after EVERY phase — the production publication
+    /// ladder observed head-relative at each rung, from
+    /// NoCoveringCheckpoint to AllBatchMarkersStructurallyMatched.
+    /// Returns the campaign facts (the terminal state: every marker
+    /// installed).
+    fn staged_production_ladder(
+        medium: &mut dyn CanonicalMedium,
+        label: &str,
+        journal_root: &std::path::Path,
+    ) -> StagedCampaign {
+        // ---- Phase A: founding → journal → p1 → members → SK ----
+        let prefix = stage_pre_checkpoint(medium, label, journal_root);
+        let classification = classify_via_medium(medium);
+        assert!(
+            matches!(classification.state, RecoveryState::NoCoveringCheckpoint),
+            "the pre-checkpoint campaign has no covering checkpoint"
+        );
+        assert!(matches!(
+            classification.witness,
+            WitnessEvidenceObservation::NoneObserved
+        ));
+        assert_eq!(
+            classification.unresolved_authority.older_checkpoints,
+            OlderRangeStatus::NoCoveringCheckpointObserved
+        );
+
+        // ---- Phase B: the keyed MK ----
+        let (mk, _metadata) = stage_checkpoint(medium, &prefix, 5);
+        let classification = classify_via_medium(medium);
+        let RecoveryState::NoRetirementEvidenceObserved { covering } = classification.state else {
+            panic!("after the MK publication the state must be NoRetirementEvidenceObserved")
+        };
+        assert_eq!(covering.record, mk);
+        assert_eq!(covering.metadata.sk, prefix.sk);
+        assert_eq!(
+            classification.unresolved_authority.older_checkpoints,
+            OlderRangeStatus::UnresolvedBelowCoveringBoundary
+        );
+
+        // ---- Phase C: the plan ----
+        let (plan_record, plan) = stage_plan(medium, &mk, journal_root, R1A2_LEDGER_BYTE_LIMIT, 6);
+        let n = plan.batches.len();
+        assert!(
+            n >= 2,
+            "the ledger byte limit must split the range into at least two batches: {n}"
+        );
+        let classification = classify_via_medium(medium);
+        let RecoveryState::PlanObservedWithoutBegin {
+            plan: observed,
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("after the plan publication the state must be PlanObservedWithoutBegin")
+        };
+        assert_eq!(observed.record, plan_record);
+        assert_eq!(audits_observed, Vec::<u64>::new());
+        assert_eq!(audits_not_observed, (0..n as u64).collect::<Vec<u64>>());
+
+        // ---- Phase D: every audit ----
+        let audits = stage_audits(medium, &mk, &plan, 7);
+        let classification = classify_via_medium(medium);
+        let RecoveryState::PlanObservedWithoutBegin {
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("after every audit the state must remain PlanObservedWithoutBegin")
+        };
+        assert_eq!(audits_observed, (0..n as u64).collect::<Vec<u64>>());
+        assert_eq!(audits_not_observed, Vec::<u64>::new());
+
+        // ---- Phase E: the begin ----
+        let begin = stage_begin(medium, &mk, 8);
+        let classification = classify_via_medium(medium);
+        let RecoveryState::V2BeginObserved {
+            begin: observed_begin,
+            markers_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("after the begin the state must be V2BeginObserved")
+        };
+        assert_eq!(observed_begin.record, begin);
+        assert_eq!(observed_begin.begin.source, plan_record);
+        assert_eq!(markers_not_observed, (0..n as u64).collect::<Vec<u64>>());
+
+        let campaign = assemble_campaign(prefix, mk, plan_record, plan, audits, begin);
+
+        // ---- Phase F: the witness ----
+        let manifest_record = stage_witness(medium, &mk, 9);
+        let classification = classify_via_medium(medium);
+        assert!(
+            matches!(classification.state, RecoveryState::V2BeginObserved { .. }),
+            "the witness publication does not move the recovery state"
+        );
+        let WitnessEvidenceObservation::CoherentlyObserved {
+            record,
+            manifest,
+            shard_records,
+        } = classification.witness
+        else {
+            panic!("the genuine witness publication must classify CoherentlyObserved")
+        };
+        assert_eq!(record, manifest_record);
+        assert_eq!(manifest.member_count, 3);
+        assert_eq!(manifest.plan_record, plan_record);
+        assert_eq!(manifest.begin_record, begin);
+        assert_eq!(shard_records.len(), manifest.shard_count as usize);
+        assert!(manifest.shard_count >= 1);
+
+        // ---- Phase G: the markers, ascending batch order ----
+        stage_marker(medium, &campaign, 0, 10);
+        let classification = classify_via_medium(medium);
+        let RecoveryState::SomeBatchMarkersObserved {
+            markers_structurally_matched,
+            markers_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("after the first marker the state must be SomeBatchMarkersObserved")
+        };
+        assert_eq!(markers_structurally_matched, vec![0u64]);
+        assert_eq!(markers_not_observed, (1..n as u64).collect::<Vec<u64>>());
+        for batch in 1..n as u64 {
+            stage_marker(medium, &campaign, batch, 10 + batch);
+        }
+        let classification = classify_via_medium(medium);
+        let RecoveryState::AllBatchMarkersStructurallyMatched {
+            markers_structurally_matched,
+            ..
+        } = classification.state
+        else {
+            panic!("after every marker the state must be AllBatchMarkersStructurallyMatched")
+        };
+        assert_eq!(
+            markers_structurally_matched,
+            (0..n as u64).rev().collect::<Vec<u64>>(),
+            "the matched list is in discovery order (newest first = descending batch)"
+        );
+        assert!(matches!(
+            classification.witness,
+            WitnessEvidenceObservation::CoherentlyObserved { .. }
+        ));
+        campaign
+    }
+
+    // ======================================================= the tests
+
+    /// (B-R1a2 §1) The staged production publication classifies per
+    /// phase under SQLite — the full ladder, every rung asserted.
+    #[test]
+    fn the_sqlite_staged_production_publication_classifies_per_phase() {
+        let (path, mut store) = sqlite_store("t1");
+        let journal = temp_path("journal", "t1");
+        staged_production_ladder(&mut store, "t1", &journal);
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §2) The same staged ladder under POSIX LocalFile —
+    /// the provider parity over identical publication APIs.
+    #[cfg(unix)]
+    #[test]
+    fn the_localfile_staged_production_publication_classifies_per_phase() {
+        let root = temp_path("store", "t2");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t2");
+        staged_production_ladder(&mut medium, "t2", &journal);
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-R1a2 §3) The markers classify when installed over the
+    /// WITNESS-LESS terminal shape (the more common production
+    /// form): Some → All across the ascending installations, the
+    /// witness observation staying None throughout.
+    #[test]
+    fn the_production_markers_classify_when_installed() {
+        let (path, mut store) = sqlite_store("t3");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t3");
+        let prefix = stage_pre_checkpoint(medium, "t3", &journal);
+        let (mk, _metadata) = stage_checkpoint(medium, &prefix, 5);
+        let (plan_record, plan) = stage_plan(medium, &mk, &journal, R1A2_LEDGER_BYTE_LIMIT, 6);
+        let n = plan.batches.len();
+        assert!(n >= 2, "the multi-batch plan is required: {n}");
+        let audits = stage_audits(medium, &mk, &plan, 7);
+        let begin = stage_begin(medium, &mk, 8);
+        let campaign = assemble_campaign(prefix, mk, plan_record, plan, audits, begin);
+        for batch in 0..n as u64 {
+            stage_marker(medium, &campaign, batch, 10 + batch);
+            let classification = classify_via_medium(medium);
+            if batch + 1 < n as u64 {
+                assert!(
+                    matches!(
+                        classification.state,
+                        RecoveryState::SomeBatchMarkersObserved { .. }
+                    ),
+                    "batch {batch}: the partial marker set is SomeBatchMarkersObserved"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        classification.state,
+                        RecoveryState::AllBatchMarkersStructurallyMatched { .. }
+                    ),
+                    "batch {batch}: the complete marker set is AllBatchMarkersStructurallyMatched"
+                );
+            }
+            assert!(matches!(
+                classification.witness,
+                WitnessEvidenceObservation::NoneObserved
+            ));
+        }
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §4) A correctly keyed but context-lying marker (the
+    /// payload binding ANOTHER batch's audit) degrades the evidence
+    /// with the C2 reader's typed context refusal — while the
+    /// witness observation stays coherent (the orthogonality).
+    #[test]
+    fn the_production_lying_marker_degrades() {
+        let (path, mut store) = sqlite_store("t4");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t4");
+        let prefix = stage_pre_checkpoint(medium, "t4", &journal);
+        let (mk, _metadata) = stage_checkpoint(medium, &prefix, 5);
+        let (plan_record, plan) = stage_plan(medium, &mk, &journal, R1A2_LEDGER_BYTE_LIMIT, 6);
+        let n = plan.batches.len();
+        assert!(n >= 2, "the lying form needs a second batch's audit: {n}");
+        let audits = stage_audits(medium, &mk, &plan, 7);
+        let begin = stage_begin(medium, &mk, 8);
+        stage_witness(medium, &mk, 9);
+        let campaign = assemble_campaign(prefix, mk, plan_record, plan, audits, begin);
+        for batch in 1..n as u64 {
+            stage_marker(medium, &campaign, batch, 10 + batch);
+        }
+        // Keyed for batch 0 while the payload binds batch 1's audit.
+        let lying = BatchCompletionContext {
+            mk: campaign.mk,
+            plan: campaign.plan_record,
+            batch_index: 0,
+            audit: campaign.audits[1],
+            begin: campaign.begin,
+        };
+        let lying_record = install_marker(medium, &campaign, &lying, 0, 20);
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MarkerContradicted {
+                    record: lying_record,
+                    batch: Some(0),
+                    rule: String::from("batch-candidate/context-mismatch"),
+                }
+            }
+        );
+        assert!(matches!(
+            classification.witness,
+            WitnessEvidenceObservation::CoherentlyObserved { .. }
+        ));
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §5) The F8 payload-inspecting foreign-key arm over
+    /// production evidence: a shard record keyed for a FOREIGN
+    /// checkpoint but carrying a GENUINE published shard payload
+    /// (binding the covering MK) degrades the witness observation,
+    /// while the retirement-evidence state is untouched.
+    #[test]
+    fn the_foreign_keyed_covering_bound_shard_degrades_over_production_evidence() {
+        let (path, mut store) = sqlite_store("t5");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t5");
+        staged_production_ladder(medium, "t5", &journal);
+        let classification = classify_via_medium(medium);
+        let WitnessEvidenceObservation::CoherentlyObserved { shard_records, .. } =
+            classification.witness
+        else {
+            panic!("the terminal campaign carries a coherent witness")
+        };
+        let shard_object = medium.read_record(&shard_records[0]).unwrap().content_refs[0];
+        let shard_bytes = medium.read_object(&shard_object).unwrap();
+        let foreign_mk = crate::hash::hash_object(b"r1a2-foreign-checkpoint");
+        install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_shard_idempotency_key(&foreign_mk, 0),
+            shard_bytes,
+            30,
+        );
+        let classification = classify_via_medium(medium);
+        let WitnessEvidenceObservation::Degraded {
+            reason: WitnessDegradation::ShardKeyNoncanonical { detail },
+        } = &classification.witness
+        else {
+            panic!("the foreign-keyed covering-bound shard must degrade the witness observation")
+        };
+        assert!(
+            detail.contains("foreign-keyed"),
+            "the F8 arm fired (not another noncanonical form): {detail}"
+        );
+        assert!(
+            matches!(
+                classification.state,
+                RecoveryState::AllBatchMarkersStructurallyMatched { .. }
+            ),
+            "the retirement-evidence state is untouched by the witness degradation"
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §6) The witness-degraded shapes over genuine
+    /// production evidence under LocalFile: (a) the manifestless
+    /// partial (the manifest record's file removed, the HEAD
+    /// rewound to the last installed shard — the crash shape)
+    /// classifies ManifestAbsentWithShardEvidence and the resumed
+    /// publication restores coherence; (b) the manifest-present
+    /// corruption (the object bytes rewritten behind the open
+    /// medium's back) degrades with the typed unreadability — the
+    /// retirement state staying V2BeginObserved throughout (the
+    /// orthogonality).
+    #[cfg(unix)]
+    #[test]
+    fn the_production_witness_degradations_classify() {
+        let root = temp_path("store", "t6");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t6");
+        let prefix = stage_pre_checkpoint(&mut medium, "t6", &journal);
+        let (mk, _metadata) = stage_checkpoint(&mut medium, &prefix, 5);
+        let (_plan_record, plan) =
+            stage_plan(&mut medium, &mk, &journal, R1A2_LEDGER_BYTE_LIMIT, 6);
+        stage_audits(&mut medium, &mk, &plan, 7);
+        stage_begin(&mut medium, &mk, 8);
+        let publication = publish_ancestry_witness(&mut medium, &mk, 9).unwrap();
+        // (a) The manifestless partial: remove the manifest record
+        // and rewind the HEAD to the last installed shard (bp1's
+        // crash-shape construction, the production entry untouched).
+        let last_shard = publication
+            .shard_outcomes
+            .iter()
+            .rev()
+            .find_map(|outcome| match outcome {
+                WitnessPublicationOutcome::Accepted { record, .. }
+                | WitnessPublicationOutcome::DuplicateVerified { record } => Some(*record),
+                _ => None,
+            })
+            .expect("at least one installed shard");
+        let shard_count = publication.shard_outcomes.len() as u64;
+        std::fs::remove_file(medium.object_path_pub(&publication.manifest_record)).unwrap();
+        {
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str(crate::local::HEAD_DOMAIN);
+            enc.write_u32(crate::local::HEAD_VERSION);
+            enc.write_bytes(last_shard.as_bytes());
+            std::fs::write(root.join("HEAD"), enc.into_bytes()).unwrap();
+        }
+        let classification = classify_via_medium(&mut medium);
+        let WitnessEvidenceObservation::ManifestAbsentWithShardEvidence { shard_indices } =
+            &classification.witness
+        else {
+            panic!("the manifestless shard prefix must classify ManifestAbsentWithShardEvidence")
+        };
+        assert_eq!(*shard_indices, (0..shard_count).collect::<Vec<u64>>());
+        assert!(
+            matches!(classification.state, RecoveryState::V2BeginObserved { .. }),
+            "the retirement state is untouched by the manifestless witness shape"
+        );
+        // The resumed publication restores coherence (the B-P1
+        // reconciliation over the same evidence).
+        let resumed = publish_ancestry_witness(&mut medium, &mk, 10).unwrap();
+        assert!(matches!(
+            resumed.manifest_outcome,
+            WitnessPublicationOutcome::Accepted { .. }
+        ));
+        let classification = classify_via_medium(&mut medium);
+        assert!(matches!(
+            classification.witness,
+            WitnessEvidenceObservation::CoherentlyObserved { .. }
+        ));
+        // (b) The manifest-present corruption: the manifest object's
+        // bytes rewritten behind the open medium's back — the L0
+        // discovery walk itself refuses with the typed
+        // object-corruption error (the walk hash-verifies every
+        // consulted record's first content object, so the corrupted
+        // manifest never reaches the witness classification).
+        let manifest_object = medium
+            .read_record(&resumed.manifest_record)
+            .unwrap()
+            .content_refs[0];
+        std::fs::write(
+            medium.object_path_pub(&manifest_object),
+            b"corrupted-manifest-bytes",
+        )
+        .unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let mut reads = MediumReads::new(&mut medium);
+        let error =
+            classify_recovery_evidence(&mut reads, &head, &DiscoveryLimits::default_limits())
+                .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ClassificationError::Discovery(DiscoveryError::EvidenceObjectCorrupt {
+                    record,
+                    object,
+                }) if *record == resumed.manifest_record && *object == manifest_object
+            ),
+            "the corrupted manifest object refuses at the L0 walk: {error:?}"
+        );
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-R1a2 §7) The interrupted pre-begin shape: the plan with a
+    /// PARTIAL audit set (every batch except the last) stays
+    /// PlanObservedWithoutBegin with the exact per-batch split.
+    #[test]
+    fn the_interrupted_pre_begin_shape_classifies() {
+        let (path, mut store) = sqlite_store("t7");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t7");
+        let prefix = stage_pre_checkpoint(medium, "t7", &journal);
+        let (mk, _metadata) = stage_checkpoint(medium, &prefix, 5);
+        let (_plan_record, plan) = stage_plan(medium, &mk, &journal, R1A2_LEDGER_BYTE_LIMIT, 6);
+        let n = plan.batches.len();
+        assert!(
+            n >= 2,
+            "the partial-audit shape needs multiple batches: {n}"
+        );
+        for batch in &plan.batches {
+            if batch.index == n as u64 - 1 {
+                continue;
+            }
+            let (_audit, _outcome) =
+                publish_reclamation_ledger_v2(medium, &mk, batch.index, 7).unwrap();
+        }
+        let classification = classify_via_medium(medium);
+        let RecoveryState::PlanObservedWithoutBegin {
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("the interrupted pre-begin shape must stay PlanObservedWithoutBegin")
+        };
+        assert_eq!(audits_observed, (0..n as u64 - 1).collect::<Vec<u64>>());
+        assert_eq!(audits_not_observed, vec![n as u64 - 1]);
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §8) The V1 legacy production lane: a genuine V1
+    /// ledger (constructed over the campaign's actual retirement
+    /// index, newest-first, with the read-back content references)
+    /// plus the V1 begin (bound to the audit) classifies
+    /// V1EvidenceObserved with the exact record identities.
+    #[test]
+    fn the_v1_legacy_production_lane_classifies() {
+        let (path, mut store) = sqlite_store("t8");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "t8");
+        let prefix = stage_pre_checkpoint(medium, "t8", &journal);
+        let (mk, metadata) = stage_checkpoint(medium, &prefix, 5);
+        // The V1 ledger over the actual index, newest-first (SK,
+        // then the members in reverse construction order).
+        let mut units: Vec<ReclaimUnit> = Vec::new();
+        let mut keyed = 0u64;
+        let (unit, is_keyed) = v1_unit(medium, &prefix.sk);
+        units.push(unit);
+        keyed += is_keyed as u64;
+        for id in prefix.members.iter().rev() {
+            let (unit, is_keyed) = v1_unit(medium, id);
+            units.push(unit);
+            keyed += is_keyed as u64;
+        }
+        let ledger = ReclamationLedger {
+            mk,
+            sk: prefix.sk,
+            range_digest: metadata.range_digest,
+            seed: metadata.seed,
+            records: units.len() as u64,
+            reclaimed_keys: keyed,
+            journal_files: Vec::new(),
+            units,
+        };
+        let (v1_audit, _outcome) = publish_reclamation_ledger(medium, &ledger, 6).unwrap();
+        let outcome = medium.begin_reclamation(&v1_audit, &mk, 7).unwrap();
+        let BeginPublicationOutcome::Accepted { id: begin, .. } = outcome else {
+            panic!("the V1 begin over the genuine ledger must be Accepted")
+        };
+        let classification = classify_via_medium(medium);
+        let RecoveryState::V1EvidenceObserved {
+            v1_audit: observed_audit,
+            begin: observed_begin,
+            ..
+        } = classification.state
+        else {
+            panic!("the V1 legacy lane must classify V1EvidenceObserved")
+        };
+        assert_eq!(observed_audit, v1_audit);
+        let Some(observed) = observed_begin else {
+            panic!("the V1 begin must be observed")
+        };
+        assert_eq!(observed.record, begin);
+        assert_eq!(observed.begin.source, v1_audit);
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// One V1 reclaim unit read back from the actual record (the
+    /// genuine content references), with its keyed-ness.
+    fn v1_unit(medium: &mut dyn CanonicalMedium, id: &Hash) -> (ReclaimUnit, bool) {
+        let record = medium.read_record(id).unwrap();
+        let keyed = record.idempotency_key.is_some();
+        (
+            ReclaimUnit {
+                record: *id,
+                objects: record.content_refs.clone(),
+            },
+            keyed,
+        )
+    }
+
+    /// (B-R1a2 §9) On Windows the LocalFile begin admission refuses
+    /// the platform tier (the typed
+    /// `v2-begin-admission/tier-insufficient`) before any begin
+    /// exists — the classification truthfully stays
+    /// PlanObservedWithoutBegin with every audit observed.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_localfile_tier_refusal_stands() {
+        let root = temp_path("store", "t9");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t9");
+        let prefix = stage_pre_checkpoint(&mut medium, "t9", &journal);
+        let (mk, _metadata) = stage_checkpoint(&mut medium, &prefix, 5);
+        let (_plan_record, plan) =
+            stage_plan(&mut medium, &mk, &journal, R1A2_LEDGER_BYTE_LIMIT, 6);
+        let _audits = stage_audits(&mut medium, &mk, &plan, 7);
+        let error = medium.begin_reclamation_v2(&mk, 8).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "v2-begin-admission/tier-insufficient"
+                }
+            ),
+            "the Windows tier refusal is typed: {error:?}"
+        );
+        let classification = classify_via_medium(&mut medium);
+        let RecoveryState::PlanObservedWithoutBegin {
+            audits_observed,
+            audits_not_observed,
+            ..
+        } = classification.state
+        else {
+            panic!("the refused begin must leave the state PlanObservedWithoutBegin")
+        };
+        assert_eq!(
+            audits_observed,
+            (0..plan.batches.len() as u64).collect::<Vec<u64>>()
+        );
+        assert_eq!(audits_not_observed, Vec::<u64>::new());
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-R1a2 §10) The SQLite twin carries the full staged ladder
+    /// on Windows — the platform's positive evidence (the LocalFile
+    /// positives cannot run there; SQLite is transactionally
+    /// durable).
+    #[cfg(windows)]
+    #[test]
+    fn the_sqlite_twin_carries_windows() {
+        let (path, mut store) = sqlite_store("t10");
+        let journal = temp_path("journal", "t10");
+        staged_production_ladder(&mut store, "t10", &journal);
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §11) The read-only proof at the file level: the
+    /// terminal campaign classified AND discovered repeatedly
+    /// leaves the LocalFile store byte-identical (the HEAD and
+    /// every file unchanged) — the observation paths write nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_production_read_only_proof() {
+        let root = temp_path("store", "t11");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = crate::LocalFileMedium::open(&root).unwrap();
+        let journal = temp_path("journal", "t11");
+        staged_production_ladder(&mut medium, "t11", &journal);
+        let head_before = medium.head().unwrap().unwrap();
+        let inventory_before = store_inventory(&root);
+        let first = classify_via_medium(&mut medium);
+        let discovery = discover_via_medium(&mut medium);
+        let second = classify_via_medium(&mut medium);
+        assert_eq!(medium.head().unwrap().unwrap(), head_before);
+        assert_eq!(store_inventory(&root), inventory_before);
+        assert_eq!(first.state, second.state);
+        assert_eq!(first.witness, second.witness);
+        assert_eq!(first.discovery, discovery);
+        drop(medium);
+        cleanup(&[root, journal]);
+    }
+
+    /// (B-R1a2 §12) The unresolved-authority statement at the
+    /// terminal state is TOTAL — every authority field destructured
+    /// to NotEstablished, older_checkpoints unresolved below the
+    /// boundary — over genuine production evidence.
+    #[test]
+    fn the_production_unresolved_authority_is_total() {
+        let (path, mut store) = sqlite_store("t12");
+        let journal = temp_path("journal", "t12");
+        staged_production_ladder(&mut store, "t12", &journal);
+        let classification = classify_via_medium(&mut store);
+        let UnresolvedAuthority {
+            provider_canonical_head: NotEstablished,
+            founding_derived_seed: NotEstablished,
+            original_range_digest: NotEstablished,
+            original_object_closures: NotEstablished,
+            physical_retirement: NotEstablished,
+            journal_retirement: NotEstablished,
+            provider_durability: NotEstablished,
+            older_checkpoints,
+            completed_range_authority: NotEstablished,
+            startup_safety: NotEstablished,
+        } = &classification.unresolved_authority;
+        assert_eq!(
+            *older_checkpoints,
+            OlderRangeStatus::UnresolvedBelowCoveringBoundary
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §13) The discovery layer's own observations over the
+    /// terminal campaign: the keyed covering identification, the
+    /// newest-first record order with every family present, the
+    /// boundary below the covering checkpoint, and the complete
+    /// structural-candidate set.
+    #[test]
+    fn the_discovery_layer_production_observations() {
+        let (path, mut store) = sqlite_store("t13");
+        let journal = temp_path("journal", "t13");
+        let campaign = staged_production_ladder(&mut store, "t13", &journal);
+        let discovery = discover_via_medium(&mut store);
+        // The covering checkpoint is the keyed MK.
+        let CoveringObservation::Identified(covering) = &discovery.covering else {
+            panic!("the terminal campaign's covering checkpoint must be identified")
+        };
+        assert_eq!(covering.record, campaign.mk);
+        assert_eq!(covering.metadata.sk, campaign.sk);
+        assert_eq!(
+            covering.key.as_deref(),
+            Some(checkpoint_mk_idempotency_key(&campaign.sk).as_slice())
+        );
+        let Some(boundary) = &discovery.boundary else {
+            panic!("the identified covering checkpoint carries the boundary")
+        };
+        assert_eq!(boundary.sk, campaign.sk);
+        // Every family present, newest-first from the last marker.
+        let families: Vec<DiscoveredFamily> = discovery
+            .records
+            .iter()
+            .map(|record| record.family)
+            .collect();
+        assert_eq!(families[0], DiscoveredFamily::ReclamationCompleteV2);
+        let n = campaign.plan.batches.len();
+        for family in [
+            DiscoveredFamily::ReclamationCompleteV2,
+            DiscoveredFamily::AncestryWitnessManifest,
+            DiscoveredFamily::AncestryWitnessShard,
+            DiscoveredFamily::ReclamationBegin,
+            DiscoveredFamily::ReclamationAuditV2,
+            DiscoveredFamily::ReclamationPlan,
+        ] {
+            assert!(
+                families.contains(&family),
+                "the family is present: {family:?}"
+            );
+        }
+        assert_eq!(
+            families
+                .iter()
+                .filter(|family| **family == DiscoveredFamily::ReclamationAuditV2)
+                .count(),
+            n
+        );
+        assert_eq!(
+            families
+                .iter()
+                .filter(|family| **family == DiscoveredFamily::ReclamationCompleteV2)
+                .count(),
+            n
+        );
+        // The terminus is counted but not carried in records.
+        assert_eq!(
+            discovery.records.len() as u64 + 1,
+            discovery.records_consulted
+        );
+        // The marker structural candidates: one per batch, all
+        // structural.
+        assert_eq!(discovery.completion_candidates.len(), n);
+        assert!(
+            discovery
+                .completion_candidates
+                .iter()
+                .all(|candidate| matches!(
+                    candidate.structural,
+                    CompletionStructural::StructuralCandidate(_)
+                )),
+            "every honest production marker is a structural candidate"
+        );
+        // The plan and begin payloads decoded and carried.
+        assert!(
+            discovery
+                .records
+                .iter()
+                .any(|record| matches!(record.payload, DiscoveredPayload::Plan(_)))
+        );
+        assert!(
+            discovery
+                .records
+                .iter()
+                .any(|record| matches!(record.payload, DiscoveredPayload::Begin(_)))
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a2 §14) The discovery read-only proof: repeated
+    /// head-relative discovery over the terminal campaign returns
+    /// identical observations and never moves the head.
+    #[test]
+    fn the_discovery_layer_read_only_proof() {
+        let (path, mut store) = sqlite_store("t14");
+        let journal = temp_path("journal", "t14");
+        staged_production_ladder(&mut store, "t14", &journal);
+        let head = store.head().unwrap().unwrap();
+        let first = discover_via_medium(&mut store);
+        let second = discover_via_medium(&mut store);
+        assert_eq!(first, second);
+        assert_eq!(store.head().unwrap().unwrap(), head);
+        assert_eq!(first.head, head);
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+}

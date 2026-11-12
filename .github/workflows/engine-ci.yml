@@ -143,22 +143,24 @@ jobs:
       # crash-test-seams only in its own job, where its
       # dev-dependency edge enables engine-persist/composite-test-
       # fixture (cargo tree -f '{p} {f}' verified both sides). The
-      # partition is exact at the INTEGRATED Stage 6 tree + the C5b
-      # Option A line (the C5b pin recompute, from the executed
-      # local shard run — never estimates): this shard executes 896
-      # tests on Linux / 846 on Windows (the integrated baseline 882
-      # / 832 plus the C5b line's 14 cross-platform engine-persist
-      # lib tests — the Linux count locally executed at the C5b tree:
-      # 896 passed, 0 failed, 0 ignored, rc=0; the Windows count
-      # derived from the measured platform-uniform delta: all 14 C5b
-      # tests are cross-platform with zero cfg gates — the no-tier-
-      # gate finding: the OC-P2 tier gates BEGIN ADMISSIONS, not
-      # read-only observations), heavy supplies 442 / 441 (UNCHANGED
-      # — engine-slice's test count untouched by the C5b line: the
-      # store/worker routing additions are production dispatch
-      # surface, not tests), and the two sum to the C5b battery
-      # (1338 / 1287; the Linux count locally executed at the C5b
-      # tree).
+      # partition is exact at the CONSOLIDATED Stage 6 tree (the
+      # STAGE6 night consolidation of the C5b Option A line AND the
+      # B-R1a2 production-path package, both from 4bd57f0; recomputed
+      # from executed runs — never estimates): this shard executes
+      # 908 tests on Linux / 857 on Windows (the integrated baseline
+      # 882 / 832 plus the C5b line's 14 cross-platform tests and
+      # the B-R1a2 package's 12 Linux / 11 Windows tests — the Linux
+      # count MEASURED at this exact shard command on the
+      # consolidated tree: 908 passed / 1 ignored / 30 result lines,
+      # rc=0; the Windows count derived from BOTH lines' MEASURED
+      # CI-confirmed deltas: the C5b run's 846 and the B-R1a2 run's
+      # 843, cross-checked two ways: 846 + 11 == 843 + 14 == 857),
+      # heavy supplies 442 / 441 (UNCHANGED — MEASURED at the
+      # consolidated tree: the C5b store/worker routing and the
+      # B-R1a2 package add no engine-slice tests), and the two sum
+      # to the consolidated battery (1350 / 1298; the Linux count
+      # locally executed, the Windows count from the measured
+      # deltas, verified by the cold CI run).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -171,8 +173,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=896
-          if [ "$(uname -s)" != "Linux" ]; then expected=846; fi
+          expected=908
+          if [ "$(uname -s)" != "Linux" ]; then expected=857; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -180,17 +182,19 @@ jobs:
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 1 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 1"; exit 1; }
           [ "$results" -eq 30 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 30"; exit 1; }
-      # (V2X-CP3-B-P1 F3) The FEATURE-DISABLED production-path
-      # regression: the B-P1 production tests are cfg(test)-only
-      # (never feature-gated), and this step runs them WITHOUT the
-      # composite-test-fixture flag on every platform — the proof
-      # that the production publisher works in the normal build.
-      # The command must fail if any production-path test fails or
-      # if the module is silently absent (the exact-name filter
-      # reports zero-run as an error).
-      - name: Feature-disabled production-path tests (B-P1)
+      # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
+      # production-path regression: the B-P1 and B-R1a2 production
+      # tests are cfg(test)-only (never feature-gated), and this
+      # step runs them WITHOUT the composite-test-fixture flag on
+      # every platform — the proof that the production publishers
+      # and the classifier observation paths work in the normal
+      # build. The commands must fail if any production-path test
+      # fails or if a module is silently absent (the exact-name
+      # filter reports zero-run as an error).
+      - name: Feature-disabled production-path tests (B-P1, B-R1a2)
         run: |
           cargo test -p engine-persist --lib bp1_production_tests
+          cargo test -p engine-persist --lib r1a2_production_tests
       - name: Fingerprint self-test double run
         shell: bash
         run: |
@@ -365,12 +369,14 @@ jobs:
       # one-thread-per-process invariant SDL requires.
       - name: Tests (workspace, SDL-free suites)
         run: cargo test --workspace --exclude engine-shell --features engine-persist/composite-test-fixture,engine-slice/crash-test-seams
-      # (V2X-CP3-B-P1 F3) The feature-disabled production-path
-      # regression on macOS ARM64, identical to the matrix job's
-      # step: the B-P1 production tests run WITHOUT
-      # composite-test-fixture on every platform.
-      - name: Feature-disabled production-path tests (B-P1)
-        run: cargo test -p engine-persist --lib bp1_production_tests
+      # (V2X-CP3-B-P1 F3, extended to B-R1a2) The feature-disabled
+      # production-path regression on macOS ARM64, identical to the
+      # matrix job's step: the B-P1 and B-R1a2 production tests run
+      # WITHOUT composite-test-fixture on every platform.
+      - name: Feature-disabled production-path tests (B-P1, B-R1a2)
+        run: |
+          cargo test -p engine-persist --lib bp1_production_tests
+          cargo test -p engine-persist --lib r1a2_production_tests
       - name: Tests (engine-shell, one test per process)
         shell: bash
         run: |
@@ -514,8 +520,8 @@ jobs:
       # the 42 integration binaries + the doc section) — UNCHANGED at
       # the integrated Stage 6 tree (engine-slice untouched by the
       # A/B lines; locally re-executed at the integrated tree).
-      # Together with the main shard's 882 / 832 these sum to the
-      # integrated battery (1324 / 1273). MAINTENANCE OBLIGATION:
+      # Together with the main shard's 908 / 857 these sum to the
+      # consolidated battery (1350 / 1298). MAINTENANCE OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
