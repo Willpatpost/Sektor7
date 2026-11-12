@@ -5879,8 +5879,7 @@ mod r1a3_degradation_tests {
         let sk_id = {
             let head = medium.head().unwrap().unwrap();
             let epoch = medium.read_record(&head).unwrap().epoch;
-            let sk = RevisionRecord::regular(head, epoch, 2)
-                .with_content_refs(vec![shared.hash()]);
+            let sk = RevisionRecord::regular(head, epoch, 2).with_content_refs(vec![shared.hash()]);
             medium
                 .append(&sk, std::slice::from_ref(&shared), Some(head))
                 .unwrap();
@@ -5903,14 +5902,10 @@ mod r1a3_degradation_tests {
         let metadata_object = StoredObject::new(metadata.canonical_bytes()).unwrap();
         let head = medium.head().unwrap().unwrap();
         let epoch = medium.read_record(&head).unwrap().epoch;
-        let unkeyed = RevisionRecord::regular(head, epoch, 3)
-            .with_content_refs(vec![metadata_object.hash()]);
+        let unkeyed =
+            RevisionRecord::regular(head, epoch, 3).with_content_refs(vec![metadata_object.hash()]);
         medium
-            .append(
-                &unkeyed,
-                std::slice::from_ref(&metadata_object),
-                Some(head),
-            )
+            .append(&unkeyed, std::slice::from_ref(&metadata_object), Some(head))
             .unwrap();
         let classification = classify_via_medium(medium);
         assert_eq!(
@@ -6075,7 +6070,10 @@ mod r1a3_degradation_tests {
             );
             let classification = classify_via_medium(medium);
             let RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::MalformedPlanPayload { record: observed, .. },
+                reason:
+                    EvidenceDegradation::MalformedPlanPayload {
+                        record: observed, ..
+                    },
             } = classification.state
             else {
                 panic!("the truncated plan payload must degrade as MalformedPlanPayload")
@@ -6095,7 +6093,12 @@ mod r1a3_degradation_tests {
             let record = install_keyed_object_record(
                 medium,
                 reclamation_plan_idempotency_key(&campaign.mk),
-                plan_payload(&campaign, wrong_digest, R1A3_LEDGER_BYTE_LIMIT, minimal_batches(&campaign)),
+                plan_payload(
+                    &campaign,
+                    wrong_digest,
+                    R1A3_LEDGER_BYTE_LIMIT,
+                    minimal_batches(&campaign),
+                ),
                 6,
             );
             let classification = classify_via_medium(medium);
@@ -6204,18 +6207,11 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d4a");
             let campaign = stage_prefix(medium, "d4a", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
-            let (plan_record, _plan) =
-                crate::reclaim::find_installed_plan(medium, &campaign.mk)
-                    .unwrap()
-                    .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
             let mut payload = crate::reclaim::ReclamationBegin {
                 mk: campaign.mk,
                 source: plan_record,
@@ -6232,7 +6228,10 @@ mod r1a3_degradation_tests {
             );
             let classification = classify_via_medium(medium);
             let RecoveryState::EvidenceDegraded {
-                reason: EvidenceDegradation::MalformedBeginPayload { record: observed, .. },
+                reason:
+                    EvidenceDegradation::MalformedBeginPayload {
+                        record: observed, ..
+                    },
             } = classification.state
             else {
                 panic!("the truncated begin payload must degrade as MalformedBeginPayload")
@@ -6247,14 +6246,8 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d4b");
             let campaign = stage_prefix(medium, "d4b", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
             let payload = crate::reclaim::ReclamationBegin {
                 mk: campaign.mk,
                 source: campaign.mk,
@@ -6287,18 +6280,11 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d4c");
             let campaign = stage_prefix(medium, "d4c", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
-            let (plan_record, _plan) =
-                crate::reclaim::find_installed_plan(medium, &campaign.mk)
-                    .unwrap()
-                    .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
+            let (plan_record, _plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
             let mut wrong_seed = campaign.metadata.seed;
             wrong_seed[0] ^= 0xff;
             let payload = crate::reclaim::ReclamationBegin {
@@ -6354,14 +6340,8 @@ mod r1a3_degradation_tests {
         let medium: &mut dyn CanonicalMedium = &mut store;
         let journal = temp_path("journal", "d5");
         let campaign = stage_prefix(medium, "d5", &journal);
-        publish_reclamation_plan(
-            medium,
-            &campaign.mk,
-            R1A3_LEDGER_BYTE_LIMIT,
-            &journal,
-            6,
-        )
-        .unwrap();
+        publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+            .unwrap();
         let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
             .unwrap()
             .unwrap();
@@ -6400,14 +6380,8 @@ mod r1a3_degradation_tests {
         let medium: &mut dyn CanonicalMedium = &mut store;
         let journal = temp_path("journal", "d6");
         let campaign = stage_prefix(medium, "d6", &journal);
-        publish_reclamation_plan(
-            medium,
-            &campaign.mk,
-            R1A3_LEDGER_BYTE_LIMIT,
-            &journal,
-            6,
-        )
-        .unwrap();
+        publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+            .unwrap();
         let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
             .unwrap()
             .unwrap();
@@ -6419,7 +6393,7 @@ mod r1a3_degradation_tests {
             }
             publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
         }
-        let record = install_keyed_object_record(
+        install_keyed_object_record(
             medium,
             reclamation_begin_idempotency_key(&campaign.mk),
             genuine_begin_payload(&campaign, plan_record),
@@ -6456,14 +6430,8 @@ mod r1a3_degradation_tests {
         let medium: &mut dyn CanonicalMedium = &mut store;
         let journal = temp_path("journal", "d7");
         let campaign = stage_prefix(medium, "d7", &journal);
-        publish_reclamation_plan(
-            medium,
-            &campaign.mk,
-            R1A3_LEDGER_BYTE_LIMIT,
-            &journal,
-            6,
-        )
-        .unwrap();
+        publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+            .unwrap();
         let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
             .unwrap()
             .unwrap();
@@ -6511,7 +6479,10 @@ mod r1a3_degradation_tests {
         };
         let record = install_keyed_object_record(
             medium,
-            crate::batch_completion::reclamation_complete_v2_idempotency_key(&campaign.mk, n as u64),
+            crate::batch_completion::reclamation_complete_v2_idempotency_key(
+                &campaign.mk,
+                n as u64,
+            ),
             marker.canonical_bytes(),
             9,
         );
@@ -6598,14 +6569,8 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d8a");
             let campaign = stage_prefix(medium, "d8a", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
             let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
                 .unwrap()
                 .unwrap();
@@ -6665,14 +6630,8 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d8b");
             let campaign = stage_prefix(medium, "d8b", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
             let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
                 .unwrap()
                 .unwrap();
@@ -6715,14 +6674,8 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d8c");
             let campaign = stage_prefix(medium, "d8c", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
             let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
                 .unwrap()
                 .unwrap();
@@ -6825,14 +6778,8 @@ mod r1a3_degradation_tests {
             let medium: &mut dyn CanonicalMedium = &mut store;
             let journal = temp_path("journal", "d8e");
             let campaign = stage_prefix(medium, "d8e", &journal);
-            publish_reclamation_plan(
-                medium,
-                &campaign.mk,
-                R1A3_LEDGER_BYTE_LIMIT,
-                &journal,
-                6,
-            )
-            .unwrap();
+            publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+                .unwrap();
             let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
                 .unwrap()
                 .unwrap();
@@ -6919,14 +6866,8 @@ mod r1a3_degradation_tests {
         let medium: &mut dyn CanonicalMedium = &mut store;
         let journal = temp_path("journal", "d10");
         let campaign = stage_prefix(medium, "d10", &journal);
-        publish_reclamation_plan(
-            medium,
-            &campaign.mk,
-            R1A3_LEDGER_BYTE_LIMIT,
-            &journal,
-            6,
-        )
-        .unwrap();
+        publish_reclamation_plan(medium, &campaign.mk, R1A3_LEDGER_BYTE_LIMIT, &journal, 6)
+            .unwrap();
         let (plan_record, _plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
             .unwrap()
             .unwrap();
@@ -6972,6 +6913,154 @@ mod r1a3_degradation_tests {
                 reason: EvidenceDegradation::MixedV1AndV2Evidence {
                     v1_record,
                     v2_record: plan_record,
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §11) A witness manifest observed with NO plan and
+    /// NO V1 audit to bind to degrades with
+    /// OrphanedWitnessManifest — the manifest key occupied over a
+    /// bare checkpoint with a genuine-shaped manifest payload
+    /// (the publication order makes an orphaned manifest
+    /// incoherent retained evidence; the witness observation
+    /// degrades independently and orthogonally).
+    #[test]
+    fn the_orphaned_witness_manifest_degrades() {
+        let (path, mut store) = sqlite_store("d11");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d11");
+        let campaign = stage_prefix(medium, "d11", &journal);
+        let manifest = crate::ancestry_witness::AncestryWitnessManifest {
+            mk: campaign.mk,
+            plan_record: campaign.mk,
+            begin_record: campaign.mk,
+            metadata_object: campaign.mk,
+            member_count: 3,
+            shard_count: 1,
+            coverage_digest: [11u8; 32],
+        };
+        let record = install_keyed_object_record(
+            medium,
+            crate::ancestry_witness::reclamation_witness_manifest_idempotency_key(&campaign.mk),
+            manifest.canonical_bytes(),
+            6,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::OrphanedWitnessManifest { record }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §12) A recognized reclamation-family payload
+    /// binding the covering MK under an INCORRECT key degrades
+    /// with SameCheckpointWrongKeyEvidence — a genuine-shaped plan
+    /// payload installed under an arbitrary key over a bare
+    /// checkpoint (the same-MK wrong-key scan reads and decodes
+    /// the payload solely to test the MK binding; the correctly
+    /// keyed lanes never see it).
+    #[test]
+    fn the_same_checkpoint_wrong_key_evidence_degrades() {
+        let (path, mut store) = sqlite_store("d12");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d12");
+        let campaign = stage_prefix(medium, "d12", &journal);
+        let record = install_keyed_object_record(
+            medium,
+            b"r1a3-wrong-plan-key".to_vec(),
+            plan_payload(
+                &campaign,
+                campaign.metadata.range_digest,
+                R1A3_LEDGER_BYTE_LIMIT,
+                minimal_batches(&campaign),
+            ),
+            6,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::SameCheckpointWrongKeyEvidence {
+                    record,
+                    family: "plan",
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §13) The V1 lane's begin binding: a begin under
+    /// the exact begin key over a GENUINELY published V1 ledger
+    /// whose source is not the observed V1 audit degrades with
+    /// BeginBindingMismatch{v1-source-or-mk} (the genuine V1
+    /// begin — the R1a2 package's territory — binds the audit; the
+    /// classifier independently refuses the wrong binding).
+    #[test]
+    fn the_v1_begin_binding_mismatch_degrades() {
+        let (path, mut store) = sqlite_store("d13");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d13");
+        let campaign = stage_prefix(medium, "d13", &journal);
+        // The genuine V1 ledger over the campaign's actual
+        // retirement index, newest-first, published through the
+        // genuine route (no V2 plan exists in this campaign).
+        let mut units: Vec<ReclaimUnit> = Vec::new();
+        let mut keyed = 0u64;
+        let sk_record = medium.read_record(&campaign.sk).unwrap();
+        keyed += sk_record.idempotency_key.is_some() as u64;
+        units.push(ReclaimUnit {
+            record: campaign.sk,
+            objects: sk_record.content_refs.clone(),
+        });
+        for id in campaign.members.iter().rev() {
+            let record = medium.read_record(id).unwrap();
+            keyed += record.idempotency_key.is_some() as u64;
+            units.push(ReclaimUnit {
+                record: *id,
+                objects: record.content_refs.clone(),
+            });
+        }
+        let ledger = ReclamationLedger {
+            mk: campaign.mk,
+            sk: campaign.sk,
+            range_digest: campaign.metadata.range_digest,
+            seed: campaign.metadata.seed,
+            records: units.len() as u64,
+            reclaimed_keys: keyed,
+            journal_files: Vec::new(),
+            units,
+        };
+        publish_reclamation_ledger(medium, &ledger, 6).unwrap();
+        // The begin under the exact begin key binding the WRONG
+        // source (the MK record, not the V1 audit).
+        let payload = crate::reclaim::ReclamationBegin {
+            mk: campaign.mk,
+            source: campaign.mk,
+            range_digest: campaign.metadata.range_digest,
+            seed: campaign.metadata.seed,
+        }
+        .canonical_bytes();
+        let record = install_keyed_object_record(
+            medium,
+            reclamation_begin_idempotency_key(&campaign.mk),
+            payload,
+            7,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::BeginBindingMismatch {
+                    record,
+                    rule: "v1-source-or-mk",
                 }
             }
         );
