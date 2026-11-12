@@ -8362,7 +8362,6 @@ mod c5b_sqlite_tests {
 #[cfg(test)]
 mod c5d_sqlite_tests {
     use super::c5b_sqlite_tests::{genuine_campaign, temp_db};
-    use super::*;
     use crate::range_installation::{
         DiscoveredRangeContext, RangeInstallationLimits, RangeInstallationObservation,
         observe_discovered_range_terminal_under_coordination,

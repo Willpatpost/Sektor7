@@ -1232,7 +1232,6 @@ pub fn observe_discovered_range_terminal_under_coordination(
     let discovery =
         crate::recovery_discovery::discover_recovery_evidence(&mut reads, head, discovery_limits)
             .map_err(DiscoveredObservationError::Discovery)?;
-    drop(reads);
     // Stage two — the context derivation.
     let derivation = derive_range_completion_context(&discovery);
     // Stage three — the coordinated observation for the derived

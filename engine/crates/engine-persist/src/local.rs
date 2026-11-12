@@ -12945,8 +12945,8 @@ mod c5d_local_tests {
     use super::c5b_local_tests::{a_root, genuine_campaign, inventory, plain_object};
     use super::*;
     use crate::range_installation::{
-        CoordinatedObservation, DiscoveredRangeContext, DiscoveredRangeObservation,
-        NotObservedTerminus, RangeInstallationLimits, RangeInstallationObservation,
+        DiscoveredRangeContext, DiscoveredRangeObservation, NotObservedTerminus,
+        RangeInstallationLimits, RangeInstallationObservation,
         observe_discovered_range_terminal_under_coordination,
     };
     use crate::recovery_discovery::DiscoveryLimits;
