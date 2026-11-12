@@ -6529,4 +6529,453 @@ mod r1a3_degradation_tests {
         drop(store);
         cleanup(&[path, journal]);
     }
+
+    /// The genuine units of a plan batch, read back from the
+    /// actual records (the identity, the content references, and
+    /// the keyed count — the shape the genuine audit publishes).
+    fn genuine_units(
+        medium: &mut dyn CanonicalMedium,
+        plan: &ReclaimPlan,
+        batch_index: u64,
+    ) -> (Vec<ReclaimUnit>, u64) {
+        let batch = plan
+            .batches
+            .iter()
+            .find(|batch| batch.index == batch_index)
+            .expect("the batch index is in the plan");
+        let mut units = Vec::with_capacity(batch.records.len());
+        let mut keyed = 0u64;
+        for record_id in &batch.records {
+            let record = medium.read_record(record_id).unwrap();
+            if record.idempotency_key.is_some() {
+                keyed += 1;
+            }
+            units.push(ReclaimUnit {
+                record: *record_id,
+                objects: record.content_refs.clone(),
+            });
+        }
+        (units, keyed)
+    }
+
+    /// A V2 audit payload over the campaign's genuine bindings
+    /// with the caller's digest, units, and keyed count.
+    fn ledger_payload(
+        campaign: &Campaign,
+        batch: u64,
+        range_digest: [u8; 32],
+        units: Vec<ReclaimUnit>,
+        reclaimed_keys: u64,
+    ) -> Vec<u8> {
+        ReclamationLedgerV2 {
+            mk: campaign.mk,
+            sk: campaign.sk,
+            batch,
+            range_digest,
+            seed: campaign.metadata.seed,
+            records: units.len() as u64,
+            reclaimed_keys,
+            units,
+        }
+        .canonical_bytes()
+    }
+
+    /// (B-R1a3 §8) The doctored audit payloads degrade: a
+    /// byte-limit-exceeding payload (AuditByteLimitExceeded — the
+    /// raw-bytes ceiling check fires before the decode), a
+    /// TRUNCATED payload (MalformedAuditPayload), a
+    /// binding-incorrect digest (AuditBindingMismatch), reordered
+    /// units (AuditUnitsMismatch), and an inflated keyed count
+    /// (AuditKeyedCountMismatch) — each under the exact (mk, 0)
+    /// audit key through the in-crate receipt seam with the
+    /// genuine begin observed (the L5 lane validates every
+    /// observed audit in full).
+    #[test]
+    fn the_doctored_audit_payloads_degrade() {
+        // (a) The byte-limit-exceeding payload.
+        {
+            let (path, mut store) = sqlite_store("d8a");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d8a");
+            let campaign = stage_prefix(medium, "d8a", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
+            let n = plan.batches.len();
+            assert!(n >= 2, "the audit arms need multiple batches: {n}");
+            for batch in &plan.batches {
+                if batch.index == 0 {
+                    continue;
+                }
+                publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+            }
+            // A genuine-shaped ledger for batch 0 inflated past
+            // the plan's admitted byte limit with repeated units.
+            let (units, keyed) = genuine_units(medium, &plan, 0);
+            let mut fat_units = units.clone();
+            for _ in 0..12 {
+                fat_units.extend(units.iter().cloned());
+            }
+            let payload = ledger_payload(
+                &campaign,
+                0,
+                campaign.metadata.range_digest,
+                fat_units,
+                keyed,
+            );
+            let observed = payload.len() as u64;
+            assert!(observed > R1A3_LEDGER_BYTE_LIMIT);
+            install_keyed_object_record(
+                medium,
+                reclamation_ledger_v2_idempotency_key(&campaign.mk, 0),
+                payload,
+                9,
+            );
+            install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                genuine_begin_payload(&campaign, plan_record),
+                8,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::AuditByteLimitExceeded {
+                        batch: 0,
+                        observed,
+                        limit: R1A3_LEDGER_BYTE_LIMIT,
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (b) The truncated payload.
+        {
+            let (path, mut store) = sqlite_store("d8b");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d8b");
+            let campaign = stage_prefix(medium, "d8b", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
+            for batch in &plan.batches {
+                if batch.index == 0 {
+                    continue;
+                }
+                publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+            }
+            let (units, keyed) = genuine_units(medium, &plan, 0);
+            let mut payload =
+                ledger_payload(&campaign, 0, campaign.metadata.range_digest, units, keyed);
+            payload.truncate(payload.len() - 6);
+            install_keyed_object_record(
+                medium,
+                reclamation_ledger_v2_idempotency_key(&campaign.mk, 0),
+                payload,
+                9,
+            );
+            install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                genuine_begin_payload(&campaign, plan_record),
+                8,
+            );
+            let classification = classify_via_medium(medium);
+            let RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MalformedAuditPayload { batch, .. },
+            } = classification.state
+            else {
+                panic!("the truncated audit payload must degrade as MalformedAuditPayload")
+            };
+            assert_eq!(batch, 0);
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (c) The binding-incorrect digest.
+        {
+            let (path, mut store) = sqlite_store("d8c");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d8c");
+            let campaign = stage_prefix(medium, "d8c", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
+            for batch in &plan.batches {
+                if batch.index == 0 {
+                    continue;
+                }
+                publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+            }
+            let (units, keyed) = genuine_units(medium, &plan, 0);
+            let mut wrong_digest = campaign.metadata.range_digest;
+            wrong_digest[0] ^= 0xff;
+            install_keyed_object_record(
+                medium,
+                reclamation_ledger_v2_idempotency_key(&campaign.mk, 0),
+                ledger_payload(&campaign, 0, wrong_digest, units, keyed),
+                9,
+            );
+            install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                genuine_begin_payload(&campaign, plan_record),
+                8,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::AuditBindingMismatch {
+                        batch: 0,
+                        rule: "bindings",
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+        // (d) The reordered units: a WIDE-limit campaign (one
+        // multi-record batch, so the reordered payload stays under
+        // the plan's own byte ceiling and the decode succeeds),
+        // no genuine batch-0 audit published (the doctored form
+        // takes the unoccupied key), the units in reverse order
+        // against the plan's newest-first membership.
+        {
+            let (path, mut store) = sqlite_store("d8d");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d8d");
+            let campaign = stage_prefix(medium, "d8d", &journal);
+            publish_reclamation_plan(medium, &campaign.mk, 10_000, &journal, 6).unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
+            let batch0 = plan
+                .batches
+                .iter()
+                .find(|batch| batch.index == 0)
+                .expect("batch 0 exists");
+            assert!(
+                batch0.records.len() >= 2,
+                "the wide limit yields one multi-record batch"
+            );
+            let (units, keyed) = genuine_units(medium, &plan, 0);
+            let mut reordered = units.clone();
+            reordered.reverse();
+            install_keyed_object_record(
+                medium,
+                reclamation_ledger_v2_idempotency_key(&campaign.mk, 0),
+                ledger_payload(
+                    &campaign,
+                    0,
+                    campaign.metadata.range_digest,
+                    reordered,
+                    keyed,
+                ),
+                9,
+            );
+            install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                genuine_begin_payload(&campaign, plan_record),
+                8,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::AuditUnitsMismatch {
+                        batch: 0,
+                        position: 0,
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+
+        // (e) The inflated keyed count.
+        {
+            let (path, mut store) = sqlite_store("d8e");
+            let medium: &mut dyn CanonicalMedium = &mut store;
+            let journal = temp_path("journal", "d8e");
+            let campaign = stage_prefix(medium, "d8e", &journal);
+            publish_reclamation_plan(
+                medium,
+                &campaign.mk,
+                R1A3_LEDGER_BYTE_LIMIT,
+                &journal,
+                6,
+            )
+            .unwrap();
+            let (plan_record, plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+                .unwrap()
+                .unwrap();
+            for batch in &plan.batches {
+                if batch.index == 0 {
+                    continue;
+                }
+                publish_reclamation_ledger_v2(medium, &campaign.mk, batch.index, 7).unwrap();
+            }
+            let (units, keyed) = genuine_units(medium, &plan, 0);
+            install_keyed_object_record(
+                medium,
+                reclamation_ledger_v2_idempotency_key(&campaign.mk, 0),
+                ledger_payload(
+                    &campaign,
+                    0,
+                    campaign.metadata.range_digest,
+                    units,
+                    keyed + 1,
+                ),
+                9,
+            );
+            install_keyed_object_record(
+                medium,
+                reclamation_begin_idempotency_key(&campaign.mk),
+                genuine_begin_payload(&campaign, plan_record),
+                8,
+            );
+            let classification = classify_via_medium(medium);
+            assert_eq!(
+                classification.state,
+                RecoveryState::EvidenceDegraded {
+                    reason: EvidenceDegradation::AuditKeyedCountMismatch {
+                        batch: 0,
+                        observed: keyed + 1,
+                        expected: keyed,
+                    }
+                }
+            );
+            drop(store);
+            cleanup(&[path, journal]);
+        }
+    }
+
+    /// (B-R1a3 §9) A begin observed with NO plan and NO V1 audit
+    /// to bind its source to degrades with
+    /// BeginSourceNotObserved — the begin key occupied over a
+    /// bare checkpoint (the publication gates cannot produce this
+    /// shape: every begin admission requires its source evidence
+    /// first; the in-crate seam is the only route, and the
+    /// classifier independently refuses it).
+    #[test]
+    fn the_begin_without_source_degrades() {
+        let (path, mut store) = sqlite_store("d9");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d9");
+        let campaign = stage_prefix(medium, "d9", &journal);
+        let record = install_keyed_object_record(
+            medium,
+            reclamation_begin_idempotency_key(&campaign.mk),
+            genuine_begin_payload(&campaign, campaign.mk),
+            6,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::BeginSourceNotObserved { record }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
+
+    /// (B-R1a3 §10) The mixed V1/V2 evidence degrades: a genuine
+    /// V2 plan published plus a genuine-shaped V1 ledger installed
+    /// under the exact V1 key (the publication refuses this shape
+    /// at its plan-exclusion gate — the in-crate seam is the only
+    /// route around it, and the classifier independently refuses
+    /// the one-retirement-authority-per-checkpoint invariant).
+    #[test]
+    fn the_mixed_v1_and_v2_evidence_degrades() {
+        let (path, mut store) = sqlite_store("d10");
+        let medium: &mut dyn CanonicalMedium = &mut store;
+        let journal = temp_path("journal", "d10");
+        let campaign = stage_prefix(medium, "d10", &journal);
+        publish_reclamation_plan(
+            medium,
+            &campaign.mk,
+            R1A3_LEDGER_BYTE_LIMIT,
+            &journal,
+            6,
+        )
+        .unwrap();
+        let (plan_record, _plan) = crate::reclaim::find_installed_plan(medium, &campaign.mk)
+            .unwrap()
+            .unwrap();
+        // The V1 ledger over the campaign's actual retirement
+        // index, newest-first (SK, then the members reversed),
+        // with the read-back content references.
+        let mut units: Vec<ReclaimUnit> = Vec::new();
+        let mut keyed = 0u64;
+        let sk_record = medium.read_record(&campaign.sk).unwrap();
+        keyed += sk_record.idempotency_key.is_some() as u64;
+        units.push(ReclaimUnit {
+            record: campaign.sk,
+            objects: sk_record.content_refs.clone(),
+        });
+        for id in campaign.members.iter().rev() {
+            let record = medium.read_record(id).unwrap();
+            keyed += record.idempotency_key.is_some() as u64;
+            units.push(ReclaimUnit {
+                record: *id,
+                objects: record.content_refs.clone(),
+            });
+        }
+        let ledger = ReclamationLedger {
+            mk: campaign.mk,
+            sk: campaign.sk,
+            range_digest: campaign.metadata.range_digest,
+            seed: campaign.metadata.seed,
+            records: units.len() as u64,
+            reclaimed_keys: keyed,
+            journal_files: Vec::new(),
+            units,
+        };
+        let v1_record = install_keyed_object_record(
+            medium,
+            reclamation_ledger_idempotency_key(&campaign.mk),
+            ledger.canonical_bytes(),
+            7,
+        );
+        let classification = classify_via_medium(medium);
+        assert_eq!(
+            classification.state,
+            RecoveryState::EvidenceDegraded {
+                reason: EvidenceDegradation::MixedV1AndV2Evidence {
+                    v1_record,
+                    v2_record: plan_record,
+                }
+            }
+        );
+        drop(store);
+        cleanup(&[path, journal]);
+    }
 }
