@@ -4496,7 +4496,9 @@ mod r1a2_production_tests {
 
     /// The complete sorted file inventory of a store root (every
     /// file with its size) — the read-only proof's observation
-    /// subject.
+    /// subject. Unix-only like its sole caller (the LocalFile
+    /// read-only proof): a Windows build must not carry the orphan.
+    #[cfg(unix)]
     fn store_inventory(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
         fn walk(dir: &std::path::Path, files: &mut Vec<(std::path::PathBuf, u64)>) {
             for entry in std::fs::read_dir(dir).unwrap() {
