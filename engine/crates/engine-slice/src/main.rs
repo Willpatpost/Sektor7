@@ -86,6 +86,16 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--benchmark-entity-scale") {
+        // The quality audit's F-06/F-08 runway: the CPU/LOD stress
+        // benchmark — the real spine over a parameterized entity
+        // count (1k → 5k → 20k) under three region-LOD views, with
+        // the double-run determinism proof (pod results,
+        // observational; never CI thresholds).
+        engine_slice::benchmark::run_entity_scale_benchmark();
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "--sim") {

@@ -33,14 +33,17 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine_core::{HistoryKind, PresenceSample, Spine};
+use engine_core::{
+    Event, EventClass, EventSpec, ExecCtx, Fingerprinter, HistoryKind, LodLevel, PresenceSample,
+    Schedule, Spine, Tick, World,
+};
 use engine_persist::{
     AuthorityMode, CanonicalMedium, CommitOutcome, LocalFileMedium, RevisionRecord, SqliteMedium,
     T1Journal,
 };
 
 use crate::crossing::{SessionCrossing, restore_session, save_session};
-use crate::npc::{NpcConfig, NpcWorld, install_initial_schedules};
+use crate::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules, mix64};
 use crate::orchestration::{OrchestratedSession, SubmitRefusal};
 use crate::persist_demo::{DemoOptions, run_persist_demo_headless};
 use crate::region::{RegionConfig, RegionDirector};
@@ -1249,5 +1252,242 @@ fn overhead_options(root: &Path, evidence: Option<EvidenceConfig>) -> DemoOption
         scenario_seed: None,
         soak_wall_seconds: None,
         stabilization_deadline_secs: None,
+    }
+}
+
+// ==================================================== the entity-scale runs
+//
+// (The quality audit's F-06/F-08 runway, Agent A's assignment) The
+// CPU/LOD stress benchmark: the REAL spine (the same budget,
+// reservation, lanes, and follow-up machinery the 1000-NPC game
+// workload runs) over a PARAMETERIZED entity count, measuring
+// 1k → 5k → 20k+ entities under three region-LOD views. The scaled
+// world carries NpcWorld's routine-chain semantics exactly — the
+// typed routine payload, the class↔region consistency gate, the
+// cadence-multiplied execution-relative chaining, the logical-data
+// jitter — with the entity count as a workload parameter (never a
+// canonical game-layout identity: its fingerprint domain is
+// deliberately distinct from the frozen npc-world/1). **Pod
+// results, observational** — never CI thresholds, never
+// physical-rig claims.
+
+/// One (scale, scenario) run's measurements.
+struct ScaledRun {
+    tick_samples: Vec<Duration>,
+    fingerprint_hex: String,
+    fingerprint_time: Duration,
+    executed: u64,
+    near_executed: u64,
+    far_executed: u64,
+    pending: usize,
+    budget_exhausted_ticks: u64,
+    late_executions: u64,
+}
+
+/// The scaled activity world: NpcWorld's routine-chain semantics at
+/// a parameterized entity count (the audit's "equivalent
+/// deterministic semantics" — the identical chaining, jitter, and
+/// LOD-cadence policy; only the identity space scales).
+struct ScaledWorld {
+    entity_count: usize,
+    config: NpcConfig,
+    region_lods: [LodLevel; REGION_COUNT],
+    steps: Vec<u64>,
+    routine_cursor: Vec<u64>,
+}
+
+impl ScaledWorld {
+    fn new(entity_count: usize, config: NpcConfig, region_lods: [LodLevel; REGION_COUNT]) -> Self {
+        ScaledWorld {
+            entity_count,
+            config,
+            region_lods,
+            steps: vec![0; entity_count],
+            routine_cursor: vec![0; entity_count],
+        }
+    }
+}
+
+impl World for ScaledWorld {
+    fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
+        // The typed routine payload, the identity bound, and the
+        // class↔region consistency gate — NpcWorld's exact rules.
+        let Some((entity, cursor)) = crate::npc::routine_payload_parts(event.payload) else {
+            return;
+        };
+        if entity >= self.entity_count {
+            return;
+        }
+        if entity % REGION_COUNT != usize::from(event.class.0) {
+            return;
+        }
+        self.steps[entity] += 1;
+        self.routine_cursor[entity] += 1;
+        // The LOD-cadenced execution-relative chaining with the
+        // logical-data jitter — NpcWorld's exact arithmetic.
+        let region = entity % REGION_COUNT;
+        let lod = self.region_lods[region];
+        let cadence = self.config.cadence_factor(lod);
+        let jitter = crate::npc::mix64(self.config.seed ^ ((entity as u64) << 32) ^ cursor) % 2;
+        let delay = self.config.activity_period * cadence + jitter;
+        let field = self.config.lod_field(lod);
+        ctx.follow_up_in_field(
+            field,
+            delay,
+            event.class,
+            crate::npc::routine_payload(entity, self.routine_cursor[entity]),
+            Vec::new(),
+        );
+    }
+
+    fn fingerprint(&self, fp: &mut Fingerprinter) {
+        // The scaled-workload domain: deliberately distinct from the
+        // frozen npc-world/1 (the entity count is a workload
+        // parameter, never a canonical identity).
+        fp.write_str("engine-slice/entity-scale/1");
+        fp.write_u64(self.config.seed);
+        fp.write_u64(self.config.activity_period);
+        fp.write_usize(self.entity_count);
+        for lod in &self.region_lods {
+            let code = match lod {
+                LodLevel::Full => 1u8,
+                LodLevel::Simplified => 2,
+                LodLevel::EventDriven => 3,
+                LodLevel::Dormant => 4,
+            };
+            fp.write_u8(code);
+        }
+        for step in &self.steps {
+            fp.write_u64(*step);
+        }
+    }
+}
+
+/// Installs one initial routine-chain event per entity —
+/// NpcWorld's installer shape: the seeded spread over the first two
+/// cadenced periods, in the region's LOD-classified lane.
+fn install_scaled_schedules(spine: &mut Spine<ScaledWorld>) {
+    let (seed, activity_period, entity_count, region_lods) = {
+        let world = spine.world();
+        (
+            world.config.seed,
+            world.config.activity_period,
+            world.entity_count,
+            world.region_lods,
+        )
+    };
+    for entity in 0..entity_count {
+        let region = entity % REGION_COUNT;
+        let lod = region_lods[region];
+        let field = spine.world().config.lod_field(lod);
+        let spread = (activity_period * 2 * spine.world().config.cadence_factor(lod)).max(1);
+        let offset = mix64(seed ^ ((entity as u64) << 32)) % spread;
+        spine
+            .schedule(
+                EventSpec::new(
+                    EventClass::new(region as u16),
+                    Schedule::AtLogicalTime {
+                        due: Tick(1 + offset),
+                    },
+                    crate::npc::routine_payload(entity, 0),
+                )
+                .in_field(field),
+            )
+            .expect("the initial entity schedule is dependency-free");
+    }
+}
+
+/// One measured (scale, scenario) run: the fixed window over the
+/// production reservation (budget 200, near reserve 60 — the same
+/// spine configuration the game workload runs).
+fn run_scaled_once(
+    entity_count: usize,
+    config: &NpcConfig,
+    region_lods: [LodLevel; REGION_COUNT],
+    ticks: u64,
+) -> ScaledRun {
+    let world = ScaledWorld::new(entity_count, config.clone(), region_lods);
+    let mut spine = Spine::with_reservation(world, 200, 60);
+    install_scaled_schedules(&mut spine);
+    let mut tick_samples = Vec::with_capacity(ticks as usize);
+    for _ in 0..ticks {
+        let start = Instant::now();
+        spine.run_tick();
+        tick_samples.push(start.elapsed());
+    }
+    let fp_start = Instant::now();
+    let mut fp = Fingerprinter::new();
+    spine.world().fingerprint(&mut fp);
+    let fingerprint_hex = fp.finish_hex();
+    let fingerprint_time = fp_start.elapsed();
+    let stats = spine.stats();
+    let lanes = spine.lane_totals();
+    ScaledRun {
+        tick_samples,
+        fingerprint_hex,
+        fingerprint_time,
+        executed: stats.executed,
+        near_executed: lanes.near_executed,
+        far_executed: lanes.far_executed,
+        pending: spine.pending_count(),
+        budget_exhausted_ticks: stats.budget_exhausted_ticks,
+        late_executions: stats.late_executions,
+    }
+}
+
+/// The entity-scale CPU/LOD benchmark: 1k → 5k → 20k entities under
+/// three region-LOD views (all-Full — the max-work baseline; mixed —
+/// the near/far split exercising the reservation; all-EventDriven —
+/// the commitment-window cadence). Every (scale, scenario) runs
+/// TWICE on fresh worlds: the measurements from the first run, the
+/// DETERMINISM PROOF from the double-run fingerprint equality (a
+/// mismatch fails the benchmark visibly).
+pub fn run_entity_scale_benchmark() {
+    println!("Entity-scale CPU/LOD benchmark — the real spine over a parameterized entity count");
+    println!("  pod results, observational (never CI thresholds, never physical-rig claims)");
+    let config = NpcConfig {
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let mut mixed = [LodLevel::Full; REGION_COUNT];
+    for (index, lod) in mixed.iter_mut().enumerate() {
+        if index % 2 == 1 {
+            *lod = LodLevel::EventDriven;
+        }
+    }
+    let scenarios: [(&str, [LodLevel; REGION_COUNT]); 3] = [
+        ("full", [LodLevel::Full; REGION_COUNT]),
+        ("mixed", mixed),
+        ("event-driven", [LodLevel::EventDriven; REGION_COUNT]),
+    ];
+    const TICKS: u64 = 600;
+    for entity_count in [1_000usize, 5_000, 20_000] {
+        for (name, region_lods) in scenarios {
+            let first = run_scaled_once(entity_count, &config, region_lods, TICKS);
+            let second = run_scaled_once(entity_count, &config, region_lods, TICKS);
+            assert_eq!(
+                first.fingerprint_hex, second.fingerprint_hex,
+                "the scaled workload must be deterministic (scale {entity_count}, scenario {name})"
+            );
+            println!(
+                "  scale {entity_count} scenario {name} (budget 200, near reserve 60, period {}, {TICKS} ticks):",
+                config.activity_period
+            );
+            report("tick wall time", &mut first.tick_samples.clone());
+            let fp_ms = first.fingerprint_time.as_secs_f64() * 1e3;
+            println!("  fingerprint feed over {entity_count} entities: {fp_ms:.3} ms");
+            println!(
+                "  executed {} (near {} / far {}) over {} ticks; late {}; pending {}; budget-exhausted ticks {}",
+                first.executed,
+                first.near_executed,
+                first.far_executed,
+                TICKS,
+                first.late_executions,
+                first.pending,
+                first.budget_exhausted_ticks,
+            );
+            println!("  fingerprint {}", first.fingerprint_hex);
+            println!("  determinism: DOUBLE-RUN IDENTICAL");
+        }
     }
 }

@@ -180,9 +180,11 @@ pub use engine_core::POSITION_DISCARDED;
 /// (Batch 2 corrective finding D).
 pub const REPRESENTED_THROUGH_DISCARDED: Tick = Tick(u64::MAX);
 
-/// splitmix64 finalizer — a fully specified, stable mixer (no `std`
-/// hasher nondeterminism reaches fingerprinted state).
-fn mix64(mut x: u64) -> u64 {
+/// The deterministic 64-bit mixer (SplitMix64's finalizer — fully
+/// specified, stable, no `std` hasher nondeterminism): the workload's
+/// jitter derivation, pure over logical data. Crate-shared with the
+/// entity-scale benchmark's equivalent-semantics world.
+pub(crate) fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
