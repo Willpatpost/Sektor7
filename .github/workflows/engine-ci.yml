@@ -527,12 +527,19 @@ jobs:
       # prior 441 + the same six platform-uniform tests (no cfg
       # gates). UNCHANGED through C5d and B-R1a4 (engine-slice
       # untouched by both lines; re-MEASURED at the C5d worktree:
-      # 448 passed / 0 failed / 44 result lines). Together with
+      # 448 passed / 0 failed / 44 result lines). RECOMPUTED at the
+      # audit-F-07 persistence-throughput branch (the main 3d43075 +
+      # the six platform-uniform audit_f07_persistence benchmark
+      # suites): 454 Linux MEASURED with this shard's own command
+      # (454 passed / 0 failed / 3 ignored / 45 result lines — the
+      # new integration binary adds one result line); 453 Windows =
+      # the prior 447 + the same six platform-uniform tests (no cfg
+      # gates). Together with
       # the main shard's 947 / 896 (the cycle-2 921 / 870 plus
       # the C5d +14 and the B-R1a4 +12 engine-persist lib tests)
-      # these sum to the cycle-3 battery (1395 / 1343; both
-      # re-MEASURED at this tree before the commit). MAINTENANCE
-      # OBLIGATION:
+      # these sum to the cycle-3 battery + F-07 (1401 / 1349; the
+      # heavy count re-MEASURED at the F-07 worktree before the
+      # commit). MAINTENANCE OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
@@ -541,12 +548,12 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=448
-          if [ "$(uname -s)" != "Linux" ]; then expected=447; fi
+          expected=454
+          if [ "$(uname -s)" != "Linux" ]; then expected=453; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 44)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 45)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 3 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 3"; exit 1; }
-          [ "$results" -eq 44 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 44"; exit 1; }
+          [ "$results" -eq 45 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 45"; exit 1; }
