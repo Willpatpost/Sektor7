@@ -7,7 +7,7 @@ use ash::vk;
 use sdl3::video::Window as SdlWindow;
 
 use crate::config::{RenderConfig, present_mode_str};
-use crate::overlay::build_overlay_vertices;
+use crate::overlay::build_overlay_vertices_into;
 use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
@@ -97,6 +97,11 @@ pub struct Renderer {
     stats: RenderStats,
     overlay_enabled: bool,
     overlay_color: [f32; 4],
+    /// The F-05 retained overlay-vertex buffer: rebuilt in place every
+    /// frame (the capacity from the first frames is reused — no
+    /// per-frame allocation or growth; the vertex content is
+    /// identical to the allocating form).
+    overlay_vertices: Vec<crate::overlay::OverlayVertex>,
 }
 
 impl Renderer {
@@ -179,6 +184,7 @@ impl Renderer {
             stats,
             overlay_enabled: true,
             overlay_color: [0.72, 1.0, 0.78, 0.85],
+            overlay_vertices: Vec::new(),
         })
     }
 
@@ -199,14 +205,26 @@ impl Renderer {
         overlay_text: Option<&str>,
         window_size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
-        let overlay = match (self.overlay_enabled, overlay_text) {
-            (true, Some(text)) => build_overlay_vertices(
-                text,
-                (self.swapchain.extent.width, self.swapchain.extent.height),
-                self.overlay_color,
-            ),
-            _ => Vec::new(),
-        };
+        // The F-05 overlay-vertex reuse (the audit's measured
+        // candidate): the glyph vertices are rebuilt into the
+        // renderer's own retained buffer — the capacity from the
+        // first frames is reused every frame (no per-frame
+        // allocation or growth; the vertex content is identical).
+        if self.overlay_enabled {
+            if let Some(text) = overlay_text {
+                build_overlay_vertices_into(
+                    &mut self.overlay_vertices,
+                    text,
+                    (self.swapchain.extent.width, self.swapchain.extent.height),
+                    self.overlay_color,
+                );
+            } else {
+                self.overlay_vertices.clear();
+            }
+        } else {
+            self.overlay_vertices.clear();
+        }
+        let overlay = &self.overlay_vertices;
         let outcome = vulkan::render_frame(
             &mut self.ctx,
             &mut self.swapchain,
@@ -217,7 +235,7 @@ impl Renderer {
             self.config.replace_pipelines,
             view_proj,
             region_scene,
-            &overlay,
+            overlay,
             self.overlay_enabled,
         )?;
         if outcome.presented {

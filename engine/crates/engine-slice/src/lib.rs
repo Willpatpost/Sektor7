@@ -13,6 +13,7 @@ pub mod orchestration;
 pub mod persist_demo;
 pub mod region;
 pub mod region_render;
+pub mod render_benchmark;
 pub mod render_demo;
 pub mod save_demo;
 pub mod session;

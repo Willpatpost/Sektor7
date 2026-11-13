@@ -12,7 +12,7 @@ use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::npc::NpcConfig;
 use crate::region::{RegionConfig, stage4_state_fingerprint_hex};
-use crate::region_render::{build_region_scene, camera_presence, levels_compact};
+use crate::region_render::{build_region_scene_into, camera_presence, levels_compact};
 use crate::sim::{SimConfig, SimDriver};
 
 /// Demo options; CLI parsing lives in the binary.
@@ -219,6 +219,11 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         ))
     };
     let mut timing = FrameTiming::new();
+    // The F-02 caller-held region-scene scratch buffer: the capacity
+    // retained from the first frames is reused every frame (no
+    // per-frame allocation or growth; the derived geometry is
+    // identical to the allocating form, proven by test).
+    let mut region_scratch: Vec<engine_renderer::scene::SceneVertex> = Vec::new();
 
     loop {
         let frame_start = Instant::now();
@@ -282,13 +287,22 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         // stays strictly downstream of authoritative state. Rebuilt
         // per frame (the region levels and represented positions move
         // with the simulation); the CPU cost is part of the measured
-        // frame work, and the GPU update is one per-slot copy.
-        let region_scene = if options.regions {
+        // frame work, and the GPU update is one per-slot copy. The
+        // F-02 scratch form: the buffer is held across frames (the
+        // capacity retained from the first frames is reused — no
+        // per-frame allocation or growth; the geometry is identical).
+        if options.regions {
             let director = sim.director().expect("region driver");
-            build_region_scene(&director.levels(), sim.spine().world(), director.config())
+            build_region_scene_into(
+                &mut region_scratch,
+                &director.levels(),
+                sim.spine().world(),
+                director.config(),
+            );
         } else {
-            Vec::new()
-        };
+            region_scratch.clear();
+        }
+        let region_scene = &region_scratch;
 
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
@@ -377,7 +391,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         let frame_result = renderer
             .render_frame(
                 &view_proj,
-                &region_scene,
+                region_scene,
                 overlay_text.as_deref(),
                 window_size,
             )

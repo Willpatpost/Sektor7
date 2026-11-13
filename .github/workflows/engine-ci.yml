@@ -154,10 +154,13 @@ jobs:
       # the two try_regular tests, no cfg gates; the Linux count
       # MEASURED at this exact shard command on the audit worktree:
       # 950 passed / 1 ignored / 30 result lines, rc=0; the Windows
-      # count the exact uniform delta 896 + 3); heavy supplies 448 /
-      # 447 (UNCHANGED — engine-slice gained no tests, only the
-      # benchmark mode; re-MEASURED at this tree); the two shards
-      # sum to the F-01 battery (1398 / 1346).
+      # count the exact uniform delta 896 + 3); heavy supplies 455 /
+      # 454 (the cycle-3 448 / 447 plus the F-07 package's six
+      # platform-uniform harness suites AND the F-02
+      # geometry-equivalence test; see the heavy job's comment for
+      # the measured provenance); the two shards sum to the
+      # audit-cycle battery (1405 / 1353; the counts re-MEASURED at
+      # the consolidated tree before the commit).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -546,8 +549,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=454
-          if [ "$(uname -s)" != "Linux" ]; then expected=453; fi
+          expected=455
+          if [ "$(uname -s)" != "Linux" ]; then expected=454; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
@@ -555,3 +558,15 @@ jobs:
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 3 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 3"; exit 1; }
           [ "$results" -eq 45 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 45"; exit 1; }
+      # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
+      # render-path CPU canary: the comparative microbenchmark in
+      # release mode on the llvipe runner — NO timing thresholds (the
+      # audit's rule: thresholds only after variance is measured; this
+      # step only PRINTS the distributions and the A/B equality proof,
+      # so it cannot flake on runner variance). The llvipe numbers are
+      # software-rasterization CPU evidence, NOT real-GPU evidence.
+      - name: Release render-path CPU benchmark canary (F-06, Linux only — no thresholds)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run --release -q -p engine-slice -- --benchmark-render

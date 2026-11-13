@@ -95,7 +95,7 @@ use crate::orchestration::{
     SessionPhase, SubmitRefusal,
 };
 use crate::region::{RegionConfig, RegionDirector, stage4_state_fingerprint_hex};
-use crate::region_render::{build_region_scene, camera_presence, levels_compact};
+use crate::region_render::{build_region_scene_into, camera_presence, levels_compact};
 use crate::sim::SimConfig;
 use crate::soak_evidence::{
     EvidenceCollector, EvidenceConfig, EvidenceError, EvidenceOutcome, EvidenceRecord, FrameSample,
@@ -2671,6 +2671,9 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         ))
     };
     let mut frame_timing = FrameTiming::new();
+    // The F-02 caller-held region-scene scratch buffer (the retained
+    // capacity is reused every frame — no per-frame allocation).
+    let mut region_scratch: Vec<engine_renderer::scene::SceneVertex> = Vec::new();
 
     'run: loop {
         let frame_start = Instant::now();
@@ -2787,15 +2790,19 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         // The derived scene: read-only over the authoritative world
         // (rendering stays strictly downstream of authoritative
         // state — the excursion's LOD cycle is visible as the plates
-        // and proxies change).
-        let region_scene = {
+        // and proxies change). The F-02 scratch form: the buffer is
+        // held across frames (the retained capacity is reused — no
+        // per-frame allocation; the geometry is identical).
+        {
             let session = demo.session();
-            build_region_scene(
+            build_region_scene_into(
+                &mut region_scratch,
                 &session.director().levels(),
                 session.spine().world(),
                 session.director().config(),
-            )
-        };
+            );
+        }
+        let region_scene = &region_scratch;
 
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
@@ -2907,7 +2914,7 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
 
         let frame_result = match renderer.render_frame(
             &view_proj,
-            &region_scene,
+            region_scene,
             overlay_text.as_deref(),
             app.window_size(),
         ) {

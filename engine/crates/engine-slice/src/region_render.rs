@@ -23,20 +23,20 @@ use crate::region::RegionConfig;
 /// Region area plate footprint (world units): covers the 16×16 proxy
 /// grid (15 units at 1-unit spacing) with margin; plates never overlap
 /// on the default ring (adjacent centers ≈ 75–106 units apart).
-const PLATE_FOOTPRINT: f32 = 20.0;
+pub(crate) const PLATE_FOOTPRINT: f32 = 20.0;
 /// Region area plate height — a low slab whose top face carries the
 /// LOD color and whose sides make the area's extent visible.
-const PLATE_HEIGHT: f32 = 0.15;
+pub(crate) const PLATE_HEIGHT: f32 = 0.15;
 /// NPC render proxy footprint and height (one small box per proxied
 /// NPC, standing on its region's plate).
-const PROXY_FOOTPRINT: f32 = 0.4;
-const PROXY_HEIGHT: f32 = 0.5;
+pub(crate) const PROXY_FOOTPRINT: f32 = 0.4;
+pub(crate) const PROXY_HEIGHT: f32 = 0.5;
 
 /// Area plate color per LOD level: Full bright green, Simplified blue,
 /// EventDriven amber, Dormant near-black (visible as "gone dark" —
 /// dormant regions drop their proxies but keep a dark plate, so
 /// activation and deactivation stay observable in the graphical run).
-fn lod_color(level: LodLevel) -> [f32; 3] {
+pub(crate) fn lod_color(level: LodLevel) -> [f32; 3] {
     match level {
         LodLevel::Full => [0.20, 0.70, 0.30],
         LodLevel::Simplified => [0.25, 0.45, 0.80],
@@ -58,13 +58,35 @@ pub fn build_region_scene(
     config: &RegionConfig,
 ) -> Vec<SceneVertex> {
     let mut vertices = Vec::new();
+    build_region_scene_into(&mut vertices, levels, world, config);
+    vertices
+}
+
+/// The caller-held scratch form (the 2026-11-12 quality audit's F-02
+/// candidate, adopted on the measured A/B): clears and refills the
+/// caller's buffer — the capacity retained from the first frames is
+/// reused every frame, so the steady-state per-frame cost is the
+/// geometry work alone (no fresh allocation, no doubling growth).
+/// The NPC iteration is the direct region-index stride
+/// (`region`, `region + REGION_COUNT`, …) — the exact same NPC
+/// sequence the all-NPC filter selects, in the same order, so the
+/// derived geometry is byte-identical to the original form (proven
+/// by test); the stride simply visits each NPC once per frame
+/// instead of once per region. Rendering stays non-authoritative.
+pub fn build_region_scene_into(
+    vertices: &mut Vec<SceneVertex>,
+    levels: &[LodLevel; REGION_COUNT],
+    world: &NpcWorld,
+    config: &RegionConfig,
+) {
+    vertices.clear();
     let positions = world.positions();
     let half_grid = (f32::from(REGION_GRID) - 1.0) / 2.0;
     for (region, &level) in levels.iter().enumerate() {
         let (cx, cy) = config.centers[region];
         let color = lod_color(level);
         push_box(
-            &mut vertices,
+            vertices,
             [cx as f32, 0.0, cy as f32],
             PLATE_FOOTPRINT,
             PLATE_HEIGHT,
@@ -77,14 +99,14 @@ pub fn build_region_scene(
             continue;
         }
         let proxy_color = [color[0] * 1.4, color[1] * 1.4, color[2] * 1.4];
-        for npc in (0..NPC_COUNT).filter(|npc| npc % REGION_COUNT == region) {
+        for npc in (region..NPC_COUNT).step_by(REGION_COUNT) {
             let (gx, gy) = positions[npc];
             if (gx, gy) == POSITION_DISCARDED {
                 // Dormant discard sentinel — no represented position.
                 continue;
             }
             push_box(
-                &mut vertices,
+                vertices,
                 [
                     cx as f32 + f32::from(gx) - half_grid,
                     PLATE_HEIGHT,
@@ -96,7 +118,6 @@ pub fn build_region_scene(
             );
         }
     }
-    vertices
 }
 
 /// Maps the graphical camera to a live presence sample: render-space
@@ -134,4 +155,54 @@ pub fn levels_compact(levels: &[LodLevel; REGION_COUNT]) -> String {
         });
     }
     text
+}
+
+#[cfg(test)]
+mod f02_tests {
+    use super::*;
+    use crate::benchmark::scenario_pair;
+    use engine_core::PresenceSample;
+
+    /// The F-02 adoption proof: the scratch form produces BYTE-IDENTICAL
+    /// geometry to the allocating form over a real deterministic scenario
+    /// (the accrual-peak fixture), and the stride iteration visits the
+    /// same NPCs in the same order as the all-NPC filter (the equality
+    /// over the full vertex sequence IS that proof). The scratch buffer
+    /// also retains its capacity across builds (the no-realloc property).
+    #[test]
+    fn the_scratch_form_builds_identical_geometry_and_retains_capacity() {
+        let near = PresenceSample {
+            position: (-100.0, 0.0),
+            velocity: (0.0, 0.0),
+        };
+        let (spine, director) = scenario_pair(150, &near);
+        let levels = director.levels();
+        let world = spine.world();
+        let config = director.config();
+
+        let allocating = build_region_scene(&levels, world, config);
+        let mut scratch = Vec::new();
+        build_region_scene_into(&mut scratch, &levels, world, config);
+        assert_eq!(
+            scratch, allocating,
+            "the derived geometry must be identical"
+        );
+
+        // The stride sequence == the filter sequence (the per-region NPC
+        // index order, proven directly on the index arithmetic).
+        for region in 0..REGION_COUNT {
+            let filtered: Vec<usize> = (0..NPC_COUNT)
+                .filter(|npc| npc % REGION_COUNT == region)
+                .collect();
+            let strided: Vec<usize> = (region..NPC_COUNT).step_by(REGION_COUNT).collect();
+            assert_eq!(filtered, strided, "region {region}: the same NPC order");
+        }
+
+        // The retained-capacity property: after a build, a second build
+        // into the same buffer does not reduce capacity (clear keeps it).
+        let capacity_after_first = scratch.capacity();
+        build_region_scene_into(&mut scratch, &levels, world, config);
+        assert!(scratch.capacity() >= capacity_after_first);
+        assert_eq!(scratch, allocating, "the second build is also identical");
+    }
 }
