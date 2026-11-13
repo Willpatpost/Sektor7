@@ -198,14 +198,19 @@ fn f07_sequential_baseline_throughput_and_latency() {
     let mut medium = worker.source().unwrap().open_medium().unwrap();
     let shared = payload_object(b"f07-sequential-payload");
     // The founding publication (before the measured loop).
-    let founding =
-        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-seq", 0)
-            .with_content_refs(vec![shared.hash()]);
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-seq",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
     medium
         .append(&founding, std::slice::from_ref(&shared), None)
         .unwrap();
     let mut parent = Some(founding.id());
-    let mut samples = Samples { micros: Vec::with_capacity(ops) };
+    let mut samples = Samples {
+        micros: Vec::with_capacity(ops),
+    };
     let start = Instant::now();
     for tick in 0..ops as u64 {
         let op_start = Instant::now();
@@ -246,14 +251,19 @@ fn f07_direct_provider_baseline_commits() {
     let mut medium = engine_persist::SqliteMedium::open(&db).unwrap();
     let shared = payload_object(b"f07-direct-payload");
     // The founding publication (before the measured loop).
-    let founding =
-        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-dir", 0)
-            .with_content_refs(vec![shared.hash()]);
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-dir",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
     medium
         .append(&founding, std::slice::from_ref(&shared), None)
         .unwrap();
     let mut parent = Some(founding.id());
-    let mut samples = Samples { micros: Vec::with_capacity(ops) };
+    let mut samples = Samples {
+        micros: Vec::with_capacity(ops),
+    };
     let start = Instant::now();
     for tick in 0..ops as u64 {
         let op_start = Instant::now();
@@ -292,21 +302,26 @@ fn f07_controlled_contention_over_one_queue() {
     let shared = payload_object(b"f07-contention-payload");
     // The founding publication (before the measured producers).
     let mut founding_proxy = source.clone().open_medium().unwrap();
-    let founding =
-        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-ct", 0)
-            .with_content_refs(vec![shared.hash()]);
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-ct",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
     founding_proxy
         .append(&founding, std::slice::from_ref(&shared), None)
         .unwrap();
     drop(founding_proxy);
     let start = Instant::now();
     let handles: Vec<_> = (0..producers)
-        .map(|producer| {
+        .map(|_producer| {
             let source = source.clone();
             let shared = shared.clone();
             std::thread::spawn(move || {
                 let mut medium = source.open_medium().unwrap();
-                let mut samples = Samples { micros: Vec::with_capacity(per_producer) };
+                let mut samples = Samples {
+                    micros: Vec::with_capacity(per_producer),
+                };
                 let mut retries = 0usize;
                 for tick in 0..per_producer as u64 {
                     let op_start = Instant::now();
@@ -315,9 +330,7 @@ fn f07_controlled_contention_over_one_queue() {
                         let epoch = medium.read_record(&head).unwrap().epoch;
                         let record = RevisionRecord::regular(head, epoch, tick)
                             .with_content_refs(vec![shared.hash()]);
-                        match medium
-                            .append(&record, std::slice::from_ref(&shared), Some(head))
-                        {
+                        match medium.append(&record, std::slice::from_ref(&shared), Some(head)) {
                             Ok(AppendOutcome::Accepted { .. }) => break,
                             Ok(AppendOutcome::RejectedStaleParent { .. }) => {
                                 retries += 1;
@@ -335,7 +348,9 @@ fn f07_controlled_contention_over_one_queue() {
             })
         })
         .collect();
-    let mut all = Samples { micros: Vec::with_capacity(producers * per_producer) };
+    let mut all = Samples {
+        micros: Vec::with_capacity(producers * per_producer),
+    };
     let mut total_retries = 0usize;
     for handle in handles {
         let (samples, retries) = handle.join().unwrap();
@@ -385,14 +400,19 @@ fn f07_wal_growth_and_checkpoint_pause() {
     let worker = spawn_worker(&db);
     let mut medium = worker.source().unwrap().open_medium().unwrap();
     let shared = payload_object(b"f07-wal-payload");
-    let founding =
-        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-wal", 0)
-            .with_content_refs(vec![shared.hash()]);
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-wal",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
     medium
         .append(&founding, std::slice::from_ref(&shared), None)
         .unwrap();
     let mut parent = Some(founding.id());
-    let mut samples = Samples { micros: Vec::with_capacity(ops) };
+    let mut samples = Samples {
+        micros: Vec::with_capacity(ops),
+    };
     let start = Instant::now();
     for tick in 0..ops as u64 {
         let op_start = Instant::now();
@@ -500,9 +520,12 @@ fn f07_head_of_line_block_behind_a_slow_operation() {
     let worker = spawn_worker(&db);
     let mut medium = worker.source().unwrap().open_medium().unwrap();
     let shared = payload_object(b"f07-hol-payload");
-    let founding =
-        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-hol", 0)
-            .with_content_refs(vec![shared.hash()]);
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-hol",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
     medium
         .append(&founding, std::slice::from_ref(&shared), None)
         .unwrap();
@@ -520,7 +543,7 @@ fn f07_head_of_line_block_behind_a_slow_operation() {
         .submit_probe(engine_slice::worker::MediumOp::Validate)
         .unwrap();
     let behind_start = Instant::now();
-    parent = Some(append_one(&mut medium, &shared, parent, ops as u64 + 1));
+    append_one(&mut medium, &shared, parent, ops as u64 + 1);
     let behind_micros = behind_start.elapsed().as_micros();
     let validation = match probe.recv().unwrap() {
         Ok(engine_slice::worker::WorkerReply::Validate(summary)) => summary.height,
