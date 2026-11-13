@@ -545,7 +545,7 @@ pub fn verify_range_terminal_on_observed_ancestry<R: crate::reclaim::BeginReads>
             });
         }
         if let Some(child_epoch) = previous_epoch
-            && record.epoch + 1 != child_epoch
+            && record.epoch.checked_add(1) != Some(child_epoch)
         {
             return Err(MediumError::Chain {
                 rule: "range-observation/epoch-linkage",
@@ -2523,6 +2523,70 @@ mod c5a_tests {
             Err(MediumError::Chain {
                 rule: "range-observation/foreign-boundary-in-segment"
             })
+        ));
+    }
+
+    #[test]
+    fn the_max_epoch_crafted_record_refuses_the_epoch_linkage_typed() {
+        // (F-01, the audit's P1 correctness item) A hash-valid
+        // crafted record with epoch == u64::MAX must refuse with
+        // the TYPED epoch-linkage error — the checked_add form the
+        // neighboring recovery discovery verifier uses, never the
+        // debug-build panic or the release-build wrapping
+        // divergence the unchecked `record.epoch + 1` had. The
+        // crafted shape is unconstructible through the honest
+        // builders: `regular` would itself overflow computing the
+        // child epoch, and the fallible `try_regular` refuses it.
+        let object = plain_object(b"c5a-f01-max");
+        let object_hash = hash_object(&object);
+        let crafted = RevisionRecord {
+            kind: RecordKind::Regular,
+            epoch: u64::MAX,
+            // The parent below is never read: the epoch linkage
+            // check on this record refuses the walk first.
+            parent: Some(hash_object(b"c5a-f01-below")),
+            idempotency_key: None,
+            tick: 1,
+            content_refs: vec![object_hash],
+            depends_on: Vec::new(),
+        };
+        let crafted_id = crafted.id();
+        let head_object = plain_object(b"c5a-f01-head");
+        let head_object_hash = hash_object(&head_object);
+        let head = RevisionRecord {
+            kind: RecordKind::Regular,
+            epoch: 7,
+            parent: Some(crafted_id),
+            idempotency_key: None,
+            tick: 2,
+            content_refs: vec![head_object_hash],
+            depends_on: Vec::new(),
+        };
+        let head_id = head.id();
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(head_id, head.canonical_bytes());
+        records.insert(crafted_id, crafted.canonical_bytes());
+        let mut objects = std::collections::BTreeMap::new();
+        objects.insert(object_hash, object);
+        objects.insert(head_object_hash, head_object);
+        let mut reads = SyntheticReads { records, objects };
+        let expected = RangeCompletionContext {
+            mk: hash_object(b"c5a-f01-mk"),
+            plan: hash_object(b"c5a-f01-plan"),
+            begin: hash_object(b"c5a-f01-begin"),
+        };
+        let error = verify_range_terminal_on_observed_ancestry(
+            &mut reads,
+            &head_id,
+            &expected,
+            &RangeInstallationLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MediumError::Chain {
+                rule: "range-observation/epoch-linkage",
+            }
         ));
     }
 }
