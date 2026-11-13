@@ -143,23 +143,23 @@ jobs:
       # crash-test-seams only in its own job, where its
       # dev-dependency edge enables engine-persist/composite-test-
       # fixture (cargo tree -f '{p} {f}' verified both sides). The
-      # partition is exact at the CYCLE-2 CONSOLIDATED tree (the
-      # STAGE6 night consolidation baseline f3f03bb, plus Agent A's
-      # C5c completion-crossing-recognition AND Agent B's B-R1a3
-      # degradation matrix, both from the new main; recomputed from
-      # executed runs — never estimates): this shard executes 935
-      # tests on Linux / 884 on Windows (the cycle-2 consolidated
-      # 921 / 870 plus the C5d discovered-range-observation
-      # package's 14 FULLY CROSS-PLATFORM engine-persist lib tests
-      # — 7 c5d_core + 5 c5d_local + 2 c5d_sqlite, no cfg gates,
-      # platform-uniform deltas; the Linux count MEASURED at this
-      # exact shard command on the C5d worktree: 935 passed / 1
-      # ignored / 30 result lines, rc=0; the Windows count the
-      # exact uniform delta 870 + 14); heavy supplies 448 / 447
-      # (UNCHANGED at C5d — engine-slice untouched; see the heavy
-      # job's comment for the provenance); the two
-      # shards sum to the C5d battery (1383 / 1331; both counts
-      # re-MEASURED at this tree before the commit).
+      # partition is exact at the CYCLE-3 CONSOLIDATED tree (the
+      # cycle-2 main 2ea7622, plus Agent A's C5d discovered-range-
+      # observation AND Agent B's B-R1a4 witness-degradation matrix,
+      # both from that baseline; recomputed from executed runs —
+      # never estimates): this shard executes 947 tests on Linux /
+      # 896 on Windows (the cycle-2 baseline 921 / 870 plus the
+      # C5d package's 14 FULLY CROSS-PLATFORM engine-persist lib
+      # tests — 7 c5d_core + 5 c5d_local + 2 c5d_sqlite, no cfg
+      # gates — and the B-R1a4 package's 12 FULLY CROSS-PLATFORM
+      # engine-persist lib tests; BOTH lines' Linux counts MEASURED
+      # at this exact shard command on their own worktrees (935 and
+      # 933, each rc=0), the consolidated Linux count re-MEASURED
+      # at this tree before the commit; the Windows count the exact
+      # uniform deltas 870 + 14 + 12); heavy supplies 448 / 447
+      # (UNCHANGED — engine-slice untouched by both lines; see the
+      # heavy job's comment); the two shards sum to the cycle-3
+      # battery (1395 / 1343).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -172,8 +172,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=935
-          if [ "$(uname -s)" != "Linux" ]; then expected=884; fi
+          expected=947
+          if [ "$(uname -s)" != "Linux" ]; then expected=896; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -525,13 +525,14 @@ jobs:
       # shard's own command (448 passed / 0 failed / 3 ignored / 44
       # result lines, the workflow's own awk); 447 Windows = the
       # prior 441 + the same six platform-uniform tests (no cfg
-      # gates). UNCHANGED at the C5d discovered-range-observation
-      # package (engine-slice untouched; re-MEASURED at the C5d
-      # worktree: 448 passed / 0 failed / 44 result lines). Together
-      # with the main shard's 935 / 884 (the cycle-2 921 / 870 plus
-      # the C5d +14 engine-persist lib tests) these sum to the C5d
-      # battery (1383 / 1331; both re-MEASURED
-      # at this tree before the commit). MAINTENANCE OBLIGATION:
+      # gates). UNCHANGED through C5d and B-R1a4 (engine-slice
+      # untouched by both lines; re-MEASURED at the C5d worktree:
+      # 448 passed / 0 failed / 44 result lines). Together with
+      # the main shard's 947 / 896 (the cycle-2 921 / 870 plus
+      # the C5d +14 and the B-R1a4 +12 engine-persist lib tests)
+      # these sum to the cycle-3 battery (1395 / 1343; both
+      # re-MEASURED at this tree before the commit). MAINTENANCE
+      # OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
       # here — compilation success is never counted as coverage.
