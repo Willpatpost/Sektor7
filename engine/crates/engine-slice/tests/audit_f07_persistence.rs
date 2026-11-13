@@ -274,3 +274,273 @@ fn f07_direct_provider_baseline_commits() {
     let _ = std::fs::remove_file(db.with_extension("db-wal"));
     let _ = std::fs::remove_file(db.with_extension("db-shm"));
 }
+
+/// (F-07 §3) The controlled contention: P producers, each with its
+/// own queue proxy over the ONE worker, each appending with the
+/// CAS retry discipline (a `RejectedStaleParent` rederives the
+/// head — the realistic contended publication pattern). The
+/// aggregate throughput stays bounded by the single serialized
+/// worker (by design); the per-op latency grows with the queue
+/// depth, and the retry count is the CAS-collision evidence.
+#[test]
+fn f07_controlled_contention_over_one_queue() {
+    let db = temp_db("contend");
+    let producers = 8usize;
+    let per_producer = f07_ops(25);
+    let worker = spawn_worker(&db);
+    let source = worker.source().unwrap();
+    let shared = payload_object(b"f07-contention-payload");
+    // The founding publication (before the measured producers).
+    let mut founding_proxy = source.clone().open_medium().unwrap();
+    let founding =
+        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-ct", 0)
+            .with_content_refs(vec![shared.hash()]);
+    founding_proxy
+        .append(&founding, std::slice::from_ref(&shared), None)
+        .unwrap();
+    drop(founding_proxy);
+    let start = Instant::now();
+    let handles: Vec<_> = (0..producers)
+        .map(|producer| {
+            let source = source.clone();
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let mut medium = source.open_medium().unwrap();
+                let mut samples = Samples { micros: Vec::with_capacity(per_producer) };
+                let mut retries = 0usize;
+                for tick in 0..per_producer as u64 {
+                    let op_start = Instant::now();
+                    loop {
+                        let head = medium.head().unwrap().unwrap();
+                        let epoch = medium.read_record(&head).unwrap().epoch;
+                        let record = RevisionRecord::regular(head, epoch, tick)
+                            .with_content_refs(vec![shared.hash()]);
+                        match medium
+                            .append(&record, std::slice::from_ref(&shared), Some(head))
+                        {
+                            Ok(AppendOutcome::Accepted { .. }) => break,
+                            Ok(AppendOutcome::RejectedStaleParent { .. }) => {
+                                retries += 1;
+                                continue;
+                            }
+                            Ok(other) => {
+                                panic!("the contended append must Accepted-or-Stale: {other:?}")
+                            }
+                            Err(error) => panic!("the contended append failed: {error:?}"),
+                        }
+                    }
+                    samples.record(op_start);
+                }
+                (samples, retries)
+            })
+        })
+        .collect();
+    let mut all = Samples { micros: Vec::with_capacity(producers * per_producer) };
+    let mut total_retries = 0usize;
+    for handle in handles {
+        let (samples, retries) = handle.join().unwrap();
+        total_retries += retries;
+        all.micros.extend(samples.micros);
+    }
+    let wall = start.elapsed().as_secs_f64();
+    all.report("contention-8-producers", wall);
+    all.assert_consistent();
+    println!(
+        "[F07] contention-8-producers: retries={} ops={} aggregate={:.0}ops/s",
+        total_retries,
+        all.count(),
+        all.count() as f64 / wall
+    );
+    // The correctness check: the chain height equals the founding
+    // plus every accepted append (the CAS discipline never loses
+    // an accepted publication).
+    let mut verify_proxy = source.open_medium().unwrap();
+    let summary = verify_proxy.validate().unwrap();
+    // ChainSummary.height carries the HEAD EPOCH (the sqlite
+    // construction: `height: head_epoch` — the founding is epoch
+    // 0, so N accepted appends surface as height N; the doc
+    // comment's "height - 1" wording is the recorded mismatch).
+    assert_eq!(
+        summary.height as usize,
+        producers * per_producer,
+        "the chain height accounts for every accepted contended append"
+    );
+    drop(verify_proxy);
+    drop(source);
+    worker.join().unwrap();
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
+
+/// (F-07 §4) The WAL growth and the checkpoint pause: the wal
+/// file's retained size mid-run and after the load, then the
+/// explicit TRUNCATE checkpoint's own latency through the queue
+/// (the ratified lifecycle boundary) and the post-checkpoint wal
+/// size.
+#[test]
+fn f07_wal_growth_and_checkpoint_pause() {
+    let db = temp_db("wal");
+    let ops = f07_ops(200);
+    let worker = spawn_worker(&db);
+    let mut medium = worker.source().unwrap().open_medium().unwrap();
+    let shared = payload_object(b"f07-wal-payload");
+    let founding =
+        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-wal", 0)
+            .with_content_refs(vec![shared.hash()]);
+    medium
+        .append(&founding, std::slice::from_ref(&shared), None)
+        .unwrap();
+    let mut parent = Some(founding.id());
+    let mut samples = Samples { micros: Vec::with_capacity(ops) };
+    let start = Instant::now();
+    for tick in 0..ops as u64 {
+        let op_start = Instant::now();
+        parent = Some(append_one(&mut medium, &shared, parent, tick));
+        samples.record(op_start);
+        if tick % 64 == 0 {
+            println!(
+                "[F07] wal-growth sample at op {}: db={}B wal={}B",
+                tick,
+                file_len(&db),
+                file_len(&db.with_extension("db-wal")),
+            );
+        }
+    }
+    let wall = start.elapsed().as_secs_f64();
+    samples.report("wal-growth-load", wall);
+    samples.assert_consistent();
+    let wal_before = file_len(&db.with_extension("db-wal"));
+    let checkpoint_start = Instant::now();
+    medium.checkpoint().unwrap();
+    let checkpoint_micros = checkpoint_start.elapsed().as_micros();
+    let wal_after = file_len(&db.with_extension("db-wal"));
+    println!(
+        "[F07] checkpoint-truncate: latency={}us wal_before={}B wal_after={}B (ops={})",
+        checkpoint_micros, wal_before, wal_after, ops
+    );
+    // The TRUNCATE checkpoint resets the wal (the ratified
+    // lifecycle boundary; a correctness assert, not a timing one).
+    assert_eq!(wal_after, 0, "the TRUNCATE checkpoint resets the wal");
+    drop(medium);
+    worker.join().unwrap();
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
+
+/// (F-07 §5) The cold-reopen recovery: after the load and a clean
+/// worker shutdown, a FRESH worker over the same database — the
+/// reopen, the first head read, and the full authoritative-chain
+/// validation (the cold walk over the grown chain) are the
+/// recovery latency the audit asked for.
+#[test]
+fn f07_cold_reopen_recovery_latency() {
+    let db = temp_db("recover");
+    let ops = f07_ops(200);
+    let worker = spawn_worker(&db);
+    let mut medium = worker.source().unwrap().open_medium().unwrap();
+    let shared = payload_object(b"f07-recovery-payload");
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-rec",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
+    medium
+        .append(&founding, std::slice::from_ref(&shared), None)
+        .unwrap();
+    let mut parent = Some(founding.id());
+    for tick in 0..ops as u64 {
+        parent = Some(append_one(&mut medium, &shared, parent, tick));
+    }
+    let expected_epoch = ops as u64;
+    drop(medium);
+    worker.join().unwrap();
+    // The cold reopen: a FRESH worker over the same store.
+    let reopen_start = Instant::now();
+    let worker2 = spawn_worker(&db);
+    let reopen_micros = reopen_start.elapsed().as_micros();
+    let mut fresh = worker2.source().unwrap().open_medium().unwrap();
+    let head_start = Instant::now();
+    let head = fresh.head().unwrap().unwrap();
+    let head_micros = head_start.elapsed().as_micros();
+    assert_eq!(head, parent.expect("the load appended records"));
+    let validate_start = Instant::now();
+    let summary = fresh.validate().unwrap();
+    let validate_micros = validate_start.elapsed().as_micros();
+    println!(
+        "[F07] cold-recovery: reopen={}us first_head={}us full_validate={}us (ops={}, height={})",
+        reopen_micros, head_micros, validate_micros, ops, summary.height
+    );
+    assert_eq!(summary.height, expected_epoch);
+    let _ = validate_micros;
+    drop(fresh);
+    worker2.join().unwrap();
+    println!(
+        "[F07] cold-recovery retained: db={}B wal={}B",
+        file_len(&db),
+        file_len(&db.with_extension("db-wal")),
+    );
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
+
+/// (F-07 §6) The head-of-line demonstration: a slow operation
+/// (the full-chain validation) submitted without waiting (the
+/// worker's test-only probe), then one append timed behind it —
+/// the append's latency includes the in-flight validation's
+/// remaining execution, exactly the single-worker head-of-line
+/// effect the audit named as the risk to measure.
+#[test]
+fn f07_head_of_line_block_behind_a_slow_operation() {
+    let db = temp_db("hol");
+    let ops = f07_ops(200);
+    let worker = spawn_worker(&db);
+    let mut medium = worker.source().unwrap().open_medium().unwrap();
+    let shared = payload_object(b"f07-hol-payload");
+    let founding =
+        RevisionRecord::founding(engine_persist::record::AuthorityMode::Standalone, "f07-hol", 0)
+            .with_content_refs(vec![shared.hash()]);
+    medium
+        .append(&founding, std::slice::from_ref(&shared), None)
+        .unwrap();
+    let mut parent = Some(founding.id());
+    for tick in 0..ops as u64 {
+        parent = Some(append_one(&mut medium, &shared, parent, tick));
+    }
+    // The baseline: one more append's latency unencumbered.
+    let baseline_start = Instant::now();
+    parent = Some(append_one(&mut medium, &shared, parent, ops as u64));
+    let baseline_micros = baseline_start.elapsed().as_micros();
+    // The slow in-flight operation: the full-chain validation,
+    // submitted through the worker's probe (fire-and-forget).
+    let probe = worker
+        .submit_probe(engine_slice::worker::MediumOp::Validate)
+        .unwrap();
+    let behind_start = Instant::now();
+    parent = Some(append_one(&mut medium, &shared, parent, ops as u64 + 1));
+    let behind_micros = behind_start.elapsed().as_micros();
+    let validation = match probe.recv().unwrap() {
+        Ok(engine_slice::worker::WorkerReply::Validate(summary)) => summary.height,
+        Ok(other) => panic!("the probe returned {other:?}"),
+        Err(error) => panic!("the probe validation failed: {error:?}"),
+    };
+    println!(
+        "[F07] head-of-line: baseline_append={}us append_behind_validate={}us (ops={}, epoch={})",
+        baseline_micros, behind_micros, ops, validation
+    );
+    // The append behind the in-flight validation is slower — the
+    // magnitude is the measurement (asserted only as ordering,
+    // never a fixed threshold).
+    assert!(
+        behind_micros > baseline_micros,
+        "the queued append waits for the in-flight validation: {behind_micros}us vs {baseline_micros}us"
+    );
+    drop(medium);
+    worker.join().unwrap();
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
