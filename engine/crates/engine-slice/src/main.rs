@@ -86,6 +86,15 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--benchmark-render") {
+        // The 2026-11-12 quality audit's F-02/F-05 render-path CPU
+        // benchmark — the per-frame derived-render costs in isolation
+        // (pod CPU evidence only, never real-GPU or CI-threshold
+        // claims; the owner's rig is the authoritative GPU benchmark).
+        engine_slice::render_benchmark::run();
+        return;
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "--sim") {

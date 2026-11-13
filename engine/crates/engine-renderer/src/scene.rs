@@ -6,7 +6,10 @@
 use crate::config::FRAMES_IN_FLIGHT;
 
 /// Scene vertex: position + color (24 bytes, matches `scene.vert`).
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// `PartialEq` supports the render-path geometry-equivalence proofs
+/// (the F-02 A/B adoption discipline — the derived geometry must be
+/// byte-identical between the allocating and scratch forms).
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct SceneVertex {
     pub pos: [f32; 3],

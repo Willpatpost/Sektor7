@@ -34,8 +34,23 @@ pub fn build_overlay_vertices(
     extent: (u32, u32),
     color: [f32; 4],
 ) -> Vec<OverlayVertex> {
-    let (width, height) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
     let mut vertices = Vec::new();
+    build_overlay_vertices_into(&mut vertices, text, extent, color);
+    vertices
+}
+
+/// The caller-held scratch form (the F-05 measured candidate): clears
+/// and refills the caller's buffer — the capacity retained from the
+/// first frames is reused every frame (no per-frame allocation or
+/// growth); the vertex content is identical to the allocating form.
+pub fn build_overlay_vertices_into(
+    vertices: &mut Vec<OverlayVertex>,
+    text: &str,
+    extent: (u32, u32),
+    color: [f32; 4],
+) {
+    vertices.clear();
+    let (width, height) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
     let mut glyph_x = 0.0f32;
     let mut glyph_y = 4.0f32;
     let mut glyph_count = 0usize;
@@ -72,7 +87,6 @@ pub fn build_overlay_vertices(
             break;
         }
     }
-    vertices
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ use crate::store::{SessionStore, StoreLocation};
 use crate::worker::WorkerFault;
 
 /// One measured operation's distribution, printed as one line.
-fn report(name: &str, samples: &mut [Duration]) {
+pub(crate) fn report(name: &str, samples: &mut [Duration]) {
     samples.sort_unstable();
     let n = samples.len();
     let min = samples[0].as_secs_f64() * 1e3;
@@ -88,7 +88,10 @@ fn dir_size(path: &Path) -> u64 {
 /// The real scenario pair (the crossing suite's fixture, local to this
 /// module): the Lod-mode spine plus the director, driven through the
 /// driver's own per-tick sequence.
-fn scenario_pair(ticks: u64, presence: &PresenceSample) -> (Spine<NpcWorld>, RegionDirector) {
+pub(crate) fn scenario_pair(
+    ticks: u64,
+    presence: &PresenceSample,
+) -> (Spine<NpcWorld>, RegionDirector) {
     let config = NpcConfig {
         region_lods_enabled: true,
         ..NpcConfig::default()
