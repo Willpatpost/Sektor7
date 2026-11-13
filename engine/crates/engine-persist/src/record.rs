@@ -111,6 +111,26 @@ impl RevisionRecord {
         }
     }
 
+    /// Builds a regular record on top of `parent` — the fallible
+    /// form for callers whose `parent_epoch` is UNTRUSTED: a
+    /// parent at `u64::MAX` has no representable child epoch and
+    /// refuses (`None`) instead of wrapping. Trusted callers keep
+    /// [`RevisionRecord::regular`]; the validation walks enforce
+    /// the same linkage with checked arithmetic on decoded records
+    /// (the typed epoch-linkage refusals).
+    pub fn try_regular(parent: Hash, parent_epoch: u64, tick: u64) -> Option<Self> {
+        let epoch = parent_epoch.checked_add(1)?;
+        Some(RevisionRecord {
+            kind: RecordKind::Regular,
+            epoch,
+            parent: Some(parent),
+            idempotency_key: None,
+            tick,
+            content_refs: Vec::new(),
+            depends_on: Vec::new(),
+        })
+    }
+
     /// Attaches an idempotency key (chain-unique).
     pub fn with_idempotency_key(mut self, key: Vec<u8>) -> Self {
         self.idempotency_key = Some(key);
@@ -513,5 +533,28 @@ mod tests {
             RevisionRecord::decode(&bytes),
             Err(SaveError::Limit { .. })
         ));
+    }
+
+    #[test]
+    fn try_regular_refuses_the_unrepresentable_max_parent_epoch() {
+        // (F-01) A parent at u64::MAX has no representable child
+        // epoch: the fallible constructor refuses (None) instead of
+        // wrapping — the honest boundary for untrusted epochs.
+        let parent = hash_object(b"try-regular-parent");
+        assert!(RevisionRecord::try_regular(parent, u64::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn try_regular_agrees_with_regular_on_representable_epochs() {
+        // The compatibility proof: for every representable parent
+        // epoch the fallible form builds the identical record the
+        // trusted form does.
+        let parent = hash_object(b"try-regular-parent");
+        for parent_epoch in [0u64, 1, 41, u64::MAX - 1] {
+            assert_eq!(
+                RevisionRecord::try_regular(parent, parent_epoch, 7),
+                Some(RevisionRecord::regular(parent, parent_epoch, 7))
+            );
+        }
     }
 }
