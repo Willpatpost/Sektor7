@@ -734,7 +734,10 @@ fn the_rotation_retirement_evidence_distinguishes_canceled_from_subsumed() {
 /// and MK-bound, its object files the only additions). The POSIX
 /// crash/resume substance is covered on the eligible platforms.
 /// Returns true when the caller should STOP (the Windows path).
-#[cfg(windows)]
+/// (RMD-03) The helper also rides the crash-test-seams feature —
+/// its only caller is the feature-gated death test (the Windows
+/// clippy's dead-code refusal, the platform-gated-caller lesson).
+#[cfg(all(windows, feature = "crash-test-seams"))]
 fn windows_refuses_reclamation_death() -> bool {
     let wdir = TestDir::new("reclaim-child-windows");
     let wlocation = found_location(&wdir, false);
