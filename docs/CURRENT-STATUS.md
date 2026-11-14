@@ -128,13 +128,19 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 
 ## 6. Deferred design decisions (documented, not yet authorized)
 
-- **F-03** — the region-render vertex-capacity policy (bounded capacity today;
-  the variable-scale policy is a design decision before large worlds).
-- **F-04** — GPU asset streaming / upload architecture (P3; the measured-
-  hypothesis plan is an active remediation work item, §9).
-- **F-08 / F-12** — the dense-world representative workload and the
-  sustained-load scale methodology (bounded tick cost ≠ sustainable
-  simulation — the qualification experiments are an active work item).
+- **F-03** — the region-render vertex-capacity policy: the design and the
+  acceptance tests are now **DESIGN READY**
+  (`docs/GPU-CAPACITY-SYNC-ANALYSIS.md` §4 — the truncation-visibility
+  counter first, then the constants-derived capacity + typed refusal); the
+  implementation awaits the next authorized package.
+- **F-04** — GPU asset streaming / upload architecture: the measured-
+  hypothesis plan is **DESIGN READY** (the same document §2.2/§3 — gated on
+  the rig measurements H1/H4/H5; no refactor justified by current
+  evidence).
+- **F-08 / F-12** — the sustained-load scale methodology is **DESIGN
+  READY** (`docs/SUSTAINED-LOAD-METHODOLOGY.md` — the six experiment
+  classes, twelve dimensions, the backlog-vs-deliberate-LOD distinction);
+  the implementation harness awaits its package.
 - **The F-05 overlay throttle** — deliberately NOT implemented (the measured
   costs are negligible at target frame budgets; revisit only with rig
   evidence).
@@ -185,16 +191,19 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 
 The **post-audit remediation cycle** (2026-11-14, the owner's directive
 preserved at the coordination ledger, §10): F-09 GPU-kit/CLI correctness
-(this cycle's first package), F-11 deterministic head-of-line test, F-14
-epoch trust-boundary audit, F-13 this documentation reconciliation; then
-Milestone 2 — the F-12/F-08 sustained-scale methodology, the F-07
-persistence interpretation, the F-03/F-04 GPU capacity/synchronization
-analysis, the F-10 fault-coverage matrix; then the Milestone-3 next-cycle
-proposal (correctness + performance + forward feature progress).
+(delivered), F-11 deterministic head-of-line test, F-14 epoch
+trust-boundary audit, F-13 this documentation reconciliation (delivered);
+Milestone 2 — the F-12/F-08 sustained-scale methodology (DESIGN READY,
+`docs/SUSTAINED-LOAD-METHODOLOGY.md`), the F-07 persistence
+interpretation, the F-03/F-04 GPU capacity/synchronization analysis
+(DESIGN READY, `docs/GPU-CAPACITY-SYNC-ANALYSIS.md`), the F-10
+fault-coverage matrix; then the Milestone-3 next-cycle proposal
+(correctness + performance + forward feature progress).
 
-Work-in-flight branches: `s6-remediation-c-renderer-docs` (this file's
-package: F-09 + F-13), the parallel A (epoch audit) and B (persistence/CI)
-packages per the coordinator's assignment ledger.
+Work-in-flight branches: `s6-remediation-c-renderer-docs` (F-09 + F-13
+delivered; the two M2 design documents added), the parallel A (epoch
+audit) and B (persistence/CI) packages per the coordinator's assignment
+ledger.
 
 ## 10. The authoritative coordination ledger
 
