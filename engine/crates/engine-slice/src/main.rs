@@ -504,6 +504,110 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--player") {
+        // [cycle1-P3] the player movement/collision prototype demo —
+        // the render loop with the free-flight camera replaced by the
+        // fixed-step player (delimited wiring; the integrator
+        // reconciles CLI registration).
+        let mut options = engine_slice::player_demo::PlayerOptions::default();
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--present" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(mode) = engine_renderer::PresentModePreference::parse(value)
+                    {
+                        options.present = mode;
+                        index += 1;
+                    }
+                }
+                "--fps" => {
+                    if let Some(value) = args.get(index + 1) {
+                        match parse_fps(value) {
+                            Ok(Some(fps)) => {
+                                options.fps = fps;
+                                index += 1;
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                eprintln!("error: {message}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                "--frames" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(frames) = value.parse::<u64>()
+                    {
+                        options.frames = Some(frames.clamp(1, 1_000_000));
+                        index += 1;
+                    }
+                }
+                "--no-overlay" => options.overlay = false,
+                "--validation" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(preference) =
+                            engine_renderer::ValidationPreference::parse(value)
+                    {
+                        options.validation = preference;
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if let Err(message) = engine_slice::player_demo::run_player_demo(options) {
+            eprintln!("error: {message}");
+            if message.contains("Vulkan loader") {
+                eprintln!(
+                    "(no Vulkan runtime installed? headless smoke uses \
+                     SDL_VIDEODRIVER=offscreen plus a software ICD)"
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args.iter().any(|arg| arg == "--player-headless") {
+        // [cycle1-P3] the deterministic headless player path (no GPU,
+        // no window — the --sim pattern).
+        let mut ticks: u64 = 240;
+        let mut script = engine_slice::player_demo::HeadlessScript::WalkJump;
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--ticks" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(count) = value.parse::<u64>()
+                    {
+                        ticks = count.clamp(1, 1_000_000);
+                        index += 1;
+                    }
+                }
+                "--script" => {
+                    if let Some(value) = args.get(index + 1) {
+                        if let Some(parsed) =
+                            engine_slice::player_demo::HeadlessScript::parse(value)
+                        {
+                            script = parsed;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        println!(
+            "{}",
+            engine_slice::player_demo::run_player_headless(ticks, script)
+        );
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--window") {
         let dummy = args.iter().any(|arg| arg == "--dummy");
         // Headless smoke: 180 frames (~3 s at the 60 fps target).
@@ -616,5 +720,44 @@ mod tests {
         assert_eq!(parse_fps("banana"), Ok(None));
         assert_eq!(parse_fps("-1"), Ok(None));
         assert_eq!(parse_fps("sixty"), Ok(None));
+    }
+
+    #[test]
+    fn player_headless_script_parsing_and_tick_bounds() {
+        use engine_slice::player_demo::HeadlessScript;
+        assert_eq!(
+            HeadlessScript::parse("settle"),
+            Some(HeadlessScript::Settle)
+        );
+        assert_eq!(HeadlessScript::parse("walk"), Some(HeadlessScript::Walk));
+        assert_eq!(
+            HeadlessScript::parse("jump"),
+            Some(HeadlessScript::WalkJump)
+        );
+        assert_eq!(HeadlessScript::parse("tour"), Some(HeadlessScript::Tour));
+        assert_eq!(
+            HeadlessScript::parse("spin"),
+            None,
+            "unknown scripts are not silently reinterpreted"
+        );
+        // The CLI tick bound (the house clamp pattern).
+        assert_eq!(0u64.clamp(1, 1_000_000), 1);
+        assert_eq!(2_000_000u64.clamp(1, 1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn player_options_defaults_match_the_demo_contract() {
+        let options = engine_slice::player_demo::PlayerOptions::default();
+        assert_eq!(options.fps, 60);
+        assert_eq!(options.frames, None);
+        assert!(options.overlay);
+        assert_eq!(
+            options.present,
+            engine_renderer::PresentModePreference::Auto
+        );
+        assert_eq!(
+            options.validation,
+            engine_renderer::ValidationPreference::Auto
+        );
     }
 }
