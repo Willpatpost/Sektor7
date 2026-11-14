@@ -15,12 +15,20 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+// (RMD-03) The atomic ordering rides the crash-test-seams feature
+// (the gated child-role arms are its only consumers).
+#[cfg(feature = "crash-test-seams")]
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use engine_core::{LodLevel, PresenceSample, Spine};
 use engine_persist::{CommitOutcome, ConsequenceId, T1Journal};
-use engine_slice::crossing::{ARM_AFTER_COVERING_EXIT, ARM_MID_INSTALL_EXIT, SessionCrossing};
+// (RMD-03) The crash-seam statics are compile-time isolated under
+// the crash-test-seams feature; the child-role arms below carry the
+// matching cfg (the feature-enabled shards run them as before).
+use engine_slice::crossing::SessionCrossing;
+#[cfg(feature = "crash-test-seams")]
+use engine_slice::crossing::{ARM_AFTER_COVERING_EXIT, ARM_MID_INSTALL_EXIT};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 
@@ -83,6 +91,7 @@ fn child_role(store: PathBuf, journal_path: PathBuf, role: &str) -> ! {
         // seam armed, the process dies INSIDE the install's mutation
         // sequence — after the spine suspension, before the ledger
         // capture (exit 7, distinct from the gap's 6).
+        #[cfg(feature = "crash-test-seams")]
         "mid-install-kill" => {
             ARM_MID_INSTALL_EXIT.store(true, Ordering::Relaxed);
             let _ = crossing.deactivate(&mut spine, &mut director, 4, now);
@@ -93,6 +102,7 @@ fn child_role(store: PathBuf, journal_path: PathBuf, role: &str) -> ! {
         // distinct from the install windows' 6 and 7) — the covering
         // is durable on the chain, the transaction never journaled,
         // the install never started.
+        #[cfg(feature = "crash-test-seams")]
         "after-covering-kill" => {
             ARM_AFTER_COVERING_EXIT.store(true, Ordering::Relaxed);
             let _ = crossing.deactivate(&mut spine, &mut director, 4, now);

@@ -118,18 +118,29 @@ jobs:
             echo "the feature-disabled build is missing the authorized nondestructive B-P1 witness publisher"
             exit 1
           fi
-          # (T2-B) The crossing's crash-test seams are compile-time
+          # (T2-B + RMD-03) The crash-test seams are compile-time
           # excluded from the production build — the process-exit
-          # arm must be absent from the feature-disabled engine-slice
-          # artifact.
+          # arms must be absent from the feature-disabled artifacts.
+          # The RMD-03 corrective completes the isolation: ALL SIX
+          # crossing statics (the T2-B original plus the five the
+          # F-10 audit found ungated) AND the two engine-persist
+          # reclamation seams (behind engine-persist's own
+          # crash-test-seams feature, forwarded from engine-slice's)
+          # are nm-verified absent.
+          persist_arms=$(nm "$rlib" | grep -c "ARM_RECLAIM_MID_UNIT\|ARM_RECLAIM_LAST_UNIT" || true)
+          if [ "$persist_arms" != "0" ]; then
+            echo "the feature-disabled build carries the reclamation crash-seam arms ($persist_arms matches)"
+            exit 1
+          fi
+          echo "crash-seam isolation verified: 0 reclamation crash-seam symbols in the feature-disabled engine-persist rlib"
           slice_rlib="target/debug/libengine_slice.rlib"
           if [ -f "$slice_rlib" ]; then
-            arms=$(nm "$slice_rlib" | grep -c ARM_RECLAIM_BEFORE_COMPLETION || true)
+            arms=$(nm "$slice_rlib" | grep -c "ARM_RECLAIM_BEFORE_COMPLETION\|ARM_MID_INSTALL_EXIT\|ARM_AFTER_COVERING_EXIT\|ARM_AFTER_SK_EXIT\|ARM_RECLAIM_AFTER_AUDIT\|ARM_RECLAIM_AFTER_MEDIUM" || true)
             if [ "$arms" != "0" ]; then
-              echo "the feature-disabled build carries the crash-test arm ($arms matches)"
+              echo "the feature-disabled build carries the crash-test arms ($arms matches)"
               exit 1
             fi
-            echo "crash-seam isolation verified: 0 ARM_RECLAIM_BEFORE_COMPLETION symbols in the feature-disabled engine-slice rlib"
+            echo "crash-seam isolation verified: 0 crossing crash-seam symbols in the feature-disabled engine-slice rlib"
           fi
           echo "activation isolation verified: 0 activation symbols in the feature-disabled rlib"
       # (CI-C2, the owner's 2026-11-11 GO — the F1-corrected package

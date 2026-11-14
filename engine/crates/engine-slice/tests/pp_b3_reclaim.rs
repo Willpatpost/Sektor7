@@ -25,6 +25,11 @@ use std::sync::atomic::Ordering;
 
 use engine_core::{Encoder, LodLevel, PresenceSample, Spine};
 use engine_persist::checkpoint::{CheckpointMetadata, ReclaimedIndexEntry, chain_range_digest};
+// (RMD-03) The crash-seam statics are compile-time isolated under
+// the crash-test-seams feature; the arming child tests below carry
+// the matching cfg (the established ARM_RECLAIM_BEFORE_COMPLETION
+// pattern — the feature-enabled shards run them exactly as before).
+#[cfg(feature = "crash-test-seams")]
 use engine_persist::local::{ARM_RECLAIM_LAST_UNIT, ARM_RECLAIM_MID_UNIT};
 use engine_persist::reclaim::{ReclaimUnit, ReclamationLedger, publish_reclamation_ledger};
 use engine_persist::{
@@ -34,9 +39,9 @@ use engine_persist::{
 };
 #[cfg(feature = "crash-test-seams")]
 use engine_slice::crossing::ARM_RECLAIM_BEFORE_COMPLETION;
-use engine_slice::crossing::{
-    ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM, SessionCrossing, TransitionError,
-};
+#[cfg(feature = "crash-test-seams")]
+use engine_slice::crossing::{ARM_RECLAIM_AFTER_AUDIT, ARM_RECLAIM_AFTER_MEDIUM};
+use engine_slice::crossing::{SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 use engine_slice::store::StoreLocation;
@@ -1389,6 +1394,7 @@ fn four_checkpoints_reclaim_sequentially_across_generations() {
 /// campaign at environment-provided paths, then the armed seam —
 /// the process dies between the audit revision's durable
 /// installation and Phase B's first deletion.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn pp_b3_reclaim_child_after_audit() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
@@ -1503,6 +1509,7 @@ fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
 /// the process dies between the first unit's RECORD deletion and
 /// its referenced-object deletions, leaving content only the
 /// audited manifest can still identify.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn pp_b3_reclaim_child_mid_unit() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
@@ -1780,6 +1787,7 @@ fn rotated_two_checkpoint_campaign_at(
 /// record's deletion and BEFORE its referenced objects, the exact
 /// state record-presence completion misclassifies as fully
 /// reclaimed.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn pp_b3_reclaim_child_last_unit() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {
@@ -1986,6 +1994,7 @@ fn a_real_death_at_the_last_unit_resumes_and_converges() {
 /// then the armed after-medium seam — the process dies AFTER the
 /// canonical medium's manifest deletes complete and BEFORE the
 /// audited stale journal generations retire.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn pp_b3_reclaim_child_before_journals() {
     let Ok(store) = std::env::var(RECLAIM_CHILD_STORE_ENV) else {

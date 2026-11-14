@@ -24,6 +24,13 @@ sha2 = "0.11"
 # check (the Linux-only activation-isolation step) proving the
 # feature-disabled artifact carries zero activation symbols.
 composite-test-fixture = []
+# Test-only (the RMD-03 isolation corrective, the T2-B pattern):
+# the local medium's reclamation process-exit crash seams
+# (ARM_RECLAIM_MID_UNIT / ARM_RECLAIM_LAST_UNIT) — compile-time
+# EXCLUDED from every default build; enabled only through
+# engine-slice's forwarding feature (the heavy shard's battery,
+# whose pp_b3_reclaim children are the sole armers).
+crash-test-seams = []
 
 [[test]]
 name = "composite_append"

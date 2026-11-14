@@ -37,17 +37,20 @@
 //! CI-reliability finding).** The head-of-line material is SPLIT
 //! by question: §6a proves the queue-ordering CORRECTNESS
 //! deterministically (the worker's own `ParkNext`/`park_entered`
-//! synchronization barrier + the append-parent dependency as the
-//! order detector — FIFO established through causal observations
-//! and the authority state, never a wall-clock magnitude), while
-//! §6b retains the head-of-line LATENCY as observational
-//! distributions (printed, never asserted — no absolute or
-//! relative timing thresholds, so no scheduling noise, filesystem
-//! variance, or unusually slow sample can fail the CI).
+//! synchronization barrier — its wait BOUNDED per the final
+//! review's RMD-02: a missing park-entry signal is a named
+//! failure at a generous deadline, never an indefinite hang —
+//! plus the append-parent dependency as the order detector: FIFO
+//! established through causal observations and the authority
+//! state, never a wall-clock magnitude), while §6b retains the
+//! head-of-line LATENCY as observational distributions (printed,
+//! never asserted — no absolute or relative timing thresholds, so
+//! no scheduling noise, filesystem variance, or unusually slow
+//! sample can fail the CI).
 
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, RevisionRecord, StoredObject, SyncTier,
@@ -594,8 +597,23 @@ fn f07_head_of_line_queue_ordering_is_deterministic() {
         .unwrap();
     // The park-entry barrier: the worker HOLDS the slow job
     // (dequeued, pre-execution) — the deterministic event, never a
-    // stall duration.
+    // stall duration. The wait is BOUNDED (the RMD-02 corrective):
+    // a worker failure or a missing park-entry signal converts to
+    // a NAMED failure at the deadline, never an indefinite hang —
+    // the bound is a failure diagnostic, NOT a timing assertion
+    // (the synchronization remains the flag itself; the barrier is
+    // never replaced by a guessed sleep, and the ordering proof
+    // below is unchanged).
+    let park_deadline = Instant::now() + Duration::from_secs(60);
     while !worker.fault_control().park_entered() {
+        if Instant::now() > park_deadline {
+            panic!(
+                "the park-entry barrier never fired within 60s: the worker \
+                 did not take-and-park the slow-op job (the ParkNext \
+                 admission boundary — a worker death or a missing \
+                 park-entry signal, never a slow machine)"
+            );
+        }
         std::hint::spin_loop();
     }
     // (2) The second operation, admitted BEHIND it: the append of
