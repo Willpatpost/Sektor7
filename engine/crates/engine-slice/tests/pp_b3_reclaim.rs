@@ -1132,7 +1132,9 @@ fn dir_size(path: &Path) -> u64 {
 
 /// The objects directory's file-name set (the F4 convergence proof:
 /// the crashed-and-resumed store against the cleanly reclaimed
-/// twin).
+/// twin). (RMD-03) The helper rides the crash-test-seams feature —
+/// the gated death tests are its only consumers.
+#[cfg(feature = "crash-test-seams")]
 fn object_names(store: &Path) -> BTreeSet<String> {
     std::fs::read_dir(store.join("objects"))
         .map(|entries| {
@@ -1412,6 +1414,7 @@ fn pp_b3_reclaim_child_after_audit() {
     panic!("the armed seam must terminate the child before this point");
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_death_after_the_audit_resumes_and_completes_to_convergence() {
     // THE REAL DEATH (the review corrective F4): a genuine child
@@ -1527,6 +1530,7 @@ fn pp_b3_reclaim_child_mid_unit() {
     panic!("the armed seam must terminate the child before this point");
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_death_mid_unit_converges_from_the_audited_manifest() {
     // THE REAL ORPHANING DEATH (the review corrective F4's central
@@ -1744,6 +1748,9 @@ fn the_sqlite_provider_reclaims_with_transactional_atomicity() {
 /// reclamation (the full-stack shape): an outstanding unconfirmed
 /// far-boundary transaction surviving re-anchored, the legacy root
 /// journal becoming a stale generation under the audited retirement.
+/// (RMD-03) The helper rides the crash-test-seams feature — the
+/// gated death tests are its only consumers.
+#[cfg(feature = "crash-test-seams")]
 fn rotated_two_checkpoint_campaign(
     dir: &TestDir,
     campaign: &str,
@@ -1805,6 +1812,7 @@ fn pp_b3_reclaim_child_last_unit() {
     panic!("the armed seam must terminate the child before this point");
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_death_at_the_last_unit_resumes_and_converges() {
     // THE WINDOW-A REAL DEATH (the review corrective R1): a genuine
@@ -2015,6 +2023,7 @@ fn pp_b3_reclaim_child_before_journals() {
     panic!("the armed seam must terminate the child before this point");
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_death_before_the_journal_retirement_resumes_and_completes() {
     // THE WINDOW-B REAL DEATH (the review corrective R1): a genuine

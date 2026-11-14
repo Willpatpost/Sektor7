@@ -219,6 +219,10 @@ fn child_death_between_journal_and_install_recovers_from_disk() {
     );
 }
 
+// (RMD-03) The parents spawning the gated child roles carry the
+// matching cfg (the child-role arms are feature-gated; these tests
+// are their only drivers).
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn child_death_mid_install_recovers_from_disk() {
     // The GENUINE mid-install window (the review's fourth
@@ -234,6 +238,7 @@ fn child_death_mid_install_recovers_from_disk() {
     );
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn child_death_after_the_covering_recovers_the_pre_deactivation_state() {
     // The C1 covering/T1 gap (the §6 crash-window matrix): the child
