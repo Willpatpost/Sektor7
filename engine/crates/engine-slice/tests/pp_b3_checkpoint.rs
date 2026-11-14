@@ -28,9 +28,9 @@ use std::process::Command;
 #[cfg(feature = "crash-test-seams")]
 use std::sync::atomic::Ordering;
 
-use engine_core::{Decoder, LodLevel, PresenceSample, Spine, wire::MAX_TAG_LEN};
 #[cfg(feature = "crash-test-seams")]
 use engine_core::HistoryKind;
+use engine_core::{Decoder, LodLevel, PresenceSample, Spine, wire::MAX_TAG_LEN};
 use engine_persist::{
     CanonicalMedium, CheckpointMetadata, LocalFileMedium, ReclaimedIndexEntry, SkipEntry,
     T1Journal, chain_range_digest, checkpoint_mk_idempotency_key, compute_digest_seed,
