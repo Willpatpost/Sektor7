@@ -30,7 +30,7 @@
 
 use engine_core::{
     Decoder, Encoder, Event, EventClass, EventId, EventSpec, ExecCtx, Field, Fingerprinter,
-    LodLevel, SaveError, SaveWorld, Schedule, Spine, Tick, World,
+    LodLevel, ObligationLocation, SaveError, SaveWorld, Schedule, Spine, Tick, World,
 };
 
 use crate::npc::{NpcConfig, REGION_COUNT, mix64};
@@ -465,4 +465,672 @@ pub fn steady_state_mean(samples: &[u64]) -> f64 {
     let tail = &samples[samples.len() - half..];
     let sum: u64 = tail.iter().sum();
     sum as f64 / tail.len() as f64
+}
+
+// ==================================================== the cell runner
+//
+// (The amended matrix's composition: every cell is a real-chain base
+// at (population, LOD scenario) plus the class's exact-count overlay,
+// with skip decisions made by the composition table — never padded.)
+
+/// Window length for per-window dimension sampling.
+pub const WINDOW_TICKS: u64 = 50;
+
+/// One run-matrix cell's specification. `population: 0` is the pure
+/// synthetic instrument (no chains — the exact-growth-rate regressions
+/// demand source); every reference-matrix cell carries real chains.
+#[derive(Debug, Clone)]
+pub struct CellSpec {
+    pub class: WorkloadClass,
+    pub population: usize,
+    pub scenario: &'static str,
+    pub region_lods: [LodLevel; REGION_COUNT],
+    pub budget: u32,
+    pub reserve: u32,
+    pub seed: u64,
+    pub horizon: u64,
+    /// The composition-derived overlay demand per tick (near lane).
+    pub overlay_near: u32,
+    /// The composition-derived overlay demand per tick (far lane).
+    pub overlay_far: u32,
+    /// Recovery's demand-fall tick: the overlay is active for
+    /// `tick <= recovery_at`, zero afterwards (the drain phase).
+    pub recovery_at: Option<u64>,
+    /// Class 6's harness-driven LOD transitions (F4: new follow-ups
+    /// consume the synced level; in-flight obligations keep their
+    /// lane — the runner applies no reclassification).
+    pub lod_transitions: Vec<(u64, [LodLevel; REGION_COUNT])>,
+}
+
+impl CellSpec {
+    /// The default production configuration (budget 200, near reserve
+    /// 60, seed 1337, horizon 600 — the entity-scale benchmark's
+    /// window), no overlay, no transitions.
+    pub fn base(
+        class: WorkloadClass,
+        population: usize,
+        scenario: (&'static str, [LodLevel; REGION_COUNT]),
+    ) -> Self {
+        CellSpec {
+            class,
+            population,
+            scenario: scenario.0,
+            region_lods: scenario.1,
+            budget: 200,
+            reserve: 60,
+            seed: 1337,
+            horizon: 600,
+            overlay_near: 0,
+            overlay_far: 0,
+            recovery_at: None,
+            lod_transitions: Vec::new(),
+        }
+    }
+}
+
+/// Per-window dimension samples (the twelve dimensions' windowed
+/// form; the report aggregates — methodology §2). All logical counts
+/// are deterministic; the three cost fields are wall-clock
+/// observations (public-boundary granularity, dimension 10's honest
+/// label: admission = overlay scheduling, execution = `run_tick`,
+/// accounting = this sampling itself).
+#[derive(Debug, Clone, Default)]
+pub struct WindowSample {
+    pub tick_end: u64,
+    pub scheduled: u64,
+    pub executed: u64,
+    pub near_executed: u64,
+    pub far_executed: u64,
+    pub pending_near: usize,
+    pub pending_far: usize,
+    /// The §5 split, per lane, never summed: obligations past due.
+    pub near_overdue: usize,
+    pub far_overdue: usize,
+    pub near_max_overdue_age: u64,
+    pub far_max_overdue_age: u64,
+    pub near_p95_wait: f64,
+    pub far_p95_wait: f64,
+    pub budget_exhausted: u64,
+    pub late_count: u64,
+    pub late_p50: f64,
+    pub late_p95: f64,
+    pub late_max: u64,
+    pub admission_us: u64,
+    pub execution_us: u64,
+    pub accounting_us: u64,
+}
+
+/// The per-lane workload-shape verdict — the methodology's exact
+/// claim vocabulary (§6), nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneVerdict {
+    Sustainable,
+    Saturated,
+    Overloaded,
+    Recovering,
+}
+
+impl LaneVerdict {
+    pub fn name(self) -> &'static str {
+        match self {
+            LaneVerdict::Sustainable => "sustainable",
+            LaneVerdict::Saturated => "saturated",
+            LaneVerdict::Overloaded => "overloaded",
+            LaneVerdict::Recovering => "recovering",
+        }
+    }
+}
+
+/// The §5 classification: near and far lanes are judged SEPARATELY
+/// against their own cadence budgets, never summed.
+#[derive(Debug, Clone)]
+pub struct Classification {
+    pub near: LaneVerdict,
+    pub far: LaneVerdict,
+    /// Measured overdue-growth slope per tick (the overload rate).
+    pub near_overdue_slope: f64,
+    pub far_overdue_slope: f64,
+    pub near_max_overdue_age: u64,
+    pub far_max_overdue_age: u64,
+}
+
+/// The least-squares slope of a per-window series (deterministic
+/// arithmetic over deterministic samples).
+fn series_slope(values: &[f64]) -> f64 {
+    let n = values.len() as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let mean_x = (n - 1.0) / 2.0;
+    let mean_y = values.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut var = 0.0;
+    for (index, value) in values.iter().enumerate() {
+        let dx = index as f64 - mean_x;
+        cov += dx * (value - mean_y);
+        var += dx * dx;
+    }
+    if var == 0.0 { 0.0 } else { cov / var }
+}
+
+fn sorted_percentile(values: &mut [f64], quantile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let index = ((quantile * values.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len() - 1);
+    values[index]
+}
+
+/// Classifies one lane's window series against its cadence budget:
+/// growth slope ≥ +0.5/tick → Overloaded; ≤ −0.5/tick → Recovering;
+/// otherwise Saturated when overdue age ever exceeds the cadence
+/// budget or exhaustion occurs; else Sustainable.
+fn classify_lane(
+    overdue: &[f64],
+    max_age: u64,
+    exhausted: bool,
+    cadence_budget: u64,
+) -> LaneVerdict {
+    let slope = series_slope(overdue);
+    if slope >= 0.5 {
+        LaneVerdict::Overloaded
+    } else if slope <= -0.5 {
+        LaneVerdict::Recovering
+    } else if max_age > cadence_budget || exhausted {
+        LaneVerdict::Saturated
+    } else {
+        LaneVerdict::Sustainable
+    }
+}
+
+/// The §5 classification over a cell's window series. The cadence
+/// budgets are the lanes' designed inter-execution intervals as
+/// configured by the composition (the regressions set them
+/// explicitly; the reference matrix derives them from the scenario).
+pub fn classify(
+    windows: &[WindowSample],
+    near_cadence_budget: u64,
+    far_cadence_budget: u64,
+) -> Classification {
+    let near_overdue: Vec<f64> = windows.iter().map(|w| w.near_overdue as f64).collect();
+    let far_overdue: Vec<f64> = windows.iter().map(|w| w.far_overdue as f64).collect();
+    let near_max = windows
+        .iter()
+        .map(|w| w.near_max_overdue_age)
+        .max()
+        .unwrap_or(0);
+    let far_max = windows
+        .iter()
+        .map(|w| w.far_max_overdue_age)
+        .max()
+        .unwrap_or(0);
+    let exhausted = windows.iter().any(|w| w.budget_exhausted > 0);
+    Classification {
+        near: classify_lane(&near_overdue, near_max, exhausted, near_cadence_budget),
+        far: classify_lane(&far_overdue, far_max, exhausted, far_cadence_budget),
+        near_overdue_slope: series_slope(&near_overdue),
+        far_overdue_slope: series_slope(&far_overdue),
+        near_max_overdue_age: near_max,
+        far_max_overdue_age: far_max,
+    }
+}
+
+/// FNV-1a over the deterministic per-tick trace (dimension 12's
+/// double-run comparison key, alongside the world fingerprint).
+struct TraceDigest(u64);
+
+impl TraceDigest {
+    fn new() -> Self {
+        TraceDigest(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish_hex(self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+/// Resident set in bytes, Linux only — the honesty rule: `None` is
+/// reported as "unmeasured on this platform", never omitted silently.
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut fields = statm.split_whitespace();
+    fields.next()?;
+    let pages: u64 = fields.next()?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_bytes() -> Option<u64> {
+    None
+}
+
+/// One cell's complete measured outcome (the §7 report's data).
+#[derive(Debug, Clone)]
+pub struct CellReport {
+    pub class: WorkloadClass,
+    pub population: usize,
+    pub scenario: &'static str,
+    pub budget: u32,
+    pub reserve: u32,
+    pub horizon: u64,
+    pub overlay_near: u32,
+    pub overlay_far: u32,
+    pub windows: Vec<WindowSample>,
+    pub classification: Classification,
+    pub scheduled: u64,
+    pub executed: u64,
+    pub late_arrivals: u64,
+    pub late_executions: u64,
+    pub budget_exhausted_ticks: u64,
+    pub processed_through: Option<u64>,
+    pub near_executed: u64,
+    pub far_executed: u64,
+    pub near_backlogged_ticks: u64,
+    pub far_backlogged_ticks: u64,
+    pub fingerprint_hex: String,
+    pub digest_hex: String,
+    pub save_len: usize,
+    pub save_us: u64,
+    pub resident: Option<u64>,
+    pub conservation_holds: bool,
+}
+
+/// Runs one cell: installs the real-chain base, applies the class's
+/// overlay and transitions, samples the twelve dimensions per window,
+/// classifies the §5 split, and fingerprints/digests the deterministic
+/// trace. The harness NEVER compacts a measured run (dimension 6
+/// requires the full ledger; the compacted form is a separate
+/// variant). A conservation violation is a hard failure (asserted).
+pub fn run_cell(spec: &CellSpec) -> CellReport {
+    let near_regions = [false; REGION_COUNT];
+    let config = NpcConfig {
+        seed: spec.seed,
+        near_regions,
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let world = SustainedWorld::new(spec.population, config, spec.region_lods);
+    let mut spine = Spine::with_reservation(world, spec.budget, spec.reserve);
+    install_sustained_schedules(&mut spine);
+
+    let mut sequence = 0u64;
+    let mut digest = TraceDigest::new();
+    let mut windows: Vec<WindowSample> = Vec::new();
+    let mut window = WindowSample::default();
+    let mut conservation_holds = true;
+    let mut ledger_cursor: usize = 0;
+    let mut last_scheduled = spine.stats().scheduled;
+    let mut last_executed = spine.stats().executed;
+    let mut last_exhausted = spine.stats().budget_exhausted_ticks;
+    let mut last_lanes = spine.lane_totals();
+
+    for tick in 1..=spec.horizon {
+        for (at, lods) in &spec.lod_transitions {
+            if *at == tick {
+                spine.world_mut().set_region_lods(*lods);
+            }
+        }
+        let overlay_active = spec.recovery_at.is_none_or(|at| tick <= at);
+        let overlay_near = if overlay_active { spec.overlay_near } else { 0 };
+        let overlay_far = if overlay_active { spec.overlay_far } else { 0 };
+
+        let admission_start = std::time::Instant::now();
+        if overlay_near > 0 {
+            schedule_demand(&mut spine, overlay_near, Field::Near, &mut sequence);
+        }
+        if overlay_far > 0 {
+            schedule_demand(&mut spine, overlay_far, Field::Far, &mut sequence);
+        }
+        let admission = admission_start.elapsed();
+
+        let execution_start = std::time::Instant::now();
+        spine.run_tick();
+        let execution = execution_start.elapsed();
+
+        let stats = spine.stats();
+        let scheduled_delta = stats.scheduled - last_scheduled;
+        let executed_delta = stats.executed - last_executed;
+        last_scheduled = stats.scheduled;
+        last_executed = stats.executed;
+        digest.write_u64(scheduled_delta);
+        digest.write_u64(executed_delta);
+        digest.write_u64(spine.near_pending_count() as u64);
+        digest.write_u64(spine.far_pending_count() as u64);
+        window.scheduled += scheduled_delta;
+        window.executed += executed_delta;
+        window.admission_us += admission.as_micros() as u64;
+        window.execution_us += execution.as_micros() as u64;
+
+        if tick % WINDOW_TICKS == 0 {
+            let accounting_start = std::time::Instant::now();
+            let clock = spine.clock().as_u64();
+            window.tick_end = tick;
+            window.pending_near = spine.near_pending_count();
+            window.pending_far = spine.far_pending_count();
+            window.budget_exhausted = stats.budget_exhausted_ticks - last_exhausted;
+            last_exhausted = stats.budget_exhausted_ticks;
+            let lanes = spine.lane_totals();
+            window.near_executed = lanes.near_executed - last_lanes.near_executed;
+            window.far_executed = lanes.far_executed - last_lanes.far_executed;
+            last_lanes = lanes;
+
+            // The §5 pending-age scan, per lane, never summed.
+            let mut near_ages = Vec::new();
+            let mut far_ages = Vec::new();
+            for view in spine.collect_matching(|_| true) {
+                if view.location != ObligationLocation::Queued {
+                    continue;
+                }
+                let age = clock.saturating_sub(view.due.as_u64());
+                match view.field {
+                    Field::Near => {
+                        if age > 0 {
+                            window.near_overdue += 1;
+                            window.near_max_overdue_age = window.near_max_overdue_age.max(age);
+                        }
+                        near_ages.push(age as f64);
+                    }
+                    Field::Far => {
+                        if age > 0 {
+                            window.far_overdue += 1;
+                            window.far_max_overdue_age = window.far_max_overdue_age.max(age);
+                        }
+                        far_ages.push(age as f64);
+                    }
+                }
+            }
+            window.near_p95_wait = sorted_percentile(&mut near_ages, 0.95);
+            window.far_p95_wait = sorted_percentile(&mut far_ages, 0.95);
+
+            // Dimension 6's lateness magnitudes — the ledger CURSOR
+            // scan (linear in new records, never a quadratic re-scan).
+            let ledger = spine
+                .try_ledger_full()
+                .expect("the harness never compacts a measured run");
+            let mut lateness = Vec::new();
+            for record in ledger[ledger_cursor..].iter() {
+                if record.late {
+                    lateness.push(
+                        (record.executed_tick.as_u64() - record.intended_due.as_u64()) as f64,
+                    );
+                }
+            }
+            ledger_cursor = ledger.len();
+            window.late_count = lateness.len() as u64;
+            if !lateness.is_empty() {
+                let max_late = lateness.iter().cloned().fold(0.0_f64, f64::max);
+                window.late_p50 = sorted_percentile(&mut lateness.clone(), 0.50);
+                window.late_p95 = sorted_percentile(&mut lateness, 0.95);
+                window.late_max = max_late as u64;
+            }
+            window.accounting_us = accounting_start.elapsed().as_micros() as u64;
+
+            let stats = spine.stats();
+            let conservation = stats.scheduled
+                == stats.executed
+                    + spine.pending_count() as u64
+                    + spine.blocked_count() as u64
+                    + spine.held_count() as u64;
+            conservation_holds &= conservation;
+
+            windows.push(std::mem::take(&mut window));
+        }
+    }
+    assert!(
+        conservation_holds,
+        "conservation identity violated in cell {:?}/{}",
+        spec.class.name(),
+        spec.scenario
+    );
+
+    let stats = spine.stats();
+    let lanes = spine.lane_totals();
+    let mut fp = Fingerprinter::new();
+    spine.world().fingerprint(&mut fp);
+    let fingerprint_hex = fp.finish_hex();
+    digest.write_u64(stats.scheduled);
+    digest.write_u64(stats.executed);
+    digest.write_u64(stats.budget_exhausted_ticks);
+    let digest_hex = digest.finish_hex();
+    let save_start = std::time::Instant::now();
+    let save = spine.save_bytes();
+    let save_us = save_start.elapsed().as_micros() as u64;
+
+    // The cadence budgets: each lane's designed inter-execution
+    // interval at its scenario cadence, with one designed interval of
+    // acknowledged slack (the composition's policy, stated here so
+    // the classifier's inputs are auditable).
+    let period = 6;
+    let near_cadence_budget = period * 2;
+    let far_cadence_budget = period * 12 * 2;
+    let classification = classify(&windows, near_cadence_budget, far_cadence_budget);
+
+    CellReport {
+        class: spec.class,
+        population: spec.population,
+        scenario: spec.scenario,
+        budget: spec.budget,
+        reserve: spec.reserve,
+        horizon: spec.horizon,
+        overlay_near: spec.overlay_near,
+        overlay_far: spec.overlay_far,
+        windows,
+        classification,
+        scheduled: stats.scheduled,
+        executed: stats.executed,
+        late_arrivals: stats.late_arrivals,
+        late_executions: stats.late_executions,
+        budget_exhausted_ticks: stats.budget_exhausted_ticks,
+        processed_through: spine.processed_through().map(|t| t.as_u64()),
+        near_executed: lanes.near_executed,
+        far_executed: lanes.far_executed,
+        near_backlogged_ticks: lanes.near_backlogged_ticks,
+        far_backlogged_ticks: lanes.far_backlogged_ticks,
+        fingerprint_hex,
+        digest_hex,
+        save_len: save.len(),
+        save_us,
+        resident: resident_bytes(),
+        conservation_holds,
+    }
+}
+
+/// The double-run determinism proof for one cell (methodology §8.4):
+/// two independent constructions, identical specification — the
+/// trace digest and the world fingerprint must be byte-identical.
+pub fn run_cell_deterministic(spec: &CellSpec) -> (CellReport, CellReport, bool) {
+    let first = run_cell(spec);
+    let second = run_cell(spec);
+    let deterministic =
+        first.digest_hex == second.digest_hex && first.fingerprint_hex == second.fingerprint_hex;
+    (first, second, deterministic)
+}
+
+impl CellReport {
+    /// The §7 per-workload report — the eight required fields, with
+    /// the §6 honesty rules enforced in the wording: completed vs
+    /// deferred never conflated, backlog per lane never summed,
+    /// unmeasured cases explicit.
+    pub fn print(&self) {
+        println!(
+            "sustained-load cell: class {} / population {} / scenario {} / budget {} (reserve {}) / horizon {} / overlay near {} far {} per tick",
+            self.class.name(),
+            self.population,
+            self.scenario,
+            self.budget,
+            self.reserve,
+            self.horizon,
+            self.overlay_near,
+            self.overlay_far
+        );
+        let mut exec: Vec<f64> = self
+            .windows
+            .iter()
+            .map(|w| w.execution_us as f64 / 1000.0)
+            .collect();
+        let mut adm: Vec<f64> = self
+            .windows
+            .iter()
+            .map(|w| w.admission_us as f64 / 1000.0)
+            .collect();
+        let mut acc: Vec<f64> = self
+            .windows
+            .iter()
+            .map(|w| w.accounting_us as f64 / 1000.0)
+            .collect();
+        println!(
+            "  computational cost (public-boundary split, ms/window): execution p50 {:.3} / p95 {:.3} · admission p50 {:.3} · accounting p50 {:.3}",
+            sorted_percentile(&mut exec.clone(), 0.50),
+            sorted_percentile(&mut exec, 0.95),
+            sorted_percentile(&mut adm, 0.50),
+            sorted_percentile(&mut acc, 0.50)
+        );
+        println!(
+            "  logical progress: scheduled {} / executed {} (near {} / far {}) / processed_through {:?}",
+            self.scheduled,
+            self.executed,
+            self.near_executed,
+            self.far_executed,
+            self.processed_through
+        );
+        println!(
+            "  fidelity level: real chains at the scenario's designed cadences + synthetic overlay (near {} / far {} per tick); completed obligations are the executed counts above; deferred work is the per-lane backlog below — budget-limiting is NOT reported as efficiency, and no equivalence beyond the region routine contracts is claimed",
+            self.overlay_near, self.overlay_far
+        );
+        println!(
+            "  backlog (per lane, never summed): near {} (slope {:+.2}/tick, max overdue age {}) / far {} (slope {:+.2}/tick, max overdue age {})",
+            self.windows.last().map(|w| w.near_overdue).unwrap_or(0),
+            self.classification.near_overdue_slope,
+            self.classification.near_max_overdue_age,
+            self.windows.last().map(|w| w.far_overdue).unwrap_or(0),
+            self.classification.far_overdue_slope,
+            self.classification.far_max_overdue_age
+        );
+        println!(
+            "  classification: near {} / far {}",
+            self.classification.near.name(),
+            self.classification.far.name()
+        );
+        let late_p95 = self
+            .windows
+            .iter()
+            .map(|w| w.late_p95)
+            .fold(0.0_f64, f64::max);
+        println!(
+            "  latency: late executions {} (p95 magnitude {:.1} ticks late, max {})",
+            self.late_executions,
+            late_p95,
+            self.windows.iter().map(|w| w.late_max).max().unwrap_or(0)
+        );
+        println!(
+            "  memory: resident {} / snapshot {} B in {} us (ledger-size dependent — the lifetime history is part of the measured representation cost)",
+            self.resident
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "unmeasured on this platform".to_string()),
+            self.save_len,
+            self.save_us
+        );
+        println!(
+            "  determinism: trace digest {} / world fingerprint {}",
+            self.digest_hex, self.fingerprint_hex
+        );
+        println!(
+            "  failure/saturation: budget-exhausted ticks {} (near-backlogged {} / far-backlogged {}) · conservation {}",
+            self.budget_exhausted_ticks,
+            self.near_backlogged_ticks,
+            self.far_backlogged_ticks,
+            if self.conservation_holds {
+                "holds"
+            } else {
+                "VIOLATED"
+            }
+        );
+    }
+}
+
+/// Runs the nine (population × LOD scenario) base calibrations and
+/// prints the composition table: the measured `D_base` per cell, the
+/// per-class target, the overlay or the reason a class is N/A there,
+/// and the pure-real-overload marker where the base alone exceeds
+/// twice the budget. The table is EVIDENCE — measured, never assumed.
+pub fn print_composition_table() {
+    println!(
+        "sustained-load composition table (measured D_base per cell, budget 200 / reserve 60)"
+    );
+    let near_regions = [false; REGION_COUNT];
+    for population in [1_000usize, 5_000, 20_000] {
+        for (name, lods) in lod_scenarios() {
+            let config = NpcConfig {
+                seed: 1337,
+                near_regions,
+                region_lods_enabled: true,
+                ..NpcConfig::default()
+            };
+            let samples = calibrate_base_demand(population, &config, lods, 200, 60, 200);
+            let base = steady_state_mean(&samples);
+            print!("  population {population} scenario {name}: D_base {base:.1}/tick",);
+            for class in [
+                WorkloadClass::LowDemand,
+                WorkloadClass::NearSaturation,
+                WorkloadClass::Overload,
+                WorkloadClass::Recovery,
+            ] {
+                let target = f64::from(class.target_demand_per_tick(200));
+                let note = if base >= target {
+                    "N/A (base ≥ target)"
+                } else if class == WorkloadClass::Overload && base >= 2.0 * target {
+                    "pure real-chain overload"
+                } else {
+                    "overlay"
+                };
+                print!(" · {} {}", class.name(), note);
+            }
+            println!();
+        }
+    }
+}
+
+/// The `--benchmark-sustained-load` entry point (the CLI wiring is
+/// minimal and delimited in `main.rs`; the integrator reconciles).
+/// Phase 1: the measured composition table. Phase 2 (the full
+/// reference run matrix) executes as pod evidence, separate from the
+/// CI battery — never thresholds, never called complete when partial.
+pub fn run_sustained_load_benchmark() {
+    println!(
+        "Sustained-load benchmark (F-08/F-12) — pod results, observational (never CI thresholds)"
+    );
+    println!(
+        "workload: real routine chains (SustainedWorld) + exact-count demand overlays, budget 200 / near reserve 60"
+    );
+    print_composition_table();
+    // One demonstration cell (the §5 split's subject at 1k): the
+    // mixed scenario's real chains, no overlay — near lanes at
+    // designed cadence, far lanes at their sparse designed cadence.
+    let scenario = lod_scenarios()[1];
+    let spec = CellSpec::base(WorkloadClass::MixedLod, 1_000, scenario);
+    let (report, _second, deterministic) = run_cell_deterministic(&spec);
+    report.print();
+    println!(
+        "  determinism proof: {}",
+        if deterministic {
+            "DOUBLE-RUN IDENTICAL"
+        } else {
+            "DIVERGED (hard failure)"
+        }
+    );
+    assert!(
+        deterministic,
+        "the demonstration cell must be deterministic"
+    );
 }
