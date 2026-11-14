@@ -462,6 +462,14 @@ pub fn publish_checkpoint_mk(
             rule: "checkpoint-mk/parent-not-sk",
         });
     }
+    // (F-14) The construction-boundary guard: the caller-supplied
+    // SK epoch is provider-obtained at the production call sites —
+    // an epoch at u64::MAX has no representable successor, and the
+    // typed refusal precedes the constructor (the medium's
+    // append-side checked linkage is the second layer).
+    sk_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let record = RevisionRecord::regular(sk, sk_epoch, tick)
         .with_idempotency_key(checkpoint_mk_idempotency_key(&sk))
         .with_content_refs(vec![object.hash()]);

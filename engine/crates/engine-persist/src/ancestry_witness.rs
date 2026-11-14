@@ -2112,6 +2112,13 @@ fn publish_witness_object(
             .head()?
             .ok_or(MediumError::Chain { rule: "unfounded" })?;
         let epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, epoch, tick)
             .with_idempotency_key(key.to_vec())
             .with_content_refs(vec![object.hash()]);

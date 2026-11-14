@@ -260,6 +260,13 @@ pub fn publish_reclamation_ledger(
     let bytes = ledger.canonical_bytes();
     let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&head)?.epoch;
+    // (F-14) The construction-boundary guard: a provider-obtained
+    // epoch at u64::MAX has no representable successor — the typed
+    // refusal precedes the constructor (the medium's append-side
+    // checked linkage is the second layer).
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let record = RevisionRecord::regular(head, parent_epoch, tick)
         .with_idempotency_key(reclamation_ledger_idempotency_key(&ledger.mk))
         .with_content_refs(vec![object.hash()]);
@@ -2451,6 +2458,13 @@ pub fn publish_journal_root_binding(
             }
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -3959,6 +3973,13 @@ pub fn publish_reclamation_plan_authorized(
             });
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -4160,6 +4181,13 @@ pub fn publish_reclamation_ledger_v2(
             });
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -4468,6 +4496,13 @@ pub fn publish_reclamation_complete(
     let bytes = marker.canonical_bytes();
     let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&expected_parent)?.epoch;
+    // (F-14) The construction-boundary guard: a provider-obtained
+    // epoch at u64::MAX has no representable successor — the typed
+    // refusal precedes the constructor (the medium's append-side
+    // checked linkage is the second layer).
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let key = reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch));
     let record = RevisionRecord::regular(expected_parent, parent_epoch, tick)
         .with_idempotency_key(key)

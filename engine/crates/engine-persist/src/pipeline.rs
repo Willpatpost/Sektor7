@@ -1345,6 +1345,16 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         // The idempotency key IS the batch's content identity —
         // chain-unique, so the same logical batch can never
         // double-install however often it is retried or rebased.
+        // (F-14) The construction-boundary guard: the verified epoch
+        // is walk-derived from provider records — an epoch at
+        // u64::MAX has no representable successor, and the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        self.verified_epoch
+            .checked_add(1)
+            .ok_or(PipelineError::Medium(MediumError::Chain {
+                rule: "epoch-regression",
+            }))?;
         let record = RevisionRecord::regular(parent, self.verified_epoch, tick)
             .with_idempotency_key(batch_hash.as_bytes().to_vec())
             .with_content_refs(vec![batch_hash]);
