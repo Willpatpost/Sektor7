@@ -1345,6 +1345,16 @@ impl<M: CanonicalMedium> CommitVerifier<M> {
         // The idempotency key IS the batch's content identity —
         // chain-unique, so the same logical batch can never
         // double-install however often it is retried or rebased.
+        // (F-14) The construction-boundary guard: the verified epoch
+        // is walk-derived from provider records — an epoch at
+        // u64::MAX has no representable successor, and the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        self.verified_epoch
+            .checked_add(1)
+            .ok_or(PipelineError::Medium(MediumError::Chain {
+                rule: "epoch-regression",
+            }))?;
         let record = RevisionRecord::regular(parent, self.verified_epoch, tick)
             .with_idempotency_key(batch_hash.as_bytes().to_vec())
             .with_content_refs(vec![batch_hash]);
@@ -3691,5 +3701,38 @@ mod tests {
             authority.status(ConsequenceId::new(1, 1, 1)).unwrap().phase,
             KeyPhase::InConfirmedChain
         );
+    }
+
+    // (F-14) The construction-boundary regression at the commit
+    // pipeline's canonical append: the non-enforcing provider model
+    // (a crafted well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) sets the pipeline's
+    // walk-derived verified epoch to the saturation, and the commit
+    // refuses TYPED at the construction boundary — never the
+    // constructor's debug panic or the release wrap — with nothing
+    // published to the real store beneath.
+    #[test]
+    fn the_commit_refuses_a_saturated_verified_epoch_typed() {
+        let dir = TestDir::new("f14-pipeline");
+        ensure_founded(&dir);
+        let medium = LocalFileMedium::open(dir.store()).unwrap();
+        let wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let journal = T1Journal::open(dir.path().join("journal-f14.t1")).unwrap();
+        let mut pipeline = CommitPipeline::open(wrapped, journal).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        let error = pipeline.commit_canonical().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                PipelineError::Medium(MediumError::Chain {
+                    rule: "epoch-regression"
+                })
+            ),
+            "the saturated verified epoch refuses the commit typed: {error:?}"
+        );
+        // Nothing was published: the real store beneath the wrapper
+        // still holds only the founding.
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(check.validate().unwrap().records, 1, "the founding only");
     }
 }

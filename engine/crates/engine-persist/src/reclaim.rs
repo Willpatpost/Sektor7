@@ -260,6 +260,13 @@ pub fn publish_reclamation_ledger(
     let bytes = ledger.canonical_bytes();
     let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&head)?.epoch;
+    // (F-14) The construction-boundary guard: a provider-obtained
+    // epoch at u64::MAX has no representable successor — the typed
+    // refusal precedes the constructor (the medium's append-side
+    // checked linkage is the second layer).
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let record = RevisionRecord::regular(head, parent_epoch, tick)
         .with_idempotency_key(reclamation_ledger_idempotency_key(&ledger.mk))
         .with_content_refs(vec![object.hash()]);
@@ -2451,6 +2458,13 @@ pub fn publish_journal_root_binding(
             }
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -3959,6 +3973,13 @@ pub fn publish_reclamation_plan_authorized(
             });
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -4160,6 +4181,13 @@ pub fn publish_reclamation_ledger_v2(
             });
         }
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14) The construction-boundary guard: a provider-obtained
+        // epoch at u64::MAX has no representable successor — the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+            rule: "epoch-regression",
+        })?;
         let record = RevisionRecord::regular(head, parent_epoch, tick)
             .with_idempotency_key(key.clone())
             .with_content_refs(vec![object.hash()]);
@@ -4468,6 +4496,13 @@ pub fn publish_reclamation_complete(
     let bytes = marker.canonical_bytes();
     let object = StoredObject::new(bytes)?;
     let parent_epoch = medium.read_record(&expected_parent)?.epoch;
+    // (F-14) The construction-boundary guard: a provider-obtained
+    // epoch at u64::MAX has no representable successor — the typed
+    // refusal precedes the constructor (the medium's append-side
+    // checked linkage is the second layer).
+    parent_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let key = reclamation_complete_idempotency_key(&marker.mk, Some(marker.batch));
     let record = RevisionRecord::regular(expected_parent, parent_epoch, tick)
         .with_idempotency_key(key)
@@ -7012,6 +7047,59 @@ mod tests {
             "the rejected publication never became canonical"
         );
         drop(medium);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // (F-14) The construction-boundary regression at the v1 ledger
+    // publication: the non-enforcing provider model (a crafted
+    // well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) refuses the publication
+    // TYPED at the construction boundary — never the constructor's
+    // debug panic or the release wrap — with nothing published.
+    #[test]
+    fn the_v1_ledger_publication_refuses_a_saturated_head_epoch_typed() {
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-f14-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"f14-ledger-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "f14-ledger", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let mut wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let error = publish_reclamation_ledger(&mut wrapped, &sample_ledger(), 7).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the saturated head refuses the v1 ledger publication typed: {error:?}"
+        );
+        assert_eq!(
+            wrapped.true_head().unwrap(),
+            Some(founding.id()),
+            "the refusal published nothing"
+        );
+        drop(wrapped);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

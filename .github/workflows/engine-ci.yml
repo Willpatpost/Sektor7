@@ -147,20 +147,26 @@ jobs:
       # cycle-2 main 2ea7622, plus Agent A's C5d discovered-range-
       # observation AND Agent B's B-R1a4 witness-degradation matrix,
       # both from that baseline; recomputed from executed runs —
-      # never estimates): this shard executes 950 tests on Linux /
-      # 899 on Windows (the cycle-3 consolidated 947 / 896 plus the
+      # never estimates): this shard executes 955 tests on Linux /
+      # 904 on Windows (the cycle-3 consolidated 947 / 896 plus the
       # F-01 audit-hardening package's 3 FULLY CROSS-PLATFORM
       # engine-persist lib tests — the malformed-epoch regression +
-      # the two try_regular tests, no cfg gates; the Linux count
-      # MEASURED at this exact shard command on the audit worktree:
-      # 950 passed / 1 ignored / 30 result lines, rc=0; the Windows
-      # count the exact uniform delta 896 + 3); heavy supplies 455 /
+      # the two try_regular tests, no cfg gates — plus the
+      # POST-AUDIT REMEDIATION F-14 package's 5 FULLY CROSS-PLATFORM
+      # engine-persist lib tests, the maximum-epoch construction-
+      # boundary regressions: four plain (the v1 ledger publication,
+      # the witness object publication, the MK publication, the
+      # commit pipeline) and one feature-gated (the plan
+      # publication); the Linux count MEASURED at this exact shard
+      # command on the remediation worktree: 955 passed / 1 ignored
+      # / 30 result lines, rc=0; the Windows count the exact uniform
+      # delta 899 + 5); heavy supplies 455 /
       # 454 (the cycle-3 448 / 447 plus the F-07 package's six
       # platform-uniform harness suites AND the F-02
       # geometry-equivalence test; see the heavy job's comment for
       # the measured provenance); the two shards sum to the
-      # audit-cycle battery (1405 / 1353; the counts re-MEASURED at
-      # the consolidated tree before the commit).
+      # audit-cycle battery (1410 / 1358; the F-14 counts
+      # re-MEASURED at the remediation worktree before the commit).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -173,8 +179,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=950
-          if [ "$(uname -s)" != "Linux" ]; then expected=899; fi
+          expected=955
+          if [ "$(uname -s)" != "Linux" ]; then expected=904; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)

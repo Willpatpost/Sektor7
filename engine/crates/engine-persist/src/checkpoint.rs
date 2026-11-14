@@ -462,6 +462,14 @@ pub fn publish_checkpoint_mk(
             rule: "checkpoint-mk/parent-not-sk",
         });
     }
+    // (F-14) The construction-boundary guard: the caller-supplied
+    // SK epoch is provider-obtained at the production call sites —
+    // an epoch at u64::MAX has no representable successor, and the
+    // typed refusal precedes the constructor (the medium's
+    // append-side checked linkage is the second layer).
+    sk_epoch.checked_add(1).ok_or(MediumError::Chain {
+        rule: "epoch-regression",
+    })?;
     let record = RevisionRecord::regular(sk, sk_epoch, tick)
         .with_idempotency_key(checkpoint_mk_idempotency_key(&sk))
         .with_content_refs(vec![object.hash()]);
@@ -754,5 +762,74 @@ mod tests {
             checkpoint_mk_idempotency_key(&sk),
             checkpoint_mk_idempotency_key(&hash_object(b"other"))
         );
+    }
+
+    // (F-14) The construction-boundary regression at the MK
+    // publication: an UNTRUSTED caller-supplied SK epoch at
+    // u64::MAX (the production callers read the epoch from provider
+    // records) refuses the publication TYPED at the construction
+    // boundary — never the constructor's debug panic or the release
+    // wrap — with nothing published.
+    #[test]
+    fn the_mk_publication_refuses_an_untrusted_saturated_sk_epoch_typed() {
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::AuthorityMode;
+        let root = std::env::temp_dir().join(format!(
+            "s7-f14-mk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"f14-mk-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "f14-mk", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        // The SK stands as the current head (the adjacency gate's
+        // expectation); the caller-supplied epoch is the adversarial
+        // saturation.
+        let sk = medium.head().unwrap().unwrap();
+        let sk_parent = hash_object(b"f14-mk-sk-parent");
+        let (digest, seed) = compute_range_digest(&sk_parent, &[b"record-a", b"record-b"]);
+        let metadata = CheckpointMetadata::new(
+            sk,
+            sk_parent,
+            vec![SkipEntry::self_skip(sk_parent)],
+            vec![ReclaimedIndexEntry::new(
+                Some(b"f14-mk-key".to_vec()),
+                hash_object(b"f14-mk-reclaimed"),
+                3,
+            )],
+            digest,
+            seed,
+        );
+        let error = publish_checkpoint_mk(&mut medium, sk, u64::MAX, &metadata, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the saturated SK epoch refuses the MK publication typed: {error:?}"
+        );
+        assert_eq!(
+            medium.head().unwrap(),
+            Some(sk),
+            "the refusal published nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
