@@ -3702,4 +3702,37 @@ mod tests {
             KeyPhase::InConfirmedChain
         );
     }
+
+    // (F-14) The construction-boundary regression at the commit
+    // pipeline's canonical append: the non-enforcing provider model
+    // (a crafted well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) sets the pipeline's
+    // walk-derived verified epoch to the saturation, and the commit
+    // refuses TYPED at the construction boundary — never the
+    // constructor's debug panic or the release wrap — with nothing
+    // published to the real store beneath.
+    #[test]
+    fn the_commit_refuses_a_saturated_verified_epoch_typed() {
+        let dir = TestDir::new("f14-pipeline");
+        ensure_founded(&dir);
+        let medium = LocalFileMedium::open(dir.store()).unwrap();
+        let wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let journal = T1Journal::open(dir.path().join("journal-f14.t1")).unwrap();
+        let mut pipeline = CommitPipeline::open(wrapped, journal).unwrap();
+        capture_index_on(&mut pipeline, 1);
+        let error = pipeline.commit_canonical().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                PipelineError::Medium(MediumError::Chain {
+                    rule: "epoch-regression"
+                })
+            ),
+            "the saturated verified epoch refuses the commit typed: {error:?}"
+        );
+        // Nothing was published: the real store beneath the wrapper
+        // still holds only the founding.
+        let mut check = LocalFileMedium::open(dir.store()).unwrap();
+        assert_eq!(check.validate().unwrap().records, 1, "the founding only");
+    }
 }

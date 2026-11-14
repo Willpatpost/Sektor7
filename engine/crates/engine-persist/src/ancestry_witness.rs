@@ -3780,6 +3780,60 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
+
+    // (F-14) The construction-boundary regression at the witness
+    // object publication: the non-enforcing provider model (a
+    // crafted well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) refuses the publication
+    // TYPED at the construction boundary — never the constructor's
+    // debug panic or the release wrap — with nothing published.
+    #[test]
+    fn the_witness_object_publication_refuses_a_saturated_head_epoch_typed() {
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-f14-witness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"f14-witness-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "f14-witness", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let mut wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let error =
+            publish_witness_object(&mut wrapped, b"f14-witness-key", &plain, 9).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the saturated head refuses the witness object publication typed: {error:?}"
+        );
+        assert_eq!(
+            wrapped.true_head().unwrap(),
+            Some(founding.id()),
+            "the refusal published nothing"
+        );
+        drop(wrapped);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 // -------------------------------------------------------------
@@ -5916,6 +5970,129 @@ pub(crate) mod a12_tests {
         drop(wrapped);
         a12_sqlite_cleanup(&path);
         let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    // (F-14) The construction-boundary regression at the STANDALONE
+    // plan publication: the non-enforcing provider model (a crafted
+    // well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) refuses the publication
+    // TYPED at the construction boundary — past the full
+    // bound-journal authority, MK membership, metadata, and
+    // first-execution-evidence verification — with nothing
+    // published.
+    #[test]
+    fn the_plan_publication_refuses_a_saturated_head_epoch_typed() {
+        let (root, mut medium) = a12_local_store("f14-plan");
+        let journal_root = a12_journal_root("f14-plan");
+        let shared = plain_object(b"f14-plan-shared");
+        let founding = crate::record::RevisionRecord::founding(
+            crate::record::AuthorityMode::Standalone,
+            "f14-plan",
+            0,
+        )
+        .with_content_refs(vec![shared.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&shared), None)
+            .unwrap();
+        let founding_id = founding.id();
+        // The honest bound-journal bootstrap (the a12 campaign's own
+        // sequence — the binding publication itself passes the new
+        // construction guard at the founding's epoch 0, the
+        // valid-epoch pass-through).
+        let location = crate::reclaim::JournalRootBinding::normalize_location(&journal_root);
+        let root_id = crate::reclaim::journal_root_id(&founding_id, &location);
+        drop(
+            crate::reclaim::create_campaign_bound_journal(&mut medium, &journal_root, &founding_id)
+                .unwrap(),
+        );
+        let (_binding, binding_outcome) = crate::reclaim::publish_journal_root_binding(
+            &mut medium,
+            &founding_id,
+            &root_id,
+            &location,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            binding_outcome,
+            crate::reclaim::JournalRootBindingOutcome::Accepted { .. }
+        ));
+        // The accepted campaign shape below the wrap point: p1, one
+        // keyed retiring member, SK, and the MK over the true epochs
+        // (the a12 fixture's proven metadata shape).
+        let p1_id = a12_step(&mut medium, std::slice::from_ref(&shared), 2);
+        let member_object = plain_object(b"f14-plan-member-payload");
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let member = crate::record::RevisionRecord::regular(head, epoch, 3)
+            .with_idempotency_key(a12_member_key("f14-plan", 0, 48))
+            .with_content_refs(vec![member_object.hash()]);
+        medium
+            .append(&member, std::slice::from_ref(&member_object), Some(head))
+            .unwrap();
+        let member_id = member.id();
+        let sk_id = a12_step(&mut medium, std::slice::from_ref(&shared), 4);
+        let seed = crate::checkpoint::compute_digest_seed(&founding_id);
+        let member_record = medium.read_record(&member_id).unwrap();
+        let digest =
+            crate::checkpoint::chain_range_digest_step(&seed, &member_record.canonical_bytes());
+        let sk_record = medium.read_record(&sk_id).unwrap();
+        let index = vec![
+            crate::checkpoint::ReclaimedIndexEntry::new(
+                member_record.idempotency_key.clone(),
+                member_id,
+                member_record.epoch,
+            ),
+            crate::checkpoint::ReclaimedIndexEntry::new(
+                sk_record.idempotency_key.clone(),
+                sk_id,
+                sk_record.epoch,
+            ),
+        ];
+        let meta = crate::checkpoint::CheckpointMetadata::new(
+            sk_id,
+            member_id,
+            vec![crate::checkpoint::SkipEntry::new(Hash::ZERO, p1_id)],
+            index,
+            digest,
+            seed,
+        );
+        let meta_object = StoredObject::new(meta.canonical_bytes()).unwrap();
+        let head = medium.head().unwrap().unwrap();
+        let epoch = medium.read_record(&head).unwrap().epoch;
+        let mk = crate::record::RevisionRecord::regular(head, epoch, 5)
+            .with_content_refs(vec![meta_object.hash()]);
+        medium
+            .append(&mk, std::slice::from_ref(&meta_object), Some(head))
+            .unwrap();
+        let mk_id = mk.id();
+        let bound_head = medium.head().unwrap().unwrap();
+        let mut wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let error = crate::reclaim::publish_reclamation_plan(
+            &mut wrapped,
+            &mk_id,
+            10_000,
+            &journal_root,
+            6,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::medium::MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the saturated head refuses the plan publication typed: {error:?}"
+        );
+        assert_eq!(
+            wrapped.true_head().unwrap(),
+            Some(bound_head),
+            "the refusal published nothing"
+        );
+        drop(wrapped);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&journal_root);
     }
 }
 

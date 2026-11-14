@@ -7049,4 +7049,57 @@ mod tests {
         drop(medium);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // (F-14) The construction-boundary regression at the v1 ledger
+    // publication: the non-enforcing provider model (a crafted
+    // well-formed head record at epoch u64::MAX — see
+    // crate::medium::epoch_audit_media) refuses the publication
+    // TYPED at the construction boundary — never the constructor's
+    // debug panic or the release wrap — with nothing published.
+    #[test]
+    fn the_v1_ledger_publication_refuses_a_saturated_head_epoch_typed() {
+        use crate::local::LocalFileMedium;
+        use crate::medium::CanonicalMedium;
+        use crate::record::{AuthorityMode, RevisionRecord};
+        let root = std::env::temp_dir().join(format!(
+            "s7-f14-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut medium = LocalFileMedium::open(&root).unwrap();
+        let plain = StoredObject::new({
+            let mut enc = engine_core::Encoder::new();
+            enc.write_str("sektor7/save/1");
+            enc.write_bytes(b"f14-ledger-payload");
+            enc.into_bytes()
+        })
+        .unwrap();
+        let founding = RevisionRecord::founding(AuthorityMode::Standalone, "f14-ledger", 0)
+            .with_content_refs(vec![plain.hash()]);
+        medium
+            .append(&founding, std::slice::from_ref(&plain), None)
+            .unwrap();
+        let mut wrapped = crate::medium::epoch_audit_media::MaxEpochHeadMedium::over(medium);
+        let error = publish_reclamation_ledger(&mut wrapped, &sample_ledger(), 7).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MediumError::Chain {
+                    rule: "epoch-regression"
+                }
+            ),
+            "the saturated head refuses the v1 ledger publication typed: {error:?}"
+        );
+        assert_eq!(
+            wrapped.true_head().unwrap(),
+            Some(founding.id()),
+            "the refusal published nothing"
+        );
+        drop(wrapped);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -829,3 +829,148 @@ pub trait CanonicalMedium {
         limits: &crate::range_installation::RangeInstallationLimits,
     ) -> Result<crate::range_installation::CoordinatedObservation, MediumError>;
 }
+
+/// The F-14 epoch-audit test media (test-only): the non-enforcing
+/// provider model. A crafted, otherwise well-formed regular record
+/// at epoch `u64::MAX` is presented as the observed HEAD — exactly
+/// the state the honest providers' open-time checked-ladder
+/// validation makes unreachable through them (every parent/child
+/// linkage on the descent is checked, so a saturated head requires a
+/// physically unconstructible `u64::MAX`-deep hash-valid chain). The
+/// construction-boundary guards are proven against this
+/// provider-discipline-absent hypothesis: `head()` reports the
+/// crafted identity, `read_record` returns the crafted record for
+/// it, and every other operation delegates to the real
+/// [`LocalFileMedium`] beneath (whose chain the crafted record
+/// parents onto, so the keyed descents terminate normally).
+#[cfg(test)]
+pub(crate) mod epoch_audit_media {
+    use super::*;
+    use crate::local::LocalFileMedium;
+
+    pub(crate) struct MaxEpochHeadMedium {
+        inner: LocalFileMedium,
+        crafted_id: Hash,
+        crafted_record: RevisionRecord,
+    }
+
+    impl MaxEpochHeadMedium {
+        /// Wraps a FOUNDED real medium, crafting the saturated head
+        /// over its current head: a plain regular child of the real
+        /// head whose epoch is forced to `u64::MAX` — the saturation
+        /// is unconstructible through the honest builders (`regular`
+        /// overflows, `try_regular` refuses), the adversarial shape
+        /// itself.
+        pub(crate) fn over(mut inner: LocalFileMedium) -> Self {
+            let head = inner.head().unwrap().expect("a founded medium");
+            let parent_epoch = inner.read_record(&head).unwrap().epoch;
+            let mut crafted = RevisionRecord::regular(head, parent_epoch, 999);
+            crafted.epoch = u64::MAX;
+            let crafted_id = crafted.id();
+            Self {
+                inner,
+                crafted_id,
+                crafted_record: crafted,
+            }
+        }
+
+        /// The real medium's true head — the publication-refusal
+        /// assertions compare against it.
+        pub(crate) fn true_head(&mut self) -> Result<Option<Hash>, MediumError> {
+            self.inner.head()
+        }
+    }
+
+    impl CanonicalMedium for MaxEpochHeadMedium {
+        fn head(&mut self) -> Result<Option<Hash>, MediumError> {
+            Ok(Some(self.crafted_id))
+        }
+
+        fn append_admitted(
+            &mut self,
+            admitted: AdmittedAppend,
+            expected_parent: Option<Hash>,
+        ) -> Result<AppendOutcome, MediumError> {
+            self.inner.append_admitted(admitted, expected_parent)
+        }
+
+        fn read_record(&mut self, id: &Hash) -> Result<RevisionRecord, MediumError> {
+            if *id == self.crafted_id {
+                Ok(self.crafted_record.clone())
+            } else {
+                self.inner.read_record(id)
+            }
+        }
+
+        fn read_object(&mut self, hash: &Hash) -> Result<Vec<u8>, MediumError> {
+            self.inner.read_object(hash)
+        }
+
+        fn validate(&mut self) -> Result<ChainSummary, MediumError> {
+            self.inner.validate()
+        }
+
+        fn reconcile_unknown(&mut self, candidate: &Hash) -> Result<Reconciliation, MediumError> {
+            self.inner.reconcile_unknown(candidate)
+        }
+
+        fn durability_tier(&self) -> SyncTier {
+            self.inner.durability_tier()
+        }
+
+        fn reclaim(
+            &mut self,
+            directive: &crate::reclaim::ReclaimDirective,
+        ) -> Result<crate::reclaim::ReclaimOutcome, MediumError> {
+            self.inner.reclaim(directive)
+        }
+
+        fn reclaim_pending(
+            &mut self,
+            directive: &crate::reclaim::ReclaimDirective,
+        ) -> Result<bool, MediumError> {
+            self.inner.reclaim_pending(directive)
+        }
+
+        fn begin_reclamation(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.inner.begin_reclamation(audit, mk, tick)
+        }
+
+        fn verify_begin_authority(
+            &mut self,
+            audit: &Hash,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            self.inner.verify_begin_authority(audit, mk)
+        }
+
+        fn begin_reclamation_v2(
+            &mut self,
+            mk: &Hash,
+            tick: u64,
+        ) -> Result<crate::reclaim::BeginPublicationOutcome, MediumError> {
+            self.inner.begin_reclamation_v2(mk, tick)
+        }
+
+        fn verify_begin_authority_v2(
+            &mut self,
+            mk: &Hash,
+        ) -> Result<crate::reclaim::BeginAuthority, MediumError> {
+            self.inner.verify_begin_authority_v2(mk)
+        }
+
+        fn observe_range_terminal_under_coordination(
+            &mut self,
+            expected: &crate::range_completion::RangeCompletionContext,
+            limits: &crate::range_installation::RangeInstallationLimits,
+        ) -> Result<crate::range_installation::CoordinatedObservation, MediumError> {
+            self.inner
+                .observe_range_terminal_under_coordination(expected, limits)
+        }
+    }
+}
