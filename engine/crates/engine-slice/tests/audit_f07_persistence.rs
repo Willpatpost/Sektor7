@@ -53,9 +53,7 @@ use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, RevisionRecord, StoredObject, SyncTier,
 };
 use engine_slice::store::{MediumSource, StoreLocation};
-use engine_slice::worker::{
-    DEFAULT_QUEUE_CAPACITY, IoWorker, WorkerFault, WorkerFaultControl,
-};
+use engine_slice::worker::{DEFAULT_QUEUE_CAPACITY, IoWorker, WorkerFault, WorkerFaultControl};
 
 // ------------------------------------------------------------ the fixtures
 
@@ -584,8 +582,8 @@ fn f07_head_of_line_queue_ordering_is_deterministic() {
     // advances the epoch by one, so after the load of 8 the tail
     // carries epoch 8 — r1's own epoch is 9.
     worker.fault_control().set(WorkerFault::ParkNext);
-    let r1 = RevisionRecord::regular(parent, load as u64, 101)
-        .with_content_refs(vec![shared.hash()]);
+    let r1 =
+        RevisionRecord::regular(parent, load as u64, 101).with_content_refs(vec![shared.hash()]);
     let r1_id = r1.id();
     let probe_slow = worker
         .submit_probe(engine_slice::worker::MediumOp::Append {
@@ -604,8 +602,8 @@ fn f07_head_of_line_queue_ordering_is_deterministic() {
     // r2 whose expected parent IS r1 — the completion order is
     // detected through the authority state (r2 can only be
     // Accepted after r1's durable commit).
-    let r2 = RevisionRecord::regular(r1_id, load as u64 + 1, 102)
-        .with_content_refs(vec![shared.hash()]);
+    let r2 =
+        RevisionRecord::regular(r1_id, load as u64 + 1, 102).with_content_refs(vec![shared.hash()]);
     let r2_id = r2.id();
     let probe_behind = worker
         .submit_probe(engine_slice::worker::MediumOp::Append {
