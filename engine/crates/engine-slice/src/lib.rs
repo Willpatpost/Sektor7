@@ -24,6 +24,7 @@ pub mod sim_demo;
 pub mod soak_evidence;
 pub mod soak_scenario;
 pub mod store;
+pub mod sustained_load;
 pub mod window_demo;
 pub mod worker;
 pub mod world;

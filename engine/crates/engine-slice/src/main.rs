@@ -123,6 +123,24 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--benchmark-sustained-load") {
+        // [cycle1-P2] The F-08/F-12 sustained-load harness: the
+        // measured composition table first, then the run matrix over
+        // the six workload classes (pod reference evidence,
+        // observational; never CI thresholds; the deterministic CI
+        // regressions live in tests/sustained_load.rs).
+        engine_slice::sustained_load::run_sustained_load_benchmark();
+        return;
+    }
+
+    if std::env::args().any(|arg| arg == "--sustained-load-full-matrix") {
+        // [cycle1-P2] The full reference matrix (pod evidence,
+        // double-run per cell, mechanical N/A skip rules) plus the
+        // reduced-budget and compacted-representation variants.
+        engine_slice::sustained_load::run_reference_matrix();
+        return;
+    }
+
     if std::env::args().any(|arg| arg == "--benchmark-render") {
         // The 2026-11-12 quality audit's F-02/F-05 render-path CPU
         // benchmark — the per-frame derived-render costs in isolation
