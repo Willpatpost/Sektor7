@@ -123,6 +123,44 @@ impl Camera {
     }
 }
 
+/// The F-09 presentation-limitation classification for a run
+/// summary. `None` when the run made no uncapped/immediate
+/// measurement intent (a paced vsync run is the ordinary case and
+/// needs no ceiling caveat); otherwise the exact line for the
+/// RESOLVED present mode — an immediate resolution is
+/// refresh-unbounded (the honest non-caveat), while every
+/// vsync-class resolution (fifo, fifo-relaxed, mailbox) bounds
+/// presented throughput by the display refresh and is therefore
+/// NEVER the engine's unrestricted ceiling; an immediate REQUEST
+/// that fell back names the FIFO fallback explicitly.
+fn presentation_limitation_line(
+    uncapped_pacing: bool,
+    immediate_requested: bool,
+    resolved_present_mode: &str,
+) -> Option<String> {
+    if !uncapped_pacing && !immediate_requested {
+        return None;
+    }
+    Some(if resolved_present_mode == "immediate" {
+        "presentation: immediate resolved — presented throughput is \
+         not refresh-bounded (the reading is bounded by CPU/GPU work, \
+         not vsync)"
+            .to_string()
+    } else {
+        format!(
+            "presentation-limited: resolved present mode {resolved_present_mode} — \
+             a vsync-class mode, presented throughput is bounded by the display \
+             refresh; this run is NOT an unrestricted ceiling{}",
+            if immediate_requested {
+                "; immediate was requested but this surface does not \
+                 expose it (the FIFO fallback)"
+            } else {
+                ""
+            }
+        )
+    })
+}
+
 pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     let shell_config = ShellConfig {
         title: "Sektor7 original engine — Stage 2 render".to_string(),
@@ -468,6 +506,18 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         stats.validation_errors,
         stats.validation_warnings
     );
+    // F-09: verify the RESOLVED present mode against the measurement
+    // intent — the tested classification in
+    // `presentation_limitation_line` (a vsync-class resolution of an
+    // uncapped/immediate-intent run is presentation-limited, never
+    // the unrestricted ceiling; a FIFO fallback is named as such).
+    if let Some(line) = presentation_limitation_line(
+        options.fps == 0,
+        options.present == PresentModePreference::Immediate,
+        &stats.present_mode,
+    ) {
+        println!("{line}");
+    }
     println!("--- simulation summary ---");
     let spine = sim.spine();
     let sim_stats = spine.stats();
@@ -605,4 +655,56 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
          smoke only."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::presentation_limitation_line;
+
+    #[test]
+    fn paced_vsync_runs_print_no_caveat() {
+        // The ordinary case: a paced run on the default FIFO makes no
+        // uncapped-ceiling claim, so no line is warranted.
+        assert_eq!(presentation_limitation_line(false, false, "fifo"), None);
+        assert_eq!(presentation_limitation_line(false, false, "mailbox"), None);
+    }
+
+    #[test]
+    fn uncapped_immediate_resolved_is_refresh_unbounded() {
+        let line =
+            presentation_limitation_line(true, true, "immediate").expect("a line is warranted");
+        assert!(line.starts_with("presentation: immediate resolved"));
+        assert!(line.contains("not refresh-bounded"));
+        assert!(!line.contains("presentation-limited"));
+    }
+
+    #[test]
+    fn uncapped_vsync_resolved_is_presentation_limited() {
+        // The F-09 core case: uncapped pacing on a FIFO-only surface
+        // (lavapipe) must self-identify as NOT an unrestricted
+        // ceiling, without claiming an immediate request was made.
+        let line = presentation_limitation_line(true, false, "fifo").expect("a line is warranted");
+        assert!(line.starts_with("presentation-limited: resolved present mode fifo"));
+        assert!(line.contains("NOT an unrestricted ceiling"));
+        assert!(!line.contains("FIFO fallback"));
+    }
+
+    #[test]
+    fn immediate_request_falling_back_names_the_fifo_fallback() {
+        let line = presentation_limitation_line(false, true, "fifo").expect("a line is warranted");
+        assert!(line.starts_with("presentation-limited: resolved present mode fifo"));
+        assert!(line.contains("immediate was requested"));
+        assert!(line.contains("the FIFO fallback"));
+    }
+
+    #[test]
+    fn mailbox_resolutions_are_vsync_class_too() {
+        // MAILBOX is triple-buffered vsync: presented throughput is
+        // still refresh-bounded, so an uncapped run on it is
+        // presentation-limited just like FIFO.
+        let line =
+            presentation_limitation_line(true, true, "mailbox").expect("a line is warranted");
+        assert!(line.starts_with("presentation-limited: resolved present mode mailbox"));
+        assert!(line.contains("NOT an unrestricted ceiling"));
+    }
 }

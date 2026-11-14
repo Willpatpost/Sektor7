@@ -1897,6 +1897,16 @@ impl<S: MediumSource> SessionCrossing<S> {
         let mut medium = self.source.open_medium()?;
         let head = medium.head()?.ok_or(PipelineError::UnfoundedMedium)?;
         let parent_epoch = medium.read_record(&head)?.epoch;
+        // (F-14, A's routed residual — the construction-boundary
+        // guard): the parent epoch is provider-read — an epoch at
+        // u64::MAX has no representable successor, and the typed
+        // refusal precedes the constructor (the medium's append-side
+        // checked linkage is the second layer).
+        parent_epoch
+            .checked_add(1)
+            .ok_or(PipelineError::Medium(MediumError::Chain {
+                rule: "epoch-regression",
+            }))?;
         let record = RevisionRecord::regular(head, parent_epoch, spine.clock().as_u64())
             .with_idempotency_key(snapshot_hash.as_bytes().to_vec())
             .with_content_refs(vec![snapshot_hash]);
@@ -3516,6 +3526,16 @@ fn covering_append(
     clock: Tick,
 ) -> Result<CoveringAttempt, PipelineError> {
     let parent_epoch = medium.read_record(&parent)?.epoch;
+    // (F-14, A's routed residual — the construction-boundary guard):
+    // the parent epoch is provider-read — an epoch at u64::MAX has
+    // no representable successor, and the typed refusal precedes the
+    // constructor (the medium's append-side checked linkage is the
+    // second layer).
+    parent_epoch
+        .checked_add(1)
+        .ok_or(PipelineError::Medium(MediumError::Chain {
+            rule: "epoch-regression",
+        }))?;
     let record = RevisionRecord::regular(parent, parent_epoch, clock.as_u64())
         .with_idempotency_key(content_hash.as_bytes().to_vec())
         .with_content_refs(vec![content_hash]);

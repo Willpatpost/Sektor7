@@ -2041,6 +2041,17 @@ impl OrchestratedSession {
             .read_record(&head)
             .map_err(PipelineError::Medium)?
             .epoch;
+        // (F-14, A's routed residual — the construction-boundary
+        // guard at the observe_head source, covering both orchestration
+        // construction sites): the epoch is provider-read — an epoch
+        // at u64::MAX has no representable successor, and the typed
+        // refusal precedes every constructor this value reaches (the
+        // medium's append-side checked linkage is the second layer).
+        epoch
+            .checked_add(1)
+            .ok_or(PipelineError::Medium(MediumError::Chain {
+                rule: "epoch-regression",
+            }))?;
         Ok((head, epoch))
     }
 

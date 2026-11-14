@@ -165,8 +165,12 @@ jobs:
       # platform-uniform harness suites AND the F-02
       # geometry-equivalence test; see the heavy job's comment for
       # the measured provenance); the two shards sum to the
-      # audit-cycle battery (1410 / 1358; the F-14 counts
-      # re-MEASURED at the remediation worktree before the commit).
+      # remediation-integration battery (1422 / 1370 expected — main
+      # 955 / 904 = the audit-cycle 950 / 899 + the F-14 five
+      # engine-persist lib tests; heavy the composed 467 / 466 = the
+      # audit-cycle 455 / 454 + the F-11 one + the F-09 eleven; EVERY
+      # count re-MEASURED at this integrated tree before the commit —
+      # never the branch arithmetic).
       # MAINTENANCE OBLIGATION (the F2 exact-count gates): adding
       # legitimate tests to any package requires updating the pinned
       # counts in this step and the heavy job's step in the same
@@ -262,12 +266,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0
+          # F-09: every finite-frame smoke uses `--fps uncapped` — the
+          # numeric `--fps 0` these commands carried was silently clamped
+          # to 1 FPS (pacing each 20-frame smoke at ~20 s); numeric 0 is
+          # now refused by the binary, so the uncapped spelling is also
+          # the only valid no-pacing form.
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps uncapped
           # Corrective-pass verification: run with the Khronos validation
           # layer actually enabled and exercise the swapchain-recreation
           # path (--simulate-resize) — the demo exits nonzero when the
           # layer is active and reports errors.
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps 0 --validation on --simulate-resize
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --frames 20 --fps uncapped --validation on --simulate-resize
           # Stage 4: the regional render path (camera-as-presence, dynamic
           # region-scene buffers) under the ACTIVE validation layer, plus
           # the swapchain-recreation path with region geometry live — zero
@@ -275,13 +284,13 @@ jobs:
           # runners expose no Vulkan loader; that platform's validation
           # coverage stays in these Linux gates (reported honestly, not
           # silently skipped).
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps uncapped --validation on
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps uncapped --validation on --simulate-resize
           # Stage 4 final-review finding A: force pipeline replacement on
           # recreation with region buffers initialized — the
           # surface-format-change lifecycle (region-scene buffer
           # carry-over) that same-format resizing cannot reach.
-          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps 0 --validation on --simulate-resize --replace-pipelines
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --render --regions --frames 20 --fps uncapped --validation on --simulate-resize --replace-pipelines
       - name: Stage 6 integrated soak smoke (Linux only — lavapipe, correctness evidence, NOT performance evidence)
         if: runner.os == 'Linux'
         # The bounded S6-C3 smoke, never a 900-second CI job: the REAL
@@ -541,20 +550,32 @@ jobs:
       # one result line); 453 Windows = the prior 447 + the same six
       # platform-uniform tests (no cfg gates); the audit-C F-02
       # package adds one further cross-platform geometry-equivalence
-      # test (455 / 454 at the final consolidated tree). Together
-      # with the main shard's 950 / 899 (the cycle-3 947 / 896 plus
-      # the F-01 +3 engine-persist lib tests) these sum to the
-      # audit-cycle battery (1405 / 1353; the heavy count re-MEASURED
-      # at the consolidated tree before the commit). RECOMPUTED at
-      # the remediation-B F-11 branch (the audit-cycle main a4fe0ec
-      # + the F-11 §6a deterministic queue-ordering proof, ONE
+      # test (455 / 454 at the final consolidated tree). RECOMPUTED at
+      # the post-audit-remediation F-09 branch
+      # (s6-remediation-c-renderer-docs from main a4fe0ec: the --fps 0
+      # CLI refusal + the presentation-limitation classification):
+      # 466 Linux MEASURED with this shard's own command
+      # (466 passed / 0 failed / 3 ignored / 46 result lines, the
+      # workflow's own awk — the four parse_fps unit tests in the bin
+      # target's already-counted result line + the five
+      # presentation_limitation_line unit tests in the lib target's
+      # already-counted result line + the new two-test
+      # cli_fps_rejection integration binary, +1 result line); 465
+      # Windows = the prior 454 + the same eleven platform-uniform
+      # tests (no cfg gates). Together
+      # with the main shard's 955 / 904 (the F-14 five engine-persist
+      # lib tests on the audit-cycle 950 / 899) these sum to the
+      # remediation-integration battery (1422 / 1370 expected; every
+      # count re-MEASURED at this integrated tree before the commit).
+      # The branch provenance: the F-11 branch recomputed 456 / 455
+      # (the §6a deterministic queue-ordering proof, ONE
       # platform-uniform test added to the audit_f07_persistence
-      # binary, no cfg gates): 456 Linux MEASURED with this shard's
-      # own command (456 passed / 0 failed / 3 ignored / 45 result
-      # lines, the workflow's own awk, rc=0); 455 Windows = the prior
-      # 454 + the same one platform-uniform test. The main shard's
-      # pins are UNCHANGED (engine-slice is excluded there; the
-      # remediation's analysis documents add no tests). MAINTENANCE
+      # binary, no cfg gates — MEASURED with this shard's own command
+      # at that tree); the F-09 branch recomputed 466 / 465 with the
+      # 46-line gate (the eleven CLI/presentation tests + the new
+      # cli_fps_rejection integration binary); the INTEGRATED pins
+      # below carry the measurement at THIS tree (the composed
+      # expectation 467 / 466 with 46 result lines). MAINTENANCE
       # OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
@@ -564,15 +585,15 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=456
-          if [ "$(uname -s)" != "Linux" ]; then expected=455; fi
+          expected=467
+          if [ "$(uname -s)" != "Linux" ]; then expected=466; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 45)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 46)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 3 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 3"; exit 1; }
-          [ "$results" -eq 45 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 45"; exit 1; }
+          [ "$results" -eq 46 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 46"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
