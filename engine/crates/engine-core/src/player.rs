@@ -531,8 +531,8 @@ pub fn step_player(
 
     let (min, max) = player_box(state.position, config);
     if let Some(push) = world.depenetration(min, max) {
-        for axis in 0..3 {
-            state.position[axis] += push[axis];
+        for (position, component) in state.position.iter_mut().zip(push) {
+            *position += component;
         }
     }
 
@@ -1369,11 +1369,11 @@ mod tests {
             )
         };
         let pattern = |tick: u64| MoveIntent {
-            forward: if tick % 3 == 0 { 1 } else { 0 },
-            strafe: if tick % 5 == 0 { 1 } else { 0 },
+            forward: if tick.is_multiple_of(3) { 1 } else { 0 },
+            strafe: if tick.is_multiple_of(5) { 1 } else { 0 },
             jump_pressed: tick == 10 || tick == 100,
-            sprint: tick % 2 == 0,
-            look: if tick % 7 == 0 {
+            sprint: tick.is_multiple_of(2),
+            look: if tick.is_multiple_of(7) {
                 (0.01, -0.003)
             } else {
                 (0.0, 0.0)

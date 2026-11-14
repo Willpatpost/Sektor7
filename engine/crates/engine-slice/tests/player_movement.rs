@@ -16,34 +16,35 @@ use engine_slice::player_demo::{
 /// (spacing 3.0, footprint 0.9, heights 0.6 + |gx + gz|·0.45) plus
 /// its three depth demonstrators, in the demo world's construction
 /// order. The heights are FROZEN at the scene's computed f32 values
-/// (measured, like every pin — a decimal-shortest literal such as
+/// in their shortest round-trip spellings (measured, like every pin:
 /// `1.95` parses to a different f32 than the rendered geometry's
-/// `0.6 + 3·0.45` rounding chain, one ulp away).
+/// `0.6 + 3·0.45` rounding chain, one ulp away, while `1.05` happens
+/// to be the exact shortest form of the n=1 chain).
 const DEMO_BOXES: [([f32; 3], f32, f32); 28] = [
     ([-6.0, 0.0, -6.0], 0.9, 2.4),
-    ([-6.0, 0.0, -3.0], 0.9, 1.9499999284744263),
+    ([-6.0, 0.0, -3.0], 0.9, 1.9499999),
     ([-6.0, 0.0, 0.0], 0.9, 1.5),
-    ([-6.0, 0.0, 3.0], 0.9, 1.0499999523162842),
+    ([-6.0, 0.0, 3.0], 0.9, 1.05),
     ([-6.0, 0.0, 6.0], 0.9, 0.6),
-    ([-3.0, 0.0, -6.0], 0.9, 1.9499999284744263),
+    ([-3.0, 0.0, -6.0], 0.9, 1.9499999),
     ([-3.0, 0.0, -3.0], 0.9, 1.5),
-    ([-3.0, 0.0, 0.0], 0.9, 1.0499999523162842),
+    ([-3.0, 0.0, 0.0], 0.9, 1.05),
     ([-3.0, 0.0, 3.0], 0.9, 0.6),
-    ([-3.0, 0.0, 6.0], 0.9, 1.0499999523162842),
+    ([-3.0, 0.0, 6.0], 0.9, 1.05),
     ([0.0, 0.0, -6.0], 0.9, 1.5),
-    ([0.0, 0.0, -3.0], 0.9, 1.0499999523162842),
+    ([0.0, 0.0, -3.0], 0.9, 1.05),
     ([0.0, 0.0, 0.0], 0.9, 0.6),
-    ([0.0, 0.0, 3.0], 0.9, 1.0499999523162842),
+    ([0.0, 0.0, 3.0], 0.9, 1.05),
     ([0.0, 0.0, 6.0], 0.9, 1.5),
-    ([3.0, 0.0, -6.0], 0.9, 1.0499999523162842),
+    ([3.0, 0.0, -6.0], 0.9, 1.05),
     ([3.0, 0.0, -3.0], 0.9, 0.6),
-    ([3.0, 0.0, 0.0], 0.9, 1.0499999523162842),
+    ([3.0, 0.0, 0.0], 0.9, 1.05),
     ([3.0, 0.0, 3.0], 0.9, 1.5),
-    ([3.0, 0.0, 6.0], 0.9, 1.9499999284744263),
+    ([3.0, 0.0, 6.0], 0.9, 1.9499999),
     ([6.0, 0.0, -6.0], 0.9, 0.6),
-    ([6.0, 0.0, -3.0], 0.9, 1.0499999523162842),
+    ([6.0, 0.0, -3.0], 0.9, 1.05),
     ([6.0, 0.0, 0.0], 0.9, 1.5),
-    ([6.0, 0.0, 3.0], 0.9, 1.9499999284744263),
+    ([6.0, 0.0, 3.0], 0.9, 1.9499999),
     ([6.0, 0.0, 6.0], 0.9, 2.4),
     ([0.0, 0.0, -2.0], 1.4, 1.4),
     ([0.6, 0.3, 0.8], 1.4, 1.4),
@@ -137,10 +138,12 @@ fn headless_runner_double_run_identical() {
 fn snapshot_to_intent_mapping() {
     // Axes pass through (the shell cancels opposite keys; the mapping
     // trusts the snapshot).
-    let mut snapshot = InputSnapshot::default();
-    snapshot.move_forward = 1;
-    snapshot.move_strafe = -1;
-    snapshot.look_delta = (100.0, -50.0);
+    let snapshot = InputSnapshot {
+        move_forward: 1,
+        move_strafe: -1,
+        look_delta: (100.0, -50.0),
+        ..InputSnapshot::default()
+    };
     let mapped = map_intent(&snapshot, false);
     assert_eq!(mapped.intent.forward, 1);
     assert_eq!(mapped.intent.strafe, -1);
@@ -151,8 +154,10 @@ fn snapshot_to_intent_mapping() {
     assert!(!mapped.toggle_camera);
 
     // Jump is a key edge; the toggle is a different key's edge.
-    let mut snapshot = InputSnapshot::default();
-    snapshot.keys_pressed = vec![Keycode::Space];
+    let snapshot = InputSnapshot {
+        keys_pressed: vec![Keycode::Space],
+        ..InputSnapshot::default()
+    };
     let mapped = map_intent(&snapshot, true);
     assert!(mapped.intent.jump_pressed);
     assert!(!mapped.toggle_camera);
@@ -161,8 +166,10 @@ fn snapshot_to_intent_mapping() {
         "sprint is the caller's held-key query"
     );
 
-    let mut snapshot = InputSnapshot::default();
-    snapshot.keys_pressed = vec![Keycode::C];
+    let snapshot = InputSnapshot {
+        keys_pressed: vec![Keycode::C],
+        ..InputSnapshot::default()
+    };
     let mapped = map_intent(&snapshot, false);
     assert!(mapped.toggle_camera);
     assert!(!mapped.intent.jump_pressed);
@@ -170,19 +177,23 @@ fn snapshot_to_intent_mapping() {
     // Focus loss and minimization map to the neutral intent — no
     // stuck movement across focus changes (the shell's anti-stuck
     // discipline, mirrored at the mapping boundary).
-    let mut snapshot = InputSnapshot::default();
-    snapshot.move_forward = 1;
-    snapshot.move_strafe = 1;
-    snapshot.look_delta = (10.0, 10.0);
-    snapshot.keys_pressed = vec![Keycode::C];
-    snapshot.focus_lost = true;
+    let snapshot = InputSnapshot {
+        move_forward: 1,
+        move_strafe: 1,
+        look_delta: (10.0, 10.0),
+        keys_pressed: vec![Keycode::C],
+        focus_lost: true,
+        ..InputSnapshot::default()
+    };
     let mapped = map_intent(&snapshot, true);
     assert_eq!(mapped.intent, engine_core::MoveIntent::default());
     assert!(!mapped.toggle_camera);
 
-    let mut snapshot = InputSnapshot::default();
-    snapshot.move_forward = 1;
-    snapshot.minimized = true;
+    let snapshot = InputSnapshot {
+        move_forward: 1,
+        minimized: true,
+        ..InputSnapshot::default()
+    };
     let mapped = map_intent(&snapshot, false);
     assert_eq!(mapped.intent, engine_core::MoveIntent::default());
 }
