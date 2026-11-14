@@ -32,15 +32,30 @@
 //! audit_f07_persistence -- --nocapture`) — the 1x/10x/100x load
 //! characterization in the delivery report comes from those
 //! release-mode runs, never from the CI's debug build.
+//!
+//! **The F-11 remediation (§6, the post-audit directive's
+//! CI-reliability finding).** The head-of-line material is SPLIT
+//! by question: §6a proves the queue-ordering CORRECTNESS
+//! deterministically (the worker's own `ParkNext`/`park_entered`
+//! synchronization barrier + the append-parent dependency as the
+//! order detector — FIFO established through causal observations
+//! and the authority state, never a wall-clock magnitude), while
+//! §6b retains the head-of-line LATENCY as observational
+//! distributions (printed, never asserted — no absolute or
+//! relative timing thresholds, so no scheduling noise, filesystem
+//! variance, or unusually slow sample can fail the CI).
 
 use std::path::PathBuf;
+use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
 use engine_persist::{
     AppendOutcome, CanonicalMedium, Hash, RevisionRecord, StoredObject, SyncTier,
 };
 use engine_slice::store::{MediumSource, StoreLocation};
-use engine_slice::worker::IoWorker;
+use engine_slice::worker::{
+    DEFAULT_QUEUE_CAPACITY, IoWorker, WorkerFault, WorkerFaultControl,
+};
 
 // ------------------------------------------------------------ the fixtures
 
@@ -507,16 +522,153 @@ fn f07_cold_reopen_recovery_latency() {
     let _ = std::fs::remove_file(db.with_extension("db-shm"));
 }
 
-/// (F-07 §6) The head-of-line demonstration: a slow operation
-/// (the full-chain validation) submitted without waiting (the
-/// worker's test-only probe), then one append timed behind it —
-/// the append's latency includes the in-flight validation's
-/// remaining execution, exactly the single-worker head-of-line
-/// effect the audit named as the risk to measure.
+/// (F-07 §6a, the F-11 remediation) The head-of-line queue-ordering
+/// CORRECTNESS proof — deterministic, never a wall-clock magnitude.
+/// The single-worker FIFO discipline is established through the
+/// worker's own test-only synchronization seams (the `ParkNext`
+/// barrier with `park_entered`/`release_park` — the established
+/// deterministic replacements for timing-based "the worker holds
+/// the job" assumptions) plus the append-parent dependency as the
+/// order detector:
+///
+/// 1. A controlled slow operation is admitted FIRST: the append of
+///    `r1`, armed with `ParkNext` — the worker dequeues the job and
+///    parks BEFORE its execution (the `park_entered` barrier is the
+///    real event, waited on directly, never a guessed duration).
+/// 2. The second operation is admitted BEHIND it: the append of
+///    `r2` (submitted while the worker is provably parked inside
+///    `r1`'s job slot) whose EXPECTED PARENT is `r1`'s identity —
+///    the authority state itself detects the completion order.
+/// 3. The second cannot complete before the first's required
+///    completion boundary: at the frozen point BOTH reply slots
+///    are empty (`try_recv` → `Empty`, causally guaranteed — the
+///    one worker thread is parked before `r1`'s execution, and a
+///    reply slot can only be filled by that same thread), and
+///    after the release `r2`'s `Accepted` outcome requires `r1`'s
+///    durable commit (the CAS parent discipline refuses any
+///    earlier execution).
+/// 4. Both operations produce valid outcomes: both `Accepted`,
+///    both records read back with the exact parent/epoch linkage.
+/// 5. The authoritative revision state remains correct: the head
+///    is `r2`, the height accounts for the founding load plus both
+///    appends, and the full-chain validation passes.
+#[test]
+fn f07_head_of_line_queue_ordering_is_deterministic() {
+    let db = temp_db("hol-order");
+    // A small FIXED load: this is an ordering proof, not a scale
+    // measurement (the F07_OPS deep runs exercise §1–§5 and §6b).
+    let load = 8usize;
+    let worker = IoWorker::spawn_with_faults(
+        &StoreLocation::Database(db.to_path_buf()),
+        DEFAULT_QUEUE_CAPACITY,
+        WorkerFaultControl::new(),
+    )
+    .unwrap();
+    let mut medium = worker.source().unwrap().open_medium().unwrap();
+    let shared = payload_object(b"f07-hol-order-payload");
+    let founding = RevisionRecord::founding(
+        engine_persist::record::AuthorityMode::Standalone,
+        "f07-hol-o",
+        0,
+    )
+    .with_content_refs(vec![shared.hash()]);
+    medium
+        .append(&founding, std::slice::from_ref(&shared), None)
+        .unwrap();
+    let mut parent = founding.id();
+    for tick in 0..load as u64 {
+        parent = append_one(&mut medium, &shared, Some(parent), tick);
+    }
+    // (1) The controlled slow operation, admitted FIRST: the append
+    // of r1. The founding is epoch 0 and each regular append
+    // advances the epoch by one, so after the load of 8 the tail
+    // carries epoch 8 — r1's own epoch is 9.
+    worker.fault_control().set(WorkerFault::ParkNext);
+    let r1 = RevisionRecord::regular(parent, load as u64, 101)
+        .with_content_refs(vec![shared.hash()]);
+    let r1_id = r1.id();
+    let probe_slow = worker
+        .submit_probe(engine_slice::worker::MediumOp::Append {
+            record: r1,
+            objects: vec![shared.clone()],
+            expected_parent: Some(parent),
+        })
+        .unwrap();
+    // The park-entry barrier: the worker HOLDS the slow job
+    // (dequeued, pre-execution) — the deterministic event, never a
+    // stall duration.
+    while !worker.fault_control().park_entered() {
+        std::hint::spin_loop();
+    }
+    // (2) The second operation, admitted BEHIND it: the append of
+    // r2 whose expected parent IS r1 — the completion order is
+    // detected through the authority state (r2 can only be
+    // Accepted after r1's durable commit).
+    let r2 = RevisionRecord::regular(r1_id, load as u64 + 1, 102)
+        .with_content_refs(vec![shared.hash()]);
+    let r2_id = r2.id();
+    let probe_behind = worker
+        .submit_probe(engine_slice::worker::MediumOp::Append {
+            record: r2,
+            objects: vec![shared.clone()],
+            expected_parent: Some(r1_id),
+        })
+        .unwrap();
+    // (3) The frozen point: NEITHER reply exists — a causal
+    // impossibility turned into a direct observation (the one
+    // worker thread is parked inside r1's job slot, before r1's
+    // execution; r2's reply slot can only be filled by that same
+    // thread, so `Empty` here is deterministic, not a timing race).
+    assert!(matches!(probe_slow.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(probe_behind.try_recv(), Err(TryRecvError::Empty)));
+    // (4) The release: the controlled slow op proceeds to its
+    // required completion boundary (the durable commit, then the
+    // reply deposit), and only then does r2 execute behind it.
+    worker.fault_control().release_park();
+    worker.fault_control().clear();
+    match probe_slow.recv().unwrap() {
+        Ok(engine_slice::worker::WorkerReply::Append(AppendOutcome::Accepted { id, .. })) => {
+            assert_eq!(id, r1_id);
+        }
+        other => panic!("the slow-op append must be Accepted: {other:?}"),
+    }
+    match probe_behind.recv().unwrap() {
+        Ok(engine_slice::worker::WorkerReply::Append(AppendOutcome::Accepted { id, .. })) => {
+            assert_eq!(id, r2_id);
+        }
+        other => panic!("the behind append must be Accepted: {other:?}"),
+    }
+    // (5) The authoritative revision state: the head is r2, the
+    // height accounts for the founding load plus both appends, and
+    // the record reads back with the exact parent/epoch linkage.
+    assert_eq!(medium.head().unwrap(), Some(r2_id));
+    let readback = medium.read_record(&r2_id).unwrap();
+    assert_eq!(readback.parent, Some(r1_id));
+    assert_eq!(readback.epoch, load as u64 + 2);
+    let summary = medium.validate().unwrap();
+    assert_eq!(summary.height, load as u64 + 2);
+    drop(medium);
+    worker.join().unwrap();
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
+
+/// (F-07 §6b, the F-11 remediation) The head-of-line LATENCY —
+/// observational distributions only. The slow in-flight operation
+/// (the full-chain validation, submitted fire-and-forget through the
+/// worker's test-only probe) and one append timed behind it, over a
+/// small fixed pair count: each pair prints its baseline, its
+/// behind-the-slow-op latency, and the amplification factor; the
+/// distributions are reported, never asserted (no absolute or
+/// relative timing thresholds — the queue-ordering CORRECTNESS is
+/// §6a's deterministic proof, so a scheduling-noise reversal here is
+/// an honest measurement, never a CI failure).
 #[test]
 fn f07_head_of_line_block_behind_a_slow_operation() {
     let db = temp_db("hol");
     let ops = f07_ops(200);
+    let pairs = 5usize;
     let worker = spawn_worker(&db);
     let mut medium = worker.source().unwrap().open_medium().unwrap();
     let shared = payload_object(b"f07-hol-payload");
@@ -533,34 +685,75 @@ fn f07_head_of_line_block_behind_a_slow_operation() {
     for tick in 0..ops as u64 {
         parent = Some(append_one(&mut medium, &shared, parent, tick));
     }
-    // The baseline: one more append's latency unencumbered.
-    let baseline_start = Instant::now();
-    parent = Some(append_one(&mut medium, &shared, parent, ops as u64));
-    let baseline_micros = baseline_start.elapsed().as_micros();
-    // The slow in-flight operation: the full-chain validation,
-    // submitted through the worker's probe (fire-and-forget).
-    let probe = worker
-        .submit_probe(engine_slice::worker::MediumOp::Validate)
-        .unwrap();
-    let behind_start = Instant::now();
-    append_one(&mut medium, &shared, parent, ops as u64 + 1);
-    let behind_micros = behind_start.elapsed().as_micros();
-    let validation = match probe.recv().unwrap() {
-        Ok(engine_slice::worker::WorkerReply::Validate(summary)) => summary.height,
-        Ok(other) => panic!("the probe returned {other:?}"),
-        Err(error) => panic!("the probe validation failed: {error:?}"),
+    let mut epoch = ops as u64;
+    let mut baselines = Samples {
+        micros: Vec::with_capacity(pairs),
     };
+    let mut behinds = Samples {
+        micros: Vec::with_capacity(pairs),
+    };
+    for pair in 0..pairs {
+        // The baseline: one more append's latency unencumbered.
+        let baseline_start = Instant::now();
+        parent = Some(append_one(&mut medium, &shared, parent, epoch));
+        baselines.record(baseline_start);
+        epoch += 1;
+        // The slow in-flight operation: the full-chain validation,
+        // submitted through the worker's probe (fire-and-forget).
+        let probe = worker
+            .submit_probe(engine_slice::worker::MediumOp::Validate)
+            .unwrap();
+        // The append timed behind it: submitted after the
+        // validation is admitted, so its latency includes whatever
+        // remains of the in-flight validation's execution — the
+        // single-worker head-of-line effect the audit named.
+        let behind_start = Instant::now();
+        parent = Some(append_one(&mut medium, &shared, parent, epoch));
+        behinds.record(behind_start);
+        epoch += 1;
+        // The probe's reply is the correctness fact (the validation
+        // observed the definite chain state behind the pair's
+        // baseline append); its latency contribution is already
+        // inside the behind sample.
+        match probe.recv().unwrap() {
+            Ok(engine_slice::worker::WorkerReply::Validate(summary)) => {
+                assert_eq!(summary.height, epoch - 1);
+            }
+            Ok(other) => panic!("the probe returned {other:?}"),
+            Err(error) => panic!("the probe validation failed: {error:?}"),
+        }
+        println!(
+            "[F07] head-of-line pair {pair}: baseline={}us behind={}us",
+            baselines.micros[baselines.count() - 1],
+            behinds.micros[behinds.count() - 1],
+        );
+    }
+    // The pair distributions, reported observationally (no
+    // throughput figure — the pair loop is a latency measurement,
+    // not a rate one).
     println!(
-        "[F07] head-of-line: baseline_append={}us append_behind_validate={}us (ops={}, epoch={})",
-        baseline_micros, behind_micros, ops, validation
+        "[F07] head-of-line pairs: baseline mean={}us p50={}us p95={}us max={}us | behind mean={}us p50={}us p95={}us max={}us (ops={}, pairs={})",
+        baselines.mean(),
+        baselines.p50(),
+        baselines.p95(),
+        baselines.max(),
+        behinds.mean(),
+        behinds.p50(),
+        behinds.p95(),
+        behinds.max(),
+        ops,
+        pairs
     );
-    // The append behind the in-flight validation is slower — the
-    // magnitude is the measurement (asserted only as ordering,
-    // never a fixed threshold).
-    assert!(
-        behind_micros > baseline_micros,
-        "the queued append waits for the in-flight validation: {behind_micros}us vs {baseline_micros}us"
-    );
+    // Correctness-only (never a performance gate): the samples are
+    // populated and internally ordered; the final chain accounts
+    // for the load plus every pair's two appends.
+    baselines.assert_consistent();
+    behinds.assert_consistent();
+    assert_eq!(baselines.count(), pairs);
+    assert_eq!(behinds.count(), pairs);
+    assert_eq!(medium.head().unwrap(), parent);
+    let summary = medium.validate().unwrap();
+    assert_eq!(summary.height, epoch);
     drop(medium);
     worker.join().unwrap();
     let _ = std::fs::remove_file(&db);
