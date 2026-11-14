@@ -126,6 +126,47 @@ pub(crate) fn present_mode_str(mode: vk::PresentModeKHR) -> &'static str {
     }
 }
 
+/// The single capacity decision for one dynamic-geometry upload+draw
+/// pair (F-03 Step 1, fail-visible over fail-silent): what the frame
+/// supplied, the frame slot's vertex capacity, the vertex count
+/// actually copied and drawn, and the count omitted.
+///
+/// Computed ONCE per frame per buffer at the record step — both the
+/// upload byte bound (`drawn` × vertex size) and the draw count consume
+/// `drawn`, so one physical truncation is counted exactly once (never
+/// once per historical clamp site) and the copy can never disagree
+/// with the draw: no out-of-bounds copy, no inflated draw count. The
+/// omitted count is reported upstream, never fatal — the
+/// capacity/refusal policy is Step 2, separately authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DynamicClamp {
+    /// Vertices the caller supplied this frame.
+    pub supplied: u32,
+    /// The frame slot's vertex capacity.
+    pub capacity: u32,
+    /// Vertices actually copied and drawn (`<= capacity` and
+    /// `<= supplied`).
+    pub drawn: u32,
+    /// Vertices omitted (`supplied − drawn`; 0 in capacity). Raw
+    /// vertex counts — an overflow can cut a 36-vertex proxy box
+    /// mid-primitive, and the count says so.
+    pub truncated: u32,
+}
+
+/// The decision is pure and central: `supplied` arrives as the
+/// caller's slice length and converts saturating, so a supply beyond
+/// `u32::MAX` (unreachable at 24 B/vertex) degrades instead of
+/// wrapping — the bound is structural rather than memory luck.
+pub(crate) fn dynamic_geometry_clamp(supplied: usize, capacity: u32) -> DynamicClamp {
+    let supplied = supplied.min(u32::MAX as usize) as u32;
+    DynamicClamp {
+        supplied,
+        capacity,
+        drawn: supplied.min(capacity),
+        truncated: supplied.saturating_sub(capacity),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +239,108 @@ mod tests {
             ValidationPreference::parse("off"),
             Some(ValidationPreference::Off)
         );
+    }
+
+    #[test]
+    fn clamp_decision_in_capacity_supplies_every_vertex() {
+        // In-capacity geometry is copied and drawn whole — the decision
+        // reproduces today's min() values exactly.
+        for (supplied, capacity) in [
+            (0_usize, 36_800_u32),
+            (1, 36_800),
+            (36_288, 36_800),
+            (299_999, 300_000),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert_eq!(clamp.drawn, supplied as u32, "everything fits");
+            assert_eq!(clamp.truncated, 0, "nothing omitted");
+            assert_eq!(clamp.capacity, capacity);
+        }
+    }
+
+    #[test]
+    fn clamp_decision_at_capacity_boundary_omits_nothing() {
+        let clamp = dynamic_geometry_clamp(36_800, 36_800);
+        assert_eq!(clamp.drawn, 36_800);
+        assert_eq!(clamp.truncated, 0);
+    }
+
+    #[test]
+    fn clamp_decision_oversize_omits_exact_delta() {
+        // The capacity-decision logic with oversized synthetic input —
+        // exact deltas, including the smoke's mod-36 derivation
+        // (push_box emits 36 verts/call; the region capacity 36,800 is
+        // ≡ 8 mod 36, so a 1,050-box supply of 37,800 omits exactly
+        // 1,000) and the overlay case (2,000 'A' glyphs × 168 verts =
+        // 336,000 vs 300,000 → 36,000).
+        for (supplied, capacity, omitted) in [
+            (36_801_usize, 36_800_u32, 1_u32),
+            (36_836, 36_800, 36),
+            (37_800, 36_800, 1_000),
+            (336_000, 300_000, 36_000),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert_eq!(clamp.drawn, capacity, "the draw never exceeds capacity");
+            assert_eq!(clamp.truncated, omitted, "the exact omitted delta");
+            assert_eq!(
+                clamp.supplied,
+                clamp
+                    .drawn
+                    .checked_add(clamp.truncated)
+                    .expect("drawn + omitted == supplied by construction"),
+                "supplied is exactly drawn + omitted"
+            );
+        }
+        // A supply beyond u32::MAX (unreachable at 24 B/vertex)
+        // saturates instead of wrapping.
+        let huge = dynamic_geometry_clamp(usize::MAX, 36_800);
+        assert_eq!(huge.supplied, u32::MAX);
+        assert_eq!(huge.drawn, 36_800);
+    }
+
+    #[test]
+    fn clamp_decision_byte_bound_matches_vertex_clamp() {
+        // The upload/draw agreement — no out-of-bounds copy, no
+        // inflated draw — asserted per bound for BOTH dynamic vertex
+        // types: the copy length is drawn × vertex size, which never
+        // exceeds the slot's byte capacity nor the supplied bytes.
+        use crate::overlay::OverlayVertex;
+        use crate::scene::SceneVertex;
+
+        assert_eq!(std::mem::size_of::<SceneVertex>(), 24);
+        assert_eq!(std::mem::size_of::<OverlayVertex>(), 24);
+        for (supplied, capacity) in [
+            (36_288_usize, 36_800_u32),
+            (37_800, 36_800),
+            (336_000, 300_000),
+            (700_000, 300_000),
+        ] {
+            let clamp = dynamic_geometry_clamp(supplied, capacity);
+            assert!(
+                clamp.drawn <= clamp.capacity,
+                "draw never exceeds the per-slot capacity"
+            );
+            let slot_bytes = capacity as usize * 24;
+            assert!(
+                clamp.drawn as usize * 24 <= slot_bytes,
+                "copy bytes fit the slot"
+            );
+            assert!(
+                clamp.drawn as usize * 24 <= supplied * 24,
+                "copy bytes never exceed the supplied bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_decision_degenerate_capacities_refuse_whole() {
+        // Zero supply draws nothing; a zero capacity (an unallocated
+        // buffer) would omit everything — defensive only: the record
+        // path never reaches a non-empty supply with capacity 0 (the
+        // lazy region buffer allocates first).
+        let empty = dynamic_geometry_clamp(0, 36_800);
+        assert_eq!((empty.drawn, empty.truncated), (0, 0));
+        let unallocated = dynamic_geometry_clamp(1_000, 0);
+        assert_eq!((unallocated.drawn, unallocated.truncated), (0, 1_000));
     }
 }

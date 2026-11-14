@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    PresentModePreference, RenderConfig, RenderStats, Renderer, ValidationPreference,
+};
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
 use crate::frame_timing::FrameTiming;
@@ -159,6 +161,70 @@ fn presentation_limitation_line(
             }
         )
     })
+}
+
+/// The run-summary view of the F-03 Step 1 truncation counters — a
+/// plain public struct so the reporting is unit-testable without a
+/// renderer (`RenderStats` carries private percentile history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TruncationReport {
+    /// Cumulative region-scene vertices omitted (slot-capacity clamp).
+    pub region_truncated: u64,
+    /// Peak region vertices supplied in one frame.
+    pub region_supplied_peak: u32,
+    /// The region frame slot's vertex capacity (0 = the lazy buffer
+    /// never allocated — no region frames).
+    pub region_capacity: u32,
+    pub overlay_truncated: u64,
+    pub overlay_supplied_peak: u32,
+    pub overlay_capacity: u32,
+}
+
+impl TruncationReport {
+    pub fn from_stats(stats: &RenderStats) -> Self {
+        TruncationReport {
+            region_truncated: stats.region_truncated_vertices,
+            region_supplied_peak: stats.region_supplied_peak_vertices,
+            region_capacity: stats.region_capacity_vertices,
+            overlay_truncated: stats.overlay_truncated_vertices,
+            overlay_supplied_peak: stats.overlay_supplied_peak_vertices,
+            overlay_capacity: stats.overlay_capacity_vertices,
+        }
+    }
+}
+
+/// The F-03 Step 1 run-summary lines: region/overlay truncation with
+/// the supplied/capacity context. Zero-omitted lines are the
+/// ordinary-run proof (H3); a nonzero line carries the uppercase
+/// TRUNCATION marker with the exact counts — reported, never fatal
+/// (the capacity/refusal policy is Step 2, separately authorized).
+pub fn truncation_report_lines(report: &TruncationReport) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2);
+    if report.region_capacity == 0 {
+        lines.push("region buffer: not allocated (no region frames)".to_string());
+    } else if report.region_truncated == 0 {
+        lines.push(format!(
+            "region geometry: 0 vertices omitted (peak {} / capacity {})",
+            report.region_supplied_peak, report.region_capacity
+        ));
+    } else {
+        lines.push(format!(
+            "REGION TRUNCATION: {} vertices omitted (peak {} / capacity {})",
+            report.region_truncated, report.region_supplied_peak, report.region_capacity
+        ));
+    }
+    if report.overlay_truncated == 0 {
+        lines.push(format!(
+            "overlay geometry: 0 vertices omitted (peak {} / capacity {})",
+            report.overlay_supplied_peak, report.overlay_capacity
+        ));
+    } else {
+        lines.push(format!(
+            "OVERLAY TRUNCATION: {} vertices omitted (peak {} / capacity {})",
+            report.overlay_truncated, report.overlay_supplied_peak, report.overlay_capacity
+        ));
+    }
+    lines
 }
 
 pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
@@ -506,6 +572,12 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
         stats.validation_errors,
         stats.validation_warnings
     );
+    // F-03 Step 1: dynamic-geometry truncation belongs in the run
+    // summary — zero on every ordinary run (the H3 proof); nonzero is
+    // reported with the supplied/capacity context, never fatal.
+    for line in truncation_report_lines(&TruncationReport::from_stats(stats)) {
+        println!("{line}");
+    }
     // F-09: verify the RESOLVED present mode against the measurement
     // intent — the tested classification in
     // `presentation_limitation_line` (a vsync-class resolution of an
@@ -659,7 +731,7 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::presentation_limitation_line;
+    use super::{TruncationReport, presentation_limitation_line, truncation_report_lines};
 
     #[test]
     fn paced_vsync_runs_print_no_caveat() {
@@ -706,5 +778,61 @@ mod tests {
             presentation_limitation_line(true, true, "mailbox").expect("a line is warranted");
         assert!(line.starts_with("presentation-limited: resolved present mode mailbox"));
         assert!(line.contains("NOT an unrestricted ceiling"));
+    }
+
+    #[test]
+    fn truncation_lines_report_zero_with_capacity_context() {
+        // The ordinary-run proof lines (H3): zero omitted, with the
+        // peak-supplied/capacity context — and the unallocated region
+        // buffer on the plain --render path says so instead of
+        // pretending a capacity exists.
+        let plain = TruncationReport::default();
+        let lines = truncation_report_lines(&plain);
+        assert_eq!(lines[0], "region buffer: not allocated (no region frames)");
+        assert_eq!(
+            lines[1],
+            "overlay geometry: 0 vertices omitted (peak 0 / capacity 0)"
+        );
+        let regions = TruncationReport {
+            region_supplied_peak: 36_288,
+            region_capacity: 36_800,
+            overlay_supplied_peak: 168_000,
+            overlay_capacity: 300_000,
+            ..TruncationReport::default()
+        };
+        let lines = truncation_report_lines(&regions);
+        assert_eq!(
+            lines[0],
+            "region geometry: 0 vertices omitted (peak 36288 / capacity 36800)"
+        );
+        assert_eq!(
+            lines[1],
+            "overlay geometry: 0 vertices omitted (peak 168000 / capacity 300000)"
+        );
+    }
+
+    #[test]
+    fn truncation_lines_report_nonzero_with_marker_and_counts() {
+        // The fail-visible case: the uppercase TRUNCATION marker, the
+        // omitted count, the peak supplied, and the capacity — the
+        // directive's required context, exact strings (the oversize
+        // smoke asserts the same numbers through the real path).
+        let oversize = TruncationReport {
+            region_truncated: 2_000,
+            region_supplied_peak: 37_800,
+            region_capacity: 36_800,
+            overlay_truncated: 36_000,
+            overlay_supplied_peak: 336_000,
+            overlay_capacity: 300_000,
+        };
+        let lines = truncation_report_lines(&oversize);
+        assert_eq!(
+            lines[0],
+            "REGION TRUNCATION: 2000 vertices omitted (peak 37800 / capacity 36800)"
+        );
+        assert_eq!(
+            lines[1],
+            "OVERLAY TRUNCATION: 36000 vertices omitted (peak 336000 / capacity 300000)"
+        );
     }
 }

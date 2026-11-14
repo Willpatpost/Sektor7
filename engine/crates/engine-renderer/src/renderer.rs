@@ -49,6 +49,20 @@ pub struct RenderStats {
     pub validation_warnings: u64,
     /// Last validation messages (bounded), most recent last.
     pub recent_validation: Vec<String>,
+    /// F-03 Step 1 (fail-visible over fail-silent): cumulative
+    /// dynamic-geometry vertices omitted because a frame's supply
+    /// exceeded the frame slot's buffer capacity, with the peak
+    /// supplied and the per-slot capacity for context. Zero in every
+    /// ordinary run (the H3 proof); nonzero is REPORTED in the run
+    /// summary, never fatal — the capacity/refusal policy is Step 2,
+    /// separately authorized. The region capacity reads 0 until the
+    /// lazy region buffer allocates (no region frames).
+    pub region_truncated_vertices: u64,
+    pub region_supplied_peak_vertices: u32,
+    pub region_capacity_vertices: u32,
+    pub overlay_truncated_vertices: u64,
+    pub overlay_supplied_peak_vertices: u32,
+    pub overlay_capacity_vertices: u32,
     gpu_history_ms: Vec<f64>,
 }
 
@@ -173,6 +187,12 @@ impl Renderer {
             validation_errors: 0,
             validation_warnings: 0,
             recent_validation: Vec::new(),
+            region_truncated_vertices: 0,
+            region_supplied_peak_vertices: 0,
+            region_capacity_vertices: 0,
+            overlay_truncated_vertices: 0,
+            overlay_supplied_peak_vertices: 0,
+            overlay_capacity_vertices: 0,
             gpu_history_ms: Vec::new(),
         };
         Ok(Renderer {
@@ -238,6 +258,30 @@ impl Renderer {
             overlay,
             self.overlay_enabled,
         )?;
+        // F-03 Step 1: accumulate the frame's capacity decisions —
+        // cumulative omitted vertices, peak supplied, and the per-slot
+        // capacities (region stays 0 until its lazy buffer allocates).
+        // Deferred/minimized frames carry all-zero decisions, so they
+        // contribute nothing. Nonzero truncation is REPORTED in the run
+        // summary, never fatal.
+        self.stats.region_truncated_vertices += u64::from(outcome.region.truncated);
+        self.stats.region_supplied_peak_vertices = self
+            .stats
+            .region_supplied_peak_vertices
+            .max(outcome.region.supplied);
+        self.stats.region_capacity_vertices = self
+            .stats
+            .region_capacity_vertices
+            .max(outcome.region.capacity);
+        self.stats.overlay_truncated_vertices += u64::from(outcome.overlay.truncated);
+        self.stats.overlay_supplied_peak_vertices = self
+            .stats
+            .overlay_supplied_peak_vertices
+            .max(outcome.overlay.supplied);
+        self.stats.overlay_capacity_vertices = self
+            .stats
+            .overlay_capacity_vertices
+            .max(outcome.overlay.capacity);
         if outcome.presented {
             self.stats.frames_presented += 1;
         }
