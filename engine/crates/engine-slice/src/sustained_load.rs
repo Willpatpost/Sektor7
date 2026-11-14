@@ -1175,3 +1175,181 @@ pub fn run_sustained_load_benchmark() {
         "the demonstration cell must be deterministic"
     );
 }
+
+/// F3's compacted-representation variant: one mixed-scenario cell per
+/// population — the full-history save (the measured form) vs the
+/// compacted `spine-history/2` save, with the ledger downgrade
+/// verified (dimension 6's percentiles are never taken on this form;
+/// the full and compacted representations reject one another by
+/// domain, never silently reinterpreted).
+pub fn measure_compacted_representation(population: usize) {
+    let near_regions = [false; REGION_COUNT];
+    let config = NpcConfig {
+        seed: 1337,
+        near_regions,
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let scenario = lod_scenarios()[1];
+    let world = SustainedWorld::new(population, config, scenario.1);
+    let mut spine = Spine::with_reservation(world, 200, 60);
+    install_sustained_schedules(&mut spine);
+    for _ in 0..300 {
+        spine.run_tick();
+    }
+    let full_len = spine.save_bytes().len();
+    let executed = spine.stats().executed;
+    let retain = executed / 2;
+    spine
+        .compact(retain)
+        .expect("the compaction summarizes half the ledger");
+    let compacted_len = spine.save_bytes().len();
+    assert!(
+        spine.try_ledger_full().is_none(),
+        "the compacted history downgrades the full-ledger view"
+    );
+    println!(
+        "  compacted representation @ {population}: full save {full_len} B vs compacted {compacted_len} B (executed {executed}, retain {retain} records) — the lifetime ledger dominates the full form; dimension 6 percentiles are never taken on the compacted form",
+    );
+}
+
+/// The full reference matrix (§4 as amended): composition-derived
+/// cells over MEASURED `D_base`, mechanical skip rules (every N/A
+/// printed with its reason — never padded), every cell double-run,
+/// reduced-budget variants for classes 1–5 (F5), and the
+/// compacted-representation variants (F3). Pod reference evidence —
+/// never CI thresholds; a partial matrix is never called complete
+/// (§6). The overlay is near-lane-targeted (the stated composition
+/// policy; the lane split is reported per cell).
+pub fn run_reference_matrix() {
+    println!(
+        "=== SUSTAINED-LOAD REFERENCE MATRIX (F-08/F-12) — pod evidence, double-run per cell ==="
+    );
+    let near_regions = [false; REGION_COUNT];
+    let config = NpcConfig {
+        seed: 1337,
+        near_regions,
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+    let mut run_cells = 0usize;
+    let mut skipped = 0usize;
+
+    // Classes 1–4 (the demand levels) over every (population × LOD
+    // scenario) with the measured base and the mechanical skip rule.
+    for population in [1_000usize, 5_000, 20_000] {
+        for scenario in lod_scenarios() {
+            let samples = calibrate_base_demand(population, &config, scenario.1, 200, 60, 200);
+            let base = steady_state_mean(&samples);
+            println!(
+                "-- population {population} scenario {} (measured D_base {base:.1}/tick) --",
+                scenario.0
+            );
+            for class in [
+                WorkloadClass::LowDemand,
+                WorkloadClass::NearSaturation,
+                WorkloadClass::Overload,
+                WorkloadClass::Recovery,
+            ] {
+                let target = f64::from(class.target_demand_per_tick(200));
+                if base >= target {
+                    skipped += 1;
+                    println!(
+                        "   [N/A] {}: base {base:.1} ≥ target {target:.0} — the class is undefined here (reason-coded, never padded)",
+                        class.name()
+                    );
+                    continue;
+                }
+                let mut spec = CellSpec::base(class, population, scenario);
+                spec.overlay_near = (target - base).round() as u32;
+                if class == WorkloadClass::Recovery {
+                    spec.recovery_at = Some(200);
+                }
+                if population >= 5_000 && class == WorkloadClass::Overload {
+                    // Bounded observation cost at scale (the pending
+                    // scan is linear in backlog); the horizon is
+                    // printed per cell — never a hidden cap.
+                    spec.horizon = 300;
+                }
+                let (report, _second, deterministic) = run_cell_deterministic(&spec);
+                assert!(
+                    deterministic,
+                    "cell {}/{} diverged between runs",
+                    class.name(),
+                    scenario.0
+                );
+                report.print();
+                run_cells += 1;
+            }
+            // Class 5 (the §5 split's subject) rides the mixed
+            // scenario at every population.
+            if scenario.0 == "mixed" {
+                let spec = CellSpec::base(WorkloadClass::MixedLod, population, scenario);
+                let (report, _second, deterministic) = run_cell_deterministic(&spec);
+                assert!(deterministic, "the mixed-lod cell diverged");
+                report.print();
+                run_cells += 1;
+            }
+        }
+        // Class 6 (F4's scaled mechanism, labeled): harness-driven LOD
+        // transitions on the mixed scenario — mixed → all-EventDriven
+        // at tick 200. The RegionDirector-protocol-driven 1k anchor
+        // is a stated limitation of this cycle's matrix (the
+        // director's apply is NpcWorld-typed); the director's own
+        // transition semantics remain covered by the existing
+        // regions/s6 suites.
+        let scenario = lod_scenarios()[1];
+        let mut spec = CellSpec::base(WorkloadClass::ChangingPresence, population, scenario);
+        spec.lod_transitions = vec![(200u64, [LodLevel::EventDriven; REGION_COUNT])];
+        let (report, _second, deterministic) = run_cell_deterministic(&spec);
+        assert!(deterministic, "the changing-presence cell diverged");
+        report.print();
+        run_cells += 1;
+    }
+
+    // Reduced-budget variants (F5): classes 1–5 at the representative
+    // 1k-mixed cell under budget 100 / reserve 30. The class-1 N/A
+    // here is itself the informative outcome — the low-demand comfort
+    // is budget-relative.
+    println!("-- reduced-budget variants (budget 100 / reserve 30, 1k-mixed) --");
+    let samples = calibrate_base_demand(1_000, &config, lod_scenarios()[1].1, 100, 30, 200);
+    let base = steady_state_mean(&samples);
+    for class in [
+        WorkloadClass::LowDemand,
+        WorkloadClass::NearSaturation,
+        WorkloadClass::Overload,
+        WorkloadClass::Recovery,
+        WorkloadClass::MixedLod,
+    ] {
+        let target = f64::from(class.target_demand_per_tick(100));
+        if base >= target {
+            skipped += 1;
+            println!(
+                "   [N/A] {} (reduced budget): base {base:.1} ≥ target {target:.0} — the comfort is budget-relative",
+                class.name()
+            );
+            continue;
+        }
+        let mut spec = CellSpec::base(class, 1_000, lod_scenarios()[1]);
+        spec.budget = 100;
+        spec.reserve = 30;
+        spec.overlay_near = (target - base).round() as u32;
+        if class == WorkloadClass::Recovery {
+            spec.recovery_at = Some(200);
+        }
+        let (report, _second, deterministic) = run_cell_deterministic(&spec);
+        assert!(deterministic, "the reduced-budget cell diverged");
+        report.print();
+        run_cells += 1;
+    }
+
+    // Compacted-representation variants (F3): one per population.
+    println!("-- compacted-representation variants (F3) --");
+    for population in [1_000usize, 5_000, 20_000] {
+        measure_compacted_representation(population);
+    }
+
+    println!(
+        "=== matrix composition: {run_cells} cells measured (each double-run) + 3 compacted-representation variants, {skipped} N/A reason-coded — the honest effective matrix, never padded; partial never called complete ==="
+    );
+}
