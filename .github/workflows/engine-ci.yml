@@ -545,7 +545,16 @@ jobs:
       # with the main shard's 950 / 899 (the cycle-3 947 / 896 plus
       # the F-01 +3 engine-persist lib tests) these sum to the
       # audit-cycle battery (1405 / 1353; the heavy count re-MEASURED
-      # at the consolidated tree before the commit). MAINTENANCE
+      # at the consolidated tree before the commit). RECOMPUTED at
+      # the remediation-B F-11 branch (the audit-cycle main a4fe0ec
+      # + the F-11 §6a deterministic queue-ordering proof, ONE
+      # platform-uniform test added to the audit_f07_persistence
+      # binary, no cfg gates): 456 Linux MEASURED with this shard's
+      # own command (456 passed / 0 failed / 3 ignored / 45 result
+      # lines, the workflow's own awk, rc=0); 455 Windows = the prior
+      # 454 + the same one platform-uniform test. The main shard's
+      # pins are UNCHANGED (engine-slice is excluded there; the
+      # remediation's analysis documents add no tests). MAINTENANCE
       # OBLIGATION:
       # legitimate new tests require updating these pins in the same
       # change. A shard that unexpectedly executes no tests fails
@@ -555,8 +564,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=455
-          if [ "$(uname -s)" != "Linux" ]; then expected=454; fi
+          expected=456
+          if [ "$(uname -s)" != "Linux" ]; then expected=455; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
