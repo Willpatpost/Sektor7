@@ -8,6 +8,7 @@
 
 ## Recommended reading order
 
+0. [CURRENT-STATUS.md](CURRENT-STATUS.md) — **the maintained current-state index (read first):** what the engine actually is today — integrated capabilities, verified test coverage, real performance evidence, known limitations, active priorities, and the authoritative coordination ledger's location. Introduced 2026-11-14 (the post-audit remediation, F-13); the numbered items below are the historical and vision layer it sits on top of.
 1. [VISION.md](VISION.md) — shared goals, the Twin Summits, original reusable engine decision, high-level launch commitments and collaboration agreement.
 2. [DESIGN-BIBLE.md](DESIGN-BIBLE.md) — first RPG gameplay: cameras, systemic combat, traversal, classless progression, quests, NPC agency and unresolved solo mechanics.
 3. [MULTIPLAYER-SPEC.md](MULTIPLAYER-SPEC.md) — world-bound shared campaigns, roster democracy, authored/frontier access, group reputation, rewards, saves, waiting, disconnect recovery and open edge cases.
@@ -37,6 +38,8 @@
 | `STAGE6-S6C2-BURST-VALIDATION.md` | S6-C2 implementation artifact: the finite-burst stress, identity-conservation, and no-silent-drop verification matrix (CLOSED-PASS, consolidated into main) | TECH-ARCHITECTURE stage gates, DECISIONS registry, lead approval |
 | `STAGE6-S6C3-SOAK-RUNNER.md` | S6-C3 implementation artifact: the tick-indexed integrated scenario, the automated wall-clock soak runner, the corrected time-debt termination protocol, and the bounded CI smokes (delivered on the development branch — pending independent review) | TECH-ARCHITECTURE stage gates, DECISIONS registry, lead approval |
 | `STAGE6-S6C3-HARDWARE-RUNBOOKS.md` | S6-C3 implementation artifact: the prepared (NOT executed) S6-C4 physical measurement runbooks — Windows 11/RTX 5070 Ti and macOS ARM64/M1 MoltenVK (delivered on the development branch — pending independent review) | TECH-ARCHITECTURE stage gates, DECISIONS registry, lead approval |
+| `CURRENT-STATUS.md` | The maintained current-state index (introduced 2026-11-14, F-13): integrated capabilities, verified test coverage, performance evidence, known limitations, active priorities, the coordination ledger's location | The substantive owners above (capabilities defer to the crate code and the DECISIONS registry; coverage to the CI workflow); the historical acceptance records are never rewritten to match it |
+| `WINDOWS-GPU-PROFILING-KIT.md` | The owner's real-rig GPU measurement procedure (F-06's hardware baseline; F-09-corrected 2026-11-14: the `--fps uncapped --present immediate` commands, the resolved-present-mode verification, the four-quantity methodology) | TECH-ARCHITECTURE stage gates, DECISIONS registry, lead approval; no CI or pod number is GPU evidence |
 | `README.md` | Folder map, maintenance rules | All substantive owners above |
 
 **Prevent contradictory copies:** A high-level file may summarize a decision in one sentence and link to its owner. It must not redefine the owner's thresholds or mechanisms. If a future subsystem gets a dedicated implementation specification, record its boundary explicitly. For example, `MULTIPLAYER-SPEC.md` owns what saves/waits mean to players; a possible future `SAVE-ARCHITECTURE.md` would own serialization, distributed snapshot replication and crash consistency.

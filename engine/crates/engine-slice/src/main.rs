@@ -1,7 +1,9 @@
 //! Interactive slice binary: the Stage 0 stdin CLI for `engine-core`, the
 //! Stage 1 SDL3 shell modes (`--window`, `--window --dummy`,
 //! `--soak <secs>`), the Stage 2 Vulkan render demo (`--render`, with
-//! `--present auto|fifo|mailbox|immediate`, `--fps <n>|uncapped`,
+//! `--present auto|fifo|mailbox|immediate`, `--fps <1-1000>|uncapped`
+//! (numeric `0` is refused with an error — it previously clamped to a
+//! silent 1 FPS, the F-09 correction),
 //! `--frames <n>`, `--no-overlay`, `--validation auto|on|off`,
 //! `--simulate-resize`, `--sim-budget <n>`, `--sim-near-reserve <n>`,
 //! and the Stage 4 region visualization `--regions` with the
@@ -26,6 +28,31 @@ use std::path::PathBuf;
 use engine_slice::region::PresenceScenario;
 use engine_slice::session::{Outcome, Session, run_selftest};
 use engine_slice::window_demo;
+
+/// Parses one `--fps` value for the `--render` and `--demo-persist`
+/// modes. `uncapped` selects zero pacing (real rendering every
+/// iteration — the measurement form); a numeric target is 1..=1000
+/// (values above 1000 clamp, the pre-existing behavior). Numeric `0`
+/// is REFUSED with the direction to `uncapped` — the F-09
+/// correction: `0` previously clamped to 1, silently pacing a
+/// supposedly uncapped measurement run at 1 FPS. Any other text is
+/// not a frame-rate value and is ignored by the caller (the
+/// lenient pre-existing CLI contract — the only new strictness is
+/// the `0` refusal).
+fn parse_fps(value: &str) -> Result<Option<u32>, &'static str> {
+    if value == "uncapped" {
+        return Ok(Some(0));
+    }
+    match value.parse::<u32>() {
+        Ok(0) => Err(
+            "--fps 0 is not a frame-rate target: numeric values are 1..=1000 \
+             (0 used to silently clamp to 1 FPS); use `--fps uncapped` for \
+             unpaced measurement runs",
+        ),
+        Ok(fps) => Ok(Some(fps.clamp(1, 1000))),
+        Err(_) => Ok(None),
+    }
+}
 
 fn main() {
     // C3-F5B: the namespaced integrated-soak flags are valid ONLY
@@ -218,7 +245,7 @@ fn main() {
         let Some(dir) = args.get(position + 1) else {
             eprintln!(
                 "usage: --demo-persist <campaign-dir> [--headless --ticks <n> \
-                 [--action-at <tick>]] [--fps <n>|uncapped] [--frames <n>] \
+                 [--action-at <tick>]] [--fps <1-1000>|uncapped] [--frames <n>] \
                  [--validation auto|on|off] [--present auto|fifo|mailbox|immediate] \
                  [--no-overlay] [--scenario stage6-v1|stage6-v1-short \
                  [--scenario-seed <n>] [--evidence-dir <dir>]] \
@@ -282,12 +309,16 @@ fn main() {
                 }
                 "--fps" => {
                     if let Some(value) = args.get(index + 1) {
-                        if value == "uncapped" {
-                            options.fps = 0;
-                            index += 1;
-                        } else if let Ok(fps) = value.parse::<u32>() {
-                            options.fps = fps.clamp(1, 1000);
-                            index += 1;
+                        match parse_fps(value) {
+                            Ok(Some(fps)) => {
+                                options.fps = fps;
+                                index += 1;
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                eprintln!("error: {message}");
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
@@ -406,12 +437,16 @@ fn main() {
                 }
                 "--fps" => {
                     if let Some(value) = args.get(index + 1) {
-                        if value == "uncapped" {
-                            options.fps = 0;
-                            index += 1;
-                        } else if let Ok(fps) = value.parse::<u32>() {
-                            options.fps = fps.clamp(1, 1000);
-                            index += 1;
+                        match parse_fps(value) {
+                            Ok(Some(fps)) => {
+                                options.fps = fps;
+                                index += 1;
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                eprintln!("error: {message}");
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
@@ -537,4 +572,49 @@ fn main() {
         }
     }
     let _ = writeln!(stdout, "clean shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fps;
+
+    #[test]
+    fn fps_uncapped_selects_zero_pacing() {
+        assert_eq!(parse_fps("uncapped"), Ok(Some(0)));
+    }
+
+    #[test]
+    fn fps_numeric_zero_is_refused_with_uncapped_direction() {
+        // F-09: every numeric spelling of zero is refused — the old
+        // behavior clamped them all to a silent 1 FPS pacing.
+        for zero in ["0", "00", "+0"] {
+            let refusal = parse_fps(zero).expect_err("numeric zero must be refused");
+            assert!(
+                refusal.contains("--fps uncapped"),
+                "the refusal must direct to uncapped: {refusal}"
+            );
+            assert!(
+                refusal.contains("1 FPS"),
+                "the refusal must state the old silent 1 FPS clamp: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn fps_numeric_targets_clamp_from_above_only() {
+        assert_eq!(parse_fps("1"), Ok(Some(1)));
+        assert_eq!(parse_fps("60"), Ok(Some(60)));
+        assert_eq!(parse_fps("1000"), Ok(Some(1000)));
+        assert_eq!(parse_fps("2400"), Ok(Some(1000)));
+    }
+
+    #[test]
+    fn fps_non_numeric_values_stay_lenient() {
+        // The pre-existing lenient contract: unparseable values are
+        // not frame-rate targets and are ignored by the caller (the
+        // F-09 correction adds no strictness beyond the 0 refusal).
+        assert_eq!(parse_fps("banana"), Ok(None));
+        assert_eq!(parse_fps("-1"), Ok(None));
+        assert_eq!(parse_fps("sixty"), Ok(None));
+    }
 }
