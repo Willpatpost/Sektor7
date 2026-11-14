@@ -42,9 +42,13 @@ ARM64) with a five-job CI:
   with first-class lateness, the safe `processed_through` watermark, FNV-1a
   fingerprints, canonical wire primitives + full-fidelity spine round-trip.
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
-  revision store; `CanonicalMedium` boundary with **two production mediums**
-  (LocalFile and SQLite, both WAL + `synchronous=FULL`); the durable T1
-  journal (hash-chained transaction frames); the `CommitPipeline`
+  revision store; `CanonicalMedium` boundary with **two production mediums
+  carrying distinct durability contracts** — SQLiteMedium
+  `TransactionalWalFull` (WAL + `synchronous=FULL`, both verified by
+  querying the actual configuration at open) and LocalFileMedium
+  `FullPosixSequence` on supported POSIX / `ProcessCrashOnly` on Windows
+  (see §5 and §8); the durable T1 journal (hash-chained transaction
+  frames); the `CommitPipeline`
   (single-authority per-key lattice, canonical confirmation); the
   recovery machinery (strict temporal boundaries, authenticated ancestry
   witnesses, recovery-state classification, degradation matrices); the
@@ -120,9 +124,16 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   inclusion AND per-key validation); no parallel canonical writes.
 - The T1 journal and the two-contract recovery (pure-function
   reconciliation; strict temporal boundaries at every begin).
-- SQLite and LocalFile as peer production canonical mediums (WAL +
-  `synchronous=FULL`; the provider-selection gate closed through the PP
-  line).
+- The two production canonical mediums with their **distinct durability
+  contracts** (the provider-selection gate closed through the PP line):
+  SQLiteMedium **`TransactionalWalFull`** (WAL + `synchronous=FULL`, both
+  verified by querying the actual configuration at open — PP-B1/D-PP-1,
+  subject to its documented configuration/storage assumptions);
+  LocalFileMedium **`FullPosixSequence`** on supported POSIX (the full
+  fsync sequence; the macOS std-semantics note applies) and
+  **`ProcessCrashOnly` on Windows** — the process-crash tier, insufficient
+  for the ratified destructive-reclamation durability requirement (the
+  OC-P2 tier gates refuse the destructive arms on that platform).
 - SDL3 vendored-static; the engine never links system SDL.
 - Production-persistence decisions: `docs/PRODUCTION-PERSISTENCE-DECISIONS.md`.
 
@@ -144,8 +155,11 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 - **The F-05 overlay throttle** — deliberately NOT implemented (the measured
   costs are negligible at target frame budgets; revisit only with rig
   evidence).
-- Compaction follow-ups and the multiplayer/replication research
-  (`docs/MULTIPLAYER-SPEC.md` is research, not an accepted design).
+- Compaction follow-ups and the multiplayer/replication **implementation
+  choices** — `docs/MULTIPLAYER-SPEC.md`'s player-facing multiplayer and
+  governance rules are **ratified product requirements**; what remains
+  incomplete or unratified is the networking, transport, and replication
+  implementation design (the spec is never treated as mere research).
 
 ## 7. Actual performance evidence (and what is NOT evidence)
 
@@ -160,8 +174,9 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 - **Persistence (pod, the F-07 harness):** ~1295 sequential ops/s, ~9%
   worker-queue overhead, contention p99 128 ms, cold recovery ~34.7 ms,
   ~19× head-of-line amplification — pod measurements of the approved
-  topology, not universal guarantees; the actionable interpretation is an
-  active work item (§9).
+  topology, not universal guarantees; the actionable interpretation is
+  delivered
+  (`docs/F07-PERSISTENCE-OPTIMIZATION-ANALYSIS-2026-11-14.md`, §9).
 - **Real GPU (the only real-GPU evidence):** the Stage 4 Windows acceptance
   record (2026-10-21, the owner's RTX 5070 Ti rig — e.g. 1744 fps avg
   uncapped/immediate on the Stage 4 scene). **Standing rule: no CI or pod
@@ -172,6 +187,13 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 
 ## 8. Known limitations (the honest list)
 
+- **LocalFileMedium on Windows is `ProcessCrashOnly`** — the documented std
+  Windows sequence (file fsync + rename ordering) establishes
+  acknowledged-revision persistence across process crash only, NOT OS
+  crash or power loss, and it is insufficient for the ratified
+  destructive-reclamation durability requirement (the OC-P2 tier gates
+  refuse the destructive arms on that platform). Production Windows
+  deployments use the SQLite medium (`TransactionalWalFull`).
 - The renderer is prototype-class: static scene buffers, host-visible
   persistently-mapped dynamic buffers, 2 frames in flight, and a **bounded
   region-vertex capacity** (F-03 — silent-truncation risk if geometry
@@ -236,17 +258,17 @@ not implemented** / **not yet designed**.
 | Capability | Classification | Basis |
 |---|---|---|
 | Deterministic simulation & scheduling | Implemented and validated (demo scale; sustained-scale qualification in progress, §8) | `engine-core` spine; the determinism pins; the CI battery; the entity-scale benchmark |
-| Persistence & recovery | Implemented and validated | `engine-persist` store/journal/pipeline; the crash/recovery matrices; real process-kill proofs; cross-platform CI |
+| Persistence & recovery | Implemented and validated | `engine-persist` store/journal/pipeline; the crash/recovery matrices; real process-kill proofs; cross-platform CI; the per-platform durability tiers (§5/§8) |
 | Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03/F-04 open |
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
 | Physics and collision | Not yet designed | — |
 | Combat and gameplay systems | Not yet designed | — |
-| Networking and replication | Not yet designed | Research only (`docs/MULTIPLAYER-SPEC.md`) |
-| Listen-server authority | Not yet designed | — |
-| Host handoff | Not yet designed | — |
-| Co-op roster governance | Not yet designed | — |
+| Networking and replication | Not yet designed | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the networking/transport/replication implementation choices remain unratified and undesigned |
+| Listen-server authority | Not yet designed | Player-hosted listen-server is the stated working preference (unratified); no engine system |
+| Host handoff | Not yet designed | Planned-required per the ratified multiplayer requirements; no engine system |
+| Co-op roster governance | Not yet designed | The player-facing governance rules (roster democracy, unanimity requirements) are **ratified** in `docs/MULTIPLAYER-SPEC.md`; no engine system |
 | Procedural world generation | Not yet designed | — |
 | Dense city streaming | Not yet designed | F-08 deferred |
 | Assets and content pipeline | Not yet designed | — |
