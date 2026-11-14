@@ -6,12 +6,16 @@ description = "Sektor7 original engine — Stage 0 interactive slice application
 build = "build.rs"
 
 [features]
-# Test-only (the T2-B isolation corrective): the crossing's
+# Test-only (the T2-B isolation corrective, extended by the RMD-03
+# corrective to forward into engine-persist): the crossing's
 # process-death crash-test seams — compile-time EXCLUDED from every
 # default build (the production artifact carries neither the arms
 # nor the process-exit behavior); enabled only by the test
-# invocations that drive the genuine child-process deaths.
-crash-test-seams = []
+# invocations that drive the genuine child-process deaths. The
+# forwarding also enables engine-persist's own crash-test-seams
+# feature (the local medium's two reclamation seams — the same
+# compile-time isolation, the same sole-arming test corpus).
+crash-test-seams = ["engine-persist/crash-test-seams"]
 
 [dependencies]
 engine-core = { path = "../engine-core" }

@@ -1584,6 +1584,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         }
         // The C1 crash-window seam (test-only): the hard exit AFTER
         // the covering's acceptance and BEFORE the T1 capture.
+        #[cfg(feature = "crash-test-seams")]
         after_covering_seam();
         // Phases 3–4 — persist + verify: ONE journal transaction —
         // the capture envelopes plus the plan blob — SKIPPED when
@@ -2121,6 +2122,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // (test-only — see [`ARM_AFTER_SK_EXIT`]): a death here
         // leaves the ordinary snapshot standing with no checkpoint
         // status — the mandatory regression's exact boundary.
+        #[cfg(feature = "crash-test-seams")]
         after_sk_seam();
         // Phase 3 — the range walk + the metadata computation (a
         // fresh medium handle; the crossing's established pattern).
@@ -2912,6 +2914,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // corrective F4's real-kill evidence): the audit IS durably
         // on the chain; Phase B never runs — the restart resumes
         // from the installed audit and completes to convergence.
+        #[cfg(feature = "crash-test-seams")]
         reclaim_after_audit_seam();
         // PHASE B — the deletes: idempotent + restartable, driven by
         // the AUDITED MANIFEST (an interrupted unit's orphaned
@@ -2995,6 +2998,7 @@ impl<S: MediumSource> SessionCrossing<S> {
         // manifest-authorized medium byte is gone; the audited stale
         // journal generations never retire — the restart resumes
         // from the installed audit and completes the cleanup.
+        #[cfg(feature = "crash-test-seams")]
         reclaim_after_medium_seam();
         // The stale journal generations (only those named in the
         // audited ledger — only after the rotation's verified active
@@ -3463,11 +3467,17 @@ impl<S: MediumSource> SessionCrossing<S> {
 /// process-kill regression drives from a real child process (exit 7;
 /// the pre-install gap's convention is 6). Engine code never arms
 /// this; the static is process-local, so only the child that armed
-/// it dies.
+/// it dies. COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B
+/// pattern): the seam exists ONLY under the crash-test-seams
+/// feature — the production build carries neither the arm nor the
+/// process-exit behavior (the CI's feature-disabled artifact check
+/// enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_MID_INSTALL_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// The mid-install seam's exit point (see [`ARM_MID_INSTALL_EXIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn mid_install_seam() {
     if ARM_MID_INSTALL_EXIT.load(Ordering::Relaxed) {
         std::process::exit(7);
@@ -3484,12 +3494,18 @@ fn mid_install_seam() {
 /// the recovery carries the pre-deactivation state through the
 /// snapshot, the deactivation never happened durably. Engine code
 /// never arms this; the static is process-local, so only the child
-/// that armed it dies.
+/// that armed it dies. COMPILE-TIME ISOLATED (the RMD-03
+/// corrective, the T2-B pattern): the seam exists ONLY under the
+/// crash-test-seams feature — the production build carries neither
+/// the arm nor the process-exit behavior (the CI's
+/// feature-disabled artifact check enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_AFTER_COVERING_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// The after-covering seam's exit point (see
 /// [`ARM_AFTER_COVERING_EXIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn after_covering_seam() {
     if ARM_AFTER_COVERING_EXIT.load(Ordering::Relaxed) {
         std::process::exit(10);
@@ -3555,10 +3571,17 @@ fn covering_append(
 /// and NO reclaim eligibility — the recovery must find SK as an
 /// ordinary publication. Engine code never arms this; the static is
 /// process-local, so only the child that armed it dies.
+/// COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B pattern):
+/// the seam exists ONLY under the crash-test-seams feature — the
+/// production build carries neither the arm nor the process-exit
+/// behavior (the CI's feature-disabled artifact check enforces the
+/// absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_AFTER_SK_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// The after-SK seam's exit point (see [`ARM_AFTER_SK_EXIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn after_sk_seam() {
     if ARM_AFTER_SK_EXIT.load(Ordering::Relaxed) {
         std::process::exit(8);
@@ -3575,11 +3598,17 @@ fn after_sk_seam() {
 /// range intact: the re-run's pre-scan recognizes the installed
 /// audit and resumes to completion. Engine code never arms this;
 /// the static is process-local, so only the child that armed it
-/// dies.
+/// dies. COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B
+/// pattern): the seam exists ONLY under the crash-test-seams
+/// feature — the production build carries neither the arm nor the
+/// process-exit behavior (the CI's feature-disabled artifact check
+/// enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_RECLAIM_AFTER_AUDIT: AtomicBool = AtomicBool::new(false);
 
 /// The after-audit seam's exit point (see [`ARM_RECLAIM_AFTER_AUDIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn reclaim_after_audit_seam() {
     if ARM_RECLAIM_AFTER_AUDIT.load(Ordering::Relaxed) {
         std::process::exit(9);
@@ -3597,11 +3626,17 @@ fn reclaim_after_audit_seam() {
 /// (exit 12, distinct from the after-audit seam's 9, the mid-unit
 /// seam's 10, and the last-unit seam's 11). Engine code never arms
 /// this; the static is process-local, so only the child that armed
-/// it dies.
+/// it dies. COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B
+/// pattern): the seam exists ONLY under the crash-test-seams
+/// feature — the production build carries neither the arm nor the
+/// process-exit behavior (the CI's feature-disabled artifact check
+/// enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_RECLAIM_AFTER_MEDIUM: AtomicBool = AtomicBool::new(false);
 
 /// The after-medium seam's exit point (see [`ARM_RECLAIM_AFTER_MEDIUM`]).
+#[cfg(feature = "crash-test-seams")]
 fn reclaim_after_medium_seam() {
     if ARM_RECLAIM_AFTER_MEDIUM.load(Ordering::Relaxed) {
         std::process::exit(12);
@@ -3713,6 +3748,7 @@ fn install_deactivation(
     // NOT yet captured — a process death here leaves the journal's
     // durable intent standing and a partially-installed in-memory
     // state that dies with the process.
+    #[cfg(feature = "crash-test-seams")]
     mid_install_seam();
     director.install_captures(region, plan.episode, &plan.captures);
     spine.world_mut().set_region_lod(region, LodLevel::Dormant);

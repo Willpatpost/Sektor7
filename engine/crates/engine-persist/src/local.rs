@@ -58,6 +58,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+// (RMD-03) The atomic import rides the crash-test-seams feature: the
+// only consumers are the gated reclamation process-exit statics.
+#[cfg(feature = "crash-test-seams")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -2808,8 +2811,13 @@ impl LocalFileMedium {
                     .map_err(|e| io_err("reclaim record", &record_path, e))?;
                 removed += 1;
             }
+            // The two-pass schedule's crash seams (test-only, the
+            // real-kill evidence — compile-time isolated under the
+            // crash-test-seams feature per the RMD-03 corrective).
+            #[cfg(feature = "crash-test-seams")]
             reclaim_mid_unit_seam();
             if index + 1 == ledger.units.len() {
+                #[cfg(feature = "crash-test-seams")]
                 reclaim_last_unit_seam();
             }
         }
@@ -2881,11 +2889,18 @@ impl LocalFileMedium {
 /// orphaning window the audited manifest closes on the retry (exit
 /// 10, distinct from the after-SK seam's 8). Engine code never arms
 /// this; the static is process-local, so only the child that armed
-/// it dies.
+/// it dies. COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B
+/// pattern): the seam exists ONLY under engine-persist's
+/// crash-test-seams feature (forwarded from engine-slice's, which
+/// the heavy shard's battery enables) — the production build
+/// carries neither the arm nor the process-exit behavior (the CI's
+/// feature-disabled artifact check enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_RECLAIM_MID_UNIT: AtomicBool = AtomicBool::new(false);
 
 /// The mid-unit seam's exit point (see [`ARM_RECLAIM_MID_UNIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn reclaim_mid_unit_seam() {
     if ARM_RECLAIM_MID_UNIT.load(Ordering::Relaxed) {
         std::process::exit(10);
@@ -2901,10 +2916,18 @@ fn reclaim_mid_unit_seam() {
 /// probe closes (exit 11, distinct from the mid-unit seam's 10 and
 /// the after-audit seam's 9). Engine code never arms this; the
 /// static is process-local, so only the child that armed it dies.
+/// COMPILE-TIME ISOLATED (the RMD-03 corrective, the T2-B pattern):
+/// the seam exists ONLY under engine-persist's crash-test-seams
+/// feature (forwarded from engine-slice's, which the heavy shard's
+/// battery enables) — the production build carries neither the arm
+/// nor the process-exit behavior (the CI's feature-disabled
+/// artifact check enforces the absence).
+#[cfg(feature = "crash-test-seams")]
 #[doc(hidden)]
 pub static ARM_RECLAIM_LAST_UNIT: AtomicBool = AtomicBool::new(false);
 
 /// The last-unit seam's exit point (see [`ARM_RECLAIM_LAST_UNIT`]).
+#[cfg(feature = "crash-test-seams")]
 fn reclaim_last_unit_seam() {
     if ARM_RECLAIM_LAST_UNIT.load(Ordering::Relaxed) {
         std::process::exit(11);

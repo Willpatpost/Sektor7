@@ -115,6 +115,34 @@ is therefore CI-safe across both shards.
 already ratified at T2-B — the shipping artifact stops carrying seven
 process-exit hooks the SDK never needs.
 
+**STATUS: IMPLEMENTED (the RMD-03 corrective, 2026-11-14, on
+`s6-remediation-rmd02-rmd03` from the integration candidate `5c45b8f`).**
+The final remediation review's RMD-03 asked for the authorization
+determination and the bounded implementation; the determination (the
+standing directive's §9 "preserve compile-time isolation of test-only
+behavior" covers the gating — it changes ONLY the compile-time visibility
+of test hooks, touches no ratified durability or campaign-authority
+semantic, and follows the T2-B precedent) was CONFIRMED against this
+analysis, and the implementation landed exactly as the corrective above
+specifies: the five crossing statics + their seam functions + their five
+call sites behind `engine-slice/crash-test-seams`; the two engine-persist
+statics + functions + call sites behind engine-persist's OWN new
+`crash-test-seams` feature, forwarded from engine-slice's (the
+`crash-test-seams = ["engine-persist/crash-test-seams"]` chain); the
+arming tests carry the matching cfgs (the established
+`ARM_RECLAIM_BEFORE_COMPLETION` pattern — the whole-fn gating for the
+child-death tests, the match-arm gating for b4_process's shared
+child-role helper), so the feature-enabled shards (the heavy battery on
+both OSes + the macOS SDL-free suite — verified to already enable the
+feature) run every arming test exactly as before, while the
+feature-disabled compilations (the plain workspace build, the CI's
+clippy, the main shard — engine-slice excluded) carry none of the
+symbols; and the CI's activation-isolation step now nm-verifies the
+absence of ALL EIGHT statics across both rlibs. **The disposition:
+implemented + cross-reviewed (A's adversarial pass over the corrective
+follows through the coordinator); no unrestricted fault-system change;
+the WorkerFault panic/exit arms remain P2's documented acceptance.**
+
 ### P2 — The worker's panic/exit fault arms (the lower-value option)
 
 `WorkerFault::PanicNext`, `ExitAfterAppendPreReply`, `ExitBeforeNextJob`,

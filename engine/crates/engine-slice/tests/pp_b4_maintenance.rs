@@ -28,7 +28,12 @@ use engine_persist::{
 };
 #[cfg(windows)]
 use engine_persist::{Hash, LocalFileMedium, MediumError, PipelineError};
-use engine_slice::crossing::{ARM_AFTER_SK_EXIT, ARM_RECLAIM_AFTER_MEDIUM, TransitionError};
+// (RMD-03) The crash-seam statics are compile-time isolated under
+// the crash-test-seams feature; the arming child tests below carry
+// the matching cfg (the feature-enabled shards run them as before).
+use engine_slice::crossing::TransitionError;
+#[cfg(feature = "crash-test-seams")]
+use engine_slice::crossing::{ARM_AFTER_SK_EXIT, ARM_RECLAIM_AFTER_MEDIUM};
 use engine_slice::npc::{NpcConfig, NpcWorld, install_initial_schedules};
 use engine_slice::orchestration::{
     CloseFailure, CompletionDisposition, MaintenanceError, OrchestratedSession, PublicationOutcome,
@@ -469,6 +474,7 @@ fn the_checkpoint_lease_holds_adjacency_and_refuses_interleaving() {
 /// before MK: the child arms the accepted crash seam and dies at it;
 /// the parent verifies the crashed SK stands as an ORDINARY snapshot
 /// (the recovery works from it) and the retry checkpoint completes.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_child_checkpoint_death_after_sk_recovers() {
     if let Ok(root) = std::env::var("S7_PP_B4_CKPT_CHILD") {
@@ -728,7 +734,10 @@ fn the_rotation_retirement_evidence_distinguishes_canceled_from_subsumed() {
 /// and MK-bound, its object files the only additions). The POSIX
 /// crash/resume substance is covered on the eligible platforms.
 /// Returns true when the caller should STOP (the Windows path).
-#[cfg(windows)]
+/// (RMD-03) The helper also rides the crash-test-seams feature —
+/// its only caller is the feature-gated death test (the Windows
+/// clippy's dead-code refusal, the platform-gated-caller lesson).
+#[cfg(all(windows, feature = "crash-test-seams"))]
 fn windows_refuses_reclamation_death() -> bool {
     let wdir = TestDir::new("reclaim-child-windows");
     let wlocation = found_location(&wdir, false);
@@ -900,6 +909,7 @@ fn windows_journal_identities(journal: &std::path::Path) -> std::collections::BT
 /// parent's recovery re-derives coherently and the reclamation
 /// RESUMES (the installed audit recognized, the journal retirement
 /// completes), then the completed campaign refuses nothing-eligible.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn a_real_child_reclamation_death_resumes() {
     if let Ok(root) = std::env::var("S7_PP_B4_RECLAIM_CHILD") {

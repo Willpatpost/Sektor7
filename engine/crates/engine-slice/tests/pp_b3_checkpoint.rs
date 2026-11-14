@@ -19,15 +19,28 @@
 //! checkpoint's range.
 
 use std::path::PathBuf;
+// (RMD-03) The child-process machinery rides the crash-test-seams
+// feature (the gated death tests are its only consumers).
+#[cfg(feature = "crash-test-seams")]
 use std::process::Command;
+// (RMD-03) The atomic ordering rides the crash-test-seams feature
+// (the gated child-death test is its only consumer).
+#[cfg(feature = "crash-test-seams")]
 use std::sync::atomic::Ordering;
 
-use engine_core::{Decoder, HistoryKind, LodLevel, PresenceSample, Spine, wire::MAX_TAG_LEN};
+#[cfg(feature = "crash-test-seams")]
+use engine_core::HistoryKind;
+use engine_core::{Decoder, LodLevel, PresenceSample, Spine, wire::MAX_TAG_LEN};
 use engine_persist::{
     CanonicalMedium, CheckpointMetadata, LocalFileMedium, ReclaimedIndexEntry, SkipEntry,
     T1Journal, chain_range_digest, checkpoint_mk_idempotency_key, compute_digest_seed,
 };
-use engine_slice::crossing::{ARM_AFTER_SK_EXIT, SessionCrossing, TransitionError};
+// (RMD-03) The crash-seam static is compile-time isolated under the
+// crash-test-seams feature; the arming child test below carries the
+// matching cfg (the feature-enabled shards run it exactly as before).
+#[cfg(feature = "crash-test-seams")]
+use engine_slice::crossing::ARM_AFTER_SK_EXIT;
+use engine_slice::crossing::{SessionCrossing, TransitionError};
 use engine_slice::npc::{NpcConfig, NpcWorld, REGION_COUNT, install_initial_schedules};
 use engine_slice::region::{RegionConfig, RegionDirector};
 
@@ -365,8 +378,13 @@ fn an_immediate_second_checkpoint_refuses_the_empty_range() {
 
 // ------------------------------------------------- the crash regression
 
+// (RMD-03) The child-process constants ride the crash-test-seams
+// feature (the gated death tests are their only consumers).
+#[cfg(feature = "crash-test-seams")]
 const CHILD_TEST: &str = "pp_b3_child_crash_after_sk";
+#[cfg(feature = "crash-test-seams")]
 const CHILD_STORE_ENV: &str = "S7_PP_B3_CHILD_STORE";
+#[cfg(feature = "crash-test-seams")]
 const CHILD_JOURNAL_ENV: &str = "S7_PP_B3_CHILD_JOURNAL";
 
 /// The child-process entry: in a normal `cargo test` run the store
@@ -375,6 +393,7 @@ const CHILD_JOURNAL_ENV: &str = "S7_PP_B3_CHILD_JOURNAL";
 /// variables set. THE MANDATORY PP-B3 REGRESSION: the child arms the
 /// genuine in-driver seam and dies — real process termination —
 /// AFTER SK commits and BEFORE MK.
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn pp_b3_child_crash_after_sk() {
     let Ok(store) = std::env::var(CHILD_STORE_ENV) else {
@@ -399,6 +418,7 @@ fn pp_b3_child_crash_after_sk() {
     panic!("the armed seam must exit the process before MK");
 }
 
+#[cfg(feature = "crash-test-seams")]
 #[test]
 fn crash_after_sk_before_mk_leaves_an_ordinary_snapshot_and_the_retry_completes() {
     // THE MANDATORY PP-B3 REGRESSION — real process termination at
