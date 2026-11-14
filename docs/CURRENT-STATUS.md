@@ -8,9 +8,12 @@ A fresh development or review agent should be able to determine the actual
 current status, active authority, source of truth, known limitations, and next
 work from THIS file alone.
 
-- **Maintained since:** 2026-11-14 (the post-audit remediation cycle, F-13).
-- **Baseline at introduction:** `main` @ `a4fe0ec`; this revision reflects
-  the remediation-integration candidate (§9) with the measured counts.
+- **Maintained since:** 2026-11-14 (the post-audit remediation cycle, F-13);
+  reconciled for Cycle 1 on 2026-11-15.
+- **Baseline at introduction:** `main` @ `a4fe0ec` — that remediation
+  candidate was subsequently **merged** (`main` has sat at `900b0ea` since).
+  This revision reflects the **Cycle-1 integration candidate**
+  (`s7-cycle1-integration`, §9) with its measured counts.
 - **Update rule:** every change that alters capabilities, test counts,
   performance evidence, or priorities updates this file in the same change.
 
@@ -40,7 +43,10 @@ ARM64) with a five-job CI:
 - **`engine-core`** — the deterministic simulation spine: `(due, seq)` event
   queue, cross-class causal dependencies, per-tick budget, execution ledger
   with first-class lateness, the safe `processed_through` watermark, FNV-1a
-  fingerprints, canonical wire primitives + full-fidelity spine round-trip.
+  fingerprints, canonical wire primitives + full-fidelity spine round-trip;
+  plus the Cycle-1 **player movement/collision prototype module**
+  (kinematic mechanics, std-only, behind a narrow `CollisionWorld` query
+  contract — §8 scope).
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
@@ -57,7 +63,10 @@ ARM64) with a five-job CI:
   handling, present-mode preference with FIFO fallback, depth-correct scene,
   the dynamic region-scene vertex path (the F-02 caller-held scratch form),
   the retained overlay-vertex buffer (F-05), GPU timestamps, validation-layer
-  routing, the debug bitmap overlay.
+  routing, the debug bitmap overlay, and the Cycle-1 **dynamic-geometry
+  truncation counters** (F-03 Step 1: per-frame region/overlay
+  omitted-vertex counts with supplied/capacity context, reported in every
+  run summary — fail-visible over the former silent clamps).
 - **`engine-shell`** — the SDL3 application shell (statically-linked vendored
   SDL 3.4.18; real window + offscreen/dummy modes).
 - **`engine-slice`** — the integration/demo driver: the stdin CLI, `--window`,
@@ -65,9 +74,12 @@ ARM64) with a five-job CI:
   deterministic), `--demo-persist` (the integrated authoritative campaign
   behind the render loop, with the soak/evidence machinery), the session
   crossing (founded-and-anchored or recovered, the Space action, the durable
-  close), and the benchmark harnesses
+  close), the benchmark harnesses
   (`--benchmark-persistence`, `--benchmark-instrumentation`,
-  `--benchmark-entity-scale`, `--benchmark-render`).
+  `--benchmark-entity-scale`, `--benchmark-render`), and the Cycle-1
+  additions: **`--benchmark-sustained-load`** (the F-08/F-12 sustained-scale
+  reference matrix) and **`--player` / `--player-headless`** (the player
+  prototype's interactive and deterministic paths).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -80,7 +92,8 @@ with LOD, crash recovery, soak evidence, and rendering together.
 | `engine-core` spine, `engine-persist` store/journal/pipeline/recovery, `engine-renderer` Vulkan backend, `engine-shell` | **Engine libraries** — production mechanisms (no demo coupling) |
 | `engine-slice` scenarios (`stage6-v1`), the CLI modes, the benchmark harnesses, the debug overlay content | **Demo/driver layer** — deliberately not the game |
 | `composite-test-fixture` (engine-persist), `crash-test-seams` (engine-slice) | **Test-only features** — compile-time isolated, never in production builds (CI re-proves the feature-disabled production path) |
-| The Vulkan renderer's current shape (static scene buffers, host-visible persistently-mapped dynamic buffers, 2 frames in flight, bounded region-vertex capacity) | **Prototype-class** rendering design — correct and validated, not the final architecture (see §8) |
+| The Vulkan renderer's current shape (static scene buffers, host-visible persistently-mapped dynamic buffers, 2 frames in flight, bounded region-vertex capacity with **fail-visible truncation counters** — F-03 Step 1 delivered; the Step-2 capacity/refusal policy deferred) | **Prototype-class** rendering design — correct and validated, not the final architecture (see §8) |
+| The Cycle-1 player prototype (`engine-core` player module + the `--player` demo layer) | **Prototype-class** kinematic mechanics — reusable engine surface, reversible, explicitly not a ratified production physics backend |
 
 ## 4. Current automated test coverage
 
@@ -96,6 +109,19 @@ re-measured from actual output on every change, never estimated):
 
 (The macOS job runs its own execution partition — no combined count is
 defined for it. Ignored: 1 main / 3 heavy, all deliberate measurement soaks.)
+
+**The Cycle-1 candidate** (`s7-cycle1-integration`, §9 — awaiting the
+owner's mainline merge; `main` stays at the table above until then) adds
++25 main / +15 heavy platform-uniform tests and three integration binaries.
+Measured at the integrated tree (the workflow's own awk semantics):
+main **980 / 1 ignored / 30 result lines**; heavy **482 / 4 ignored / 49
+result lines**. Windows expectations 929 / 481 (platform-uniform inference)
+are confirmed by the candidate CI run; the workflow pins are updated in the
+same change (the F2 maintenance obligation). All determinism pins below are
+byte-identical at the candidate, plus the new pinned player trace
+`engine-core/player-trace/1` class (`8513d40792ea88f0`, the libm-free
+script class — cross-platform by construction; divergence is an
+investigation, never a silent re-pin).
 
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3
@@ -139,19 +165,26 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 
 ## 6. Deferred design decisions (documented, not yet authorized)
 
-- **F-03** — the region-render vertex-capacity policy: the design and the
-  acceptance tests are now **DESIGN READY**
-  (`docs/GPU-CAPACITY-SYNC-ANALYSIS.md` §4 — the truncation-visibility
-  counter first, then the constants-derived capacity + typed refusal); the
-  implementation awaits the next authorized package.
+- **F-03** — the region-render vertex-capacity policy: **Step 1 is
+  DELIVERED in Cycle 1** (the fail-visible truncation counters — §2 —
+  measured zero-truncation on every ordinary run, and the oversize
+  lavapipe smoke proves the exact counting through the real render path);
+  **Step 2** (constants-derived capacity + typed refusal at the
+  `render_frame` boundary) remains deferred awaiting the owner's separate
+  decision — the technical recommendation with alternatives and tradeoffs
+  is delivered with the Cycle-1 P1 package (`GPU-CAPACITY-SYNC-ANALYSIS.md`
+  §4 Step 2 + the delivery report).
 - **F-04** — GPU asset streaming / upload architecture: the measured-
   hypothesis plan is **DESIGN READY** (the same document §2.2/§3 — gated on
   the rig measurements H1/H4/H5; no refactor justified by current
   evidence).
-- **F-08 / F-12** — the sustained-load scale methodology is **DESIGN
-  READY** (`docs/SUSTAINED-LOAD-METHODOLOGY.md` — the six experiment
-  classes, twelve dimensions, the backlog-vs-deliberate-LOD distinction);
-  the implementation harness awaits its package.
+- **F-08 / F-12** — the sustained-load scale methodology is
+  **IMPLEMENTED in Cycle 1** (the `--benchmark-sustained-load` harness:
+  the six workload classes, twelve measurement dimensions, the measured
+  composition table, the honest effective matrix — see §7); remaining
+  follow-ups are documented limitations (§8: the class-6 director-protocol
+  anchor is harness-driven, and the sustained codec's identity-capacity
+  tightening), not missing methodology.
 - **The F-05 overlay throttle** — deliberately NOT implemented (the measured
   costs are negligible at target frame budgets; revisit only with rig
   evidence).
@@ -170,7 +203,35 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 - **Entity scale (pod, `--benchmark-entity-scale`):** 1k / 5k / 20k
   entities × three LOD scenarios, bounded event execution per tick with
   double-run determinism. Bounded-cost evidence, **not** sustained-load
-  proof (F-12/F-08 open).
+  proof (F-12/F-08 open). **Read-through correction (Cycle 1, measured
+  2026-11-14):** at the 5k and 20k points the benchmark sustains only
+  **1,000 live routine chains** — `npc::routine_payload_parts` rejects
+  identities ≥ `NPC_COUNT` (1,000), so entities above the first thousand
+  execute their initial event and never chain (measured: ≈154–162
+  executions/tick at ALL three populations; pending stays exactly 1,000).
+  The historical at-scale numbers are one-1000-chain steady states, not
+  scaled-chain evidence; the sustained-load harness below realizes full
+  chains at every population with its own codec.
+- **Sustained load (pod, Cycle-1 `--benchmark-sustained-load`):** the
+  F-08/F-12 reference matrix, measured — **35 measured cells (each
+  double-run) + 3 compacted variants + 12 mechanical N/A**. Headline
+  interpretations: the 1k campaign is **sustainable** (zero overdue, zero
+  budget exhaustion, zero lateness; far-lane pending is designed pipeline
+  depth); from 5k up the real chains **genuinely overload** the 200/tick
+  budget (the honest "fast-because-falling-behind" now measured, with the
+  known growth rate regression-pinned); **recovery drains** measured
+  (drain at tick 150, conservation exact); mixed-LOD splits lane-vs-lane
+  (near overloaded / far designed cadence); per-population horizon
+  derivation tested where drains exist. Compacted-representation variants
+  show the ledger downgrade. Pod CPU evidence only, logical-time
+  determinism throughout.
+- **Player prototype (pod, Cycle-1 `--player-headless` / offscreen):**
+  collide-what-you-see physics verified end-to-end (the scripted walk
+  stops against the visible cube at the exact SKIN offset); the
+  libm-free trace class is cross-platform bit-stable (pinned
+  `8513d40792ea88f0`, reproduced at the integrated three-package tree).
+  **No human-played run has occurred** — offscreen runs are correctness
+  smokes only.
 - **Persistence (pod, the F-07 harness):** ~1295 sequential ops/s, ~9%
   worker-queue overhead, contention p99 128 ms, cold recovery ~34.7 ms,
   ~19× head-of-line amplification — pod measurements of the approved
@@ -196,13 +257,30 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   deployments use the SQLite medium (`TransactionalWalFull`).
 - The renderer is prototype-class: static scene buffers, host-visible
   persistently-mapped dynamic buffers, 2 frames in flight, and a **bounded
-  region-vertex capacity** (F-03 — silent-truncation risk if geometry
-  exceeds it; the policy is deferred by design).
+  region-vertex capacity** (F-03 — the truncation is now COUNTED and
+  reported, measured zero on every ordinary run, but the capacity limit
+  itself stands; the Step-2 refusal policy is deferred by design).
+- The player prototype is prototype-class: kinematic axis-aligned
+  collision only (no capsules/rotated geometry/slopes/moving platforms),
+  the third-person camera has no collision handling, controller state is
+  **transient** (not persisted; restart resets the player), movement runs
+  beside the spine (not as spine events), and **no human-played run has
+  occurred** — offscreen runs are correctness smokes.
+- The sustained-load harness's documented Cycle-1 limitations: class 6's
+  RegionDirector-protocol anchor is harness-driven (the director's own
+  transition semantics stay covered by the regions/s6 suites, not the
+  matrix), and the sustained codec's 16-bit identity field contradicts
+  its 2^24 restore bound (latent — no delivered path triggers it; a
+  follow-up tightening).
+- The entity-scale benchmark's 5k/20k dead-chain read-through (§7): the
+  historical at-scale evidence is one-1000-chain steady state.
+- Sustained-load scale is now QUALIFIED at the covered populations
+  (sustainable at 1k; genuinely overloaded from 5k with real chains —
+  measured), but production-scale claims remain out; the reference
+  matrix is pod CPU evidence with logical-time determinism, not a
+  universal throughput guarantee.
 - No GPU asset streaming (F-04); dynamic content moves through per-frame
   host-visible copies.
-- Sustained-load scale is unproven (F-12/F-08): a budget-limited scheduler
-  can be fast while falling behind; backlog drain/lateness qualification is
-  pending.
 - No networking, replication, physics, combat, procedural generation, asset
   pipeline, or editor systems (§10 — not yet designed, not hidden).
 - The engine is a **development foundation + demo**, not a production game
@@ -211,34 +289,49 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
 
 ## 9. Active development priorities
 
-The **post-audit remediation cycle** (2026-11-14, the owner's directive
-preserved at the coordination ledger, §10): the three parallel packages
-delivered, cross-reviewed (all ACCEPT), and **consolidated on the
-integration branch** — F-09 GPU-kit/CLI correctness, F-11 deterministic
-head-of-line test, F-14 epoch trust-boundary audit (incl. the routed
-engine-slice construction-boundary guards), F-13 this documentation
-reconciliation; Milestone 2 — the F-12/F-08 sustained-scale methodology
-(DESIGN READY, `docs/SUSTAINED-LOAD-METHODOLOGY.md`), the F-07 persistence
-interpretation (`docs/F07-PERSISTENCE-OPTIMIZATION-ANALYSIS-2026-11-14.md`),
-the F-03/F-04 GPU capacity/synchronization analysis (DESIGN READY,
-`docs/GPU-CAPACITY-SYNC-ANALYSIS.md`), the F-10 fault-coverage matrix
-(`docs/F10-FAULT-SEAM-COVERAGE-MATRIX-2026-11-14.md`); then the
-Milestone-3 next-cycle proposal (correctness + performance + forward
-feature progress).
+The post-audit remediation cycle (2026-11-14) **is merged** — `main` @
+`900b0ea` carries F-09 GPU-kit/CLI correctness, F-11, F-14, F-13, and the
+Milestone-2 analyses (`docs/SUSTAINED-LOAD-METHODOLOGY.md`,
+`docs/F07-PERSISTENCE-OPTIMIZATION-ANALYSIS-2026-11-14.md`,
+`docs/GPU-CAPACITY-SYNC-ANALYSIS.md`,
+`docs/F10-FAULT-SEAM-COVERAGE-MATRIX-2026-11-14.md`).
 
-The consolidated candidate: `s6-remediation-integration` (from main
-`a4fe0ec`, the three reviewed packages merged, the measured counts in §4)
-— pending the owner's main-merge GO per the reserved list.
+**Cycle 1 (2026-11-14/15, the owner's GO directive preserved verbatim with
+SHA-256 at the coordination ledger, §10)** — three packages delivered,
+independently cross-reviewed (all ACCEPT), and consolidated on
+`s7-cycle1-integration`: **P1** renderer overflow visibility (F-03 Step 1,
+merged `359fbc6`), **P3** the player movement/collision prototype (merged
+`7101433`), **P2** the sustained-load verification harness (F-08/F-12,
+merged `0940a62`), plus this reconciliation commit.
+
+The **Cycle-1 candidate** (full ancestry from `900b0ea`) measured at its
+exact tree: fmt/clippy clean, main **980/1/30**, heavy **482/4/49**, every
+determinism pin byte-identical, and the cross-package combined-semantics
+check green (the P3 third-person player proxy flows through P1's truncation
+counters — 0 omitted). The five-job `workflow_dispatch` candidate CI is
+dispatched at this exact SHA; per-job conclusions are recorded in the cycle
+report. **The cycle stops at the owner-reserved mainline-merge gate** —
+pending ChatGPT's independent review and the owner's decisions on the
+mainline merge itself, the F-03 Step-2 capacity/refusal policy
+(recommendation delivered, not ratified), and the Milestone-3 next-cycle
+proposal.
 
 ## 10. The authoritative coordination ledger
 
-- **Location:** `~/.qwen/sektor7-coordination/STATUS.md` on the development
-  pod — **outside the Git repository, by charter**. The same directory holds
-  the owner's directives preserved verbatim (`OWNER_DIRECTIVE_*.md`) and the
-  relay/coordination records.
-- **Ownership:** the coordinator session (Agent D) is the **sole writer**;
-  implementation agents read it and receive byte-verified relays. The owner's
-  authorizations are the preserved directive files, never paraphrase.
+- **Location:** `/home/coder/sektor7-coordination/` on the development pod
+  (the live operational ledger since the 2026-11-14 clean-slate restart —
+  the legacy `~/.qwen/sektor7-coordination/STATUS.md` location was wiped in
+  that day's workspace purge and is obsolete) — **outside the Git
+  repository, by charter**. It holds the owner's directives preserved
+  verbatim with SHA-256 (`owner-directives/`, verified against
+  `HASHES.sha256`), the cycle charters/matrices/challenges/reviews/deliveries
+  (`cycle1/`), and the relay log (`sessions/registry.md`).
+- **Ownership:** the **GLM orchestrator session** (`coder-1e`) is the sole
+  writer, under the standing chain of command — Owner → ChatGPT (independent
+  technical lead) → orchestrator → engineering seats. Seats receive
+  provenanced relays (owner-directive + hash references, relay IDs
+  registered in the ledger). The owner's authorizations are the preserved
+  directive files, never paraphrase.
 - **Durability:** pod-local operational storage (not committed, not on
   GitHub). It is deliberately independent of the repo's branches and
   worktrees, so branch/worktree cleanup never invalidates references to it.
@@ -257,13 +350,13 @@ not implemented** / **not yet designed**.
 
 | Capability | Classification | Basis |
 |---|---|---|
-| Deterministic simulation & scheduling | Implemented and validated (demo scale; sustained-scale qualification in progress, §8) | `engine-core` spine; the determinism pins; the CI battery; the entity-scale benchmark |
+| Deterministic simulation & scheduling | Implemented and validated (demo scale; sustained-scale measured at the covered populations — §7/§8) | `engine-core` spine; the determinism pins; the CI battery; the entity-scale benchmark; the sustained-load reference matrix |
 | Persistence & recovery | Implemented and validated | `engine-persist` store/journal/pipeline; the crash/recovery matrices; real process-kill proofs; cross-platform CI; the per-platform durability tiers (§5/§8) |
-| Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03/F-04 open |
+| Rendering (Vulkan presentation) | Partially implemented (prototype-class design) | `engine-renderer`; lavapipe + rig validation; F-03 Step 1 delivered (fail-visible truncation counters), Step-2 policy + F-04 open |
 | Shader/material architecture | Prototype only | Hand-written build-time naga shaders; no material system |
 | GPU resource streaming | Not yet designed | F-04 deferred; host-visible copies only |
 | NPC/world representation (LOD) | Partially implemented | The region director, four LOD levels, activation/reconstruction — validated at 1000 NPCs / 8 regions; game-scale behaviors undesigned |
-| Physics and collision | Not yet designed | — |
+| Physics and collision | Prototype only | The Cycle-1 kinematic player prototype (`engine-core` player module: swept-AABB collision, fixed-step movement, FP/TP cameras) — headless/offscreen validated, collide-what-you-see; reversible and explicitly NOT a ratified production physics backend (§8) |
 | Combat and gameplay systems | Not yet designed | — |
 | Networking and replication | Not yet designed | The player-facing multiplayer and governance rules are **ratified** in `docs/MULTIPLAYER-SPEC.md`; the networking/transport/replication implementation choices remain unratified and undesigned |
 | Listen-server authority | Not yet designed | Player-hosted listen-server is the stated working preference (unratified); no engine system |
@@ -273,5 +366,5 @@ not implemented** / **not yet designed**.
 | Dense city streaming | Not yet designed | F-08 deferred |
 | Assets and content pipeline | Not yet designed | — |
 | Editor/creation tools | Not yet designed | — |
-| Performance instrumentation | Implemented and validated | The benchmark flags; the run summaries; the F-06 canary; the GPU kit |
+| Performance instrumentation | Implemented and validated | The benchmark flags; the run summaries; the F-06 canary; the GPU kit; the Cycle-1 sustained-load reference matrix and the renderer truncation counters |
 | Production deployment | Not yet designed | The CLI is a development driver, not a product |

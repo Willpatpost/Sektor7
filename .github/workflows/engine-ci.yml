@@ -194,8 +194,15 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          expected=955
-          if [ "$(uname -s)" != "Linux" ]; then expected=904; fi
+          # Cycle 1 (2026-11-15): the integrated candidate adds P1's 5
+          # engine-renderer clamp tests and P3's 20 engine-core player
+          # tests to this shard (25 platform-uniform, no cfg gates).
+          # Linux 980 MEASURED at the integrated tree with this step's
+          # own awk; Windows 929 = 904 + the same 25 (inference,
+          # confirmed by this candidate run — a mismatch is corrected
+          # from actuals, never by weakening a test).
+          expected=980
+          if [ "$(uname -s)" != "Linux" ]; then expected=929; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -596,15 +603,23 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          expected=467
-          if [ "$(uname -s)" != "Linux" ]; then expected=466; fi
+          # Cycle 1 (2026-11-15): the integrated candidate adds P1's 2
+          # lib tests + P3's 7 (5 integration + 2 bin) + P2's 6 — 15
+          # platform-uniform tests — and three new integration binaries
+          # (49 result lines; ignored 3 -> 4: P1's pod-only lavapipe
+          # oversize smoke). Linux 482/4/49 MEASURED at the integrated
+          # tree with this step's own awk; Windows 481 = 466 + the same
+          # 15 (inference, confirmed by this candidate run — a mismatch
+          # is corrected from actuals, never by weakening a test).
+          expected=482
+          if [ "$(uname -s)" != "Linux" ]; then expected=481; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 3 / 46)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 4 / 49)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 3 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 3"; exit 1; }
-          [ "$results" -eq 46 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 46"; exit 1; }
+          [ "$ignored" -eq 4 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 4"; exit 1; }
+          [ "$results" -eq 49 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 49"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
