@@ -546,6 +546,11 @@ pub struct WindowSample {
     /// The §5 split, per lane, never summed: obligations past due.
     pub near_overdue: usize,
     pub far_overdue: usize,
+    /// Per-lane backlogged ticks this window (due work remained for
+    /// THIS lane when the budget exhausted) — the lane's own
+    /// saturation signal, never the global flag.
+    pub near_backlogged: u64,
+    pub far_backlogged: u64,
     pub near_max_overdue_age: u64,
     pub far_max_overdue_age: u64,
     pub near_p95_wait: f64,
@@ -627,11 +632,14 @@ fn sorted_percentile(values: &mut [f64], quantile: f64) -> f64 {
 /// Classifies one lane's window series against its cadence budget:
 /// growth slope ≥ +0.5/tick → Overloaded; ≤ −0.5/tick → Recovering;
 /// otherwise Saturated when overdue age ever exceeds the cadence
-/// budget or exhaustion occurs; else Sustainable.
+/// budget or THIS LANE's own backlogged signal fires (due work
+/// remained when the budget exhausted — the §5 split's honesty: a
+/// near-lane excess must never mislabel the far lane); else
+/// Sustainable.
 fn classify_lane(
     overdue: &[f64],
     max_age: u64,
-    exhausted: bool,
+    lane_backlogged: bool,
     cadence_budget: u64,
 ) -> LaneVerdict {
     let slope = series_slope(overdue);
@@ -639,7 +647,7 @@ fn classify_lane(
         LaneVerdict::Overloaded
     } else if slope <= -0.5 {
         LaneVerdict::Recovering
-    } else if max_age > cadence_budget || exhausted {
+    } else if max_age > cadence_budget || lane_backlogged {
         LaneVerdict::Saturated
     } else {
         LaneVerdict::Sustainable
@@ -667,15 +675,46 @@ pub fn classify(
         .map(|w| w.far_max_overdue_age)
         .max()
         .unwrap_or(0);
-    let exhausted = windows.iter().any(|w| w.budget_exhausted > 0);
+    let near_backlogged = windows.iter().any(|w| w.near_backlogged > 0);
+    let far_backlogged = windows.iter().any(|w| w.far_backlogged > 0);
     Classification {
-        near: classify_lane(&near_overdue, near_max, exhausted, near_cadence_budget),
-        far: classify_lane(&far_overdue, far_max, exhausted, far_cadence_budget),
+        near: classify_lane(
+            &near_overdue,
+            near_max,
+            near_backlogged,
+            near_cadence_budget,
+        ),
+        far: classify_lane(&far_overdue, far_max, far_backlogged, far_cadence_budget),
         near_overdue_slope: series_slope(&near_overdue),
         far_overdue_slope: series_slope(&far_overdue),
         near_max_overdue_age: near_max,
         far_max_overdue_age: far_max,
     }
+}
+
+/// The measured drain tick of a class-4 arc: the first window end at
+/// which the near lane's overdue backlog has returned to zero after
+/// being nonzero (the population-parameterized anchor the horizon
+/// derivation consumes — F6).
+pub fn measured_drain_tick(windows: &[WindowSample]) -> Option<u64> {
+    let mut seen_backlog = false;
+    for window in windows {
+        if window.near_overdue > 0 {
+            seen_backlog = true;
+        }
+        if seen_backlog && window.near_overdue == 0 {
+            return Some(window.tick_end);
+        }
+    }
+    None
+}
+
+/// The methodology's horizon rule: a simulated-time horizon ≥ 10×
+/// the drain time observed in class 4 at that population — derived
+/// per population, never a fixed wall-clock cap masquerading as a
+/// logical horizon.
+pub fn derived_horizon(drain_ticks: u64) -> u64 {
+    drain_ticks.saturating_mul(10)
 }
 
 /// FNV-1a over the deterministic per-tick trace (dimension 12's
@@ -823,6 +862,8 @@ pub fn run_cell(spec: &CellSpec) -> CellReport {
             let lanes = spine.lane_totals();
             window.near_executed = lanes.near_executed - last_lanes.near_executed;
             window.far_executed = lanes.far_executed - last_lanes.far_executed;
+            window.near_backlogged = lanes.near_backlogged_ticks - last_lanes.near_backlogged_ticks;
+            window.far_backlogged = lanes.far_backlogged_ticks - last_lanes.far_backlogged_ticks;
             last_lanes = lanes;
 
             // The §5 pending-age scan, per lane, never summed.
