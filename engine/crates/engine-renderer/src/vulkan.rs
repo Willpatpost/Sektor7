@@ -68,7 +68,10 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
-use crate::config::{FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig, resolve_present_mode};
+use crate::config::{
+    DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig, dynamic_geometry_clamp,
+    resolve_present_mode,
+};
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
 
@@ -1488,11 +1491,14 @@ impl PipelineState {
     /// persistently mapped buffer (corrective finding B): each slot owns
     /// a disjoint byte range, and the caller writes a slot's region only
     /// after that slot's fence wait, so in-flight submissions never read
-    /// a region being rewritten. The copy length is bounded by the
-    /// slot's capacity.
-    pub(crate) fn write_overlay(&mut self, slot: usize, vertices: &[OverlayVertex]) {
+    /// a region being rewritten. The copy length is the frame's ONE
+    /// capacity decision (`drawn` — F-03 Step 1): the draw consumes the
+    /// same value, so the copy can never disagree with the draw and can
+    /// never leave the slot.
+    pub(crate) fn write_overlay(&mut self, slot: usize, vertices: &[OverlayVertex], drawn: u32) {
         let slot_bytes = self.overlay_slot_bytes as usize;
-        let byte_len = std::mem::size_of_val(vertices).min(slot_bytes);
+        let byte_len = drawn as usize * std::mem::size_of::<OverlayVertex>();
+        debug_assert!(byte_len <= slot_bytes);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 vertices.as_ptr() as *const u8,
@@ -1506,11 +1512,14 @@ impl PipelineState {
     /// slot's disjoint region of the persistently mapped buffer — the
     /// same fenced-slot discipline as [`Self::write_overlay`]: called
     /// during command recording, after this slot's fence wait, so
-    /// in-flight submissions never read a region being rewritten.
-    /// Truncates to the slot's capacity.
-    pub(crate) fn write_region_scene(&mut self, slot: usize, vertices: &[SceneVertex]) {
+    /// in-flight submissions never read a region being rewritten. The
+    /// copy length is the frame's ONE capacity decision (`drawn` —
+    /// F-03 Step 1): the draw consumes the same value, so the copy can
+    /// never disagree with the draw and can never leave the slot.
+    pub(crate) fn write_region_scene(&mut self, slot: usize, vertices: &[SceneVertex], drawn: u32) {
         let slot_bytes = self.region_slot_bytes as usize;
-        let byte_len = std::mem::size_of_val(vertices).min(slot_bytes);
+        let byte_len = drawn as usize * std::mem::size_of::<SceneVertex>();
+        debug_assert!(byte_len <= slot_bytes);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 vertices.as_ptr() as *const u8,
@@ -1947,6 +1956,15 @@ pub(crate) struct FrameOutcome {
     /// capabilities) — nothing was created, destroyed, or presented.
     pub deferred: bool,
     pub gpu_render_ms: Option<f64>,
+    /// F-03 Step 1: the frame's region-scene and overlay capacity
+    /// decisions (supplied / per-slot capacity / drawn / omitted). Both
+    /// stay default — all zero — on deferred or minimized frames, which
+    /// record nothing; the overlay capacity is always reported (its
+    /// buffer is allocated at pipeline build) while the region capacity
+    /// reads 0 until the lazy region buffer allocates. Nonzero omitted
+    /// counts are REPORTED upstream, never fatal here.
+    pub region: DynamicClamp,
+    pub overlay: DynamicClamp,
 }
 
 /// The full frame flow: wait → acquire → (recreate if needed) → record →
@@ -2223,18 +2241,32 @@ pub(crate) fn render_frame(
         // and view-projection push constants) from the per-slot
         // persistently mapped buffer — the overlay's fenced-slot
         // dynamic-update pattern applied to scene geometry.
+        //
+        // F-03 Step 1 (fail-visible over fail-silent): ONE capacity
+        // decision per frame per buffer, computed HERE at the record
+        // step and held in one local that BOTH the upload bound and the
+        // draw count consume — one physical truncation is counted
+        // exactly once (the two historical silent min() clamps can
+        // neither disagree nor double-count), no out-of-bounds copy, no
+        // inflated draw count. The overlay buffer always exists (its
+        // capacity is reportable on every recorded frame); the region
+        // buffer is lazy — its capacity reads 0 until the first
+        // non-empty region frame.
+        outcome.overlay.capacity = pipes.overlay_capacity;
         if !region_vertices.is_empty() {
-            pipes.write_region_scene(slot, region_vertices);
-            let vertex_count = (region_vertices.len() as u32).min(pipes.region_capacity);
+            let clamp = dynamic_geometry_clamp(region_vertices.len(), pipes.region_capacity);
+            pipes.write_region_scene(slot, region_vertices, clamp.drawn);
+            outcome.region = clamp;
             let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
             ctx.device
                 .cmd_bind_vertex_buffers(command, 0, &[pipes.region_vbo], &[region_offset]);
-            ctx.device.cmd_draw(command, vertex_count, 1, 0, 0);
+            ctx.device.cmd_draw(command, clamp.drawn, 1, 0, 0);
         }
 
         if overlay_enabled && !overlay_vertices.is_empty() {
-            pipes.write_overlay(slot, overlay_vertices);
-            let vertex_count = (overlay_vertices.len() as u32).min(pipes.overlay_capacity);
+            let clamp = dynamic_geometry_clamp(overlay_vertices.len(), pipes.overlay_capacity);
+            pipes.write_overlay(slot, overlay_vertices, clamp.drawn);
+            outcome.overlay = clamp;
             ctx.device.cmd_bind_pipeline(
                 command,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -2243,7 +2275,7 @@ pub(crate) fn render_frame(
             let overlay_offset = (slot as vk::DeviceSize) * pipes.overlay_slot_bytes;
             ctx.device
                 .cmd_bind_vertex_buffers(command, 0, &[pipes.overlay_vbo], &[overlay_offset]);
-            ctx.device.cmd_draw(command, vertex_count, 1, 0, 0);
+            ctx.device.cmd_draw(command, clamp.drawn, 1, 0, 0);
         }
 
         ctx.device.cmd_end_render_pass(command);

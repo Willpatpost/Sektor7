@@ -3059,6 +3059,13 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
         stats.validation_errors,
         stats.validation_warnings
     );
+    // F-03 Step 1: dynamic-geometry truncation belongs in the run
+    // summary — zero on every ordinary run; nonzero is reported with
+    // the supplied/capacity context, never fatal.
+    let truncation = crate::render_demo::TruncationReport::from_stats(stats);
+    for line in crate::render_demo::truncation_report_lines(&truncation) {
+        println!("{line}");
+    }
     println!("--- simulation summary (the one authoritative session) ---");
     {
         let session = demo.session();
