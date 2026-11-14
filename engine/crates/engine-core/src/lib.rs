@@ -39,6 +39,11 @@
 //! compiler versions — `std`'s hashers are not); fingerprinted state never
 //! derives from unordered iteration; wall-clock time never enters logical
 //! state.
+//!
+//! Cycle 1 P3 (2026-11-14) adds the player movement/collision prototype —
+//! kinematic, std-only mechanics (integration, collision queries, camera
+//! modes, a fixed-step driver), exercised by its own tests and the
+//! engine-slice demo application.
 
 pub mod clock;
 pub mod diag;
@@ -46,6 +51,7 @@ pub mod event;
 pub mod fingerprint;
 pub mod lod;
 pub mod npc_world_save;
+pub mod player;
 pub mod spine;
 pub mod wire;
 
@@ -57,6 +63,10 @@ pub use event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 pub use fingerprint::Fingerprinter;
+pub use player::{
+    CameraMode, CameraPose, CollisionWorld, DriveStep, MoveIntent, PlayerConfig, PlayerDriver,
+    PlayerState, StaticCollider, StepOutcome, TraceEntry,
+};
 /// The game's region layout (Stage 3 metadata): eight logical
 /// regions. Authoritative in engine-core so every layer — the
 /// application's region director AND the persistence layer's shared
