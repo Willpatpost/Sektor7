@@ -78,8 +78,10 @@ ARM64) with a five-job CI:
   (`--benchmark-persistence`, `--benchmark-instrumentation`,
   `--benchmark-entity-scale`, `--benchmark-render`), and the Cycle-1
   additions: **`--benchmark-sustained-load`** (the F-08/F-12 sustained-scale
-  reference matrix) and **`--player` / `--player-headless`** (the player
-  prototype's interactive and deterministic paths).
+  demonstration command) with **`--sustained-load-full-matrix`** (the full
+  reference matrix; the raw evidence record is archived in the
+  coordination ledger — §7) and **`--player` / `--player-headless`** (the
+  player prototype's interactive and deterministic paths).
 
 The **integrated campaign demo** (`--demo-persist`) is the vertical slice:
 one authoritative, persistently-orchestrated 1000-NPC / 8-region campaign
@@ -112,16 +114,20 @@ defined for it. Ignored: 1 main / 3 heavy, all deliberate measurement soaks.)
 
 **The Cycle-1 candidate** (`s7-cycle1-integration`, §9 — awaiting the
 owner's mainline merge; `main` stays at the table above until then) adds
-+25 main / +15 heavy platform-uniform tests and three integration binaries.
-Measured at the integrated tree (the workflow's own awk semantics):
-main **980 / 1 ignored / 30 result lines**; heavy **482 / 4 ignored / 49
-result lines**. Windows expectations 929 / 481 (platform-uniform inference)
-are confirmed by the candidate CI run; the workflow pins are updated in the
-same change (the F2 maintenance obligation). All determinism pins below are
-byte-identical at the candidate, plus the new pinned player trace
-`engine-core/player-trace/1` class (`8513d40792ea88f0`, the libm-free
-script class — cross-platform by construction; divergence is an
-investigation, never a silent re-pin).
++29 main / +16 heavy platform-uniform tests and three integration
+binaries, including the corrective round (R4's player boundary
+regressions, R2's gradual-growth regression). Measured at the
+re-integrated tree (the workflow's own awk semantics): main **984 / 1
+ignored / 30 result lines**; heavy **483 / 4 ignored / 49 result
+lines**. Windows expectations 933 / 482 (platform-uniform inference)
+are confirmed by the candidate CI run; the workflow pins are updated in
+the same change (the F2 maintenance obligation). All determinism pins
+below are byte-identical at the candidate, plus the new pinned player
+trace `engine-core/player-trace/1` class (`8513d40792ea88f0`, the
+libm-free script class — cross-platform by construction; divergence is
+an investigation, never a silent re-pin). The formerly ignored oversize
+smoke is now ALSO executed by an enforced Linux CI step (the R1
+corrective) with its evidence lines in the log.
 
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3
@@ -179,11 +185,15 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   the rig measurements H1/H4/H5; no refactor justified by current
   evidence).
 - **F-08 / F-12** — the sustained-load scale methodology is
-  **IMPLEMENTED in Cycle 1** (the `--benchmark-sustained-load` harness:
-  the six workload classes, twelve measurement dimensions, the measured
-  composition table, the honest effective matrix — see §7); remaining
-  follow-ups are documented limitations (§8: the class-6 director-protocol
-  anchor is harness-driven, and the sustained codec's identity-capacity
+  **IMPLEMENTED in Cycle 1** (the `--benchmark-sustained-load`
+  demonstration + `--sustained-load-full-matrix` full harness: the six
+  workload classes, twelve measurement dimensions, the measured
+  composition table, the honest effective matrix — see §7), **corrected
+  in the R2/R3 round** (per-logical-tick slope units; recovery horizons
+  derived from measured drains with explicit bounded-observation wording
+  for non-draining compositions); remaining follow-ups are documented
+  limitations (§8: the class-6 director-protocol anchor is
+  harness-driven, and the sustained codec's identity-capacity
   tightening), not missing methodology.
 - **The F-05 overlay throttle** — deliberately NOT implemented (the measured
   costs are negligible at target frame budgets; revisit only with rig
@@ -212,17 +222,31 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   The historical at-scale numbers are one-1000-chain steady states, not
   scaled-chain evidence; the sustained-load harness below realizes full
   chains at every population with its own codec.
-- **Sustained load (pod, Cycle-1 `--benchmark-sustained-load`):** the
-  F-08/F-12 reference matrix, measured — **35 measured cells (each
-  double-run) + 3 compacted variants + 12 mechanical N/A**. Headline
-  interpretations: the 1k campaign is **sustainable** (zero overdue, zero
-  budget exhaustion, zero lateness; far-lane pending is designed pipeline
-  depth); from 5k up the real chains **genuinely overload** the 200/tick
-  budget (the honest "fast-because-falling-behind" now measured, with the
-  known growth rate regression-pinned); **recovery drains** measured
-  (drain at tick 150, conservation exact); mixed-LOD splits lane-vs-lane
-  (near overloaded / far designed cadence); per-population horizon
-  derivation tested where drains exist. Compacted-representation variants
+- **Sustained load (pod, Cycle-1; corrected per the R2/R3 corrective):**
+  the F-08/F-12 reference matrix — **`--sustained-load-full-matrix`** runs
+  it; **`--benchmark-sustained-load`** is the bounded demonstration
+  command. The raw measurement record (every cell, double-run, with
+  environment parameters and reason-coded N/A lines) is archived at the
+  coordination ledger as
+  `cycle1/evidence/P2-sustained-load-full-matrix-R2R3.output` — this
+  summary qualifies it and replaces no raw result. **Overload onset is a
+  function of population × LOD composition, not population alone**
+  (measured base demand per logical tick against the 200/tick budget):
+  at 1k, no scenario's base saturates (full 154.1, mixed 84.1,
+  event-driven 13.7); at 5k, full and mixed saturate the budget while
+  event-driven (69.2) stays sustainable; at 20k all three saturate. The
+  overloaded cells measure the honest "fast-because-falling-behind"
+  (per-logical-tick backlog slopes — the R2 units corrective — e.g.
+  +57.7/tick at 5k-full, +199.7/tick at 1k-event-driven-overlaid; the
+  gradual-growth regression pins +1/tick so slow unsustainability cannot
+  masquerade as sustainable). **Recovery horizons are derived from
+  measured drains** (the R3 corrective: the 10× rule over observed drain
+  times — 1k drains 100–150 ticks → 1000–1500-tick horizons, one
+  resource-capped at 1200, stated); at 5k/20k no complete drain occurs
+  within the bounded probe, so those cells are explicit bounded
+  observation windows with backlog/age trends reported and **no
+  complete-recovery claim**. Mixed-LOD splits lane-vs-lane (near
+  overloaded / far designed cadence). Compacted-representation variants
   show the ledger downgrade. Pod CPU evidence only, logical-time
   determinism throughout.
 - **Player prototype (pod, Cycle-1 `--player-headless` / offscreen):**
@@ -274,11 +298,14 @@ The ledger is `docs/DECISIONS.md`; the load-bearing accepted decisions:
   follow-up tightening).
 - The entity-scale benchmark's 5k/20k dead-chain read-through (§7): the
   historical at-scale evidence is one-1000-chain steady state.
-- Sustained-load scale is now QUALIFIED at the covered populations
-  (sustainable at 1k; genuinely overloaded from 5k with real chains —
-  measured), but production-scale claims remain out; the reference
-  matrix is pod CPU evidence with logical-time determinism, not a
-  universal throughput guarantee.
+- Sustained-load scale is QUALIFIED with composition-dependent
+  interpretations (sustainable at 1k across scenarios; at 5k the full and
+  mixed compositions genuinely overload the 200/tick budget while
+  event-driven stays sustainable; at 20k all compositions overload —
+  measured, per-tick units), but production-scale claims remain out; the
+  reference matrix is pod CPU evidence with logical-time determinism,
+  not a universal throughput guarantee, and the 5k/20k recovery cells
+  are bounded observation windows, not complete drains.
 - No GPU asset streaming (F-04); dynamic content moves through per-frame
   host-visible copies.
 - No networking, replication, physics, combat, procedural generation, asset
@@ -298,23 +325,29 @@ Milestone-2 analyses (`docs/SUSTAINED-LOAD-METHODOLOGY.md`,
 
 **Cycle 1 (2026-11-14/15, the owner's GO directive preserved verbatim with
 SHA-256 at the coordination ledger, §10)** — three packages delivered,
-independently cross-reviewed (all ACCEPT), and consolidated on
+independently cross-reviewed (all ACCEPT), consolidated on
 `s7-cycle1-integration`: **P1** renderer overflow visibility (F-03 Step 1,
 merged `359fbc6`), **P3** the player movement/collision prototype (merged
 `7101433`), **P2** the sustained-load verification harness (F-08/F-12,
-merged `0940a62`), plus this reconciliation commit.
+merged `0940a62`), the §8 reconciliation (`0eeba4c`), and the **ChatGPT
+corrective round** (the HOLD review, hash-verified at the ledger): R1 the
+enforced CI execution of the oversize regression (`47c7f8e`), R2/R3 the
+per-logical-tick slope units + derived recovery horizons (merged
+`2b620eb`), R4 the player-input boundary contracts (merged `ee23927`) —
+each corrective independently verified by a non-author reviewer (all
+ACCEPT; verdicts archived in `cycle1/reviews/`).
 
-The **Cycle-1 candidate** (full ancestry from `900b0ea`) measured at its
-exact tree: fmt/clippy clean, main **980/1/30**, heavy **482/4/49**, every
-determinism pin byte-identical, and the cross-package combined-semantics
-check green (the P3 third-person player proxy flows through P1's truncation
-counters — 0 omitted). The five-job `workflow_dispatch` candidate CI is
-dispatched at this exact SHA; per-job conclusions are recorded in the cycle
-report. **The cycle stops at the owner-reserved mainline-merge gate** —
-pending ChatGPT's independent review and the owner's decisions on the
-mainline merge itself, the F-03 Step-2 capacity/refusal policy
-(recommendation delivered, not ratified), and the Milestone-3 next-cycle
-proposal.
+The **corrected Cycle-1 candidate** (full ancestry from `900b0ea`) measured
+at its exact tree: fmt/clippy clean, main **984/1/30**, heavy **483/4/49**,
+every determinism pin byte-identical, the P3 frozen trace reproducing, and
+the cross-package combined-semantics check green (the player proxy through
+the truncation counters — 0 omitted). The five-job `workflow_dispatch`
+candidate CI (including the enforced R1 execution step) is dispatched at
+this exact SHA; per-job conclusions are recorded in the cycle report.
+**The cycle stops at the owner-reserved mainline-merge gate** — pending
+ChatGPT's independent re-review and the owner's decisions on the mainline
+merge itself, the F-03 Step-2 capacity/refusal policy (recommendation
+delivered, not ratified), and the Milestone-3 next-cycle proposal.
 
 ## 10. The authoritative coordination ledger
 
