@@ -2156,4 +2156,315 @@ mod tests {
         assert_eq!(driver.state().velocity, [0.0, 0.0, 0.0]);
         assert_eq!(driver.trace().len(), 10, "the frozen state is traced");
     }
+
+    fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn step_up_climbs_small_boxes() {
+        let mut config = PlayerConfig::default();
+        config.step_height = 0.55;
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 0.5);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        settle(&mut state, &config, &world);
+
+        let walk = MoveIntent {
+            forward: 1,
+            ..idle()
+        };
+        let mut climbed = false;
+        for _ in 0..100 {
+            step_player(&mut state, &config, &world, &walk, DT);
+            if state.position[1] > 0.4 {
+                climbed = true;
+                break;
+            }
+        }
+        assert!(climbed, "the 0.5 box is stepped onto without jumping");
+        assert_eq!(state.position[1], 0.5 + SKIN, "snapped onto the step top");
+        assert!(state.on_ground);
+        assert_eq!(
+            state.velocity[2], -config.walk_speed,
+            "the climb preserves forward motion (no axis zeroing)"
+        );
+        let (min, max) = player_box(state.position, &config);
+        assert!(!world.box_overlaps(min, max));
+        for _ in 0..20 {
+            step_player(&mut state, &config, &world, &walk, DT);
+        }
+        assert!(state.on_ground, "still supported on the box top");
+        assert!(
+            state.position[2] < -4.0,
+            "progressed across the top: {}",
+            state.position[2]
+        );
+        assert_eq!(state.position[1], 0.5 + SKIN, "no height drift on top");
+    }
+
+    #[test]
+    fn step_up_refuses_tall_obstacles() {
+        let mut config = PlayerConfig::default();
+        config.step_height = 0.55;
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 1.5);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        settle(&mut state, &config, &world);
+
+        let walk = MoveIntent {
+            forward: 1,
+            ..idle()
+        };
+        for _ in 0..100 {
+            step_player(&mut state, &config, &world, &walk, DT);
+        }
+        assert_eq!(
+            state.position[2],
+            -4.0 + SKIN + config.radius,
+            "clamped at the face"
+        );
+        assert_eq!(
+            state.position[1], 0.0,
+            "no climb: the obstacle stands taller than the step"
+        );
+        assert_eq!(state.velocity[2], 0.0);
+    }
+
+    #[test]
+    fn step_up_requires_ground() {
+        let mut config = PlayerConfig::default();
+        config.step_height = 0.55;
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 0.5);
+        // Airborne at the box's face height: the probe is
+        // grounded-only, so the move stays clamped and gravity
+        // applies.
+        let mut state = PlayerState::spawn([0.0, 0.2, -3.63]);
+        step_player(
+            &mut state,
+            &config,
+            &world,
+            &MoveIntent {
+                forward: 1,
+                ..idle()
+            },
+            DT,
+        );
+        assert!(state.position[1] < 0.2, "airborne: gravity, no step gain");
+        assert!(!state.on_ground);
+        assert_eq!(state.velocity[2], 0.0, "the box still blocks horizontally");
+    }
+
+    #[test]
+    fn step_up_disabled_preserves_cycle1_behavior() {
+        // step_height 0.0 (the default): the LOW box stays a wall —
+        // the Cycle-1 clamp behavior, bit-for-bit.
+        let config = PlayerConfig::default();
+        assert_eq!(config.step_height, 0.0);
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 0.5);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        settle(&mut state, &config, &world);
+
+        let walk = MoveIntent {
+            forward: 1,
+            ..idle()
+        };
+        for _ in 0..100 {
+            step_player(&mut state, &config, &world, &walk, DT);
+        }
+        assert_eq!(
+            state.position[2],
+            -4.0 + SKIN + config.radius,
+            "the Cycle-1 clamp"
+        );
+        assert_eq!(state.position[1], 0.0, "the mechanic is disabled");
+        assert_eq!(state.velocity[2], 0.0);
+    }
+
+    #[test]
+    fn step_up_diagonal_low_corner() {
+        // Challenge F6: two adjacent LOW boxes met diagonally — the
+        // step-up may fire on either axis in one tick; the ascent is
+        // clean, supported, and drift-free across the seam.
+        let mut config = PlayerConfig::default();
+        config.step_height = 0.55;
+        // Centered on the 45° approach path (x = -z from the spawn),
+        // so the diagonal meets the z-face squarely within the pair's
+        // x-span and crosses the seam on top.
+        let world = CollisionWorld::new(0.0)
+            .with_box([5.0, 0.0, -5.0], 2.0, 0.5)
+            .with_box([3.0, 0.0, -5.0], 2.0, 0.5);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        settle(&mut state, &config, &world);
+
+        let diagonal = MoveIntent {
+            forward: 1,
+            strafe: 1,
+            ..idle()
+        };
+        let mut climbed = false;
+        for _ in 0..150 {
+            step_player(&mut state, &config, &world, &diagonal, DT);
+            if state.position[1] > 0.4 {
+                climbed = true;
+                break;
+            }
+        }
+        assert!(climbed, "the diagonal low corner is climbed");
+        assert_eq!(state.position[1], 0.5 + SKIN);
+        for _ in 0..20 {
+            step_player(&mut state, &config, &world, &diagonal, DT);
+        }
+        assert!(state.on_ground, "supported across the seam");
+        assert_eq!(state.position[1], 0.5 + SKIN, "no height jitter");
+        let (min, max) = player_box(state.position, &config);
+        assert!(!world.box_overlaps(min, max));
+        assert!(
+            state.position[2] < -4.0,
+            "progressed across the tops: {}",
+            state.position[2]
+        );
+    }
+
+    #[test]
+    fn segment_hit_returns_the_exact_first_face() {
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, 0.0], 2.0, 2.0);
+        // Straight through along -Z: the near face z = 1 over the
+        // 10 m segment → t = 0.4 exactly.
+        assert_eq!(
+            world.segment_hit([0.0, 1.0, 5.0], [0.0, 1.0, -5.0], 0.0),
+            Some(0.4)
+        );
+        // The nearer of two boxes wins.
+        let world = CollisionWorld::new(0.0)
+            .with_box([0.0, 0.0, -10.0], 2.0, 2.0)
+            .with_box([0.0, 0.0, -20.0], 2.0, 2.0);
+        assert_eq!(
+            world.segment_hit([0.0, 1.0, 0.0], [0.0, 1.0, -30.0], 0.0),
+            Some(0.3),
+            "the near box's face z = -9 over 30 m"
+        );
+        // The margin expands the faces.
+        let t = world
+            .segment_hit([0.0, 1.0, 0.0], [0.0, 1.0, -30.0], 0.5)
+            .expect("still hit");
+        assert!((t - 8.5 / 30.0).abs() < 1e-6, "expanded near face z = -8.5");
+    }
+
+    #[test]
+    fn segment_hit_registers_thin_walls_without_aliasing() {
+        // Challenge F2's adversarial: a wall thinner than any
+        // plausible march step — the exact slab form cannot step
+        // over it.
+        let world = CollisionWorld::new(0.0).with_collider(StaticCollider {
+            min: [-10.0, 0.0, -0.1],
+            max: [10.0, 3.0, 0.1],
+        });
+        assert_eq!(
+            world.segment_hit([0.0, 1.5, 5.0], [0.0, 1.5, -5.0], 0.0),
+            Some(0.49),
+            "the 0.2 m wall registers: entry z = 0.1 → t = 0.49"
+        );
+        // Clear lines miss entirely.
+        assert_eq!(
+            world.segment_hit([0.0, 4.5, 5.0], [0.0, 4.5, -5.0], 0.0),
+            None,
+            "above the wall"
+        );
+        assert_eq!(
+            world.segment_hit([12.0, 1.5, 5.0], [12.0, 1.5, -5.0], 0.0),
+            None,
+            "beside the wall"
+        );
+    }
+
+    #[test]
+    fn segment_hit_from_inside_clamps_to_zero() {
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, 0.0], 2.0, 2.0);
+        assert_eq!(
+            world.segment_hit([0.0, 1.0, 0.0], [0.0, 1.0, -5.0], 0.0),
+            Some(0.0),
+            "a segment starting inside reports the origin"
+        );
+        assert_eq!(
+            world.segment_hit([0.0, 1.0, 5.0], [0.0, 1.0, -5.0], 0.0),
+            Some(0.4)
+        );
+    }
+
+    #[test]
+    fn camera_obstruction_pulls_in() {
+        let config = PlayerConfig::default();
+        // A wall BEHIND the player (yaw 0 looks -Z; the TP camera
+        // sits at +Z behind the eye), far enough that the pull-in
+        // lands beyond the min-distance floor.
+        let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, 5.0], 4.0, 4.0);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        state.camera_mode = CameraMode::ThirdPerson;
+        settle(&mut state, &config, &world);
+
+        let desired = camera_pose(&state, &config);
+        let pose = camera_pose_obstructed(&state, &config, &world);
+        assert!(
+            pose.position[2] < desired.position[2],
+            "pulled in toward the eye: {} vs {}",
+            pose.position[2],
+            desired.position[2]
+        );
+        assert!(
+            pose.position[2] > 2.0 && pose.position[2] < 4.5,
+            "between the wall and the desired distance: {}",
+            pose.position[2]
+        );
+        let eye = [0.0, config.eye_height, 0.0];
+        let distance = dist3(pose.position, eye);
+        assert!(
+            distance >= config.tp_min_distance - 0.01,
+            "never inside the floor: {distance}"
+        );
+        assert!(distance < config.tp_distance, "strictly pulled in");
+    }
+
+    #[test]
+    fn camera_unobstructed_matches_desired() {
+        let config = PlayerConfig::default();
+        let world = CollisionWorld::new(0.0);
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        state.camera_mode = CameraMode::ThirdPerson;
+        state.yaw = 0.7;
+        let pose = camera_pose_obstructed(&state, &config, &world);
+        let desired = camera_pose(&state, &config);
+        assert_eq!(
+            bits(pose.position),
+            bits(desired.position),
+            "a clear line leaves the desired pose untouched"
+        );
+        // First person passes through as-is.
+        state.camera_mode = CameraMode::FirstPerson;
+        assert_eq!(
+            bits(camera_pose_obstructed(&state, &config, &world).position),
+            bits(camera_pose(&state, &config).position)
+        );
+    }
+
+    #[test]
+    fn camera_min_distance_floor() {
+        let config = PlayerConfig::default();
+        // The eye walled in behind: the hit lands at the origin and
+        // the camera sits AT the floor — the documented residual
+        // (possibly inside the wedged geometry).
+        let world = CollisionWorld::new(0.0).with_collider(StaticCollider {
+            min: [-10.0, 0.0, 0.5],
+            max: [10.0, 6.0, 10.0],
+        });
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        state.camera_mode = CameraMode::ThirdPerson;
+        settle(&mut state, &config, &world);
+
+        let pose = camera_pose_obstructed(&state, &config, &world);
+        let eye = [0.0, config.eye_height, 0.0];
+        let distance = dist3(pose.position, eye);
+        assert!(
+            (distance - config.tp_min_distance).abs() < 0.01,
+            "the floor binds: {distance}"
+        );
+    }
 }
