@@ -38,17 +38,24 @@
 //! prototype scope). The third-person camera has no collision of its
 //! own (documented limitation).
 //!
-//! Input-validity contracts (the Cycle-1 R4 corrective): tick rates
-//! are clamped into [`MIN_TICK_HZ`]..=[`MAX_TICK_HZ`] — the
+//! Input-validity contracts (the Cycle-1 R4/R4b correctives): tick
+//! rates are clamped into [`MIN_TICK_HZ`]..=[`MAX_TICK_HZ`] — the
 //! representable fixed-step range at nanosecond logical resolution
 //! (`period_ns` ≥ 1 ns and `dt` finite and positive; a rate above one
 //! billion would round the nanosecond period to zero — the
 //! division-by-zero hazard this policy closes). [`step_player`]
-//! refuses a non-finite or non-positive `dt` and any non-finite
-//! [`PlayerConfig`] field BEFORE any state mutation, reporting
-//! `refused_invalid_inputs`: a valid player state can never be
-//! silently turned non-finite by invalid inputs (a non-finite
-//! incoming STATE is refused separately, `refused_nonfinite_state`).
+//! refuses a non-finite or non-positive `dt` and any non-finite or
+//! semantically invalid [`PlayerConfig`] BEFORE any state mutation,
+//! reporting `refused_invalid_inputs`: a valid player state can
+//! never be silently turned non-finite by invalid inputs (a
+//! non-finite incoming STATE is refused separately,
+//! `refused_nonfinite_state`). R4b adds the semantic minimums
+//! (positive `pitch_limit` — a negative one inverts the pitch clamp
+//! and panics — and positive `height`/`radius` extents) and exact
+//! u64 tick accounting across the whole tick-rate range: a 2³²-tick
+//! obligation at the 1 GHz bound accounts exactly, and the driver's
+//! total logical advancement is bounded to [`MAX_TOTAL_ADVANCE_NS`]
+//! with any clamping REPORTED, never silent.
 
 use std::time::Duration;
 
@@ -72,6 +79,17 @@ pub const MIN_TICK_HZ: u32 = 1;
 /// the nanosecond period round to zero — a division-by-zero hazard
 /// at every accumulator site — so they clamp down.
 pub const MAX_TICK_HZ: u32 = 1_000_000_000;
+
+/// The driver's total-logical-advancement domain (R4b): u64::MAX
+/// nanoseconds (≈584 years at nanosecond resolution — beyond any
+/// conceivable session). Within the domain the tick accounting is
+/// exact in u64 for every representable input (`due == executed +
+/// outstanding`, including a 2³²-tick obligation at the 1 GHz tick
+/// bound, which the old u32 narrowing wrapped to zero); an advance
+/// that would exceed the remaining domain is clamped to the boundary
+/// and REPORTED via [`DriveStep::domain_clamped`] — never silently
+/// discarded.
+pub const MAX_TOTAL_ADVANCE_NS: u128 = u64::MAX as u128;
 
 /// Movement intent for one tick — the application maps its input
 /// snapshots onto this; the engine never sees keys or devices.
@@ -500,9 +518,14 @@ fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-/// The config side of the R4 input-validity contract: every
-/// gameplay-extent and tuning parameter must be finite.
-fn config_is_finite(config: &PlayerConfig) -> bool {
+/// The config side of the R4/R4b input-validity contract: every
+/// parameter finite, plus the semantic minimums the kinematic
+/// implementation depends on — a POSITIVE `pitch_limit` (a negative
+/// one inverts the pitch clamp's bounds, which panics; zero locks
+/// pitch and is refused by the same positive-only policy) and
+/// POSITIVE `height`/`radius` extents (nonpositive values invert or
+/// degenerate the player box).
+fn config_is_valid(config: &PlayerConfig) -> bool {
     config.walk_speed.is_finite()
         && config.sprint_speed.is_finite()
         && config.gravity.is_finite()
@@ -514,11 +537,15 @@ fn config_is_finite(config: &PlayerConfig) -> bool {
         && config.tp_distance.is_finite()
         && config.tp_lift.is_finite()
         && config.pitch_limit.is_finite()
+        && config.pitch_limit > 0.0
+        && config.height > 0.0
+        && config.radius > 0.0
 }
 
 /// One fixed-dt movement step. Order: refuse invalid inputs (a
-/// non-finite or non-positive `dt`, or a non-finite config field —
-/// nothing mutated, the outcome reports it); refuse a non-finite
+/// non-finite or non-positive `dt`, or a config that is non-finite
+/// or semantically invalid — nothing mutated, the outcome reports
+/// it); refuse a non-finite
 /// state; sanitize and apply look; set horizontal velocity from the
 /// intent in the yaw frame (diagonal normalized to the speed cap);
 /// gravity (terminal-clamped), then a grounded jump's exact impulse;
@@ -535,7 +562,7 @@ pub fn step_player(
 ) -> StepOutcome {
     let mut outcome = StepOutcome::default();
 
-    if !dt.is_finite() || dt <= 0.0 || !config_is_finite(config) {
+    if !dt.is_finite() || dt <= 0.0 || !config_is_valid(config) {
         outcome.refused_invalid_inputs = true;
         return outcome;
     }
@@ -662,8 +689,14 @@ pub struct TraceEntry {
 pub struct DriveStep {
     pub executed_ticks: u32,
     /// Due ticks retained (not yet executed) — a reported obligation,
-    /// never silently discarded; drains when catch-up capacity allows.
-    pub outstanding_ticks: u32,
+    /// never silently discarded; drains when catch-up capacity
+    /// allows. u64 (R4b): a 2³²-tick obligation at the 1 GHz tick
+    /// bound accounts exactly — the old u32 narrowing wrapped it to
+    /// zero.
+    pub outstanding_ticks: u64,
+    /// The advance was clamped to the remaining
+    /// [`MAX_TOTAL_ADVANCE_NS`] domain — reported, never silent.
+    pub domain_clamped: bool,
 }
 
 /// Fixed-step movement driver — the SimDriver discipline applied to
@@ -686,6 +719,10 @@ pub struct PlayerDriver {
     total_advanced_ns: u128,
     headless_ticks: u64,
     executed_ticks: u64,
+    /// Steps refused by the input-validity contracts (R4b): counted
+    /// and reported, never hidden as movement work. The tick itself
+    /// is still consumed — the accounting invariant is time-based.
+    refused_steps: u64,
     record_trace: bool,
     trace: Vec<TraceEntry>,
 }
@@ -727,6 +764,7 @@ impl PlayerDriver {
             total_advanced_ns: 0,
             headless_ticks: 0,
             executed_ticks: 0,
+            refused_steps: 0,
             record_trace: true,
             trace: Vec::new(),
         }
@@ -756,20 +794,30 @@ impl PlayerDriver {
         self.record_trace = on;
     }
 
-    /// Advances by elapsed monotonic time (frame-sampled live intent).
+    /// Advances by elapsed monotonic time (frame-sampled live
+    /// intent). R4b: the due-tick arithmetic is u128-wide with u64
+    /// public accounting — exact across the whole tick-rate range
+    /// (the 2³²-tick counterexample at the 1 GHz bound included; the
+    /// old `as u32` narrowing wrapped it to zero) — and an advance
+    /// beyond the remaining [`MAX_TOTAL_ADVANCE_NS`] domain is
+    /// clamped to the boundary and REPORTED via `domain_clamped`.
     pub fn advance(&mut self, elapsed: Duration, intent: MoveIntent) -> DriveStep {
-        let nanos = elapsed.as_nanos();
-        self.total_advanced_ns += nanos;
-        self.accumulator_ns += nanos;
-        let due = (self.accumulator_ns / self.period_ns) as u32;
-        let executed = due.min(self.max_catchup_per_frame);
+        let requested = elapsed.as_nanos();
+        let remaining = MAX_TOTAL_ADVANCE_NS - self.total_advanced_ns;
+        let granted = requested.min(remaining);
+        let domain_clamped = granted < requested;
+        self.total_advanced_ns += granted;
+        self.accumulator_ns += granted;
+        let due = self.accumulator_ns / self.period_ns;
+        let executed = due.min(u128::from(self.max_catchup_per_frame));
         for _ in 0..executed {
             self.tick(intent);
         }
-        self.accumulator_ns -= u128::from(executed) * self.period_ns;
+        self.accumulator_ns -= executed * self.period_ns;
         DriveStep {
-            executed_ticks: executed,
-            outstanding_ticks: (self.accumulator_ns / self.period_ns) as u32,
+            executed_ticks: executed as u32,
+            outstanding_ticks: (self.accumulator_ns / self.period_ns) as u64,
+            domain_clamped,
         }
     }
 
@@ -785,8 +833,11 @@ impl PlayerDriver {
     }
 
     fn tick(&mut self, intent: MoveIntent) {
-        step_player(&mut self.state, &self.config, &self.world, &intent, self.dt);
+        let outcome = step_player(&mut self.state, &self.config, &self.world, &intent, self.dt);
         self.executed_ticks += 1;
+        if outcome.refused_invalid_inputs || outcome.refused_nonfinite_state {
+            self.refused_steps += 1;
+        }
         if self.record_trace {
             self.trace.push(TraceEntry {
                 position: self.state.position,
@@ -798,17 +849,27 @@ impl PlayerDriver {
     }
 
     /// Ticks due from every source: elapsed-time advancement (executed
-    /// or outstanding) plus headless execution.
+    /// or outstanding) plus headless execution. Saturating only beyond
+    /// the documented [`MAX_TOTAL_ADVANCE_NS`] domain (u64::MAX ticks
+    /// — never wraps).
     pub fn ticks_due_total(&self) -> u64 {
-        ((self.total_advanced_ns / self.period_ns) as u64) + self.headless_ticks
+        ((self.total_advanced_ns / self.period_ns) as u64).saturating_add(self.headless_ticks)
     }
 
     pub fn executed_ticks_total(&self) -> u64 {
         self.executed_ticks
     }
 
-    pub fn outstanding_ticks(&self) -> u32 {
-        (self.accumulator_ns / self.period_ns) as u32
+    /// Due-but-unexecuted ticks right now — u64 (R4b): exact across
+    /// the whole tick-rate range, never a wrapped u32.
+    pub fn outstanding_ticks(&self) -> u64 {
+        (self.accumulator_ns / self.period_ns) as u64
+    }
+
+    /// Steps refused by the input-validity contracts (R4b): explicit,
+    /// bounded, never hidden as movement work.
+    pub fn refused_steps(&self) -> u64 {
+        self.refused_steps
     }
 
     /// FNV-1a over the recorded trace (bit patterns, domain
@@ -1396,7 +1457,7 @@ mod tests {
             driver.advance(Duration::from_nanos(100_000_000), idle());
             assert_eq!(
                 driver.ticks_due_total(),
-                driver.executed_ticks_total() + u64::from(driver.outstanding_ticks()),
+                driver.executed_ticks_total() + driver.outstanding_ticks(),
                 "due == executed + outstanding, never silently discarded"
             );
         }
@@ -1643,7 +1704,7 @@ mod tests {
         assert_eq!(step.executed_ticks, 3);
         assert_eq!(
             driver.ticks_due_total(),
-            driver.executed_ticks_total() + u64::from(driver.outstanding_ticks()),
+            driver.executed_ticks_total() + driver.outstanding_ticks(),
             "the accounting invariant holds at the policy bound"
         );
     }
@@ -1716,5 +1777,162 @@ mod tests {
         assert!(!outcome.refused_invalid_inputs);
         assert!(!outcome.refused_nonfinite_state);
         assert_eq!(state.velocity[2], -config.walk_speed);
+    }
+
+    #[test]
+    fn wide_tick_accounting_survives_the_two_pow32_counterexample() {
+        // R4b: at the 1 GHz policy bound, a 2^32-nanosecond advance
+        // creates 2^32 due ticks — the old `as u32` narrowing wrapped
+        // that count to ZERO, silently discarding the whole
+        // obligation. The wide accounting keeps it exact, executing
+        // only the catch-up-bounded handful of ticks (never
+        // billions).
+        let mut driver = PlayerDriver::with_catchup(
+            PlayerState::spawn([0.0, 0.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            1_000_000_000,
+            8,
+        );
+        let step = driver.advance(Duration::from_nanos(4_294_967_296), idle());
+        assert_eq!(step.executed_ticks, 8, "only the catch-up bound executes");
+        assert_eq!(
+            step.outstanding_ticks,
+            4_294_967_296 - 8,
+            "the 2^32 due ticks account exactly in u64 — no wrap to zero"
+        );
+        assert_eq!(driver.ticks_due_total(), 4_294_967_296);
+        assert_eq!(
+            driver.ticks_due_total(),
+            driver.executed_ticks_total() + driver.outstanding_ticks(),
+            "due == executed + outstanding at the counterexample"
+        );
+
+        // The documented total-advancement domain: an advance beyond
+        // the remaining u64::MAX-nanosecond domain is clamped to the
+        // boundary AND REPORTED (never silent), the accounting
+        // identity stays exact at the clamp, and the run stays fast.
+        let step = driver.advance(Duration::from_secs(u64::MAX), idle());
+        assert!(step.domain_clamped, "the domain clamp is reported");
+        assert_eq!(step.executed_ticks, 8, "still catch-up bounded");
+        assert_eq!(driver.ticks_due_total(), u64::MAX);
+        assert_eq!(
+            driver.ticks_due_total(),
+            driver.executed_ticks_total() + driver.outstanding_ticks(),
+            "the identity holds exactly at the clamped domain boundary"
+        );
+        // Past the boundary there is no remaining domain: granted
+        // time is zero, the clamp reports again, and the retained
+        // backlog still drains — the accounting stands still rather
+        // than corrupting.
+        let step = driver.advance(Duration::from_secs(1), idle());
+        assert!(step.domain_clamped);
+        assert_eq!(step.executed_ticks, 8, "the retained backlog still drains");
+        assert_eq!(
+            driver.ticks_due_total(),
+            driver.executed_ticks_total() + driver.outstanding_ticks()
+        );
+    }
+
+    #[test]
+    fn invalid_finite_configs_refused_before_mutation() {
+        // R4b: finite is not sufficient — a negative pitch limit made
+        // the subsequent clamp PANIC (min > max), and nonpositive
+        // extents invert or degenerate the player box. The semantic
+        // validity contract refuses all of them BEFORE any state
+        // mutation.
+        let world = CollisionWorld::new(0.0);
+        for config in [
+            PlayerConfig {
+                pitch_limit: -1.0,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                pitch_limit: 0.0,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                height: 0.0,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                height: -1.0,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                radius: -0.5,
+                ..PlayerConfig::default()
+            },
+        ] {
+            let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+            let position = bits(state.position);
+            let velocity = bits(state.velocity);
+            let outcome = step_player(&mut state, &config, &world, &idle(), DT);
+            assert!(
+                outcome.refused_invalid_inputs,
+                "config {config:?} must be refused"
+            );
+            assert_eq!(
+                bits(state.position),
+                position,
+                "refusal leaves the state untouched"
+            );
+            assert_eq!(bits(state.velocity), velocity);
+        }
+        // Look input cannot smuggle an invalid config past the gate:
+        // the refusal precedes the look application too.
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        let config = PlayerConfig {
+            pitch_limit: -1.0,
+            ..PlayerConfig::default()
+        };
+        let outcome = step_player(
+            &mut state,
+            &config,
+            &world,
+            &MoveIntent {
+                look: (0.1, 0.1),
+                ..idle()
+            },
+            DT,
+        );
+        assert!(outcome.refused_invalid_inputs);
+        assert_eq!(state.yaw.to_bits(), 0.0f32.to_bits());
+        assert_eq!(state.pitch.to_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn driver_reports_refused_steps_explicitly() {
+        // R4b: the driver never hides refused steps as movement work.
+        // An invalid config refuses EVERY step; the refusal count is
+        // explicit and bounded; the accounting still consumes its
+        // ticks (the invariant is time-based); the player state stays
+        // frozen at spawn, traced honestly.
+        let mut driver = PlayerDriver::new(
+            PlayerState::spawn([0.0, 5.0, 0.0]),
+            PlayerConfig {
+                pitch_limit: -1.0,
+                ..PlayerConfig::default()
+            },
+            CollisionWorld::new(0.0),
+            60,
+        );
+        driver.run_headless(10, |_| MoveIntent {
+            forward: 1,
+            ..idle()
+        });
+        assert_eq!(driver.refused_steps(), 10);
+        assert_eq!(
+            driver.executed_ticks_total(),
+            10,
+            "ticks consumed (time-based accounting)"
+        );
+        assert_eq!(
+            driver.state().position,
+            [0.0, 5.0, 0.0],
+            "no movement work happened"
+        );
+        assert_eq!(driver.state().velocity, [0.0, 0.0, 0.0]);
+        assert_eq!(driver.trace().len(), 10, "the frozen state is traced");
     }
 }

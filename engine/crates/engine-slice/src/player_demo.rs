@@ -233,7 +233,7 @@ pub fn run_player_headless(ticks: u64, script: HeadlessScript) -> String {
         "Sektor7 Cycle 1 P3 - player headless run\n\
          script={} ticks={} rate={} Hz\n\
          player pos ({:.3}, {:.3}, {:.3}) vel ({:.3}, {:.3}, {:.3}) on_ground={} mode={}\n\
-         movement ticks executed={} outstanding={} due={}\n\
+         movement ticks executed={} outstanding={} due={} refused={}\n\
          player-trace={}",
         script.name(),
         ticks,
@@ -252,6 +252,7 @@ pub fn run_player_headless(ticks: u64, script: HeadlessScript) -> String {
         driver.executed_ticks_total(),
         driver.outstanding_ticks(),
         driver.ticks_due_total(),
+        driver.refused_steps(),
         driver.trace_fingerprint_hex(),
     )
 }
