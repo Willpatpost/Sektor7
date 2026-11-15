@@ -37,6 +37,18 @@
 //! side. One depenetration pass per step (multi-box pile-ups are out of
 //! prototype scope). The third-person camera has no collision of its
 //! own (documented limitation).
+//!
+//! Input-validity contracts (the Cycle-1 R4 corrective): tick rates
+//! are clamped into [`MIN_TICK_HZ`]..=[`MAX_TICK_HZ`] — the
+//! representable fixed-step range at nanosecond logical resolution
+//! (`period_ns` ≥ 1 ns and `dt` finite and positive; a rate above one
+//! billion would round the nanosecond period to zero — the
+//! division-by-zero hazard this policy closes). [`step_player`]
+//! refuses a non-finite or non-positive `dt` and any non-finite
+//! [`PlayerConfig`] field BEFORE any state mutation, reporting
+//! `refused_invalid_inputs`: a valid player state can never be
+//! silently turned non-finite by invalid inputs (a non-finite
+//! incoming STATE is refused separately, `refused_nonfinite_state`).
 
 use std::time::Duration;
 
@@ -47,6 +59,19 @@ use crate::fingerprint::Fingerprinter;
 /// as a perpendicular-axis block and the nonpenetration invariant has a
 /// strict margin to rest on.
 pub const SKIN: f32 = 1e-4;
+
+/// The tick-rate policy's lower bound (the sim driver's own
+/// `.max(1)` precedent): rates below one tick per second are
+/// degenerate and clamp up.
+pub const MIN_TICK_HZ: u32 = 1;
+
+/// The tick-rate policy's upper bound: one billion ticks per second
+/// is the finest cadence nanosecond logical time can represent
+/// (`period_ns` = 1 ns exactly; `dt` = 1 ns⁻¹, finite and positive —
+/// 10⁹ is exactly representable in f32). Rates above this would make
+/// the nanosecond period round to zero — a division-by-zero hazard
+/// at every accumulator site — so they clamp down.
+pub const MAX_TICK_HZ: u32 = 1_000_000_000;
 
 /// Movement intent for one tick — the application maps its input
 /// snapshots onto this; the engine never sees keys or devices.
@@ -423,7 +448,8 @@ pub fn camera_pose(state: &PlayerState, config: &PlayerConfig) -> CameraPose {
 
 /// Observable per-step outcome — the fail-visible surface for input
 /// sanitization (F5): non-finite look deltas are zeroed AND counted;
-/// a non-finite state is refused AND flagged. Never silent.
+/// invalid `dt`/config inputs and non-finite states are refused AND
+/// flagged. Never silent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StepOutcome {
     pub jumped: bool,
@@ -437,6 +463,11 @@ pub struct StepOutcome {
     pub hit_ground: bool,
     /// Non-finite look-delta components zeroed this step.
     pub sanitized_look: u32,
+    /// The step was refused BEFORE any state mutation: the time step
+    /// was non-finite or non-positive, or a config field was
+    /// non-finite (the R4 input-validity contract — a valid state can
+    /// never be silently turned non-finite by invalid inputs).
+    pub refused_invalid_inputs: bool,
     /// The step was refused: the incoming state was non-finite and is
     /// left untouched for the caller to handle.
     pub refused_nonfinite_state: bool,
@@ -469,8 +500,26 @@ fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-/// One fixed-dt movement step. Order: refuse non-finite state (nothing
-/// mutated); sanitize and apply look; set horizontal velocity from the
+/// The config side of the R4 input-validity contract: every
+/// gameplay-extent and tuning parameter must be finite.
+fn config_is_finite(config: &PlayerConfig) -> bool {
+    config.walk_speed.is_finite()
+        && config.sprint_speed.is_finite()
+        && config.gravity.is_finite()
+        && config.jump_speed.is_finite()
+        && config.terminal_fall.is_finite()
+        && config.height.is_finite()
+        && config.radius.is_finite()
+        && config.eye_height.is_finite()
+        && config.tp_distance.is_finite()
+        && config.tp_lift.is_finite()
+        && config.pitch_limit.is_finite()
+}
+
+/// One fixed-dt movement step. Order: refuse invalid inputs (a
+/// non-finite or non-positive `dt`, or a non-finite config field —
+/// nothing mutated, the outcome reports it); refuse a non-finite
+/// state; sanitize and apply look; set horizontal velocity from the
 /// intent in the yaw frame (diagonal normalized to the speed cap);
 /// gravity (terminal-clamped), then a grounded jump's exact impulse;
 /// depenetrate; swept per-axis moves Y→X→Z with velocity zeroed on the
@@ -485,6 +534,11 @@ pub fn step_player(
     dt: f32,
 ) -> StepOutcome {
     let mut outcome = StepOutcome::default();
+
+    if !dt.is_finite() || dt <= 0.0 || !config_is_finite(config) {
+        outcome.refused_invalid_inputs = true;
+        return outcome;
+    }
 
     if !state_is_finite(state) {
         outcome.refused_nonfinite_state = true;
@@ -646,6 +700,14 @@ impl PlayerDriver {
         Self::with_catchup(state, config, world, tick_hz, 8)
     }
 
+    /// Constructs the driver under the documented tick-rate policy
+    /// (R4): the rate is clamped into
+    /// [`MIN_TICK_HZ`]..=[`MAX_TICK_HZ`] — the representable
+    /// fixed-step range at nanosecond logical resolution. This
+    /// guarantees `period_ns` ≥ 1 (never zero — the >1 GHz
+    /// division-by-zero hazard is structurally closed) and `dt`
+    /// finite, positive, ≥ 1 ns⁻¹. Valid rates (the demo's 60, the
+    /// tests' 100) are unaffected.
     pub fn with_catchup(
         state: PlayerState,
         config: PlayerConfig,
@@ -653,7 +715,7 @@ impl PlayerDriver {
         tick_hz: u32,
         max_catchup_per_frame: u32,
     ) -> PlayerDriver {
-        let rate = tick_hz.max(1);
+        let rate = tick_hz.clamp(MIN_TICK_HZ, MAX_TICK_HZ);
         PlayerDriver {
             state,
             config,
@@ -1498,5 +1560,161 @@ mod tests {
             bits(camera_pose(&state, &config).position),
             bits(camera_pose(&fp, &config).position)
         );
+    }
+
+    #[test]
+    fn tick_rate_policy_clamps_into_the_representable_range() {
+        // The R4 boundaries: rates at, below, and above the policy
+        // window — including the >1e9 zone that previously produced
+        // period_ns = 0 (the division-by-zero hazard).
+        for rate in [
+            0u32,
+            1,
+            2,
+            60,
+            999_999_999,
+            1_000_000_000,
+            1_000_000_001,
+            u32::MAX,
+        ] {
+            let driver = PlayerDriver::with_catchup(
+                PlayerState::spawn([0.0, 0.0, 0.0]),
+                PlayerConfig::default(),
+                CollisionWorld::new(0.0),
+                rate,
+                8,
+            );
+            assert!(
+                driver.period_ns >= 1,
+                "rate {rate}: period_ns is nonzero under the policy"
+            );
+            assert!(
+                driver.dt.is_finite() && driver.dt > 0.0,
+                "rate {rate}: dt is finite and positive"
+            );
+        }
+        // Boundary exactness: 1 Hz is a one-second period; 1 GHz is
+        // exactly one nanosecond; above the bound clamps DOWN to it.
+        let one_hz = PlayerDriver::with_catchup(
+            PlayerState::spawn([0.0, 0.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            1,
+            8,
+        );
+        assert_eq!(one_hz.period_ns, 1_000_000_000);
+        let one_ghz = PlayerDriver::with_catchup(
+            PlayerState::spawn([0.0, 0.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            1_000_000_000,
+            8,
+        );
+        assert_eq!(one_ghz.period_ns, 1);
+        let over = PlayerDriver::with_catchup(
+            PlayerState::spawn([0.0, 0.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            1_000_000_001,
+            8,
+        );
+        assert_eq!(over.period_ns, 1, "clamped down to the 1 GHz bound");
+        assert_eq!(over.dt, one_ghz.dt, "the clamp preserves dt exactness");
+    }
+
+    #[test]
+    fn period_zero_is_impossible_and_tiny_advances_execute() {
+        // At the 1 GHz bound, nanosecond-scale advances flow through
+        // every accumulator division site without a zero period —
+        // real ticks execute, bounded by the catch-up limit, and the
+        // no-discard accounting holds at the extreme rate.
+        let mut driver = PlayerDriver::with_catchup(
+            PlayerState::spawn([0.0, 0.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            1_000_000_000,
+            8,
+        );
+        assert_eq!(driver.period_ns, 1);
+        let step = driver.advance(Duration::from_nanos(8), idle());
+        assert_eq!(step.executed_ticks, 8);
+        assert_eq!(step.outstanding_ticks, 0);
+        let step = driver.advance(Duration::from_nanos(3), idle());
+        assert_eq!(step.executed_ticks, 3);
+        assert_eq!(
+            driver.ticks_due_total(),
+            driver.executed_ticks_total() + u64::from(driver.outstanding_ticks()),
+            "the accounting invariant holds at the policy bound"
+        );
+    }
+
+    #[test]
+    fn nonfinite_timestep_and_config_refused() {
+        let config = PlayerConfig::default();
+        let world = CollisionWorld::new(0.0);
+        // The R4 time-step contract: finite and positive, or refused
+        // BEFORE any state mutation.
+        for dt in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+            let position = bits(state.position);
+            let velocity = bits(state.velocity);
+            let outcome = step_player(&mut state, &config, &world, &idle(), dt);
+            assert!(outcome.refused_invalid_inputs, "dt {dt} must be refused");
+            assert!(!outcome.jumped && !outcome.landed && !outcome.hit_ground);
+            assert_eq!(
+                bits(state.position),
+                position,
+                "refusal leaves the state untouched"
+            );
+            assert_eq!(bits(state.velocity), velocity);
+        }
+        // The config side: any non-finite field refuses the step the
+        // same way — a valid state can never be silently turned
+        // non-finite by invalid inputs.
+        for config in [
+            PlayerConfig {
+                gravity: f32::NAN,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                walk_speed: f32::INFINITY,
+                ..PlayerConfig::default()
+            },
+            PlayerConfig {
+                radius: f32::NAN,
+                ..PlayerConfig::default()
+            },
+        ] {
+            let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+            let position = bits(state.position);
+            let outcome = step_player(&mut state, &config, &world, &idle(), DT);
+            assert!(
+                outcome.refused_invalid_inputs,
+                "config {config:?} must be refused"
+            );
+            assert_eq!(bits(state.position), position);
+        }
+    }
+
+    #[test]
+    fn valid_inputs_produce_no_refusals() {
+        // The validity contract never fires on the valid-input path:
+        // the frozen trace and the whole battery pin the behavior.
+        let config = PlayerConfig::default();
+        let world = CollisionWorld::new(0.0);
+        let mut state = PlayerState::spawn([0.0, 5.0, 0.0]);
+        let outcome = step_player(
+            &mut state,
+            &config,
+            &world,
+            &MoveIntent {
+                forward: 1,
+                ..idle()
+            },
+            DT,
+        );
+        assert!(!outcome.refused_invalid_inputs);
+        assert!(!outcome.refused_nonfinite_state);
+        assert_eq!(state.velocity[2], -config.walk_speed);
     }
 }
