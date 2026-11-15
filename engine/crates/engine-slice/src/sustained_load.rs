@@ -1472,6 +1472,14 @@ pub fn run_capacity_envelope() {
                 scenario.0
             );
             let mut envelope: Option<u32> = None;
+            // The budget-200 row and the first sustaining row, captured
+            // for the explicit C1 before/after COMPARISON line — both
+            // rows from THIS sweep's own measured cells (never re-run,
+            // never asserted from arithmetic): the same composition,
+            // genuinely-overdue at the 200 baseline vs sustained at the
+            // measured budget, with the CPU cost of each.
+            let mut before: Option<(u64, usize, f64, f64)> = None;
+            let mut sustain: Option<(u64, f64)> = None;
             for budget in [200u32, 400, 800, 1_600, 3_200] {
                 let mut spec = CellSpec::base(WorkloadClass::NearSaturation, population, scenario);
                 spec.budget = budget;
@@ -1485,8 +1493,21 @@ pub fn run_capacity_envelope() {
                 let last = report.windows.last().expect("windowed");
                 let sustained =
                     last.near_overdue == 0 && last.far_overdue == 0 && report.late_executions == 0;
+                if budget == 200 {
+                    before = Some((
+                        report.executed / report.horizon,
+                        last.near_overdue + last.far_overdue,
+                        report
+                            .windows
+                            .iter()
+                            .map(|w| w.late_p95)
+                            .fold(0.0_f64, f64::max),
+                        executed_per_ms,
+                    ));
+                }
                 if sustained && envelope.is_none() {
                     envelope = Some(budget);
+                    sustain = Some((report.executed / report.horizon, executed_per_ms));
                 }
                 let late_p95 = report
                     .windows
@@ -1506,12 +1527,21 @@ pub fn run_capacity_envelope() {
                     report.conservation_holds
                 );
             }
-            match envelope {
-                Some(budget) => println!(
-                    "  ENVELOPE: population {population} scenario {} — the real chains are sustained (zero overdue, zero lateness) from budget {budget} upward",
-                    scenario.0
-                ),
-                None => println!(
+            match (envelope, before, sustain) {
+                (
+                    Some(budget),
+                    Some((executed, overdue, p95, work)),
+                    Some((s_executed, s_work)),
+                ) => {
+                    println!(
+                        "  ENVELOPE: population {population} scenario {} — the real chains are sustained (zero overdue, zero lateness) from budget {budget} upward",
+                        scenario.0
+                    );
+                    println!(
+                        "  COMPARISON (C1): budget 200 → {budget}: executed {executed} → {s_executed}/tick · final overdue {overdue} → 0 · late p95 {p95:.1} → 0 · work {work:.0} → {s_work:.0} events/ms — the budget binds, not the CPU (both rows measured in this sweep)"
+                    );
+                }
+                _ => println!(
                     "  ENVELOPE: population {population} scenario {} — NOT sustained within the sweep (max budget 3200); the measured slopes above are the honest limit",
                     scenario.0
                 ),
