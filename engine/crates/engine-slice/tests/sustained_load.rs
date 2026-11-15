@@ -23,8 +23,9 @@ const FAR_CADENCE_BUDGET: u64 = 144;
 
 /// §8.2a — the classifier's overload measurement: a synthetic
 /// workload with a KNOWN growth rate (30/tick demand against budget
-/// 20 → the backlog grows at exactly 10/tick = 500 per 50-tick
-/// window) must classify Overloaded with that measured rate. Demand
+/// 20 → the backlog grows at exactly 10 overdue events per logical
+/// tick) must classify Overloaded with that measured rate in
+/// per-LOGICAL-TICK units (R2: never a per-window 500). Demand
 /// source: the pure-synthetic instrument (population 0 — no chains,
 /// demand is exactly the overlay; the spine's own ledger accounting
 /// is the oracle).
@@ -38,8 +39,8 @@ fn classifier_overload_measures_known_growth_rate() {
     let report = run_cell(&spec);
     let slope = report.classification.near_overdue_slope;
     assert!(
-        (slope - 500.0).abs() < 5.0,
-        "per-window slope {slope} must be 500 (10/tick × 50-tick windows)"
+        (slope - 10.0).abs() < 0.5,
+        "the rate must be ≈10 overdue events per LOGICAL TICK (measured {slope})"
     );
     assert_eq!(report.classification.near, LaneVerdict::Overloaded);
     assert_eq!(
@@ -56,6 +57,30 @@ fn classifier_overload_measures_known_growth_rate() {
         last.near_overdue > 0,
         "the growth is demonstrated, not hidden"
     );
+}
+
+/// R2 — gradual unsustainability: a genuinely positive but small
+/// long-run growth rate (21/tick demand against budget 20 → exactly
+/// +1 overdue event per logical tick) must classify Overloaded with
+/// that measured rate — never mislabeled Sustainable because a
+/// window-unit threshold swallowed the gradual growth.
+#[test]
+fn classifier_gradual_overload_reports_small_positive_rate() {
+    let mut spec = CellSpec::base(WorkloadClass::Overload, 0, lod_scenarios()[0]);
+    spec.budget = 20;
+    spec.reserve = 8;
+    spec.overlay_near = 21;
+    spec.horizon = 250;
+    let report = run_cell(&spec);
+    let slope = report.classification.near_overdue_slope;
+    assert!(
+        (slope - 1.0).abs() < 0.2,
+        "the gradual rate must report ≈1 overdue event per logical tick (measured {slope})"
+    );
+    assert_eq!(report.classification.near, LaneVerdict::Overloaded);
+    let last = report.windows.last().expect("windowed");
+    assert!(last.near_overdue > 0, "the backlog grows without bound");
+    assert!(report.conservation_holds);
 }
 
 /// §8.2b — the classifier's recovery measurement: the overload arc

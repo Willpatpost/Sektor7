@@ -618,6 +618,16 @@ fn series_slope(values: &[f64]) -> f64 {
     if var == 0.0 { 0.0 } else { cov / var }
 }
 
+/// R2 (the units correction): the window series is sampled every
+/// `WINDOW_TICKS` logical ticks, so a slope between window samples
+/// is a per-WINDOW rate — every reported and thresholded rate is
+/// converted to the per-LOGICAL-TICK unit by dividing out the window
+/// spacing. A 30-events/tick demand against a 20 budget reports
+/// ≈ 10 overdue events per logical tick, never 500.
+fn slope_per_tick(window_series: &[f64]) -> f64 {
+    series_slope(window_series) / WINDOW_TICKS as f64
+}
+
 fn sorted_percentile(values: &mut [f64], quantile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -629,8 +639,10 @@ fn sorted_percentile(values: &mut [f64], quantile: f64) -> f64 {
     values[index]
 }
 
-/// Classifies one lane's window series against its cadence budget:
-/// growth slope ≥ +0.5/tick → Overloaded; ≤ −0.5/tick → Recovering;
+/// Classifies one lane's window series against its cadence budget —
+/// rates in per-LOGICAL-TICK units (R2): growth ≥ +0.1 overdue
+/// events per tick → Overloaded (a genuinely positive long-run rate,
+/// however gradual, is unsustainability); ≤ −0.1/tick → Recovering;
 /// otherwise Saturated when overdue age ever exceeds the cadence
 /// budget or THIS LANE's own backlogged signal fires (due work
 /// remained when the budget exhausted — the §5 split's honesty: a
@@ -642,10 +654,10 @@ fn classify_lane(
     lane_backlogged: bool,
     cadence_budget: u64,
 ) -> LaneVerdict {
-    let slope = series_slope(overdue);
-    if slope >= 0.5 {
+    let slope = slope_per_tick(overdue);
+    if slope >= 0.1 {
         LaneVerdict::Overloaded
-    } else if slope <= -0.5 {
+    } else if slope <= -0.1 {
         LaneVerdict::Recovering
     } else if max_age > cadence_budget || lane_backlogged {
         LaneVerdict::Saturated
@@ -685,8 +697,8 @@ pub fn classify(
             near_cadence_budget,
         ),
         far: classify_lane(&far_overdue, far_max, far_backlogged, far_cadence_budget),
-        near_overdue_slope: series_slope(&near_overdue),
-        far_overdue_slope: series_slope(&far_overdue),
+        near_overdue_slope: slope_per_tick(&near_overdue),
+        far_overdue_slope: slope_per_tick(&far_overdue),
         near_max_overdue_age: near_max,
         far_max_overdue_age: far_max,
     }
@@ -1213,6 +1225,52 @@ pub fn measure_compacted_representation(population: usize) {
     );
 }
 
+/// R3: the reference-horizon methodology for recovery cells — a
+/// 100-tick arc probe MEASURES the drain at this exact composition,
+/// then the horizon is 10× the measured drain (the documented rule),
+/// capped at 1,200 ticks for bounded pod resources (the cap is
+/// STATED whenever it binds, never hidden). Compositions that do not
+/// drain within the probe (the post-arc base alone meets/exceeds the
+/// budget, or drains slower than the probe window) get an explicit
+/// bounded observation window — the report shows the backlog/age
+/// trend and no complete recovery is claimed.
+fn derive_recovery_horizon(mut spec: CellSpec, population: usize) -> CellSpec {
+    const ARC_TICKS: u64 = 100;
+    const PROBE_HORIZON: u64 = 600;
+    const HORIZON_CAP: u64 = 1_200;
+    let mut probe = spec.clone();
+    probe.recovery_at = Some(ARC_TICKS);
+    probe.horizon = PROBE_HORIZON;
+    let probe_report = run_cell(&probe);
+    spec.recovery_at = Some(ARC_TICKS);
+    match measured_drain_tick(&probe_report.windows) {
+        Some(drain_end) => {
+            let drain_ticks = drain_end.saturating_sub(ARC_TICKS);
+            let derived = derived_horizon(drain_ticks);
+            spec.horizon = derived.min(HORIZON_CAP);
+            println!(
+                "   [horizon] recovery @ population {population}: drain measured {drain_ticks} ticks after a {ARC_TICKS}-tick arc → derived 10× = {derived} ticks{}",
+                if spec.horizon < derived {
+                    format!(
+                        " — CAPPED at {} for bounded pod resources (stated, not hidden)",
+                        spec.horizon
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        }
+        None => {
+            spec.horizon = if population >= 5_000 { 300 } else { 600 };
+            println!(
+                "   [horizon] recovery @ population {population}: NO complete drain within the {PROBE_HORIZON}-tick probe (the post-arc base alone meets/exceeds the budget, or drains slower than the probe) — explicit bounded observation window of {} ticks; the backlog/age trend is reported and NO complete recovery is claimed",
+                spec.horizon
+            );
+        }
+    }
+    spec
+}
+
 /// The full reference matrix (§4 as amended): composition-derived
 /// cells over MEASURED `D_base`, mechanical skip rules (every N/A
 /// printed with its reason — never padded), every cell double-run,
@@ -1263,7 +1321,7 @@ pub fn run_reference_matrix() {
                 let mut spec = CellSpec::base(class, population, scenario);
                 spec.overlay_near = (target - base).round() as u32;
                 if class == WorkloadClass::Recovery {
-                    spec.recovery_at = Some(200);
+                    spec = derive_recovery_horizon(spec, population);
                 }
                 if population >= 5_000 && class == WorkloadClass::Overload {
                     // Bounded observation cost at scale (the pending
@@ -1335,7 +1393,7 @@ pub fn run_reference_matrix() {
         spec.reserve = 30;
         spec.overlay_near = (target - base).round() as u32;
         if class == WorkloadClass::Recovery {
-            spec.recovery_at = Some(200);
+            spec = derive_recovery_horizon(spec, 1_000);
         }
         let (report, _second, deterministic) = run_cell_deterministic(&spec);
         assert!(deterministic, "the reduced-budget cell diverged");
