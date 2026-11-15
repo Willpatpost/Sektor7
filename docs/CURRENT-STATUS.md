@@ -114,20 +114,20 @@ defined for it. Ignored: 1 main / 3 heavy, all deliberate measurement soaks.)
 
 **The Cycle-1 candidate** (`s7-cycle1-integration`, §9 — awaiting the
 owner's mainline merge; `main` stays at the table above until then) adds
-+29 main / +16 heavy platform-uniform tests and three integration
-binaries, including the corrective round (R4's player boundary
-regressions, R2's gradual-growth regression). Measured at the
-re-integrated tree (the workflow's own awk semantics): main **984 / 1
-ignored / 30 result lines**; heavy **483 / 4 ignored / 49 result
-lines**. Windows expectations 933 / 482 (platform-uniform inference)
-are confirmed by the candidate CI run; the workflow pins are updated in
-the same change (the F2 maintenance obligation). All determinism pins
-below are byte-identical at the candidate, plus the new pinned player
-trace `engine-core/player-trace/1` class (`8513d40792ea88f0`, the
-libm-free script class — cross-platform by construction; divergence is
-an investigation, never a silent re-pin). The formerly ignored oversize
-smoke is now ALSO executed by an enforced Linux CI step (the R1
-corrective) with its evidence lines in the log.
++32 main / +16 heavy platform-uniform tests and three integration
+binaries, including the full corrective round (R4/R4b player boundary
+and exact-accounting regressions, R2's gradual-growth regression).
+Measured at the R4b-merged tree (the workflow's own awk semantics):
+main **987 / 1 ignored / 30 result lines**; heavy **483 / 4 ignored / 49
+result lines**. Windows expectations 936 / 482 (platform-uniform
+inference) are confirmed by the candidate CI run; the workflow pins are
+updated in the same change (the F2 maintenance obligation). All
+determinism pins below are byte-identical at the candidate, plus the new
+pinned player trace `engine-core/player-trace/1` class
+(`8513d40792ea88f0`, the libm-free script class — cross-platform by
+construction; divergence is an investigation, never a silent re-pin).
+The formerly ignored oversize smoke is now ALSO executed by an enforced
+Linux CI step (the R1 corrective) with its evidence lines in the log.
 
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3
