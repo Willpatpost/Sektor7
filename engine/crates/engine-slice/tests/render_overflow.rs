@@ -8,7 +8,11 @@
 //! The dev pod currently has NO Vulkan loader (verified 2026-11-14), so
 //! local execution needs the user-local ICD setup; CI-Linux runners
 //! install mesa-vulkan-drivers (see the workflow's render smokes).
-//! Run explicitly:
+//! The Cycle-1 corrective R1 (the ChatGPT review 2026-11-15) adds an
+//! ENFORCED Linux CI step that executes this test with `--ignored
+//! --nocapture` — the per-stage `println!` evidence below is what the
+//! CI log must show (actual execution with exact counter values, not
+//! a compile or an ignored-skip). Run explicitly:
 //!
 //! ```sh
 //! SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_overflow -- \
@@ -110,6 +114,10 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         "lazy region buffer unallocated"
     );
     assert_eq!(stats.overlay_truncated_vertices, 0);
+    println!(
+        "[overflow-smoke] stage 1 control: region_truncated=0 region_capacity=0 \
+         (lazy buffer unallocated) overlay_truncated=0"
+    );
 
     // Frame 2: the oversize region — exactly 1,000 omitted after ONE
     // frame. The double-count guard: one physical truncation must read
@@ -122,12 +130,25 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     assert_eq!(stats.region_supplied_peak_vertices, 37_800);
     assert_eq!(stats.region_capacity_vertices, 36_800);
     assert_eq!(stats.overlay_truncated_vertices, 0, "overlay untouched");
+    println!(
+        "[overflow-smoke] stage 2 region oversize (ONE frame): \
+         region_truncated={} (double-count guard: exactly 1000, not 2000) \
+         region_peak={} region_capacity={} overlay_truncated=0",
+        stats.region_truncated_vertices,
+        stats.region_supplied_peak_vertices,
+        stats.region_capacity_vertices
+    );
 
     // Frame 3: the same oversize again (the second frame slot) — the
     // counters accumulate per recorded frame.
     frame(&mut renderer, &oversize, Some(short_text));
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 2_000);
+    println!(
+        "[overflow-smoke] stage 3 second oversize frame (second slot): \
+         region_truncated={} (per-frame accumulation)",
+        stats.region_truncated_vertices
+    );
 
     // Frame 4: the oversize overlay — 2,000 'A' glyphs × 168 verts =
     // 336,000 supplied vs the 300,000 capacity → exactly 36,000
@@ -146,6 +167,15 @@ fn oversized_region_and_overlay_report_exact_truncation() {
         stats.region_truncated_vertices, 2_000,
         "region untouched (cross-contamination guard)"
     );
+    println!(
+        "[overflow-smoke] stage 4 overlay oversize: overlay_truncated={} \
+         overlay_peak={} overlay_capacity={} region_truncated={} \
+         (cross-contamination guard: region unchanged)",
+        stats.overlay_truncated_vertices,
+        stats.overlay_supplied_peak_vertices,
+        stats.overlay_capacity_vertices,
+        stats.region_truncated_vertices
+    );
 
     // Frame 5 (control): in-capacity inputs only — the counters must
     // not move (in-capacity geometry is never counted).
@@ -153,6 +183,11 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     let stats = renderer.stats();
     assert_eq!(stats.region_truncated_vertices, 2_000);
     assert_eq!(stats.overlay_truncated_vertices, 36_000);
+    println!(
+        "[overflow-smoke] stage 5 in-capacity control: counters unchanged \
+         (region_truncated={} overlay_truncated={})",
+        stats.region_truncated_vertices, stats.overlay_truncated_vertices
+    );
 
     // The REPORTED requirement: the run-summary lines carry the exact
     // numbers through the same formatter the demos print.
@@ -164,6 +199,9 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     assert!(lines.contains(
         &"OVERLAY TRUNCATION: 36000 vertices omitted (peak 336000 / capacity 300000)".to_string()
     ));
+    for line in &lines {
+        println!("[overflow-smoke] report line: {line}");
+    }
 
     // Validation corroboration, scoped per the P1 challenge F-2: a
     // clean validation run corroborates no whole-buffer overflow and
@@ -172,4 +210,9 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // the clamp unit tests — this assertion is corroboration, not the
     // primary guard.
     assert_eq!(renderer.stats().validation_errors, 0);
+    println!(
+        "[overflow-smoke] validation errors={} (clean run corroborated) — \
+         EXECUTED through the real render path, all assertions held",
+        renderer.stats().validation_errors
+    );
 }
