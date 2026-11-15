@@ -1411,3 +1411,111 @@ pub fn run_reference_matrix() {
         "=== matrix composition: {run_cells} cells measured (each double-run) + 3 compacted-representation variants, {skipped} N/A reason-coded — the honest effective matrix, never padded; partial never called complete ==="
     );
 }
+
+/// C2-P2 Phase 1 (the amended matrix): the capacity-envelope sweep.
+/// P1.1 — spine-vs-world isolation: the pure-synthetic instrument at
+/// demand == budget (zero backlog, steady execution at the exact
+/// rate) gives the spine's per-event cost; the chain cells in the
+/// baseline matrix carry the world-execute cost on top. P1.2 — the
+/// budget sweep over the real chains (no overlay — each
+/// composition's own latent demand), reserve = 30% of budget (the
+/// baseline 60/200 ratio, per the amendment's N1), horizon 300
+/// (bounded observation; the pending scan is linear in backlog),
+/// every cell double-run. Output: per (population × scenario ×
+/// budget) — executed/tick, per-lane overdue slopes, useful work per
+/// CPU ms, lateness p95, verdicts — and the envelope: the minimum
+/// budget at which the composition's real demand is sustained (both
+/// lanes' overdue zero at the horizon end and zero lateness), or
+/// "not sustained within the sweep" with the measured slopes. Pod
+/// evidence only — never CI thresholds; release-profile numbers are
+/// the binding CPU claims, debug is continuity-only.
+pub fn run_capacity_envelope() {
+    println!(
+        "=== C2-P2 PHASE 1: CAPACITY ENVELOPE (budget sweep, reserve = 30% of budget, real chains, no overlay) ==="
+    );
+    let near_regions = [false; REGION_COUNT];
+    let config = NpcConfig {
+        seed: 1337,
+        near_regions,
+        region_lods_enabled: true,
+        ..NpcConfig::default()
+    };
+
+    // P1.1 — the spine's per-event cost in isolation.
+    println!(
+        "-- P1.1 spine isolation (pure synthetic, demand == budget → steady execution at the exact rate) --"
+    );
+    for rate in [200u32, 1_000, 3_000] {
+        let mut spec = CellSpec::base(WorkloadClass::NearSaturation, 0, lod_scenarios()[0]);
+        spec.budget = rate;
+        spec.reserve = rate * 3 / 10;
+        spec.overlay_near = rate;
+        spec.horizon = 150;
+        let (report, _second, deterministic) = run_cell_deterministic(&spec);
+        assert!(deterministic, "the isolation cell diverged");
+        let execution_us: u64 = report.windows.iter().map(|w| w.execution_us).sum();
+        let per_event_us = execution_us as f64 / (f64::from(rate) * 150.0);
+        let last = report.windows.last().expect("windowed");
+        println!(
+            "  spine @ {rate} events/tick: {per_event_us:.3} us/event · executed {} · overdue near {} / far {} · conservation {}",
+            report.executed, last.near_overdue, last.far_overdue, report.conservation_holds
+        );
+    }
+
+    // P1.2 — the budget sweep over each composition's real chains.
+    for population in [1_000usize, 5_000, 20_000] {
+        for scenario in lod_scenarios() {
+            let samples = calibrate_base_demand(population, &config, scenario.1, 200, 60, 200);
+            let base = steady_state_mean(&samples);
+            println!(
+                "-- population {population} scenario {} (D_base {base:.1}/tick realized at budget 200) --",
+                scenario.0
+            );
+            let mut envelope: Option<u32> = None;
+            for budget in [200u32, 400, 800, 1_600, 3_200] {
+                let mut spec = CellSpec::base(WorkloadClass::NearSaturation, population, scenario);
+                spec.budget = budget;
+                spec.reserve = budget * 3 / 10;
+                spec.horizon = 300;
+                let (report, _second, deterministic) = run_cell_deterministic(&spec);
+                assert!(deterministic, "the envelope cell diverged");
+                let execution_us: u64 = report.windows.iter().map(|w| w.execution_us).sum();
+                let executed_per_ms =
+                    report.executed as f64 / (execution_us as f64 / 1_000.0).max(0.001);
+                let last = report.windows.last().expect("windowed");
+                let sustained =
+                    last.near_overdue == 0 && last.far_overdue == 0 && report.late_executions == 0;
+                if sustained && envelope.is_none() {
+                    envelope = Some(budget);
+                }
+                let late_p95 = report
+                    .windows
+                    .iter()
+                    .map(|w| w.late_p95)
+                    .fold(0.0_f64, f64::max);
+                println!(
+                    "  budget {budget:>4} (reserve {}): executed {}/tick · work {executed_per_ms:.0} events/ms · near slope {:+.2}/tick · far slope {:+.2}/tick · final overdue near {} / far {} · late p95 {late_p95:.1} · verdict {}/{} · conservation {}",
+                    spec.reserve,
+                    report.executed / report.horizon,
+                    report.classification.near_overdue_slope,
+                    report.classification.far_overdue_slope,
+                    last.near_overdue,
+                    last.far_overdue,
+                    report.classification.near.name(),
+                    report.classification.far.name(),
+                    report.conservation_holds
+                );
+            }
+            match envelope {
+                Some(budget) => println!(
+                    "  ENVELOPE: population {population} scenario {} — the real chains are sustained (zero overdue, zero lateness) from budget {budget} upward",
+                    scenario.0
+                ),
+                None => println!(
+                    "  ENVELOPE: population {population} scenario {} — NOT sustained within the sweep (max budget 3200); the measured slopes above are the honest limit",
+                    scenario.0
+                ),
+            }
+        }
+    }
+}

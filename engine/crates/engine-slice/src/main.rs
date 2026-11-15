@@ -141,6 +141,16 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|arg| arg == "--sustained-load-capacity-envelope") {
+        // [cycle2-P2] The Phase-1 capacity-envelope sweep: spine
+        // isolation plus the budget sweep over the real chains
+        // (reserve = 30% of budget; pod evidence, double-run per
+        // cell; never CI thresholds; release is the binding CPU
+        // profile).
+        engine_slice::sustained_load::run_capacity_envelope();
+        return;
+    }
+
     if std::env::args().any(|arg| arg == "--benchmark-render") {
         // The 2026-11-12 quality audit's F-02/F-05 render-path CPU
         // benchmark — the per-frame derived-render costs in isolation
