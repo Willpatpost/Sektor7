@@ -49,6 +49,7 @@ pub mod clock;
 pub mod diag;
 pub mod event;
 pub mod fingerprint;
+pub mod interaction;
 pub mod lod;
 pub mod npc_world_save;
 pub mod player;
@@ -63,10 +64,11 @@ pub use event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
 };
 pub use fingerprint::Fingerprinter;
+pub use interaction::{InteractionQuery, InteractionTarget, select_target};
 pub use player::{
-    CameraMode, CameraPose, CollisionWorld, DriveStep, MoveIntent, PlayerConfig, PlayerDriver,
-    PlayerState, StaticCollider, StepOutcome, TraceEntry, camera_pose, look_direction, player_box,
-    step_player,
+    CAMERA_BACKOFF, CAMERA_MARGIN, CameraMode, CameraPose, CollisionWorld, DriveStep, MoveIntent,
+    PlayerConfig, PlayerDriver, PlayerState, StaticCollider, StepOutcome, TraceEntry, camera_pose,
+    camera_pose_obstructed, look_direction, player_box, step_player,
 };
 /// The game's region layout (Stage 3 metadata): eight logical
 /// regions. Authoritative in engine-core so every layer — the
