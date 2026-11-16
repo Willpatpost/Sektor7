@@ -295,3 +295,79 @@ fn horizon_derivation_from_measured_drain() {
     );
     assert!(mixed_report.conservation_holds);
 }
+
+/// C2-P2 (Cycle 2, C1): sustainability at the MEASURED budget — the
+/// 5k-mixed composition, genuinely overdue at the 200 baseline (the
+/// archived envelope evidence), is sustained at its measured minimum
+/// budget 800 (reserve 240, the 30% ratio): zero overdue on both
+/// lanes, zero lateness, both lanes Sustainable — the budget binds,
+/// not the CPU. CI-scale horizon 300 (bounded; the full-horizon
+/// before/after evidence is the archived envelope run).
+#[test]
+fn sustainability_at_measured_budget() {
+    let mut spec = CellSpec::base(WorkloadClass::NearSaturation, 5_000, lod_scenarios()[1]);
+    spec.budget = 800;
+    spec.reserve = 240;
+    spec.horizon = 300;
+    let (report, _second, deterministic) = run_cell_deterministic(&spec);
+    assert!(
+        deterministic,
+        "the envelope-budget cell is double-run identical"
+    );
+    let last = report.windows.last().expect("windowed");
+    assert_eq!(
+        last.near_overdue, 0,
+        "zero near overdue at the measured budget"
+    );
+    assert_eq!(
+        last.far_overdue, 0,
+        "zero far overdue at the measured budget"
+    );
+    assert_eq!(report.late_executions, 0, "nothing runs late");
+    assert_eq!(report.classification.near, LaneVerdict::Sustainable);
+    assert_eq!(report.classification.far, LaneVerdict::Sustainable);
+    assert!(report.conservation_holds);
+}
+
+/// C2-P2 (Cycle 2, C1): near-lane starvation-freedom HOLDS at the
+/// raised budget/reserve — the b3 logic at the envelope parameters:
+/// under a far flood (900/tick) at budget 800 / reserve 240, the near
+/// lane's demand (60/tick, within its reserve) executes fully every
+/// tick (zero near overdue, zero near-backlogged ticks) while the far
+/// lane honestly overloads (demand 900 vs capacity 800: far executes
+/// 740/tick, the far backlog grows, and it is classified overloaded —
+/// never hidden).
+#[test]
+fn near_starvation_freedom_at_raised_budget() {
+    let mut spec = CellSpec::base(WorkloadClass::Overload, 0, lod_scenarios()[0]);
+    spec.budget = 800;
+    spec.reserve = 240;
+    spec.overlay_near = 60;
+    spec.overlay_far = 900;
+    spec.horizon = 200;
+    let (report, _second, deterministic) = run_cell_deterministic(&spec);
+    assert!(
+        deterministic,
+        "the starvation-freedom cell is double-run identical"
+    );
+    for (index, window) in report.windows.iter().enumerate() {
+        assert_eq!(window.near_overdue, 0, "window {index}: near never starves");
+        assert_eq!(
+            window.near_backlogged, 0,
+            "window {index}: near never backlogs"
+        );
+    }
+    assert_eq!(report.near_backlogged_ticks, 0);
+    let last = report.windows.last().expect("windowed");
+    assert!(
+        last.far_overdue > 0,
+        "the far flood's backlog is demonstrated, not hidden"
+    );
+    assert_eq!(report.classification.near, LaneVerdict::Sustainable);
+    assert_eq!(report.classification.far, LaneVerdict::Overloaded);
+    assert_eq!(
+        report.executed, 160_000,
+        "execution is budget-capped at exactly 800/tick × 200 ticks"
+    );
+    assert!(report.conservation_holds);
+}
