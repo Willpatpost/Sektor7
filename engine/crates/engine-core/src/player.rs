@@ -677,6 +677,16 @@ fn config_is_valid(config: &PlayerConfig) -> bool {
         && config.step_height >= 0.0
 }
 
+/// The horizontal sweep's context for one step-up probe: the axis,
+/// the intended displacement, the clamped result it produced, and the
+/// grounded state snapshot from before the tick's vertical phase.
+struct StepProbe {
+    axis: usize,
+    want: f32,
+    clamped: f32,
+    was_on_ground: bool,
+}
+
 /// The C2-P1 grounded step-up probe for one horizontal axis: when the
 /// GROUNDED player's move is clamped and `step_height` > 0, retry the
 /// same move one step-height higher — if the raised box is clear at
@@ -691,12 +701,15 @@ fn try_step_up(
     state: &mut PlayerState,
     config: &PlayerConfig,
     world: &CollisionWorld,
-    axis: usize,
-    want: f32,
-    clamped: f32,
-    was_on_ground: bool,
+    probe: StepProbe,
     outcome: &mut StepOutcome,
 ) -> bool {
+    let StepProbe {
+        axis,
+        want,
+        clamped,
+        was_on_ground,
+    } = probe;
     if !was_on_ground || config.step_height <= 0.0 || want == 0.0 {
         return false;
     }
@@ -827,10 +840,12 @@ pub fn step_player(
             state,
             config,
             world,
-            0,
-            want_x,
-            dx,
-            was_on_ground,
+            StepProbe {
+                axis: 0,
+                want: want_x,
+                clamped: dx,
+                was_on_ground,
+            },
             &mut outcome,
         );
     if !climbed_x {
@@ -849,10 +864,12 @@ pub fn step_player(
             state,
             config,
             world,
-            2,
-            want_z,
-            dz,
-            was_on_ground,
+            StepProbe {
+                axis: 2,
+                want: want_z,
+                clamped: dz,
+                was_on_ground,
+            },
             &mut outcome,
         );
     if !climbed_z {
@@ -2163,8 +2180,10 @@ mod tests {
 
     #[test]
     fn step_up_climbs_small_boxes() {
-        let mut config = PlayerConfig::default();
-        config.step_height = 0.55;
+        let config = PlayerConfig {
+            step_height: 0.55,
+            ..PlayerConfig::default()
+        };
         let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 0.5);
         let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
         settle(&mut state, &config, &world);
@@ -2204,8 +2223,10 @@ mod tests {
 
     #[test]
     fn step_up_refuses_tall_obstacles() {
-        let mut config = PlayerConfig::default();
-        config.step_height = 0.55;
+        let config = PlayerConfig {
+            step_height: 0.55,
+            ..PlayerConfig::default()
+        };
         let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 1.5);
         let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
         settle(&mut state, &config, &world);
@@ -2231,8 +2252,10 @@ mod tests {
 
     #[test]
     fn step_up_requires_ground() {
-        let mut config = PlayerConfig::default();
-        config.step_height = 0.55;
+        let config = PlayerConfig {
+            step_height: 0.55,
+            ..PlayerConfig::default()
+        };
         let world = CollisionWorld::new(0.0).with_box([0.0, 0.0, -5.0], 2.0, 0.5);
         // Airborne at the box's face height: the probe is
         // grounded-only, so the move stays clamped and gravity
@@ -2284,8 +2307,10 @@ mod tests {
         // Challenge F6: two adjacent LOW boxes met diagonally — the
         // step-up may fire on either axis in one tick; the ascent is
         // clean, supported, and drift-free across the seam.
-        let mut config = PlayerConfig::default();
-        config.step_height = 0.55;
+        let config = PlayerConfig {
+            step_height: 0.55,
+            ..PlayerConfig::default()
+        };
         // Centered on the 45° approach path (x = -z from the spawn),
         // so the diagonal meets the z-face squarely within the pair's
         // x-span and crosses the seam on top.

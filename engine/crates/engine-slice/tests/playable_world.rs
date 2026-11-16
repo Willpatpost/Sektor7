@@ -153,8 +153,10 @@ fn scenario_trace_pinned() {
 fn interaction_events_fire_once_per_press() {
     // Mapping level: the press frame maps interact; the held frame
     // (no keys_pressed entry — the shell only reports edges) does not.
-    let mut press = InputSnapshot::default();
-    press.keys_pressed = vec![Keycode::E];
+    let press = InputSnapshot {
+        keys_pressed: vec![Keycode::E],
+        ..InputSnapshot::default()
+    };
     assert!(map_playable_input(&press, false).interact_pressed);
     let held = InputSnapshot::default();
     assert!(!map_playable_input(&held, false).interact_pressed);

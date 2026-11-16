@@ -351,6 +351,12 @@ pub struct PlayableDemo {
     ticks: u64,
 }
 
+impl Default for PlayableDemo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlayableDemo {
     pub fn new() -> PlayableDemo {
         let driver = PlayerDriver::new(
