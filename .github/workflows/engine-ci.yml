@@ -194,16 +194,15 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          # Cycle 2 (2026-11-16): the C2 candidate adds C2-P1's 17
-          # engine-core tests (11 player mechanics incl. step-up/
-          # segment/camera + 6 interaction) on top of Cycle 1's 32
-          # (49 platform-uniform, no cfg gates). Linux 1004 MEASURED
-          # at the C2-merged tree with this step's own awk; Windows
-          # 953 = 904 + the same 49 (inference, confirmed by this
-          # candidate run — a mismatch is corrected from actuals,
-          # never by weakening a test).
-          expected=1004
-          if [ "$(uname -s)" != "Linux" ]; then expected=953; fi
+          # Cycle 2 (2026-11-16, C2-P1-R corrective): adds the R2
+          # interaction-validity tests to this shard on top of the
+          # C2-P1 17 (51 platform-uniform, no cfg gates). Linux 1006
+          # MEASURED at the corrective-merged tree with this step's
+          # own awk; Windows 955 = 904 + the same 51 (inference,
+          # confirmed by this candidate run — a mismatch is corrected
+          # from actuals, never by weakening a test).
+          expected=1006
+          if [ "$(uname -s)" != "Linux" ]; then expected=955; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -325,6 +324,18 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_overflow -- --ignored --nocapture
+      # (Cycle-2 corrective integration, N1 at integrator discretion) The
+      # playable-world presentation smoke: the interactive demo's render
+      # path under the offscreen software ICD with validation on — the
+      # run summary carries the movement accounting and the goal state
+      # (a clean 20-frame exit exercises the shell/renderer construction
+      # and the shared advance_frame loop; the gameplay core is proven
+      # headless by the playable_world battery). Correctness smoke only.
+      - name: Playable-world offscreen smoke (Linux only — presentation path, correctness evidence)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo run -p engine-slice -- --playable --frames 20 --fps uncapped --validation on
       - name: Stage 6 integrated soak smoke (Linux only — lavapipe, correctness evidence, NOT performance evidence)
         if: runner.os == 'Linux'
         # The bounded S6-C3 smoke, never a 900-second CI job: the REAL
@@ -619,17 +630,16 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          # Cycle 2 (2026-11-16): the C2 candidate adds C2-P1's 7
-          # playable_world tests (a new integration binary — 50 result
-          # lines) + C2-P2's 2 envelope regressions (joining the
-          # existing sustained_load binary) on top of Cycle 1's 16 —
-          # 25 platform-uniform tests total. Linux 492/4/50 MEASURED
-          # at the C2-merged tree with this step's own awk; Windows
-          # 491 = 466 + the same 25 (inference, confirmed by this
+          # Cycle 2 (2026-11-16, C2-P1-R corrective): adds the R1
+          # interactive-progression regression to the playable_world
+          # binary on top of the C2 additions (26 platform-uniform
+          # tests total). Linux 493/4/50 MEASURED at the
+          # corrective-merged tree with this step's own awk; Windows
+          # 492 = 466 + the same 26 (inference, confirmed by this
           # candidate run — a mismatch is corrected from actuals,
           # never by weakening a test).
-          expected=492
-          if [ "$(uname -s)" != "Linux" ]; then expected=491; fi
+          expected=493
+          if [ "$(uname -s)" != "Linux" ]; then expected=492; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
