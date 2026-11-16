@@ -63,7 +63,12 @@ pub fn demo_player_config() -> PlayerConfig {
         eye_height: 1.6,
         tp_distance: 4.5,
         tp_lift: 1.2,
+        tp_min_distance: 1.2,
         pitch_limit: 1.54,
+        // 0.0 keeps the Cycle-1 demo path bit-identical (the frozen
+        // trace's guarantee); the C2-P1 playable demo sets its own
+        // step height explicitly.
+        step_height: 0.0,
     }
 }
 

@@ -626,6 +626,81 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--playable") {
+        // [cycle2-P1] The playable-world interaction loop (the
+        // gatehouse): movement + camera + interactions + visible
+        // feedback, demonstrated together (delimited wiring; the
+        // integrator reconciles).
+        let mut options = engine_slice::playable_demo::PlayableOptions::default();
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--present" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(mode) = engine_renderer::PresentModePreference::parse(value)
+                    {
+                        options.present = mode;
+                        index += 1;
+                    }
+                }
+                "--fps" => {
+                    if let Some(value) = args.get(index + 1) {
+                        match parse_fps(value) {
+                            Ok(Some(fps)) => {
+                                options.fps = fps;
+                                index += 1;
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                eprintln!("error: {message}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                "--frames" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(frames) = value.parse::<u64>()
+                    {
+                        options.frames = Some(frames.clamp(1, 1_000_000));
+                        index += 1;
+                    }
+                }
+                "--no-overlay" => options.overlay = false,
+                "--validation" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(preference) =
+                            engine_renderer::ValidationPreference::parse(value)
+                    {
+                        options.validation = preference;
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if let Err(message) = engine_slice::playable_demo::run_playable_demo(options) {
+            eprintln!("error: {message}");
+            if message.contains("Vulkan loader") {
+                eprintln!(
+                    "(no Vulkan runtime installed? headless smoke uses \
+                     SDL_VIDEODRIVER=offscreen plus a software ICD)"
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args.iter().any(|arg| arg == "--playable-headless") {
+        // [cycle2-P1] The deterministic headless scenario: the full
+        // gatehouse loop with the event log, camera samples, and the
+        // trace fingerprint (no GPU, no window).
+        println!("{}", engine_slice::playable_demo::run_playable_headless());
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--window") {
         let dummy = args.iter().any(|arg| arg == "--dummy");
         // Headless smoke: 180 frames (~3 s at the 60 fps target).
