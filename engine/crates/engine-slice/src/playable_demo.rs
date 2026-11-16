@@ -400,6 +400,41 @@ impl PlayableDemo {
         }
     }
 
+    /// The interactive frame path: one frame's elapsed time, the
+    /// frame-sampled live intent, and the frame's E edge. The
+    /// movement stays on the driver's fixed-step accumulator (the
+    /// full raw interval, bounded catch-up, no discarded
+    /// obligations); the gameplay update (the interaction
+    /// application and the goal contact) runs at the frame boundary
+    /// on the post-advance state — the SAME gameplay transitions the
+    /// headless [`Self::tick`] performs, unified here (the Cycle-2
+    /// R1 corrective).
+    pub fn advance_frame(
+        &mut self,
+        elapsed: Duration,
+        intent: MoveIntent,
+        interact: bool,
+    ) -> engine_core::DriveStep {
+        let step = self.driver.advance(elapsed, intent);
+        let boundary = self.ticks + u64::from(step.executed_ticks);
+        self.ticks = boundary;
+        if interact {
+            self.try_interact(boundary);
+        }
+        if self.gatehouse.complete.is_none() && goal_reached(self.driver.state()) {
+            self.gatehouse.complete = Some(boundary);
+            self.log(
+                boundary,
+                format!(
+                    "GOAL — scenario complete ({} ticks, {}/3 pickups)",
+                    boundary,
+                    self.gatehouse.collected_count()
+                ),
+            );
+        }
+        step
+    }
+
     /// The interaction resolution: select (engine mechanics), filter
     /// by the exact-slab line of sight, then apply the demo-layer
     /// semantics (what interactions DO lives here).
@@ -1044,12 +1079,12 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         }
 
         // Fixed-step movement on the full raw interval (the Cycle-1
-        // discipline); the interaction applies at the frame boundary
-        // on the post-advance state.
-        demo.driver.advance(split.sim_advance, mapped.intent);
-        if mapped.interact_pressed {
-            demo.try_interact(demo.tick_index());
-        }
+        // discipline) through the SHARED gameplay-update path (the
+        // R1 corrective): the interaction applies once per press at
+        // the frame boundary, the goal contact registers, and the
+        // event timestamps track the live logical position — exactly
+        // as the headless tick path does.
+        demo.advance_frame(split.sim_advance, mapped.intent, mapped.interact_pressed);
 
         if snapshot.minimized {
             std::thread::sleep(Duration::from_millis(50));

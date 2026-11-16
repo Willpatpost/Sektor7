@@ -30,12 +30,16 @@ pub struct InteractionTarget {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InteractionQuery {
     /// Maximum surface distance (target extent discounted) at which a
-    /// target is offered (m).
+    /// target is offered (m). The R2 input contract: finite and
+    /// nonnegative — an invalid reach offers nothing.
     pub range: f32,
     /// The facing cone as the cosine of its half angle: a target is
     /// offered only when the direction to it dots against the look
     /// direction by at least this (1.0 = dead ahead only; 0.0 =
-    /// the full forward hemisphere).
+    /// the full forward hemisphere). The R2 input contract: finite
+    /// and within [−1.0, 1.0] (the cosine range) — a non-finite or
+    /// out-of-range threshold offers nothing, never a bypassed
+    /// facing check.
     pub cone_half_angle_cos: f32,
 }
 
@@ -54,13 +58,29 @@ impl Default for InteractionQuery {
 /// extent discounted) target within `range` and inside the facing
 /// cone; ties break to the lowest id. Returns `None` when nothing is
 /// offered, when the eye or forward is non-finite (the F5 refusal),
-/// or when the forward vector is degenerate.
+/// when the forward vector is degenerate, or when the QUERY is
+/// invalid (the R2 contract: a non-finite or negative reach, or a
+/// non-finite cone threshold outside the cosine range [−1, 1] — an
+/// invalid query offers nothing, never a bypassed facing check).
+/// Targets with non-finite positions or radii, or negative radii,
+/// are SKIPPED — an invalid target never displaces a valid
+/// candidate (an infinite radius would otherwise collapse the
+/// surface distance to zero and offer from arbitrarily far away).
 pub fn select_target(
     targets: &[InteractionTarget],
     eye: [f32; 3],
     forward: [f32; 3],
     query: &InteractionQuery,
 ) -> Option<u32> {
+    if !query.range.is_finite() || query.range < 0.0 {
+        return None;
+    }
+    if !query.cone_half_angle_cos.is_finite()
+        || query.cone_half_angle_cos > 1.0
+        || query.cone_half_angle_cos < -1.0
+    {
+        return None;
+    }
     if !eye.iter().all(|v| v.is_finite()) || !forward.iter().all(|v| v.is_finite()) {
         return None;
     }
@@ -76,7 +96,10 @@ pub fn select_target(
     ];
     let mut best: Option<(u32, f32)> = None;
     for target in targets {
-        if !target.position.iter().all(|v| v.is_finite()) {
+        if !target.position.iter().all(|v| v.is_finite())
+            || !target.radius.is_finite()
+            || target.radius < 0.0
+        {
             continue;
         }
         let delta = [
@@ -256,5 +279,110 @@ mod tests {
         assert_eq!(select_target(&targets, eye, forward, &query), Some(1));
         let all_bad = [target(1, [f32::NAN, 0.0, 0.0])];
         assert_eq!(select_target(&all_bad, eye, forward, &query), None);
+    }
+
+    #[test]
+    fn query_validity_contract() {
+        // R2: an invalid query offers nothing — a non-finite or
+        // negative reach, or a non-finite or out-of-range cone
+        // threshold (the cosine range is [-1, 1]).
+        let (eye, forward) = eye_forward();
+        let valid = InteractionQuery::default();
+        let targets = [target(1, [0.0, 1.0, -2.0])];
+        for query in [
+            InteractionQuery {
+                range: f32::NAN,
+                ..valid
+            },
+            InteractionQuery {
+                range: -1.0,
+                ..valid
+            },
+            InteractionQuery {
+                range: f32::INFINITY,
+                ..valid
+            },
+            InteractionQuery {
+                cone_half_angle_cos: f32::NAN,
+                ..valid
+            },
+            InteractionQuery {
+                cone_half_angle_cos: f32::INFINITY,
+                ..valid
+            },
+            InteractionQuery {
+                cone_half_angle_cos: 1.5,
+                ..valid
+            },
+            InteractionQuery {
+                cone_half_angle_cos: -1.5,
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                select_target(&targets, eye, forward, &query),
+                None,
+                "the invalid query {query:?} offers nothing"
+            );
+        }
+        // The cosine-range boundaries are VALID thresholds: 1.0 is
+        // dead-ahead-only (offering a perfectly aligned target);
+        // -1.0 accepts the full sphere.
+        let dead_ahead = InteractionQuery {
+            cone_half_angle_cos: 1.0,
+            ..valid
+        };
+        let aligned = [target(1, [0.0, 1.6, -2.0])];
+        assert_eq!(
+            select_target(&aligned, eye, forward, &dead_ahead),
+            Some(1),
+            "a perfectly dead-ahead target is offered at the 1.0 boundary"
+        );
+        let full_sphere = InteractionQuery {
+            cone_half_angle_cos: -1.0,
+            ..valid
+        };
+        let behind = [target(1, [0.0, 1.0, 2.0])];
+        assert_eq!(
+            select_target(&behind, eye, forward, &full_sphere),
+            Some(1),
+            "-1.0 is the defined full-sphere boundary, not an error"
+        );
+    }
+
+    #[test]
+    fn target_radius_validity() {
+        // R2: an infinite radius never offers (the defect: the
+        // surface distance collapses to zero from arbitrarily far
+        // away); a negative radius never offers; invalid targets
+        // never displace a valid candidate.
+        let (eye, forward) = eye_forward();
+        let query = InteractionQuery::default();
+        let infinite_far = InteractionTarget {
+            id: 9,
+            position: [0.0, 1.0, -50.0],
+            radius: f32::INFINITY,
+        };
+        assert_eq!(
+            select_target(&[infinite_far], eye, forward, &query),
+            None,
+            "an infinite radius never offers, however far the target"
+        );
+        let negative = InteractionTarget {
+            id: 9,
+            position: [0.0, 1.0, -2.0],
+            radius: -1.0,
+        };
+        assert_eq!(
+            select_target(&[negative], eye, forward, &query),
+            None,
+            "a negative radius never offers"
+        );
+        let valid = target(1, [0.0, 1.0, -2.0]);
+        assert_eq!(
+            select_target(&[infinite_far, negative, valid], eye, forward, &query),
+            Some(1),
+            "invalid targets do not displace the valid candidate"
+        );
     }
 }
