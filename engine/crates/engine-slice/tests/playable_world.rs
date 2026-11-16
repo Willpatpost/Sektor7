@@ -315,3 +315,79 @@ fn gatehouse_collide_what_you_see() {
         "the open gate is not drawn"
     );
 }
+
+/// The Cycle-2 R1 corrective: the INTERACTIVE progression path
+/// (`advance_frame` — the exact shared gameplay-update mechanism the
+/// live loop routes through) registers interactions at real logical
+/// timestamps and goal-pad contact as completion, exactly as the
+/// headless `tick` path does. Written fail-first against the defect
+/// (the live loop calling `driver.advance` directly: event
+/// timestamps frozen at zero, completion never registered).
+#[test]
+fn interactive_frame_progression_registers_interactions_and_completion() {
+    let frame = std::time::Duration::from_nanos(16_666_666); // 1/60 s → one tick
+    let idle = engine_core::MoveIntent::default();
+
+    // The logical clock advances through live frames.
+    let mut demo = PlayableDemo::new();
+    for _ in 0..10 {
+        demo.advance_frame(frame, idle, false);
+    }
+    assert_eq!(
+        demo.tick_index(),
+        10,
+        "the frame path advances the logical clock"
+    );
+
+    // The switch press on the eleventh frame: the event's timestamp
+    // is the live logical position — the defect froze it at zero.
+    let mut demo_at_switch = PlayableDemo::new();
+    let state = demo_at_switch.driver.state_mut();
+    state.position = [0.0, 1.2 + engine_core::player::SKIN, -4.4];
+    state.velocity = [0.0, 0.0, 0.0];
+    state.on_ground = true;
+    for _ in 0..10 {
+        demo_at_switch.advance_frame(frame, idle, false);
+    }
+    demo_at_switch.advance_frame(frame, idle, true);
+    assert!(demo_at_switch.gatehouse.switch_on, "the switch toggled");
+    assert_eq!(
+        demo_at_switch.gatehouse.events.len(),
+        1,
+        "one press, one event"
+    );
+    let (tick, line) = &demo_at_switch.gatehouse.events[0];
+    assert!(
+        line.contains("switch toggled"),
+        "the interaction event is logged: {line}"
+    );
+    assert_eq!(
+        *tick, 11,
+        "the interaction timestamps the live logical position (the defect: 0)"
+    );
+
+    // Goal-pad contact through the frame path registers completion
+    // (the defect never registered it).
+    let mut demo_at_goal = PlayableDemo::new();
+    let state = demo_at_goal.driver.state_mut();
+    state.position = [0.8, 0.0, -21.4];
+    state.velocity = [0.0, 0.0, 0.0];
+    state.on_ground = true;
+    for _ in 0..5 {
+        demo_at_goal.advance_frame(frame, idle, false);
+    }
+    assert!(
+        demo_at_goal.gatehouse.complete.is_some(),
+        "goal-pad contact through the frame path registers completion (the defect: never)"
+    );
+    let (tick, line) = demo_at_goal
+        .gatehouse
+        .events
+        .last()
+        .expect("the GOAL event");
+    assert!(
+        line.contains("GOAL"),
+        "the completion event is logged: {line}"
+    );
+    assert!(*tick > 0, "the completion timestamp is real: {tick}");
+}
