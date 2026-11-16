@@ -194,17 +194,16 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude engine-slice --features engine-persist/composite-test-fixture 2>&1 | tee tests-main.log
-          # Cycle 1 (2026-11-15, final corrective R4b): the integrated
-          # candidate adds P1's 5 engine-renderer clamp tests, P3's 20
-          # engine-core player tests, R4's 4 and R4b's 3 player
-          # boundary/accounting regressions to this shard (32
-          # platform-uniform, no cfg gates). Linux 987 MEASURED at the
-          # R4b-merged tree with this step's own awk; Windows 936 =
-          # 904 + the same 32 (inference, confirmed by this candidate
-          # run — a mismatch is corrected from actuals, never by
-          # weakening a test).
-          expected=987
-          if [ "$(uname -s)" != "Linux" ]; then expected=936; fi
+          # Cycle 2 (2026-11-16): the C2 candidate adds C2-P1's 17
+          # engine-core tests (11 player mechanics incl. step-up/
+          # segment/camera + 6 interaction) on top of Cycle 1's 32
+          # (49 platform-uniform, no cfg gates). Linux 1004 MEASURED
+          # at the C2-merged tree with this step's own awk; Windows
+          # 953 = 904 + the same 49 (inference, confirmed by this
+          # candidate run — a mismatch is corrected from actuals,
+          # never by weakening a test).
+          expected=1004
+          if [ "$(uname -s)" != "Linux" ]; then expected=953; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -620,25 +619,24 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          # Cycle 1 (2026-11-15, corrective round): the integrated
-          # candidate adds P1's 2 lib tests + P3's 7 (5 integration +
-          # 2 bin) + P2's 6 + R2's 1 gradual-growth regression — 16
-          # platform-uniform tests — and three new integration binaries
-          # (49 result lines; ignored 3 -> 4: P1's pod-only lavapipe
-          # oversize smoke, now also EXECUTED by the enforced R1 step
-          # above). Linux 483/4/49 MEASURED at the re-integrated tree
-          # with this step's own awk; Windows 482 = 466 + the same 16
-          # (inference, confirmed by this candidate run — a mismatch is
-          # corrected from actuals, never by weakening a test).
-          expected=483
-          if [ "$(uname -s)" != "Linux" ]; then expected=482; fi
+          # Cycle 2 (2026-11-16): the C2 candidate adds C2-P1's 7
+          # playable_world tests (a new integration binary — 50 result
+          # lines) + C2-P2's 2 envelope regressions (joining the
+          # existing sustained_load binary) on top of Cycle 1's 16 —
+          # 25 platform-uniform tests total. Linux 492/4/50 MEASURED
+          # at the C2-merged tree with this step's own awk; Windows
+          # 491 = 466 + the same 25 (inference, confirmed by this
+          # candidate run — a mismatch is corrected from actuals,
+          # never by weakening a test).
+          expected=492
+          if [ "$(uname -s)" != "Linux" ]; then expected=491; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 4 / 49)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 4 / 50)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 4 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 4"; exit 1; }
-          [ "$results" -eq 49 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 49"; exit 1; }
+          [ "$results" -eq 50 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 50"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

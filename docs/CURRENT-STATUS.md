@@ -129,6 +129,18 @@ construction; divergence is an investigation, never a silent re-pin).
 The formerly ignored oversize smoke is now ALSO executed by an enforced
 Linux CI step (the R1 corrective) with its evidence lines in the log.
 
+**The Cycle-2 candidate** (`s7-cycle2-integration`, §9 — likewise
+awaiting the owner's mainline decision; built on the Cycle-1 candidate)
+adds C2-P1's +17 main (11 player mechanics: step-up, the exact-slab
+segment query, camera obstruction; 6 interaction-framework tests) and
++7 heavy (`playable_world`, a new integration binary) plus C2-P2's +2
+heavy envelope regressions, with a second frozen scenario trace
+(`8f6b490648326d26`, the libm-free gatehouse course). Measured at the
+C2-merged tree: main **1004 / 1 / 30**; heavy **492 / 4 / 50 result
+lines** (Windows 953 / 491 inference, confirmed by the candidate CI).
+Both Cycle-1 frozen traces and every determinism pin remain
+byte-identical at the C2 tree.
+
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3
   and Stage 4 scenario fingerprints — all double-run and byte-compared in CI.
@@ -344,10 +356,49 @@ the cross-package combined-semantics check green (the player proxy through
 the truncation counters — 0 omitted). The five-job `workflow_dispatch`
 candidate CI (including the enforced R1 execution step) is dispatched at
 this exact SHA; per-job conclusions are recorded in the cycle report.
-**The cycle stops at the owner-reserved mainline-merge gate** — pending
-ChatGPT's independent re-review and the owner's decisions on the mainline
-merge itself, the F-03 Step-2 capacity/refusal policy (recommendation
-delivered, not ratified), and the Milestone-3 next-cycle proposal.
+
+**Cycle 2 (2026-11-15/16, the GO directive hash-verified at the ledger)** —
+two implementation packages plus the F-03 Step-2 recommendation
+(owner-gated, §6), consolidated on `s7-cycle2-integration` (built on the
+Cycle-1 candidate):
+
+- **C2-P1 — the playable-world interaction loop** (the gatehouse
+  courtyard): step-up navigation over multi-box geometry, the exact
+  ray–AABB `segment_hit` powering both TP-camera obstruction pull-in and
+  line-of-sight interaction filtering, the minimal reusable interaction
+  framework (engine-core `interaction.rs`; game policy in the demo),
+  visible feedback through the existing overlay + dynamic scene, and the
+  `--playable` / `--playable-headless` deterministic twin (the frozen
+  scenario trace `8f6b490648326d26`; the full event log incl. the
+  occluded→clear LOS moment and the TP pull-in sample). All scenario state
+  **transient**; controls documented for the owner's hardware procedure
+  (the C2-P3 draft in the cycle report).
+- **C2-P2 — simulation scalability**: the measured **capacity envelope**
+  (budget sweep 200–3200, release profile, real chains, double-run): 1k
+  compositions sustainable from budget 200–400; **5k-full from 1600**,
+  **5k-mixed from 800**, 5k-event-driven from 200; **20k-full NOT
+  sustained within the sweep** (the honest limit at 3200), 20k-mixed from
+  3200, 20k-event-driven from 800. Spine isolation **0.278–0.517
+  µs/event release** (≈4× the debug profile); work rates 1,044–1,482
+  events/ms — **the budget binds, not the CPU**. The envelope
+  regressions pin sustainability at the measured budget (5k-mixed
+  800/240) and near-lane starvation-freedom under far flood at the
+  raised budget. The default-budget change is **owner-gated** (the
+  measured recommendation delivered; nothing silently re-defaulted). No
+  direct allocation/locality instrument was added — C4's drop rests on
+  the isolation's cost-flatness; a bounded counting-allocator remains a
+  future-cycle option (with the `unsafe_code=deny` interaction that
+  would need surfacing). The near-lane per-event-cost lead (~2×) is a
+  documented lead, not a conclusion (work/ms at sustaining budgets is
+  similar across compositions: 5k-full@1600 ≈ 1,301 vs 5k-mixed@800 ≈
+  1,280 events/ms).
+
+Both packages independently cross-reviewed (ACCEPT; verdicts archived in
+`cycle2/reviews/`). The five-job candidate CI is dispatched at the exact
+C2 candidate SHA. **The cycle stops at the owner-reserved mainline-merge
+gate** — pending ChatGPT's independent review, the owner's mainline
+decision, the F-03 Step-2 policy ratification, and the C2-P3
+hardware-validation execution on the owner's rig.
 
 ## 10. The authoritative coordination ledger
 
