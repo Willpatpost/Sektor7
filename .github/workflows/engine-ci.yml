@@ -630,16 +630,15 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p engine-slice --features engine-slice/crash-test-seams 2>&1 | tee tests-heavy.log
-          # Cycle 2 (2026-11-16, C2-P1-R corrective): adds the R1
-          # interactive-progression regression to the playable_world
-          # binary on top of the C2 additions (26 platform-uniform
-          # tests total). Linux 493/4/50 MEASURED at the
-          # corrective-merged tree with this step's own awk; Windows
-          # 492 = 466 + the same 26 (inference, confirmed by this
-          # candidate run — a mismatch is corrected from actuals,
+          # Cycle 2 (2026-11-16, C2-P1-R2 closeout): adds the connected
+          # live-frame route regression to the playable_world binary
+          # (27 platform-uniform tests total). Linux 494/4/50 MEASURED
+          # at the closeout-merged tree with this step's own awk;
+          # Windows 493 = 466 + the same 27 (inference, confirmed by
+          # this candidate run — a mismatch is corrected from actuals,
           # never by weakening a test).
-          expected=493
-          if [ "$(uname -s)" != "Linux" ]; then expected=492; fi
+          expected=494
+          if [ "$(uname -s)" != "Linux" ]; then expected=493; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
