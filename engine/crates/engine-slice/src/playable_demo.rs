@@ -331,7 +331,9 @@ pub struct GatehouseState {
 }
 
 impl GatehouseState {
-    fn gate_open(&self) -> bool {
+    /// The gate is open exactly when the switch is on (the demo's
+    /// one-way coupling, public for the battery's assertions).
+    pub fn gate_open(&self) -> bool {
         self.switch_on
     }
 
