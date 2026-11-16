@@ -391,3 +391,203 @@ fn interactive_frame_progression_registers_interactions_and_completion() {
     );
     assert!(*tick > 0, "the completion timestamp is real: {tick}");
 }
+
+/// The R2 closeout's obligation B: the CONNECTED live-frame route —
+/// a SINGLE PlayableDemo instance walked through the essential
+/// gatehouse loop entirely via `advance_frame()` (the actual shared
+/// progression code `run_playable_demo()` uses), with genuine player
+/// movement (no state teleports): settle, the staircase climb, the
+/// switch press opening the gate, the corridor walk, the pickups,
+/// and the goal pad — with real timestamps, no refused steps, and a
+/// loud bounded failure if any phase stalls. The route intentionally
+/// mirrors the scripted scenario's checkpoints but drives ONLY
+/// frames: 1/60 s per frame, the movement accumulator's own
+/// catch-up, and E edges on single frames.
+#[test]
+fn connected_live_frame_route_completes_the_gatehouse() {
+    let mut demo = PlayableDemo::new();
+    let frame = std::time::Duration::from_nanos(16_666_666); // 1/60 s → one tick
+    let idle = engine_core::MoveIntent::default();
+    let forward = engine_core::MoveIntent { forward: 1, ..idle };
+    let strafe_left = engine_core::MoveIntent { strafe: -1, ..idle };
+    let strafe_right = engine_core::MoveIntent { strafe: 1, ..idle };
+
+    // The frame-driven equivalent of the scripted runner's bounded
+    // phase loop: advance frames until the condition holds; a phase
+    // that stalls fails the test loudly (never a silent skip).
+    fn frames_until(
+        demo: &mut PlayableDemo,
+        frame: std::time::Duration,
+        intent: engine_core::MoveIntent,
+        interact: bool,
+        condition: impl Fn(&PlayableDemo) -> bool,
+        label: &str,
+    ) {
+        for _ in 0..3_000 {
+            if condition(demo) {
+                return;
+            }
+            demo.advance_frame(frame, intent, interact);
+        }
+        panic!("the connected live-frame route stalled at '{label}'");
+    }
+
+    // 1. Settle to the courtyard ground.
+    frames_until(
+        &mut demo,
+        frame,
+        idle,
+        false,
+        |d| d.driver.state().on_ground,
+        "settle",
+    );
+
+    // 2. Climb the staircase and cross the platform to the switch
+    //    (the step-up carries genuine movement over the terrain).
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -4.4,
+        "approach the switch",
+    );
+    assert!(
+        demo.driver.state().position[1] > 1.0,
+        "the staircase was genuinely climbed: y = {}",
+        demo.driver.state().position[1]
+    );
+
+    // 3. The switch press (one E edge): the gate opens.
+    demo.advance_frame(frame, idle, true);
+    assert!(demo.gatehouse.switch_on, "the switch toggled");
+    assert!(demo.gatehouse.gate_open(), "the gate opened");
+    let switch_timestamp = demo.gatehouse.events.last().expect("the switch event").0;
+    assert!(
+        switch_timestamp > 0 && switch_timestamp <= demo.tick_index(),
+        "the switch timestamp is a real logical position: {switch_timestamp}"
+    );
+
+    // 4. Third person, detour left past the switch pillar, off the
+    //    platform edge, and land.
+    demo.driver.state_mut().toggle_camera_mode();
+    frames_until(
+        &mut demo,
+        frame,
+        strafe_left,
+        false,
+        |d| d.driver.state().position[0] <= -0.5,
+        "detour past the switch pillar",
+    );
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -7.2,
+        "reach the platform edge",
+    );
+    frames_until(
+        &mut demo,
+        frame,
+        idle,
+        false,
+        |d| d.driver.state().on_ground,
+        "land",
+    );
+
+    // 5. Through the opened gate and the corridor to pickup 1.
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -15.5,
+        "reach pickup 1",
+    );
+    demo.advance_frame(frame, idle, true);
+    assert!(demo.gatehouse.pickups[0], "pickup 1 collected");
+
+    // 6. The occluder strafe, then pickups 2 and 3.
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -16.0,
+        "close on the occluder",
+    );
+    frames_until(
+        &mut demo,
+        frame,
+        strafe_right,
+        false,
+        |d| d.driver.state().position[0] >= 0.8,
+        "strafe past the occluder",
+    );
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -16.4,
+        "reach pickup 2",
+    );
+    demo.advance_frame(frame, idle, true);
+    assert!(demo.gatehouse.pickups[1], "pickup 2 collected");
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.driver.state().position[2] <= -17.9,
+        "reach pickup 3",
+    );
+    demo.advance_frame(frame, idle, true);
+    assert!(demo.gatehouse.pickups[2], "pickup 3 collected");
+
+    // 7. The goal pad: completion through the connected route.
+    frames_until(
+        &mut demo,
+        frame,
+        forward,
+        false,
+        |d| d.gatehouse.complete.is_some(),
+        "reach the goal",
+    );
+    assert!(demo.gatehouse.complete.is_some(), "the route completed");
+    let events = &demo.gatehouse.events;
+    let (_, goal_line) = events.last().expect("the GOAL event");
+    assert!(
+        goal_line.contains("GOAL"),
+        "the completion line: {goal_line}"
+    );
+    assert_eq!(
+        demo.gatehouse.collected_count(),
+        3,
+        "all pickups collected on the connected route"
+    );
+
+    // 8. The invariants: real advancing timestamps, no refused
+    //    steps, monotone event order.
+    assert!(
+        demo.tick_index() > 0,
+        "the logical clock advanced: {}",
+        demo.tick_index()
+    );
+    assert_eq!(
+        demo.driver.refused_steps(),
+        0,
+        "no refused movement steps on the connected route"
+    );
+    let mut last_tick = 0;
+    for (tick, _) in events {
+        assert!(*tick >= last_tick, "the events are timestamped in order");
+        last_tick = *tick;
+    }
+    assert_eq!(
+        events.len(),
+        5,
+        "settle-free route: switch, 3 pickups, GOAL"
+    );
+}
