@@ -376,14 +376,18 @@ impl PlayableDemo {
         self.ticks
     }
 
-    /// One movement tick plus the frame-level interaction and goal
-    /// logic. `interact` is the E EDGE for this tick (the mapping
-    /// layer derives it from `keys_pressed`; holding is not a new
-    /// press).
-    pub fn tick(&mut self, intent: MoveIntent, interact: bool) {
-        let tick = self.ticks;
-        self.ticks += 1;
-        self.driver.run_headless(1, |_| intent);
+    /// The SINGLE application-level gameplay transition (the R2
+    /// closeout's obligation A): the E-edge interaction (once per
+    /// press, at the given logical timestamp) and the goal-pad
+    /// completion registration, applied to the post-movement state.
+    /// Called by BOTH progression paths after their respective
+    /// movement advancement — the scripted logical tick and the
+    /// frame-sampled live frame — so the gameplay semantics exist
+    /// exactly once. The paths keep their intentional differences
+    /// (headless ticks advance one logical step; live frames run the
+    /// accumulator's bounded catch-up on the raw interval); no
+    /// cross-render-cadence determinism is implied between them.
+    fn apply_gameplay_transition(&mut self, tick: u64, interact: bool) {
         if interact {
             self.try_interact(tick);
         }
@@ -400,15 +404,25 @@ impl PlayableDemo {
         }
     }
 
+    /// The scripted-logical-tick path: one movement tick plus the
+    /// gameplay transition. `interact` is the E EDGE for this tick
+    /// (the mapping layer derives it from `keys_pressed`; holding is
+    /// not a new press).
+    pub fn tick(&mut self, intent: MoveIntent, interact: bool) {
+        let tick = self.ticks;
+        self.ticks += 1;
+        self.driver.run_headless(1, |_| intent);
+        self.apply_gameplay_transition(tick, interact);
+    }
+
     /// The interactive frame path: one frame's elapsed time, the
     /// frame-sampled live intent, and the frame's E edge. The
     /// movement stays on the driver's fixed-step accumulator (the
     /// full raw interval, bounded catch-up, no discarded
-    /// obligations); the gameplay update (the interaction
-    /// application and the goal contact) runs at the frame boundary
-    /// on the post-advance state — the SAME gameplay transitions the
-    /// headless [`Self::tick`] performs, unified here (the Cycle-2
-    /// R1 corrective).
+    /// obligations); the gameplay update runs at the frame boundary
+    /// on the post-advance state through the SAME single transition
+    /// the headless [`Self::tick`] uses (the Cycle-2 R1 corrective,
+    /// deduplicated by the R2 closeout).
     pub fn advance_frame(
         &mut self,
         elapsed: Duration,
@@ -416,22 +430,8 @@ impl PlayableDemo {
         interact: bool,
     ) -> engine_core::DriveStep {
         let step = self.driver.advance(elapsed, intent);
-        let boundary = self.ticks + u64::from(step.executed_ticks);
-        self.ticks = boundary;
-        if interact {
-            self.try_interact(boundary);
-        }
-        if self.gatehouse.complete.is_none() && goal_reached(self.driver.state()) {
-            self.gatehouse.complete = Some(boundary);
-            self.log(
-                boundary,
-                format!(
-                    "GOAL — scenario complete ({} ticks, {}/3 pickups)",
-                    boundary,
-                    self.gatehouse.collected_count()
-                ),
-            );
-        }
+        self.ticks += u64::from(step.executed_ticks);
+        self.apply_gameplay_transition(self.ticks, interact);
         step
     }
 
