@@ -49,4 +49,4 @@ mod vulkan;
 
 pub use config::{PresentModePreference, RenderConfig, ValidationPreference};
 pub use renderer::{FrameResult, RenderStats, Renderer};
-pub use vulkan::RendererError;
+pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};

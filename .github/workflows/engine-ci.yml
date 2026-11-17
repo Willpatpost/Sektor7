@@ -201,8 +201,13 @@ jobs:
           # own awk; Windows 955 = 904 + the same 51 (inference,
           # confirmed by this candidate run — a mismatch is corrected
           # from actuals, never by weakening a test).
-          expected=1006
-          if [ "$(uname -s)" != "Linux" ]; then expected=955; fi
+          # Orientation corrective (2026-11-17): +1 engine-renderer
+          # lib test (the A4 generated-SPIR-V adjustment pin,
+          # platform-uniform, no cfg gates). Linux 1007 MEASURED at
+          # the corrective candidate with this step's own awk;
+          # Windows 956 = the prior 955 + the same 1.
+          expected=1007
+          if [ "$(uname -s)" != "Linux" ]; then expected=956; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -324,6 +329,20 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_overflow -- --ignored --nocapture
+      # (The 2026-11-17 orientation corrective) The ENFORCED visual-
+      # orientation regression: the real renderer with pixel readback
+      # under the offscreen software ICD — ground colors in the LOWER
+      # frame region, an above-camera marker in the UPPER region, a
+      # face-on TOP surface (the winding/culling proof), and the
+      # overlay glyphs in the top-left corner. The per-stage println!
+      # evidence is what the CI log must show (the render_overflow
+      # discipline: actual pixel-measured execution, never a compile
+      # or an ignored skip).
+      - name: Visual-orientation pixel regression (Linux only — the enforced orientation corrective execution)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_orientation -- --ignored --nocapture
       # (Cycle-2 corrective integration, N1 at integrator discretion) The
       # playable-world presentation smoke: the interactive demo's render
       # path under the offscreen software ICD with validation on — the
@@ -637,15 +656,24 @@ jobs:
           # Windows 493 = 466 + the same 27 (inference, confirmed by
           # this candidate run — a mismatch is corrected from actuals,
           # never by weakening a test).
-          expected=494
-          if [ "$(uname -s)" != "Linux" ]; then expected=493; fi
+          # Orientation corrective (2026-11-17): +1 engine-slice lib
+          # test (the A3 projection-orientation regression,
+          # platform-uniform) and the new render_orientation
+          # integration binary (one #[ignore]d lavapipe smoke — the
+          # same class as render_overflow: executed by the ENFORCED
+          # Linux step, ignored in the plain run). Linux 495/5/51
+          # MEASURED at the corrective candidate with this step's own
+          # awk; Windows 494 = the prior 493 + the same 1 passed (the
+          # ignored test and the result line are platform-uniform).
+          expected=495
+          if [ "$(uname -s)" != "Linux" ]; then expected=494; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 4 / 50)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 5 / 51)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 4 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 4"; exit 1; }
-          [ "$results" -eq 50 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 50"; exit 1; }
+          [ "$ignored" -eq 5 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 5"; exit 1; }
+          [ "$results" -eq 51 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 51"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

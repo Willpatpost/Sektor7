@@ -30,3 +30,8 @@ bytemuck = { version = "1", features = ["derive"] }
 # Pinned to 29.0.4: naga 30.0.1's glsl-in frontend does not compile against its
 # own ir module (apply_default_interpolation missing) — observed 2026-10-19.
 naga = { version = "=29.0.4", features = ["glsl-in", "spv-out"] }
+
+[dev-dependencies]
+# Test-side re-parse of the build-emitted SPIR-V (the orientation
+# corrective's A4 pin): the SAME pinned naga, with the spv-in frontend.
+naga = { version = "=29.0.4", features = ["spv-in"] }
