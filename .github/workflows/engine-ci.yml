@@ -211,8 +211,14 @@ jobs:
           # units, platform-uniform). Linux 1009 MEASURED at the
           # hardening candidate with this step's own awk; Windows 958 =
           # the prior 956 + the same 2.
-          expected=1009
-          if [ "$(uname -s)" != "Linux" ]; then expected=958; fi
+          # Final cache-validation corrective (2026-11-17): +2
+          # engine-renderer lib tests (the cache-reuse full-extent and
+          # transfer-source-capability regressions, platform-uniform).
+          # Linux 1011 MEASURED at the final corrective candidate with
+          # this step's own awk; Windows 960 = the prior 958 + the
+          # same 2.
+          expected=1011
+          if [ "$(uname -s)" != "Linux" ]; then expected=960; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)

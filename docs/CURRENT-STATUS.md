@@ -105,9 +105,9 @@ re-measured from actual output on every change, never estimated):
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1009 | 958 |
+| Main shard (`--workspace --exclude engine-slice`) | 1011 | 960 |
 | Heavy shard (`-p engine-slice --features crash-test-seams`) | 498 | 497 |
-| **Combined** | **1507** | **1455** |
+| **Combined** | **1509** | **1457** |
 
 (The macOS job runs its own execution partition — no combined count is
 defined for it. Ignored: 1 main / 5 heavy, all deliberate measurement soaks.)
@@ -167,14 +167,19 @@ refused capture can never poison frame synchronization — the frame
 renders normally and the refusal is observable), and the bounded
 single-flight request lifecycle (a second request while one is
 outstanding is refused with a typed error — never overwriting an
-unconsumed readback). Adds +2 main (the H3 capture contract units)
-and +3 heavy (the H2 mouse-look direction regressions across the
-player, playable, and free-flight paths — asserting the resulting
-world-space look direction through the real mappings and engine math).
-Measured at the candidate: main **1009 / 1 / 30**; heavy **498 / 5 /
-51 result lines** (Windows 958 / 497, platform-uniform). Every
-determinism pin and both frozen traces byte-identical at the
-candidate.
+unconsumed readback). The final cache-validation corrective on the
+same candidate adds the cache-reuse full-extent validation (a
+1280×720 destination never serves a 960×960 swapchain, same pixel
+count notwithstanding) and the transfer-source-capability check
+independent of destination reusability (at preparation AND at the
+record-time guard). Adds +4 main (the H3 capture contract units and
+the two cache-validation regressions) and +3 heavy (the H2
+mouse-look direction regressions across the player, playable, and
+free-flight paths — asserting the resulting world-space look
+direction through the real mappings and engine math). Measured at
+the candidate: main **1011 / 1 / 30**; heavy **498 / 5 / 51 result
+lines** (Windows 960 / 497, platform-uniform). Every determinism pin
+and both frozen traces byte-identical at the candidate.
 
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3

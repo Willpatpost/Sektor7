@@ -2034,7 +2034,17 @@ impl CaptureState {
     /// touch no GPU state, so an unsupported surface format (e.g. an
     /// 8-byte-per-pixel fallback) is refused with a typed error before
     /// any allocation or copy command, and the byte length can never
-    /// exceed what the format actually requires.
+    /// exceed what the format actually requires. The TRANSFER-SOURCE
+    /// capability is validated INDEPENDENTLY of destination
+    /// reusability (the cache-validation corrective's defect 2): a
+    /// recreated swapchain without TRANSFER_SRC is refused even when
+    /// the cached destination would otherwise be reused — and the
+    /// refusal stays pure (no GPU state is touched). The cache reuse
+    /// itself validates the FULL extent (the corrective's defect 1):
+    /// width AND height, never just the byte count — 1280×720 and
+    /// 960×960 share a pixel count but not a shape, and the reported
+    /// capture dimensions must always correspond to the image
+    /// actually copied.
     fn ensure(
         &mut self,
         ctx: &VulkanContext,
@@ -2047,13 +2057,6 @@ impl CaptureState {
         let height = swapchain.extent.height;
         let needed = capture_byte_len(width, height, footprint)
             .ok_or(RendererError::CaptureSizingOverflow)?;
-        if self.buffer != vk::Buffer::null()
-            && self.byte_len == needed
-            && self.format == swapchain.format
-        {
-            return Ok(());
-        }
-        self.destroy(ctx);
         if !swapchain.transfer_src_supported {
             return Err(RendererError::NoDevice(
                 "the surface's swapchain images do not support TRANSFER_SRC — frame \
@@ -2061,6 +2064,14 @@ impl CaptureState {
                     .into(),
             ));
         }
+        if self.buffer != vk::Buffer::null()
+            && self.width == width
+            && self.height == height
+            && self.format == swapchain.format
+        {
+            return Ok(());
+        }
+        self.destroy(ctx);
         let (buffer, memory, mapped) = create_mapped_buffer(
             ctx,
             vk::BufferUsageFlags::TRANSFER_DST,
@@ -2076,18 +2087,19 @@ impl CaptureState {
         Ok(())
     }
 
-    /// True when the prepared destination exactly matches the given
-    /// extent and format — the record-time guard against a swapchain
-    /// that changed between the pre-acquire preparation and the
-    /// recording of the frame (the acquire path may recreate it).
-    fn matches(&self, width: u32, height: u32, format: vk::Format) -> bool {
-        if self.buffer == vk::Buffer::null() {
-            return false;
-        }
-        let Some(footprint) = capture_format_footprint(format) else {
-            return false;
-        };
-        self.byte_len == capture_byte_len(width, height, footprint).unwrap_or(usize::MAX)
+    /// The record-time guard predicate (the cache-validation
+    /// corrective): the prepared destination may serve the image
+    /// being recorded ONLY when the FULL extent (width AND height —
+    /// never just the byte count), the format, AND the current
+    /// swapchain's TRANSFER-SOURCE capability all match — a
+    /// mid-frame swapchain recreation may change the shape, the
+    /// format, or the capability between the pre-acquire preparation
+    /// and the recording.
+    fn matches(&self, width: u32, height: u32, format: vk::Format, transfer_src: bool) -> bool {
+        self.buffer != vk::Buffer::null()
+            && transfer_src
+            && self.width == width
+            && self.height == height
             && self.format == format
     }
 }
@@ -2698,16 +2710,20 @@ pub(crate) fn render_frame(
         // whole image into the mapped buffer, and transition back, all
         // inside this frame's own command buffer so the submission
         // fence proves the copy complete before `take_capture` reads.
-        // The record-time guard (the post-orientation hardening): the
-        // acquire path may have recreated the swapchain AFTER the
-        // pre-acquire preparation — a mismatched destination is never
-        // copied into; the capture is DROPPED (a typed, observable
-        // drop) and the frame renders normally.
+        // The record-time guard (the post-orientation hardening + the
+        // cache-validation corrective): the acquire path may have
+        // recreated the swapchain AFTER the pre-acquire preparation —
+        // a destination mismatched in extent, format, OR transfer-
+        // source capability is never copied into; the capture is
+        // DROPPED (a typed, observable drop) and the frame renders
+        // normally.
         if frames.capture.pending {
-            if frames
-                .capture
-                .matches(extent.width, extent.height, swapchain.format)
-            {
+            if frames.capture.matches(
+                extent.width,
+                extent.height,
+                swapchain.format,
+                swapchain.transfer_src_supported,
+            ) {
                 let image = swapchain.images[image_index as usize];
                 let subresource = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -2778,14 +2794,16 @@ pub(crate) fn render_frame(
                 frames.capture.slot = slot;
             } else {
                 // The prepared destination does not match the image
-                // being recorded (the swapchain changed mid-frame):
-                // drop the request — never copy into a mismatched
-                // destination — and record the typed, observable drop.
+                // being recorded (the swapchain changed mid-frame —
+                // its extent, format, or transfer-source capability):
+                // drop the request — never copy into a mismatched or
+                // unsupported destination — and record the typed,
+                // observable drop.
                 frames.capture.pending = false;
                 frames.capture.last_refusal = Some(RendererError::CaptureDropped(format!(
                     "the swapchain changed between the capture preparation and the \
-                     recording (extent {}×{}, format {:?})",
-                    extent.width, extent.height, swapchain.format
+                     recording (extent {}×{}, format {:?}, transfer-src {})",
+                    extent.width, extent.height, swapchain.format, swapchain.transfer_src_supported
                 )));
             }
         }
@@ -3583,5 +3601,78 @@ mod orientation {
             None,
             "u32-extreme extents must refuse instead of wrapping"
         );
+    }
+
+    /// The final cache-validation corrective's defect-1 regression: a
+    /// cached 1280×720 destination must NOT be reused for a 960×960
+    /// swapchain even though the two extents share EXACTLY the same
+    /// pixel count (and therefore byte length) — the reported capture
+    /// dimensions must always correspond to the image actually
+    /// copied. Fail-first at the held candidate: the reuse predicate
+    /// compared only the byte length and the format, so this
+    /// FAILED before the fix (log cc-failfirst-defect1.log).
+    #[test]
+    fn capture_cache_reuse_validates_the_full_extent() {
+        use super::{CaptureState, capture_byte_len};
+        use ash::vk;
+        use ash::vk::Handle;
+
+        let cached = CaptureState {
+            buffer: vk::Buffer::from_raw(1),
+            byte_len: capture_byte_len(1280, 720, 4).expect("the cached size"),
+            width: 1280,
+            height: 720,
+            format: vk::Format::B8G8R8A8_UNORM,
+            ..CaptureState::dead()
+        };
+        // The defect's exact shape: same pixel count, different
+        // dimensions — must be rejected.
+        assert!(
+            !cached.matches(960, 960, vk::Format::B8G8R8A8_UNORM, true),
+            "a 1280×720 cache must not serve a 960×960 swapchain (same \
+             byte count, different shape)"
+        );
+        // The matching extent still reuses (the positive control —
+        // the hot path does not reallocate).
+        assert!(cached.matches(1280, 720, vk::Format::B8G8R8A8_UNORM, true));
+        // A format change is likewise rejected even at the same
+        // extent.
+        assert!(!cached.matches(1280, 720, vk::Format::B8G8R8A8_SRGB, true));
+    }
+
+    /// The final cache-validation corrective's defect-2 regression:
+    /// the record-time guard requires the CURRENT swapchain's
+    /// transfer-source capability even when the destination is
+    /// otherwise a perfect match — a recreated swapchain without
+    /// TRANSFER_SRC must never reach the image-to-buffer copy. The
+    /// same predicate drives `ensure()`'s reuse decision, with the
+    /// capability checked FIRST and independently (the refusal stays
+    /// pure). Fail-first: with the capability term disabled (the
+    /// pre-fix defect form), this test fails (log
+    /// cc-failfirst-defect2.log).
+    #[test]
+    fn capture_record_guard_requires_transfer_source() {
+        use super::CaptureState;
+        use ash::vk;
+        use ash::vk::Handle;
+
+        let cached = CaptureState {
+            buffer: vk::Buffer::from_raw(1),
+            byte_len: super::capture_byte_len(1280, 720, 4).expect("the cached size"),
+            width: 1280,
+            height: 720,
+            format: vk::Format::B8G8R8A8_UNORM,
+            ..CaptureState::dead()
+        };
+        // The capability loss with an otherwise perfect match: the
+        // guard must refuse.
+        assert!(
+            !cached.matches(1280, 720, vk::Format::B8G8R8A8_UNORM, false),
+            "a swapchain without TRANSFER_SRC must never be served from the \
+             cache, however well it matches"
+        );
+        // With the capability present, the same match serves (the
+        // positive control).
+        assert!(cached.matches(1280, 720, vk::Format::B8G8R8A8_UNORM, true));
     }
 }
