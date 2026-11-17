@@ -714,6 +714,10 @@ fn pick_physical_device(
 /// out-of-date, and suboptimal-present.
 pub(crate) struct SwapchainState {
     pub swapchain: vk::SwapchainKHR,
+    /// The raw swapchain images (framebuffer-owner side of the views —
+    /// kept for the bounded frame-capture readback, which copies the
+    /// presented image; the swapchain itself owns their lifetime).
+    pub images: Vec<vk::Image>,
     pub views: Vec<vk::ImageView>,
     pub framebuffers: Vec<vk::Framebuffer>,
     /// One depth attachment per swapchain image (corrective finding A):
@@ -727,6 +731,10 @@ pub(crate) struct SwapchainState {
     pub present_mode: vk::PresentModeKHR,
     pub image_count: u32,
     pub depth_format: vk::Format,
+    /// Whether the surface's swapchain images support TRANSFER_SRC
+    /// usage (the frame-capture readback path; requested at creation
+    /// whenever supported).
+    pub transfer_src_supported: bool,
 }
 
 /// Picks the surface format (BGRA8_UNORM + sRGB non-linear preferred — the
@@ -782,6 +790,7 @@ impl SwapchainState {
         // no-ops per the Vulkan spec).
         let mut state = SwapchainState {
             swapchain: vk::SwapchainKHR::null(),
+            images: Vec::new(),
             views: Vec::new(),
             framebuffers: Vec::new(),
             depth_images: Vec::new(),
@@ -792,6 +801,7 @@ impl SwapchainState {
             present_mode: vk::PresentModeKHR::FIFO,
             image_count: 0,
             depth_format,
+            transfer_src_supported: false,
         };
         if let Err(error) = state.build(
             ctx,
@@ -845,6 +855,19 @@ impl SwapchainState {
         };
         let image_count = desired_images.min(max_images);
 
+        // Frame-capture readback (the orientation corrective): the
+        // bounded capture path copies the presented image to the host,
+        // which requires TRANSFER_SRC usage on the swapchain images —
+        // requested whenever the surface supports it (the spec only
+        // guarantees COLOR_ATTACHMENT; universal in practice).
+        self.transfer_src_supported = capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if self.transfer_src_supported {
+            image_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -852,7 +875,7 @@ impl SwapchainState {
             .image_color_space(color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(image_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -864,6 +887,9 @@ impl SwapchainState {
         let images = unsafe { ctx.swapchain_ext.get_swapchain_images(self.swapchain) }
             .map_err(|error| RendererError::vk(error, "get_swapchain_images"))?;
         self.image_count = images.len() as u32;
+        // Kept for the capture readback (CopyImageToBuffer needs the
+        // raw images; the views are the rendering side).
+        self.images = images;
 
         let subresource = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -871,7 +897,7 @@ impl SwapchainState {
             layer_count: 1,
             ..Default::default()
         };
-        for image in &images {
+        for image in &self.images {
             let view_info = vk::ImageViewCreateInfo::default()
                 .image(*image)
                 .view_type(vk::ImageViewType::TYPE_2D)
@@ -885,7 +911,7 @@ impl SwapchainState {
         // One depth attachment per swapchain image (corrective finding
         // A): in-flight submissions into different images never share
         // depth state.
-        for _ in &images {
+        for _ in &self.images {
             let depth_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .extent(vk::Extent3D {
@@ -973,6 +999,9 @@ impl SwapchainState {
                 ctx.device.destroy_image_view(*view, None);
             }
             self.views.clear();
+            // The raw swapchain images are owned by the swapchain
+            // itself (destroyed below) — only the handles are dropped.
+            self.images.clear();
             if self.swapchain != vk::SwapchainKHR::null() {
                 ctx.swapchain_ext.destroy_swapchain(self.swapchain, None);
                 self.swapchain = vk::SwapchainKHR::null();
@@ -1379,10 +1408,30 @@ impl PipelineState {
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
-        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        // The orientation corrective (A5 — the winding audit): with
+        // `perspective()` no longer negating Y, exactly ONE Y flip
+        // remains on every geometry chain — the shader-boundary
+        // conversion — so every triangle's screen-space winding is
+        // REVERSED relative to the old double-flip chain, and BOTH
+        // pipelines treat CLOCKWISE framebuffer winding as
+        // front-facing. The overlay's glyph quads face the SAME
+        // direction as the scene geometry (both authored for the
+        // y-up, pre-flip convention): under the old shared
+        // COUNTER_CLOCKWISE state they were BACK-facing and CULLED —
+        // measured on the software ICD (0 glyph pixels with
+        // COUNTER_CLOCKWISE, correct top-left glyphs with the facing
+        // corrected) — no earlier test ever asserted overlay pixels,
+        // so the glyphs had never actually rendered. Both pipelines
+        // still cull BACK faces.
+        let scene_rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0);
+        let overlay_rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0);
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -1420,7 +1469,7 @@ impl PipelineState {
             .vertex_input_state(&scene_vertex_input)
             .input_assembly_state(&scene_input_assembly)
             .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
+            .rasterization_state(&scene_rasterizer)
             .multisample_state(&multisampling)
             .depth_stencil_state(&scene_depth)
             .color_blend_state(&color_blend)
@@ -1470,7 +1519,7 @@ impl PipelineState {
             .vertex_input_state(&overlay_vertex_input)
             .input_assembly_state(&overlay_input_assembly)
             .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
+            .rasterization_state(&overlay_rasterizer)
             .multisample_state(&multisampling)
             .depth_stencil_state(&overlay_no_depth)
             .color_blend_state(&overlay_blend)
@@ -1779,6 +1828,224 @@ fn create_mapped_buffer(
     }
 }
 
+/// One captured frame's readback (the bounded capture path — the
+/// orientation corrective's visual-evidence route).
+///
+/// The bytes are the swapchain image's texels as presented: tightly
+/// packed rows, TOP row first (the framebuffer origin), one pixel per
+/// 4 bytes in the swapchain's channel order (`format`). The capture
+/// is taken AFTER the frame's render pass and BEFORE presentation —
+/// exactly the image the display receives.
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Tightly packed RGBA8-family texel rows, top row first.
+    pub bytes: Vec<u8>,
+    /// The swapchain format the bytes were copied in.
+    pub format: CaptureFormat,
+}
+
+/// The capture's channel order (the swapchain's picked format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFormat {
+    /// Byte order B, G, R, A — the renderer's preferred
+    /// `B8G8R8A8_UNORM` surface.
+    Bgra8,
+    /// Byte order R, G, B, A.
+    Rgba8,
+    /// Any other format: the raw bytes are returned, but
+    /// [`CapturedFrame::pixel_rgba`] refuses to interpret them.
+    Other,
+}
+
+impl CapturedFrame {
+    /// The RGBA tuple at pixel `(x, y)` — row 0 is the TOP row, x from
+    /// the left (the framebuffer convention; the projection-orientation
+    /// regressions assert against this). Panics for `Other` formats.
+    pub fn pixel_rgba(&self, x: u32, y: u32) -> [u8; 4] {
+        assert!(
+            x < self.width && y < self.height,
+            "pixel ({x}, {y}) outside the {width}×{height} capture",
+            width = self.width,
+            height = self.height
+        );
+        let index = (y * self.width + x) as usize * 4;
+        match self.format {
+            CaptureFormat::Bgra8 => [
+                self.bytes[index + 2],
+                self.bytes[index + 1],
+                self.bytes[index],
+                self.bytes[index + 3],
+            ],
+            CaptureFormat::Rgba8 => [
+                self.bytes[index],
+                self.bytes[index + 1],
+                self.bytes[index + 2],
+                self.bytes[index + 3],
+            ],
+            CaptureFormat::Other => {
+                panic!(
+                    "the captured format is not an RGBA8-family format — refusing to guess the channel order"
+                )
+            }
+        }
+    }
+}
+
+/// The lazily-allocated frame-capture readback state (the orientation
+/// corrective): a persistently mapped host-visible destination buffer
+/// plus the one-shot request handshake. Allocated on first request and
+/// reallocated when the swapchain extent changes; a capture records a
+/// layout barrier pair and a CopyImageToBuffer into the frame's own
+/// command buffer, so the slot's submission fence proves completion.
+pub(crate) struct CaptureState {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut core::ffi::c_void,
+    byte_len: usize,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    /// A capture was requested for the next recorded frame (survives
+    /// deferred frames — retried until a frame actually records).
+    pending: bool,
+    /// A capture was recorded; `take_capture` waits the slot's fence.
+    ready: bool,
+    slot: usize,
+}
+
+impl CaptureState {
+    fn dead() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            mapped: core::ptr::null_mut(),
+            byte_len: 0,
+            width: 0,
+            height: 0,
+            format: vk::Format::UNDEFINED,
+            pending: false,
+            ready: false,
+            slot: 0,
+        }
+    }
+
+    fn destroy(&mut self, ctx: &VulkanContext) {
+        unsafe {
+            if self.buffer != vk::Buffer::null() {
+                if !self.mapped.is_null() {
+                    ctx.device.unmap_memory(self.memory);
+                }
+                ctx.device.destroy_buffer(self.buffer, None);
+                self.buffer = vk::Buffer::null();
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                ctx.device.free_memory(self.memory, None);
+                self.memory = vk::DeviceMemory::null();
+            }
+            self.mapped = core::ptr::null_mut();
+            self.ready = false;
+        }
+    }
+
+    /// (Re)allocates for the current swapchain extent, OUTSIDE command
+    /// recording (the same discipline as the lazy region buffer). A
+    /// no-op when the existing buffer already matches.
+    fn ensure(
+        &mut self,
+        ctx: &VulkanContext,
+        swapchain: &SwapchainState,
+    ) -> Result<(), RendererError> {
+        let width = swapchain.extent.width;
+        let height = swapchain.extent.height;
+        let needed = width as usize * height as usize * 4;
+        if self.buffer != vk::Buffer::null()
+            && self.byte_len == needed
+            && self.format == swapchain.format
+        {
+            return Ok(());
+        }
+        self.destroy(ctx);
+        if !swapchain.transfer_src_supported {
+            return Err(RendererError::NoDevice(
+                "the surface's swapchain images do not support TRANSFER_SRC — frame \
+                 capture unavailable"
+                    .into(),
+            ));
+        }
+        let (buffer, memory, mapped) = create_mapped_buffer(
+            ctx,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            needed as vk::DeviceSize,
+        )?;
+        self.buffer = buffer;
+        self.memory = memory;
+        self.mapped = mapped;
+        self.byte_len = needed;
+        self.width = width;
+        self.height = height;
+        self.format = swapchain.format;
+        Ok(())
+    }
+}
+
+/// Requests that the NEXT recorded frame be copied back to the host.
+pub(crate) fn request_capture(frames: &mut FrameState) {
+    frames.capture.pending = true;
+}
+
+/// Takes the completed capture: waits the recording slot's fence (the
+/// same fence the next frame waits — a later submission on that slot
+/// can only have started after this capture's fence signaled), copies
+/// the mapped bytes out, and clears the handshake. `Ok(None)` when no
+/// capture is ready.
+pub(crate) fn take_capture(
+    ctx: &VulkanContext,
+    frames: &mut FrameState,
+) -> Result<Option<CapturedFrame>, RendererError> {
+    if !frames.capture.ready {
+        return Ok(None);
+    }
+    let slot = frames.capture.slot;
+    let (byte_len, width, height, captured_format) = {
+        let capture = &frames.capture;
+        (
+            capture.byte_len,
+            capture.width,
+            capture.height,
+            capture.format,
+        )
+    };
+    unsafe {
+        ctx.device
+            .wait_for_fences(&[frames.in_flight[slot]], true, WAIT_TIMEOUT_NS)
+            .map_err(|error| RendererError::vk(error, "wait_for_fences (capture)"))?;
+    }
+    let mut bytes = vec![0u8; byte_len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            frames.capture.mapped as *const u8,
+            bytes.as_mut_ptr(),
+            byte_len,
+        );
+    }
+    frames.capture.ready = false;
+    let format = match captured_format {
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => CaptureFormat::Bgra8,
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => CaptureFormat::Rgba8,
+        _ => CaptureFormat::Other,
+    };
+    Ok(Some(CapturedFrame {
+        width,
+        height,
+        bytes,
+        format,
+    }))
+}
+
 /// Sync objects, command buffers, and the timestamp pool, per frames-in-
 /// flight slot, plus per-swapchain-image state.
 pub(crate) struct FrameState {
@@ -1810,6 +2077,9 @@ pub(crate) struct FrameState {
     pub needs_recreate: bool,
     pub frame_slot: usize,
     pub image_index: u32,
+    /// The bounded frame-capture readback (lazily allocated on first
+    /// request — the orientation corrective's evidence path).
+    pub capture: CaptureState,
 }
 
 impl FrameState {
@@ -1831,6 +2101,7 @@ impl FrameState {
             needs_recreate: false,
             frame_slot: 0,
             image_index: 0,
+            capture: CaptureState::dead(),
         };
         if let Err(error) = state.build(ctx, swapchain_image_count) {
             state.destroy(ctx);
@@ -1941,6 +2212,7 @@ impl FrameState {
                 ctx.device.destroy_semaphore(*semaphore, None);
             }
             self.image_available.clear();
+            self.capture.destroy(ctx);
             ctx.device.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -2152,6 +2424,14 @@ pub(crate) fn render_frame(
             None
         };
 
+    // The capture readback's destination buffer, lazily allocated
+    // OUTSIDE command recording when a capture is pending (the lazy
+    // region buffer's discipline). Deferred frames keep the request
+    // alive for the next frame that records.
+    if frames.capture.pending {
+        frames.capture.ensure(ctx, swapchain)?;
+    }
+
     // Record.
     let command = frames.command_buffers[slot];
     let framebuffer = swapchain.framebuffers[image_index as usize];
@@ -2286,6 +2566,82 @@ pub(crate) fn render_frame(
                 frames.timestamp_pool,
                 (slot as u32) * 2 + 1,
             );
+        }
+        // The bounded frame-capture readback (the orientation
+        // corrective's evidence path): after the render pass the image
+        // sits in PRESENT_SRC — transition to TRANSFER_SRC, copy the
+        // whole image into the mapped buffer, and transition back, all
+        // inside this frame's own command buffer so the submission
+        // fence proves the copy complete before `take_capture` reads.
+        if frames.capture.pending {
+            let image = swapchain.images[image_index as usize];
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                level_count: 1,
+                layer_count: 1,
+                ..Default::default()
+            };
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+            ctx.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer],
+            );
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                });
+            ctx.device.cmd_copy_image_to_buffer(
+                command,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                frames.capture.buffer,
+                &[copy],
+            );
+            let to_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+            ctx.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            frames.capture.pending = false;
+            frames.capture.ready = true;
+            frames.capture.slot = slot;
         }
         ctx.device
             .end_command_buffer(command)
@@ -2863,5 +3219,171 @@ mod policy_tests {
             std::mem::take(&mut *queue)
         };
         assert_eq!(queued, vec![(1, String::from("enumeration probe"))]);
+    }
+}
+
+#[cfg(test)]
+mod orientation {
+    const SCENE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scene.vert.spv"));
+    const OVERLAY_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
+    const SCENE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scene.frag.spv"));
+    const OVERLAY_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
+
+    /// Re-parses a build-emitted SPIR-V module through the pinned
+    /// naga, WITHOUT the front end's own coordinate re-adjustment
+    /// (naga's spv-in `Options::adjust_coordinate_space` defaults to
+    /// true and would fold the flip away — the pin must observe the
+    /// emitted words exactly as the GPU receives them).
+    fn parse_emitted(bytes: &[u8], name: &str) -> naga::Module {
+        let options = naga::front::spv::Options {
+            adjust_coordinate_space: false,
+            ..Default::default()
+        };
+        naga::front::spv::parse_u8_slice(bytes, &options).unwrap_or_else(|error| {
+            panic!("the build-emitted {name} re-parses through naga: {error:?}")
+        })
+    }
+
+    /// True when the module stores a NEGATED load of the Y component
+    /// (index 1) of a `gl_Position` variable back into that same
+    /// component — the compiler-generated position-flip epilogue
+    /// (naga's `write_epilogue_position_y_flip`: AccessChain the y,
+    /// OpLoad, OpFNegate, OpStore). Name- and shape-matched, never
+    /// handle-pinned, so unrelated codegen changes cannot break the
+    /// walk — only the disappearance of the adjustment itself can.
+    fn stores_negated_position_y(module: &naga::Module) -> bool {
+        use naga::Expression;
+        use std::collections::HashSet;
+
+        let position_globals: HashSet<naga::Handle<naga::GlobalVariable>> = module
+            .global_variables
+            .iter()
+            .filter(|(_, global)| global.name.as_deref() == Some("gl_Position"))
+            .map(|(handle, _)| handle)
+            .collect();
+        if position_globals.is_empty() {
+            return false;
+        }
+
+        fn block_stores(
+            statements: &[naga::Statement],
+            negated: naga::Handle<Expression>,
+            target: naga::Handle<Expression>,
+        ) -> bool {
+            for statement in statements {
+                let found = match *statement {
+                    naga::Statement::Store { pointer, value } => {
+                        pointer == target && value == negated
+                    }
+                    naga::Statement::Block(ref body) => block_stores(body, negated, target),
+                    naga::Statement::If {
+                        ref accept,
+                        ref reject,
+                        ..
+                    } => {
+                        block_stores(accept, negated, target)
+                            || block_stores(reject, negated, target)
+                    }
+                    naga::Statement::Loop { ref body, .. } => block_stores(body, negated, target),
+                    _ => false,
+                };
+                if found {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let functions = module
+            .functions
+            .iter()
+            .map(|(_, function)| function)
+            .chain(module.entry_points.iter().map(|entry| &entry.function));
+        for function in functions {
+            let expressions = &function.expressions;
+            for (access, expression) in expressions.iter() {
+                // The accessed component: <position global>[u32 1].
+                let Expression::Access { base, index } = expression else {
+                    continue;
+                };
+                let Expression::GlobalVariable(global) = &expressions[*base] else {
+                    continue;
+                };
+                if !position_globals.contains(global) {
+                    continue;
+                }
+                let Expression::Constant(constant) = &expressions[*index] else {
+                    continue;
+                };
+                let init = module.constants[*constant].init;
+                if !matches!(
+                    module.global_expressions[init],
+                    Expression::Literal(naga::Literal::U32(1))
+                ) {
+                    continue;
+                }
+                // The negation of exactly that loaded component...
+                for (negated, negation) in expressions.iter() {
+                    let Expression::Unary {
+                        op: naga::UnaryOperator::Negate,
+                        expr: load,
+                    } = negation
+                    else {
+                        continue;
+                    };
+                    let Expression::Load { pointer } = &expressions[*load] else {
+                        continue;
+                    };
+                    if *pointer != access {
+                        continue;
+                    }
+                    // ...stored back into it.
+                    if block_stores(&function.body, negated, access) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The orientation corrective's A4 pin: the BUILD-EMITTED vertex
+    /// shaders carry the compiler-generated Y-coordinate adjustment
+    /// (naga 29.0.4's default `WriterFlags::ADJUST_COORDINATE_SPACE`
+    /// epilogue — the OpFNegate on `gl_Position.y`), and the emitted
+    /// fragment shaders carry none. This is the single authoritative
+    /// Vulkan Y-axis conversion the corrected `perspective()` relies
+    /// on: if a future naga/toolchain change stops emitting the
+    /// adjustment, the world flips upside down again and THIS pin
+    /// fails — the exact failure mode that caused the owner-reported
+    /// defect (the projection used to compensate with its own second
+    /// flip).
+    #[test]
+    fn emitted_vertex_shaders_carry_the_position_y_adjustment() {
+        let scene = parse_emitted(SCENE_VERT_SPV, "scene.vert.spv");
+        assert!(
+            stores_negated_position_y(&scene),
+            "the emitted scene.vert.spv must negate gl_Position.y (the naga \
+             ADJUST_COORDINATE_SPACE epilogue) — its absence flips the world"
+        );
+        let overlay = parse_emitted(OVERLAY_VERT_SPV, "overlay.vert.spv");
+        assert!(
+            stores_negated_position_y(&overlay),
+            "the emitted overlay.vert.spv must negate gl_Position.y — the \
+             overlay's NDC authoring is correct only WITH the adjustment"
+        );
+        // Negative controls: no Position output, no adjustment to find.
+        let scene_frag = parse_emitted(SCENE_FRAG_SPV, "scene.frag.spv");
+        assert!(
+            !stores_negated_position_y(&scene_frag),
+            "the fragment shader has no position output — a match here means \
+             the walker matches structure that is not the adjustment"
+        );
+        let overlay_frag = parse_emitted(OVERLAY_FRAG_SPV, "overlay.frag.spv");
+        assert!(
+            !stores_negated_position_y(&overlay_frag),
+            "the fragment shader has no position output — a match here means \
+             the walker matches structure that is not the adjustment"
+        );
     }
 }

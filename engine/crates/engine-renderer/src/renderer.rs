@@ -10,7 +10,7 @@ use crate::config::{RenderConfig, present_mode_str};
 use crate::overlay::build_overlay_vertices_into;
 use crate::scene::SceneVertex;
 use crate::vulkan::{
-    self, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
+    self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, pick_depth_format, pick_surface_format,
 };
 
@@ -329,6 +329,25 @@ impl Renderer {
 
     pub fn overlay_enabled(&self) -> bool {
         self.overlay_enabled
+    }
+
+    /// Requests that the NEXT rendered frame be copied back to the
+    /// host (the bounded frame-capture readback — the orientation
+    /// corrective's visual-evidence path). The request survives
+    /// deferred frames; the frame that records performs the copy, and
+    /// [`Renderer::take_frame_capture`] returns it after the frame's
+    /// fence proves completion.
+    pub fn request_frame_capture(&mut self) {
+        vulkan::request_capture(&mut self.frames);
+    }
+
+    /// Takes the completed frame capture, if one is ready: waits the
+    /// recording frame's submission fence and returns the presented
+    /// image's texels (top row first, the swapchain's channel order).
+    /// `Ok(None)` when no capture completed. Read promptly — a later
+    /// capture overwrites the shared destination buffer.
+    pub fn take_frame_capture(&mut self) -> Result<Option<CapturedFrame>, RendererError> {
+        vulkan::take_capture(&self.ctx, &mut self.frames)
     }
 
     fn push_validation_message(&mut self, message: String) {

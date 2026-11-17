@@ -31,13 +31,22 @@ pub fn mul(a: &Mat4, b: &Mat4) -> Mat4 {
     out
 }
 
-/// Right-handed perspective projection for Vulkan: NDC y points down
-/// (y flipped) and depth is mapped to [0, 1] for `LESS` depth comparison.
+/// Right-handed perspective projection authoring a y-UP NDC (the
+/// GLSL/WebGPU convention the shaders are written in), with depth
+/// mapped to [0, 1] for `LESS` depth comparison. Vulkan's y-DOWN NDC
+/// conversion happens exactly ONCE, at the shader boundary: the
+/// build-time naga compilation emits the ADJUST_COORDINATE_SPACE
+/// epilogue (an OpFNegate on `gl_Position.y` — pinned by
+/// engine-renderer's
+/// `emitted_vertex_shaders_carry_the_position_y_adjustment`). This
+/// matrix must NOT negate Y itself: composing the two flips rendered
+/// the world upside down (the owner-reported 2026-11-17 defect — a
+/// world point above the camera landed at the BOTTOM of the screen).
 pub fn perspective(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let focal = 1.0 / (fov_y_radians / 2.0).tan();
     let mut matrix = [[0.0; 4]; 4];
     matrix[0][0] = focal / aspect;
-    matrix[1][1] = -focal;
+    matrix[1][1] = focal;
     matrix[2][2] = far / (near - far);
     matrix[2][3] = -1.0;
     matrix[3][2] = near * far / (near - far);
@@ -198,5 +207,80 @@ mod tests {
     fn zero_orientation_looks_down_negative_z() {
         assert_eq!(camera_forward(0.0, 0.0, 0.0), [0.0, 0.0, -1.0]);
         assert_eq!(camera_right(0.0, 0.0, 0.0), [1.0, 0.0, 0.0]);
+    }
+
+    /// Mat4 · vec4 (column-major convention, matching `mul`).
+    fn transform(matrix: &Mat4, point: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            out[row] = matrix[0][row] * point[0]
+                + matrix[1][row] * point[1]
+                + matrix[2][row] * point[2]
+                + matrix[3][row] * point[3];
+        }
+        out
+    }
+
+    /// The orientation corrective's A3 regression: a world point ABOVE
+    /// a level camera projects toward the TOP of the screen through
+    /// the REAL render chain, and a point below projects downward.
+    /// The chain modeled here is the one the GPU executes:
+    /// `view_proj = perspective · view` (the mvp push constant), the
+    /// w-divide, and the compiler-generated shader-boundary Y flip —
+    /// naga's ADJUST_COORDINATE_SPACE epilogue, an OpFNegate on
+    /// `gl_Position.y` whose presence in the build-emitted SPIR-V is
+    /// pinned by engine-renderer's
+    /// `emitted_vertex_shaders_carry_the_position_y_adjustment`. The
+    /// projection therefore authors a y-UP NDC (the GLSL/WebGPU
+    /// convention the shaders are written in) and the flip converts
+    /// it to Vulkan's y-DOWN NDC, where +1 is the BOTTOM of the
+    /// screen and a positive-height viewport maps NDC −1 to pixel row
+    /// 0 (the top). The defect this test was written fail-first
+    /// against: `perspective()` used to negate Y itself (a SECOND
+    /// flip), so world-up landed at the bottom of the screen — the
+    /// owner-observed upside-down world.
+    #[test]
+    fn world_up_projects_to_screen_top_through_the_shader_flip_chain() {
+        let eye = [0.0, 1.6, 0.0];
+        let view = camera_view(eye, 0.0, 0.0, 0.0); // level, looking −z, +y up
+        let projection = perspective(std::f32::consts::FRAC_PI_3, 16.0 / 9.0, 0.1, 200.0);
+        let view_proj = mul(&projection, &view);
+        let (width, height) = (1280.0f32, 720.0f32);
+
+        // The full chain: clip → w-divide → the shader's Y flip →
+        // Vulkan NDC → the positive-height viewport (row 0 = top).
+        let screen = |world: [f32; 3]| -> (f32, f32) {
+            let clip = transform(&view_proj, [world[0], world[1], world[2], 1.0]);
+            let ndc_y_authored = clip[1] / clip[3];
+            let vulkan_ndc_y = -ndc_y_authored; // the shader-boundary flip
+            let pixel_x = (clip[0] / clip[3] + 1.0) / 2.0 * width;
+            let pixel_y = (vulkan_ndc_y + 1.0) / 2.0 * height;
+            (pixel_x, pixel_y)
+        };
+
+        // A point 1.6 m ABOVE the eye, 6 m ahead — top of the screen.
+        let (x, y) = screen([0.0, 3.2, -6.0]);
+        assert!(
+            y < height / 2.0,
+            "a world point above the camera projects to the TOP half: y={y}"
+        );
+        assert!((0.0..width).contains(&x), "on-screen horizontally: x={x}");
+
+        // A point 1.6 m BELOW the eye — bottom of the screen.
+        let (x, y) = screen([0.0, 0.0, -6.0]);
+        assert!(
+            y > height / 2.0,
+            "a world point below the camera projects to the BOTTOM half: y={y}"
+        );
+        assert!((0.0..width).contains(&x), "on-screen horizontally: x={x}");
+
+        // Symmetric distances land symmetrically: the same magnitude
+        // above and below mirrors around the screen center.
+        let above = screen([0.0, 3.2, -6.0]).1;
+        let below = screen([0.0, 0.0, -6.0]).1;
+        assert!(
+            (above + below - height).abs() < 1.0,
+            "equal up/down offsets mirror around the screen center: {above} + {below} vs {height}"
+        );
     }
 }
