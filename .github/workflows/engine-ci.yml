@@ -206,8 +206,13 @@ jobs:
           # platform-uniform, no cfg gates). Linux 1007 MEASURED at
           # the corrective candidate with this step's own awk;
           # Windows 956 = the prior 955 + the same 1.
-          expected=1007
-          if [ "$(uname -s)" != "Linux" ]; then expected=956; fi
+          # Post-orientation hardening (2026-11-17): +2 engine-renderer
+          # lib tests (the H3 capture format-contract and checked-sizing
+          # units, platform-uniform). Linux 1009 MEASURED at the
+          # hardening candidate with this step's own awk; Windows 958 =
+          # the prior 956 + the same 2.
+          expected=1009
+          if [ "$(uname -s)" != "Linux" ]; then expected=958; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -665,8 +670,19 @@ jobs:
           # MEASURED at the corrective candidate with this step's own
           # awk; Windows 494 = the prior 493 + the same 1 passed (the
           # ignored test and the result line are platform-uniform).
-          expected=495
-          if [ "$(uname -s)" != "Linux" ]; then expected=494; fi
+          # Post-orientation hardening (2026-11-17): +3 platform-uniform
+          # tests (the H2 mouse-look direction regressions: the
+          # engine-slice lib free-flight mapping unit, the
+          # player_movement real-mapping/driver test, and the
+          # playable_world advance_frame test). The H4/H5 capture
+          # lifecycle proof merged INTO the existing render_orientation
+          # test (SDL's main-thread rule: one SDL-initializing test per
+          # binary), so the ignored count and result lines are
+          # unchanged. Linux 498/5/51 MEASURED at the hardening
+          # candidate with this step's own awk; Windows 497 = the prior
+          # 494 + the same 3.
+          expected=498
+          if [ "$(uname -s)" != "Linux" ]; then expected=497; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)

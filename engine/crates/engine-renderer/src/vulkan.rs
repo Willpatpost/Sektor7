@@ -150,6 +150,30 @@ pub enum RendererError {
     Vulkan(String),
     /// SDL could not provide the window's Vulkan surface.
     Surface(String),
+    /// A frame-capture request was refused because another capture is
+    /// already outstanding (pending, or recorded but unconsumed) — the
+    /// bounded single-flight lifecycle policy (the post-orientation
+    /// hardening): a second copy could otherwise overwrite the earlier
+    /// readback's destination while it is still unconsumed.
+    CaptureOutstanding,
+    /// The swapchain's surface format is outside the capture API's
+    /// supported 4-byte-per-pixel RGBA8/BGRA8 family — refused with a
+    /// typed error BEFORE any GPU copy command is recorded (a fallback
+    /// surface format such as R16G16B16A16_SFLOAT needs 8 bytes per
+    /// pixel and would overflow the capture destination). The
+    /// renderer's own surface-format fallback behavior is unaffected:
+    /// only CAPTURE refuses.
+    CaptureUnsupportedFormat(String),
+    /// The capture destination's byte size overflowed checked
+    /// arithmetic (width × height × the format footprint).
+    CaptureSizingOverflow,
+    /// A pending capture was dropped: the swapchain changed between
+    /// the pre-acquire capture preparation and the recording of the
+    /// frame (the acquire path may recreate the swapchain), so the
+    /// prepared destination no longer matches the image being
+    /// recorded. Never recorded against a mismatched destination; the
+    /// frame itself renders normally.
+    CaptureDropped(String),
 }
 
 impl RendererError {
@@ -171,6 +195,23 @@ impl std::fmt::Display for RendererError {
             RendererError::Vulkan(message) => write!(f, "Vulkan error: {message}"),
             RendererError::Surface(message) => {
                 write!(f, "SDL could not create the Vulkan surface: {message}")
+            }
+            RendererError::CaptureOutstanding => write!(
+                f,
+                "frame capture refused: another capture is outstanding (take it before \
+                 requesting again)"
+            ),
+            RendererError::CaptureUnsupportedFormat(format) => write!(
+                f,
+                "frame capture refused: the surface format {format} is outside the \
+                 supported 4-byte RGBA8/BGRA8 family"
+            ),
+            RendererError::CaptureSizingOverflow => write!(
+                f,
+                "frame capture refused: the destination size overflowed checked arithmetic"
+            ),
+            RendererError::CaptureDropped(reason) => {
+                write!(f, "frame capture dropped: {reason}")
             }
         }
     }
@@ -1828,6 +1869,35 @@ fn create_mapped_buffer(
     }
 }
 
+/// The capture API's supported swapchain formats (the
+/// post-orientation hardening's format contract): the 4-byte-per-
+/// pixel RGBA8/BGRA8 family — UNORM and sRGB variants share the byte
+/// footprint and channel order semantics. Returns the per-pixel byte
+/// footprint, or `None` for every format outside the family: a
+/// fallback surface format such as `R16G16B16A16_SFLOAT` (8 bytes per
+/// pixel) must be REFUSED before any copy command is recorded, never
+/// under-allocated and overwritten. The ordinary renderer's
+/// surface-format fallback behavior is untouched — only capture
+/// refuses.
+pub(crate) fn capture_format_footprint(format: vk::Format) -> Option<usize> {
+    match format {
+        vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB => Some(4),
+        _ => None,
+    }
+}
+
+/// The capture destination's byte length, via checked arithmetic —
+/// `None` when the width × height × footprint product overflows
+/// usize (the typed [`RendererError::CaptureSizingOverflow`] refusal).
+pub(crate) fn capture_byte_len(width: u32, height: u32, footprint: usize) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(footprint))
+}
+
 /// One captured frame's readback (the bounded capture path — the
 /// orientation corrective's visual-evidence route).
 ///
@@ -1915,6 +1985,11 @@ pub(crate) struct CaptureState {
     /// A capture was recorded; `take_capture` waits the slot's fence.
     ready: bool,
     slot: usize,
+    /// The most recent refusal or drop (None in the ordinary path) —
+    /// set when a pending request is refused or dropped so the frame
+    /// can render normally; observable through
+    /// [`Renderer::last_capture_refusal`].
+    last_refusal: Option<RendererError>,
 }
 
 impl CaptureState {
@@ -1930,6 +2005,7 @@ impl CaptureState {
             pending: false,
             ready: false,
             slot: 0,
+            last_refusal: None,
         }
     }
 
@@ -1953,15 +2029,24 @@ impl CaptureState {
 
     /// (Re)allocates for the current swapchain extent, OUTSIDE command
     /// recording (the same discipline as the lazy region buffer). A
-    /// no-op when the existing buffer already matches.
+    /// no-op when the existing buffer already matches. The FORMAT
+    /// CONTRACT and the checked sizing run FIRST — pure refusals that
+    /// touch no GPU state, so an unsupported surface format (e.g. an
+    /// 8-byte-per-pixel fallback) is refused with a typed error before
+    /// any allocation or copy command, and the byte length can never
+    /// exceed what the format actually requires.
     fn ensure(
         &mut self,
         ctx: &VulkanContext,
         swapchain: &SwapchainState,
     ) -> Result<(), RendererError> {
+        let footprint = capture_format_footprint(swapchain.format).ok_or_else(|| {
+            RendererError::CaptureUnsupportedFormat(format!("{:?}", swapchain.format))
+        })?;
         let width = swapchain.extent.width;
         let height = swapchain.extent.height;
-        let needed = width as usize * height as usize * 4;
+        let needed = capture_byte_len(width, height, footprint)
+            .ok_or(RendererError::CaptureSizingOverflow)?;
         if self.buffer != vk::Buffer::null()
             && self.byte_len == needed
             && self.format == swapchain.format
@@ -1990,11 +2075,42 @@ impl CaptureState {
         self.format = swapchain.format;
         Ok(())
     }
+
+    /// True when the prepared destination exactly matches the given
+    /// extent and format — the record-time guard against a swapchain
+    /// that changed between the pre-acquire preparation and the
+    /// recording of the frame (the acquire path may recreate it).
+    fn matches(&self, width: u32, height: u32, format: vk::Format) -> bool {
+        if self.buffer == vk::Buffer::null() {
+            return false;
+        }
+        let Some(footprint) = capture_format_footprint(format) else {
+            return false;
+        };
+        self.byte_len == capture_byte_len(width, height, footprint).unwrap_or(usize::MAX)
+            && self.format == format
+    }
 }
 
 /// Requests that the NEXT recorded frame be copied back to the host.
-pub(crate) fn request_capture(frames: &mut FrameState) {
+/// ONE capture outstanding at a time (the bounded single-flight
+/// lifecycle policy): refused with a typed error while an earlier
+/// request is pending (not yet recorded) or ready-but-unconsumed — a
+/// second copy could otherwise overwrite the earlier readback's
+/// destination while it is still unconsumed.
+pub(crate) fn request_capture(frames: &mut FrameState) -> Result<(), RendererError> {
+    if frames.capture.pending || frames.capture.ready {
+        return Err(RendererError::CaptureOutstanding);
+    }
+    frames.capture.last_refusal = None;
     frames.capture.pending = true;
+    Ok(())
+}
+
+/// The most recent capture refusal or drop, if any — observable for
+/// diagnosis; a refused capture never poisons frame synchronization.
+pub(crate) fn last_capture_refusal(frames: &FrameState) -> Option<&RendererError> {
+    frames.capture.last_refusal.as_ref()
 }
 
 /// Takes the completed capture: waits the recording slot's fence (the
@@ -2319,6 +2435,23 @@ pub(crate) fn render_frame(
         outcome.recreated = true;
     }
 
+    // The capture readback's destination buffer, prepared BEFORE any
+    // acquire or fence reset (the post-orientation hardening's
+    // frame-sync rule): a refusal here touches no synchronization
+    // state, so it can never leave a fence reset-but-unsignaled or an
+    // acquired image's semaphore unconsumed. A refused capture
+    // (unsupported format, no TRANSFER_SRC, sizing overflow) is NOT a
+    // frame error — the request is dropped, recorded as the last
+    // refusal, and the frame renders normally; a later request can
+    // try again. Deferred frames keep the request alive for the next
+    // frame that records.
+    if frames.capture.pending
+        && let Err(error) = frames.capture.ensure(ctx, swapchain)
+    {
+        frames.capture.pending = false;
+        frames.capture.last_refusal = Some(error);
+    }
+
     // Wait for this slot's previous submission. The fence is reset only
     // AFTER the per-image guard below: under present backpressure the
     // driver can hand a slot the image that slot last rendered, and
@@ -2423,14 +2556,6 @@ pub(crate) fn render_frame(
         } else {
             None
         };
-
-    // The capture readback's destination buffer, lazily allocated
-    // OUTSIDE command recording when a capture is pending (the lazy
-    // region buffer's discipline). Deferred frames keep the request
-    // alive for the next frame that records.
-    if frames.capture.pending {
-        frames.capture.ensure(ctx, swapchain)?;
-    }
 
     // Record.
     let command = frames.command_buffers[slot];
@@ -2573,75 +2698,96 @@ pub(crate) fn render_frame(
         // whole image into the mapped buffer, and transition back, all
         // inside this frame's own command buffer so the submission
         // fence proves the copy complete before `take_capture` reads.
+        // The record-time guard (the post-orientation hardening): the
+        // acquire path may have recreated the swapchain AFTER the
+        // pre-acquire preparation — a mismatched destination is never
+        // copied into; the capture is DROPPED (a typed, observable
+        // drop) and the frame renders normally.
         if frames.capture.pending {
-            let image = swapchain.images[image_index as usize];
-            let subresource = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                level_count: 1,
-                layer_count: 1,
-                ..Default::default()
-            };
-            let to_transfer = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(image)
-                .subresource_range(subresource)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
-            ctx.device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_transfer],
-            );
-            let copy = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
+            if frames
+                .capture
+                .matches(extent.width, extent.height, swapchain.format)
+            {
+                let image = swapchain.images[image_index as usize];
+                let subresource = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
+                    level_count: 1,
                     layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                });
-            ctx.device.cmd_copy_image_to_buffer(
-                command,
-                image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                frames.capture.buffer,
-                &[copy],
-            );
-            let to_present = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .image(image)
-                .subresource_range(subresource)
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .dst_access_mask(vk::AccessFlags::empty())
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
-            ctx.device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_present],
-            );
-            frames.capture.pending = false;
-            frames.capture.ready = true;
-            frames.capture.slot = slot;
+                    ..Default::default()
+                };
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(image)
+                    .subresource_range(subresource)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+                ctx.device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    });
+                ctx.device.cmd_copy_image_to_buffer(
+                    command,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    frames.capture.buffer,
+                    &[copy],
+                );
+                let to_present = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .image(image)
+                    .subresource_range(subresource)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+                ctx.device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
+                frames.capture.pending = false;
+                frames.capture.ready = true;
+                frames.capture.slot = slot;
+            } else {
+                // The prepared destination does not match the image
+                // being recorded (the swapchain changed mid-frame):
+                // drop the request — never copy into a mismatched
+                // destination — and record the typed, observable drop.
+                frames.capture.pending = false;
+                frames.capture.last_refusal = Some(RendererError::CaptureDropped(format!(
+                    "the swapchain changed between the capture preparation and the \
+                     recording (extent {}×{}, format {:?})",
+                    extent.width, extent.height, swapchain.format
+                )));
+            }
         }
         ctx.device
             .end_command_buffer(command)
@@ -3384,6 +3530,58 @@ mod orientation {
             !stores_negated_position_y(&overlay_frag),
             "the fragment shader has no position output — a match here means \
              the walker matches structure that is not the adjustment"
+        );
+    }
+
+    /// The post-orientation hardening's H3 format contract: the
+    /// supported set is EXACTLY the 4-byte-per-pixel RGBA8/BGRA8
+    /// family; everything else — including the audited 8-byte
+    /// fallbacks that would overflow a `width × height × 4`
+    /// destination — is refused (typed, before any copy command).
+    #[test]
+    fn capture_formats_are_the_four_byte_family_only() {
+        use super::capture_format_footprint;
+        use ash::vk;
+
+        for format in [
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB,
+        ] {
+            assert_eq!(
+                capture_format_footprint(format),
+                Some(4),
+                "the supported family: {format:?}"
+            );
+        }
+        for format in [
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::Format::R16G16B16A16_UNORM,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::Format::B8G8R8A8_SNORM,
+            vk::Format::R5G6B5_UNORM_PACK16,
+            vk::Format::A8B8G8R8_UNORM_PACK32,
+        ] {
+            assert_eq!(
+                capture_format_footprint(format),
+                None,
+                "outside the family — refused, never under-allocated: {format:?}"
+            );
+        }
+    }
+
+    /// The post-orientation hardening's H3 checked sizing: real
+    /// extents fit; the u32-extreme product overflows usize and
+    /// refuses rather than wrapping.
+    #[test]
+    fn capture_sizing_is_checked() {
+        use super::capture_byte_len;
+        assert_eq!(capture_byte_len(1920, 1080, 4), Some(1920 * 1080 * 4));
+        assert_eq!(
+            capture_byte_len(u32::MAX, u32::MAX, 4),
+            None,
+            "u32-extreme extents must refuse instead of wrapping"
         );
     }
 }

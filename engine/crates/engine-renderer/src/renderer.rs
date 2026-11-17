@@ -332,13 +332,15 @@ impl Renderer {
     }
 
     /// Requests that the NEXT rendered frame be copied back to the
-    /// host (the bounded frame-capture readback — the orientation
-    /// corrective's visual-evidence path). The request survives
-    /// deferred frames; the frame that records performs the copy, and
-    /// [`Renderer::take_frame_capture`] returns it after the frame's
-    /// fence proves completion.
-    pub fn request_frame_capture(&mut self) {
-        vulkan::request_capture(&mut self.frames);
+    /// host (the bounded frame-capture readback). ONE capture
+    /// outstanding at a time: refused with a typed error while an
+    /// earlier request is pending or ready-but-unconsumed (the
+    /// single-flight lifecycle policy — a second copy could otherwise
+    /// overwrite the earlier readback's destination). A capture
+    /// REFUSAL never poisons frame synchronization: the frame renders
+    /// normally and a later request can try again.
+    pub fn request_frame_capture(&mut self) -> Result<(), RendererError> {
+        vulkan::request_capture(&mut self.frames)
     }
 
     /// Takes the completed frame capture, if one is ready: waits the
@@ -348,6 +350,14 @@ impl Renderer {
     /// capture overwrites the shared destination buffer.
     pub fn take_frame_capture(&mut self) -> Result<Option<CapturedFrame>, RendererError> {
         vulkan::take_capture(&self.ctx, &mut self.frames)
+    }
+
+    /// The most recent capture refusal or drop, if any (`None` in the
+    /// ordinary path) — observable for diagnosis. A refused or
+    /// dropped capture is never a frame error: the frame rendered
+    /// normally regardless.
+    pub fn last_capture_refusal(&self) -> Option<&RendererError> {
+        vulkan::last_capture_refusal(&self.frames)
     }
 
     fn push_validation_message(&mut self, message: String) {

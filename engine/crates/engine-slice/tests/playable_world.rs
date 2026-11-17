@@ -591,3 +591,78 @@ fn connected_live_frame_route_completes_the_gatehouse() {
         "settle-free route: switch, 3 pickups, GOAL"
     );
 }
+
+/// The post-orientation hardening (H2), playable path: mouse-look
+/// direction through the REAL playable mapping and the real
+/// `advance_frame` progression — mouse-right turns the look direction
+/// toward world +X, mouse-left toward −X, the vertical mapping
+/// unchanged (mouse-up looks up). The assertion reads the engine's
+/// `look_direction` off the driver's post-application state — the
+/// resulting world-space direction, never an intermediate sign.
+#[test]
+fn mouse_look_turns_the_playable_camera_correctly() {
+    use engine_core::player::look_direction;
+
+    let frame = std::time::Duration::from_nanos(16_666_666);
+    // Three 1/60 s frames execute two fixed-step ticks (the
+    // accumulator's 2/3 catch-up) — a ±0.5 rad turn, far from the
+    // wraparound that would make a half-space assertion meaningless.
+    let turn_frames = 3;
+
+    // Mouse-RIGHT through map_playable_input + advance_frame.
+    let snapshot = InputSnapshot {
+        look_delta: (100.0, 0.0),
+        ..InputSnapshot::default()
+    };
+    let intent = map_playable_input(&snapshot, false).intent;
+    let mut demo = PlayableDemo::new();
+    for _ in 0..turn_frames {
+        demo.advance_frame(frame, intent, false);
+    }
+    let state = demo.driver.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[0] > 0.2,
+        "mouse-right turns the playable camera toward world +X: {look:?} (yaw {})",
+        state.yaw
+    );
+
+    // Mouse-LEFT: the mirror.
+    let snapshot = InputSnapshot {
+        look_delta: (-100.0, 0.0),
+        ..InputSnapshot::default()
+    };
+    let intent = map_playable_input(&snapshot, false).intent;
+    let mut demo = PlayableDemo::new();
+    for _ in 0..turn_frames {
+        demo.advance_frame(frame, intent, false);
+    }
+    let state = demo.driver.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[0] < -0.2,
+        "mouse-left turns the playable camera toward world −X: {look:?}"
+    );
+
+    // The VERTICAL mapping unchanged: mouse-up (negative y delta)
+    // pitches the look direction up, with no yaw coupling.
+    let snapshot = InputSnapshot {
+        look_delta: (0.0, -100.0),
+        ..InputSnapshot::default()
+    };
+    let intent = map_playable_input(&snapshot, false).intent;
+    let mut demo = PlayableDemo::new();
+    for _ in 0..turn_frames {
+        demo.advance_frame(frame, intent, false);
+    }
+    let state = demo.driver.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[1] > 0.2,
+        "mouse-up looks up (the playable vertical mapping is unchanged): {look:?}"
+    );
+    assert!(
+        look[0].abs() < 1e-6,
+        "pure vertical input does not yaw the playable camera: {look:?}"
+    );
+}

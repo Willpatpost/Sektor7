@@ -137,7 +137,17 @@ fn headless_runner_double_run_identical() {
 #[test]
 fn snapshot_to_intent_mapping() {
     // Axes pass through (the shell cancels opposite keys; the mapping
-    // trusts the snapshot).
+    // trusts the snapshot). The look expectation carries the
+    // post-orientation hardening's corrected horizontal sign: mouse-X
+    // is NEGATED at the mapping (+yaw turns toward world-left, so
+    // rightward mouse motion must yaw negatively); the vertical
+    // contribution is unchanged (upward mouse motion = negative y
+    // delta pitches up). The pre-hardening pin (0.25, 0.125) held the
+    // INVERTED horizontal direction — corrected with the measured
+    // fail-first evidence in both directions (the new
+    // mouse_look_direction test failed at the baseline; this pin
+    // failed at the fixed tree — the two failures are the same
+    // defect seen from either side).
     let snapshot = InputSnapshot {
         move_forward: 1,
         move_strafe: -1,
@@ -149,7 +159,7 @@ fn snapshot_to_intent_mapping() {
     assert_eq!(mapped.intent.strafe, -1);
     assert_eq!(
         mapped.intent.look,
-        (100.0 * DEMO_LOOK_SENSITIVITY, 50.0 * DEMO_LOOK_SENSITIVITY)
+        (-100.0 * DEMO_LOOK_SENSITIVITY, 50.0 * DEMO_LOOK_SENSITIVITY)
     );
     assert!(!mapped.toggle_camera);
 
@@ -196,4 +206,138 @@ fn snapshot_to_intent_mapping() {
     };
     let mapped = map_intent(&snapshot, false);
     assert_eq!(mapped.intent, engine_core::MoveIntent::default());
+}
+
+/// The post-orientation hardening (H2): mouse-look direction through
+/// the ACTUAL mapping and the engine's look application — mouse-right
+/// turns the look direction toward world +X, mouse-left toward −X,
+/// the VERTICAL mapping is unchanged (mouse-up looks up), turning
+/// right and walking moves in the newly faced direction, and
+/// strafing is not reversed. Never an intermediate sign assertion:
+/// every check reads the resulting world-space look direction or the
+/// resulting world-space movement through the real engine math.
+#[test]
+fn mouse_look_direction_is_correct_through_the_real_mapping() {
+    use engine_core::player::look_direction;
+    use engine_core::{CollisionWorld, PlayerConfig, PlayerDriver, PlayerState};
+
+    let driver = || {
+        PlayerDriver::new(
+            PlayerState::spawn([0.0, 1.0, 0.0]),
+            PlayerConfig::default(),
+            CollisionWorld::new(0.0),
+            60,
+        )
+    };
+
+    // Mouse-RIGHT: positive look_delta.x through map_intent, applied
+    // by the real driver over one tick — the look direction must turn
+    // toward world +X (the right half-space).
+    let snapshot = InputSnapshot {
+        look_delta: (100.0, 0.0),
+        ..InputSnapshot::default()
+    };
+    let mut turn_right = driver();
+    let intent = map_intent(&snapshot, false).intent;
+    turn_right.run_headless(1, |_| intent);
+    let state = turn_right.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[0] > 0.2,
+        "mouse-right turns the look toward world +X: {look:?} (yaw {})",
+        state.yaw
+    );
+
+    // Mouse-LEFT: the mirror image.
+    let snapshot = InputSnapshot {
+        look_delta: (-100.0, 0.0),
+        ..InputSnapshot::default()
+    };
+    let mut turn_left = driver();
+    let intent = map_intent(&snapshot, false).intent;
+    turn_left.run_headless(1, |_| intent);
+    let state = turn_left.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[0] < -0.2,
+        "mouse-left turns the look toward world −X: {look:?}"
+    );
+
+    // The VERTICAL mapping unchanged: mouse-up (the shell's negative
+    // y delta) pitches the look direction UP, with no yaw coupling.
+    let snapshot = InputSnapshot {
+        look_delta: (0.0, -100.0),
+        ..InputSnapshot::default()
+    };
+    let mut look_up = driver();
+    let intent = map_intent(&snapshot, false).intent;
+    look_up.run_headless(1, |_| intent);
+    let state = look_up.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[1] > 0.2,
+        "mouse-up looks up (the vertical mapping is unchanged): {look:?}"
+    );
+    assert!(
+        look[0].abs() < 1e-6,
+        "pure vertical input does not yaw: {look:?}"
+    );
+
+    // Turn right, then W: the movement follows the NEW facing — the
+    // horizontal displacement points into the same half-space the
+    // camera faces (dot product positive), dominated by +X.
+    let mut walker = driver();
+    let turn = map_intent(
+        &InputSnapshot {
+            look_delta: (100.0, 0.0),
+            ..InputSnapshot::default()
+        },
+        false,
+    )
+    .intent;
+    walker.run_headless(10, |_| turn);
+    let facing = look_direction(walker.state().yaw, walker.state().pitch);
+    let walk = map_intent(
+        &InputSnapshot {
+            move_forward: 1,
+            ..InputSnapshot::default()
+        },
+        false,
+    )
+    .intent;
+    let before = walker.state().position;
+    walker.run_headless(30, |_| walk);
+    let after = walker.state().position;
+    let displacement = [after[0] - before[0], after[2] - before[2]];
+    let dot = displacement[0] * facing[0] + displacement[1] * facing[2];
+    assert!(
+        dot > 0.5,
+        "forward after a right turn moves along the new facing: \
+         displacement {displacement:?} vs facing {:.3}/{:.3}",
+        facing[0],
+        facing[2]
+    );
+    assert!(
+        displacement[0] > 0.5,
+        "a right turn then forward moves toward +X: {displacement:?}"
+    );
+
+    // Strafing is NOT reversed: strafe-right at identity facing moves
+    // toward +X exactly as before the hardening.
+    let mut strafer = driver();
+    let strafe = map_intent(
+        &InputSnapshot {
+            move_strafe: 1,
+            ..InputSnapshot::default()
+        },
+        false,
+    )
+    .intent;
+    strafer.run_headless(30, |_| strafe);
+    let after = strafer.state().position;
+    assert!(
+        after[0] > 0.5,
+        "strafe-right still moves toward +X: {:?}",
+        after
+    );
 }

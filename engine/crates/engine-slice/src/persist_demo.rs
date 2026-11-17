@@ -2044,8 +2044,13 @@ impl Default for Camera {
 impl Camera {
     fn update(&mut self, snapshot: &InputSnapshot, app: &ShellApp, dt: f32) -> [f32; 3] {
         let look = 0.0025;
-        self.yaw += snapshot.look_delta.0 * look;
-        self.pitch = (self.pitch - snapshot.look_delta.1 * look).clamp(-1.54, 1.54);
+        // The shared free-flight look mapping (the post-orientation
+        // hardening — identical to the render-demo camera, extracted
+        // so the mouse-direction fix lives in one tested place).
+        let (yaw_delta, pitch_delta) =
+            crate::render_demo::free_flight_look_delta(snapshot.look_delta, look);
+        self.yaw += yaw_delta;
+        self.pitch = (self.pitch + pitch_delta).clamp(-1.54, 1.54);
         let roll_input = i8::from(app.is_held(Keycode::E)) - i8::from(app.is_held(Keycode::Q));
         self.roll += roll_input as f32 * 1.5 * dt;
         let speed = if app.is_held(Keycode::LShift) {

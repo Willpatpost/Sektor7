@@ -92,6 +92,19 @@ impl Default for Camera {
     }
 }
 
+/// One frame of free-flight look application — the SHARED mapping for
+/// the render-demo and demo-persist cameras (the post-orientation
+/// hardening extracted it so the fix lives in one tested place):
+/// returns the (yaw, pitch) deltas for a mouse delta at the given
+/// sensitivity. Mouse-X is NEGATED — this engine's +yaw turns toward
+/// world-LEFT (`look_direction = [−sin(yaw), …]`), so rightward mouse
+/// motion must produce a negative yaw delta. The vertical convention
+/// matches the playable/player mappings exactly (upward mouse motion
+/// = negative y delta pitches the view UP) and is unchanged.
+pub fn free_flight_look_delta(look_delta: (f32, f32), sensitivity: f32) -> (f32, f32) {
+    (-look_delta.0 * sensitivity, -look_delta.1 * sensitivity)
+}
+
 impl Camera {
     /// Applies one frame of look/roll/move input and returns the world
     /// displacement actually applied — the Stage 4 graphical
@@ -99,8 +112,9 @@ impl Camera {
     /// director as the live presence velocity.
     fn update(&mut self, snapshot: &InputSnapshot, app: &ShellApp, dt: f32) -> [f32; 3] {
         let look = 0.0025;
-        self.yaw += snapshot.look_delta.0 * look;
-        self.pitch = (self.pitch - snapshot.look_delta.1 * look).clamp(-1.54, 1.54);
+        let (yaw_delta, pitch_delta) = free_flight_look_delta(snapshot.look_delta, look);
+        self.yaw += yaw_delta;
+        self.pitch = (self.pitch + pitch_delta).clamp(-1.54, 1.54);
         let roll_input = i8::from(app.is_held(Keycode::E)) - i8::from(app.is_held(Keycode::Q));
         self.roll += roll_input as f32 * 1.5 * dt;
         let speed = if app.is_held(Keycode::LShift) {
@@ -833,6 +847,46 @@ mod tests {
         assert_eq!(
             lines[1],
             "OVERLAY TRUNCATION: 36000 vertices omitted (peak 336000 / capacity 300000)"
+        );
+    }
+
+    /// The post-orientation hardening (H2), free-flight path: the
+    /// shared mapping composed with the ENGINE look math — mouse-right
+    /// turns the look direction toward world +X, mouse-left toward −X,
+    /// and the vertical convention (mouse-up pitches up) is unchanged.
+    /// The same helper drives BOTH the render-demo and demo-persist
+    /// cameras, so this covers the free-flight family.
+    #[test]
+    fn free_flight_look_delta_turns_the_view_correctly() {
+        use super::free_flight_look_delta;
+        use crate::math;
+
+        // Mouse-right: the resulting look direction through the real
+        // engine camera math.
+        let (yaw_delta, pitch_delta) = free_flight_look_delta((100.0, 0.0), 0.0025);
+        assert!(pitch_delta.abs() < 1e-9, "no vertical coupling");
+        let look = math::camera_forward(yaw_delta, 0.0, 0.0);
+        assert!(
+            look[0] > 0.2,
+            "mouse-right turns the free-flight view toward world +X: {look:?}"
+        );
+
+        // Mouse-left: the mirror.
+        let (yaw_delta, _) = free_flight_look_delta((-100.0, 0.0), 0.0025);
+        let look = math::camera_forward(yaw_delta, 0.0, 0.0);
+        assert!(
+            look[0] < -0.2,
+            "mouse-left turns the free-flight view toward world −X: {look:?}"
+        );
+
+        // Mouse-up (the shell's negative y delta) pitches the view UP,
+        // with no horizontal coupling.
+        let (yaw_delta, pitch_delta) = free_flight_look_delta((0.0, -100.0), 0.0025);
+        assert!(yaw_delta.abs() < 1e-9, "no horizontal coupling");
+        let look = math::camera_forward(0.0, pitch_delta, 0.0);
+        assert!(
+            look[1] > 0.2,
+            "mouse-up pitches the free-flight view up (unchanged): {look:?}"
         );
     }
 }

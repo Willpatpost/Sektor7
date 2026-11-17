@@ -105,16 +105,16 @@ re-measured from actual output on every change, never estimated):
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 955 | 904 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 467 | 466 |
-| **Combined** | **1422** | **1370** |
+| Main shard (`--workspace --exclude engine-slice`) | 1009 | 958 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 498 | 497 |
+| **Combined** | **1507** | **1455** |
 
 (The macOS job runs its own execution partition — no combined count is
-defined for it. Ignored: 1 main / 3 heavy, all deliberate measurement soaks.)
+defined for it. Ignored: 1 main / 5 heavy, all deliberate measurement soaks.)
 
-**The Cycle-1 candidate** (`s7-cycle1-integration`, §9 — awaiting the
-owner's mainline merge; `main` stays at the table above until then) adds
-+32 main / +16 heavy platform-uniform tests and three integration
+**The Cycle-1 candidate** (was `s7-cycle1-integration`;
+**merged to `main` 2026-11-15**, superseded by the Cycle-2 merge below)
+added +32 main / +16 heavy platform-uniform tests and three integration
 binaries, including the full corrective round (R4/R4b player boundary
 and exact-accounting regressions, R2's gradual-growth regression).
 Measured at the R4b-merged tree (the workflow's own awk semantics):
@@ -129,17 +129,52 @@ construction; divergence is an investigation, never a silent re-pin).
 The formerly ignored oversize smoke is now ALSO executed by an enforced
 Linux CI step (the R1 corrective) with its evidence lines in the log.
 
-**The Cycle-2 candidate** (`s7-cycle2-integration`, §9 — likewise
-awaiting the owner's mainline decision; built on the Cycle-1 candidate)
-adds C2-P1's +17 main (11 player mechanics: step-up, the exact-slab
-segment query, camera obstruction; 6 interaction-framework tests) and
-+7 heavy (`playable_world`, a new integration binary) plus C2-P2's +2
-heavy envelope regressions, with a second frozen scenario trace
-(`8f6b490648326d26`, the libm-free gatehouse course). Measured at the
-C2-merged tree: main **1004 / 1 / 30**; heavy **492 / 4 / 50 result
-lines** (Windows 953 / 491 inference, confirmed by the candidate CI).
-Both Cycle-1 frozen traces and every determinism pin remain
-byte-identical at the C2 tree.
+**Cycle 2** (built on the Cycle-1 candidate; **merged to `main`
+2026-11-16**, superseded by the orientation merge below) adds C2-P1's
++19 main (11 player mechanics: step-up, the exact-slab segment query,
+camera obstruction; 6 interaction-framework tests; the
+corrective/closeout rounds' progression and interaction-validity
+regressions) and +11 heavy (`playable_world`, a new integration
+binary, including the corrective rounds and the connected live-frame
+route) plus C2-P2's +2 heavy envelope regressions, with a second frozen
+scenario trace (`8f6b490648326d26`, the libm-free gatehouse course).
+Both Cycle-1 frozen traces and every determinism pin remained
+byte-identical through the merge.
+
+**The orientation corrective** (2026-11-17, PR #4 — `main` =
+`15b8109e0cca4760c1128b2bc61bf59b3f4fdce5`, post-merge CI
+`44014349602` success ×5) fixed the owner-observed upside-down world:
+the single Vulkan Y-axis conversion (the naga shader-boundary flip)
+with `perspective()` un-negated, both pipelines `front_face
+CLOCKWISE` (the winding audit), and the bounded frame-capture readback
+with pixel-level orientation regressions (`render_orientation`, an
+enforced Linux CI step). It also made the overlay actually render for
+the first time (the glyph quads had been back-facing/culled under the
+old shared COUNTER_CLOCKWISE state since Stage 2 — measured pixel
+evidence; no earlier test ever asserted overlay pixels).
+
+**The post-orientation hardening candidate** (2026-11-17,
+`s7-post-orientation-hardening`, awaiting review) fixes the
+owner-observed inverted horizontal mouse look (mouse-X negated at the
+input mappings across all four camera paths — the playable, player,
+and the shared free-flight render/persist cameras; the vertical
+mapping byte-identical) and hardens the capture API: an explicit
+4-byte RGBA8/BGRA8 capture-format contract with typed refusals before
+any GPU copy (an 8-byte fallback surface format can no longer
+under-allocate the destination), checked sizing, the fallible capture
+preparation moved BEFORE the frame-fence reset and image acquire (a
+refused capture can never poison frame synchronization — the frame
+renders normally and the refusal is observable), and the bounded
+single-flight request lifecycle (a second request while one is
+outstanding is refused with a typed error — never overwriting an
+unconsumed readback). Adds +2 main (the H3 capture contract units)
+and +3 heavy (the H2 mouse-look direction regressions across the
+player, playable, and free-flight paths — asserting the resulting
+world-space look direction through the real mappings and engine math).
+Measured at the candidate: main **1009 / 1 / 30**; heavy **498 / 5 /
+51 result lines** (Windows 958 / 497, platform-uniform). Every
+determinism pin and both frozen traces byte-identical at the
+candidate.
 
 - **Determinism pins (never change):** engine `6504123a47cab66f`, state
   `937bd3b6f56f07e0`, save `len=1209 / fnv=c6c1b46c7d21843b`, the Stage 3
@@ -394,11 +429,14 @@ Cycle-1 candidate):
   1,280 events/ms).
 
 Both packages independently cross-reviewed (ACCEPT; verdicts archived in
-`cycle2/reviews/`). The five-job candidate CI is dispatched at the exact
-C2 candidate SHA. **The cycle stops at the owner-reserved mainline-merge
-gate** — pending ChatGPT's independent review, the owner's mainline
-decision, the F-03 Step-2 policy ratification, and the C2-P3
-hardware-validation execution on the owner's rig.
+`cycle2/reviews/`), the ChatGPT review chain closed (**CYCLE 2
+CLOSED-PASS**), and merged to `main` 2026-11-16; the orientation
+corrective followed via **PR #4** (2026-11-17, `main` =
+`15b8109e0cca4760c1128b2bc61bf59b3f4fdce5`, CI `44014349602` success
+×5, the owner's physical right-side-up verification on the RTX 5070
+Ti). The post-orientation hardening candidate (§4) is the active
+review cycle. Standing owner decisions: the F-03 Step-2 policy
+ratification and the simulation default-budget change.
 
 ## 10. The authoritative coordination ledger
 

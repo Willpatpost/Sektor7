@@ -120,7 +120,13 @@ pub fn map_intent(snapshot: &InputSnapshot, sprint_held: bool) -> MappedInput {
             jump_pressed: snapshot.keys_pressed.contains(&Keycode::Space),
             sprint: sprint_held,
             look: (
-                snapshot.look_delta.0 * DEMO_LOOK_SENSITIVITY,
+                // The post-orientation hardening: mouse-X is negated
+                // at the mapping — this engine's +yaw turns toward
+                // world-LEFT (look_direction = [−sin(yaw), …]), so a
+                // rightward mouse delta must produce a NEGATIVE yaw
+                // delta to turn the view right. The vertical mapping
+                // below is unchanged.
+                -snapshot.look_delta.0 * DEMO_LOOK_SENSITIVITY,
                 -snapshot.look_delta.1 * DEMO_LOOK_SENSITIVITY,
             ),
         }

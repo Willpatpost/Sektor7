@@ -115,20 +115,26 @@ fn world_renders_right_side_up_offscreen() {
         .expect("the renderer constructs under the software ICD");
     renderer.set_overlay_enabled(true);
 
-    let mut frame = |renderer: &mut Renderer, capture: bool| {
-        if capture {
-            renderer.request_frame_capture();
-        }
+    // One render helper for the whole test (a single closure owns the
+    // app borrow — SDL's main-thread rule also means this binary runs
+    // exactly one SDL-initializing test).
+    let mut render_with = |renderer: &mut Renderer,
+                           frame_view_proj: &[[f32; 4]; 4],
+                           scene: &[engine_renderer::scene::SceneVertex],
+                           overlay: Option<&str>| {
         let _snapshot = app.frame();
         renderer
-            .render_frame(&view_proj, &region, Some("ORIENTATION"), app.window_size())
+            .render_frame(frame_view_proj, scene, overlay, app.window_size())
             .expect("the frame renders");
     };
 
     // Two warm-up frames (lazy allocations settle), then the capture.
-    frame(&mut renderer, false);
-    frame(&mut renderer, false);
-    frame(&mut renderer, true);
+    render_with(&mut renderer, &view_proj, &region, Some("ORIENTATION"));
+    render_with(&mut renderer, &view_proj, &region, Some("ORIENTATION"));
+    renderer
+        .request_frame_capture()
+        .expect("the capture request is accepted");
+    render_with(&mut renderer, &view_proj, &region, Some("ORIENTATION"));
     let captured = renderer
         .take_frame_capture()
         .expect("the capture readback completes")
@@ -198,11 +204,10 @@ fn world_renders_right_side_up_offscreen() {
     //    and the predicate finds nothing.
     let down_view = math::camera_view([-8.0, 5.0, -2.0], 0.0, -0.6, 0.0);
     let down_view_proj = math::mul(&projection, &down_view);
-    renderer.request_frame_capture();
-    let _snapshot = app.frame();
     renderer
-        .render_frame(&down_view_proj, &region, None, app.window_size())
-        .expect("the down-looking frame renders");
+        .request_frame_capture()
+        .expect("the down-looking capture request is accepted");
+    render_with(&mut renderer, &down_view_proj, &region, None);
     let down = renderer
         .take_frame_capture()
         .expect("the capture readback completes")
@@ -253,12 +258,116 @@ fn world_renders_right_side_up_offscreen() {
         "[orientation-smoke] overlay: {overlay_region} glyph pixels top-left, {lower_green} below (unchanged)"
     );
 
-    // 6. The capture path itself is validation-clean (the barrier
-    //    pair and the copy are ordinary Vulkan usage).
+    // 6. The post-orientation hardening's H4/H5 — the capture
+    //    lifecycle on the SAME renderer (ONE ShellApp per process:
+    //    SDL requires main-thread initialization, so this binary runs
+    //    exactly one SDL-initializing test). Bounded SINGLE-FLIGHT:
+    //    a second request while pending or ready-unconsumed is
+    //    refused with the TYPED error — never silently overwriting
+    //    the earlier readback. The intactness check is the overwrite
+    //    hazard's fail-first form: frame A (this red scene) is
+    //    captured, the second request refused, frame B (a blue
+    //    ground) renders UNCAPTURED, and the taken capture must still
+    //    show frame A's red. The frames around the refusal render
+    //    normally — the frame-sync health proof.
+    renderer
+        .request_frame_capture()
+        .expect("the lifecycle capture request is accepted");
+    let refusal = renderer
+        .request_frame_capture()
+        .expect_err("a second request while pending is refused");
+    assert!(
+        matches!(refusal, engine_renderer::RendererError::CaptureOutstanding),
+        "the typed single-flight refusal: {refusal:?}"
+    );
+    println!("[capture-lifecycle] pending-state refusal: {refusal}");
+
+    // Frame A renders WITH the capture (the still-pending request
+    // from above records on this frame); a request while
+    // READY-UNCONSUMED is then refused.
+    render_with(&mut renderer, &view_proj, &region, None);
+    let refusal = renderer
+        .request_frame_capture()
+        .expect_err("a request while ready-unconsumed is refused");
+    assert!(
+        matches!(refusal, engine_renderer::RendererError::CaptureOutstanding),
+        "the typed ready-state refusal: {refusal:?}"
+    );
+    println!("[capture-lifecycle] ready-state refusal: {refusal}");
+
+    // Frame B (the blue ground) renders UNCAPTURED, twice.
+    let mut blue_region = Vec::new();
+    push_box(
+        &mut blue_region,
+        [0.0, -1.0, 0.0],
+        40.0,
+        1.004,
+        [0.10, 0.15, 0.85],
+    );
+    render_with(&mut renderer, &view_proj, &blue_region, None);
+    render_with(&mut renderer, &view_proj, &blue_region, None);
+
+    // The taken capture is frame A's — INTACT, not frame B's. The
+    // discriminator is the GROUND MAJORITY: frame A's region ground
+    // is red-dominant (the static cube field legitimately contributes
+    // bluish pixels poking through, near the camera below the view
+    // axis); an overwritten frame B would flip the majority to blue
+    // (its region ground is the same box in blue).
+    let lifecycle_capture = renderer
+        .take_frame_capture()
+        .expect("the lifecycle take completes")
+        .expect("the capture from frame A completed");
+    let blue = |p: [u8; 4]| {
+        (p[2] as u16) > 150
+            && (p[2] as u16) > (p[0] as u16) + 40
+            && (p[2] as u16) > (p[1] as u16) + 40
+    };
+    let lifecycle_red = band_matches(&lifecycle_capture, 0.70, 0.98, red);
+    let lifecycle_band = band_matches(&lifecycle_capture, 0.70, 0.98, |_| true);
+    let lifecycle_blue = band_matches(&lifecycle_capture, 0.70, 0.98, blue);
+    assert!(
+        lifecycle_red > lifecycle_band / 2,
+        "the unconsumed readback is INTACT (frame A's red ground majority): \
+         {lifecycle_red} of {lifecycle_band}"
+    );
+    assert!(
+        lifecycle_red > lifecycle_blue,
+        "frame B never overwrote the capture (frame A's red majority holds over \
+         the static field's blue: {lifecycle_red} red vs {lifecycle_blue} blue)"
+    );
+    println!(
+        "[capture-lifecycle] intact readback: {lifecycle_red} red of {lifecycle_band}, blue {lifecycle_blue}"
+    );
+    assert!(
+        renderer.last_capture_refusal().is_none(),
+        "no refusal or drop recorded in the ordinary lifecycle"
+    );
+
+    // Repeated request → render → take cycles keep working after the
+    // refusals (the renderer is healthy; no dead fence).
+    for capture_scene in [&region, &blue_region, &region] {
+        renderer
+            .request_frame_capture()
+            .expect("the repeat request is accepted after consumption");
+        render_with(&mut renderer, &view_proj, capture_scene, None);
+        let repeat = renderer
+            .take_frame_capture()
+            .expect("the repeat take completes")
+            .expect("the repeat capture completed");
+        assert!(
+            repeat.width >= 640 && repeat.height >= 360,
+            "a real drawable"
+        );
+    }
+    println!("[capture-lifecycle] repeated request→render→take cycles held");
+
+    // 7. The whole run — orientation captures AND the lifecycle — is
+    //    validation-clean (the barrier pair, the copy, and the
+    //    refusals are ordinary Vulkan usage).
     let stats = renderer.stats();
     assert_eq!(
         stats.validation_errors, 0,
-        "the captured frame is validation-clean"
+        "the captured frames are validation-clean"
     );
     println!(
         "[orientation-smoke] validation errors={} (clean) — EXECUTED through the real \
