@@ -82,7 +82,9 @@ use engine_core::{
     camera_pose_obstructed, health_full, look_direction, player_box, resolve_attack,
 };
 use engine_renderer::scene::SceneVertex;
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+};
 use engine_shell::{
     Audio, AudioStatus, Cue, DriverPreference, InputSnapshot, Keycode, MouseButton, ShellApp,
     ShellConfig,
@@ -1430,6 +1432,11 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         present_mode: options.present,
         validation: options.validation,
         replace_pipelines: false,
+        // The composition fix at integration: D's scene separation added
+        // this field after F's branch diverged — the combat demo is a game
+        // scene, so the legacy Stage-2 test scene stays omitted (the
+        // playable_demo idiom).
+        demo_scene: DemoScenePreference::Omitted,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
