@@ -133,6 +133,26 @@ fn main() {
         return;
     }
 
+    if let Some(arg) = std::env::args()
+        .nth(1)
+        .filter(|arg| arg == "--benchmark-perf-sweep")
+    {
+        // [cycle4-E] The capability-E performance sweep: one named cell
+        // per process (`--benchmark-perf-sweep <cell>`; the cell list
+        // and the reproducibility rules live in
+        // cycle4/deliverables/E-workload-design.md). Wall-clock cells
+        // are meaningful in --release; the logical counters are
+        // profile-independent (pod evidence, observational; the
+        // deterministic CI regressions live in the module's tests).
+        let _ = arg;
+        let cell = std::env::args().nth(2).unwrap_or_default();
+        if !engine_slice::perf_sweep::run_named(&cell) {
+            eprintln!("unknown perf-sweep cell '{cell}'");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if std::env::args().any(|arg| arg == "--sustained-load-full-matrix") {
         // [cycle1-P2] The full reference matrix (pod evidence,
         // double-run per cell, mechanical N/A skip rules) plus the

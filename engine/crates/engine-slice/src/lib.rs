@@ -11,6 +11,7 @@ pub mod frame_timing;
 pub mod math;
 pub mod npc;
 pub mod orchestration;
+pub mod perf_sweep;
 pub mod persist_demo;
 pub mod playable_demo;
 pub mod player_demo;
