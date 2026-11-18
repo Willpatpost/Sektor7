@@ -221,8 +221,17 @@ jobs:
           # ignored 1→2 and result lines 30→31 measured with it.
           # Windows 999 = the prior 960 + the same 39 (platform-uniform
           # inference — this run confirms it).
-          expected=1052
-          if [ "$(uname -s)" != "Linux" ]; then expected=1001; fi
+          # Cycle 4 batch 2 (a10a157): Linux 1062/2/31 MEASURED at the
+          # integrated tree with this step's own awk (B's capability-B
+          # adds 10 engine-core lib tests — the weapons battery;
+          # platform-uniform, no new result lines; the local integration
+          # gates at a10a157: main 1062/2/31, heavy 521/6/53 unchanged,
+          # zero failures, every selftest pin byte-identical —
+          # /var/tmp/s7-cycle4-targets/int-gates-run2.log). Windows 1011
+          # = the prior 1001 + the same 10 (platform-uniform inference —
+          # the candidate CI run confirms it).
+          expected=1062
+          if [ "$(uname -s)" != "Linux" ]; then expected=1011; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
