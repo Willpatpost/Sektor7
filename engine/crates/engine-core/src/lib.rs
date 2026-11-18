@@ -47,6 +47,7 @@
 
 pub mod adversary;
 pub mod clock;
+pub mod combat;
 pub mod diag;
 pub mod event;
 pub mod fingerprint;
@@ -60,6 +61,12 @@ pub mod wire;
 mod sha256;
 
 pub use clock::Tick;
+pub use combat::{
+    AttackProfile, AttackRefusal, AttackRequest, COMBAT_CLASS, COMBAT_FINGERPRINT_DOMAIN,
+    COMBAT_MAGIC, COMBAT_PAYLOAD_ID_BOUND, CombatEventKind, Combatant, CombatantId, DamageOutcome,
+    HealOutcome, Health, HealthError, HitResolution, MissKind, ProfileField, combat_payload,
+    combat_payload_parts, health_full, resolve_attack, segment_box_hit,
+};
 pub use diag::{Diagnostics, Level, Record};
 pub use event::{
     Event, EventClass, EventId, EventSpec, ExecutionRecord, Field, Schedule, ScheduleKind,
