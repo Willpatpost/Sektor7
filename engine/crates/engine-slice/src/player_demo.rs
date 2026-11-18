@@ -34,7 +34,9 @@ use engine_core::{
     CameraMode, CollisionWorld, MoveIntent, PlayerConfig, PlayerDriver, PlayerState, camera_pose,
 };
 use engine_renderer::scene::{SceneVertex, push_box};
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+};
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
 use crate::frame_timing::FrameTiming;
@@ -285,10 +287,13 @@ pub fn run_player_demo(options: PlayerOptions) -> Result<(), String> {
     let mut app = ShellApp::new(shell_config)?;
     app.set_relative_mouse(true);
 
+    // The explicit opt-in (P3): this demo's collision world IS the
+    // Stage-2 cube field — collide-what-you-see requires the field.
     let render_config = RenderConfig {
         present_mode: options.present,
         validation: options.validation,
         replace_pipelines: false,
+        demo_scene: DemoScenePreference::Included,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

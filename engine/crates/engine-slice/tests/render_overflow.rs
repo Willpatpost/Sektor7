@@ -20,7 +20,9 @@
 //! ```
 
 use engine_renderer::scene::{SceneVertex, push_box};
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+};
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 
 use engine_slice::render_demo::{TruncationReport, truncation_report_lines};
@@ -78,11 +80,14 @@ fn oversized_region_and_overlay_report_exact_truncation() {
     // supported, works offscreen), validation requested ON (an absent
     // layer is an environment limitation, not an error), overlay
     // enabled (the frame-4 assertions depend on it), no
-    // pipeline-replacement scenario.
+    // pipeline-replacement scenario, and the P3 explicit demo-scene
+    // opt-in — this smoke drives the renderer exactly as render_demo
+    // does, and render_demo demonstrates the original Stage-2 scene.
     let config = RenderConfig {
         present_mode: PresentModePreference::Auto,
         validation: ValidationPreference::On,
         replace_pipelines: false,
+        demo_scene: DemoScenePreference::Included,
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 F-03 Step 1 oversize smoke".to_string(),

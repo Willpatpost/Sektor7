@@ -47,6 +47,6 @@ pub mod scene;
 mod renderer;
 mod vulkan;
 
-pub use config::{PresentModePreference, RenderConfig, ValidationPreference};
+pub use config::{DemoScenePreference, PresentModePreference, RenderConfig, ValidationPreference};
 pub use renderer::{FrameResult, RenderStats, Renderer};
 pub use vulkan::{CaptureFormat, CapturedFrame, RendererError};
