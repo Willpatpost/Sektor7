@@ -126,10 +126,12 @@ fn winnable_scenario_completes_headless() {
         "settled on the arena ground",
         "adversary attack — player takes 20 (80/100)",
         "encounter activated — the adversary stirs",
+        "adversary attack — player takes 20 (60/100)",
         "fire 1: HIT — adversary 75/100",
         "fire 2: HIT — adversary 50/100",
-        "adversary attack — player takes 20 (60/100)",
+        "adversary attack — player takes 20 (40/100)",
         "fire 3: HIT — adversary 25/100",
+        "adversary attack — player takes 20 (20/100)",
         "fire 4: HIT — adversary 0/100",
         "ADVERSARY DEFEATED — encounter WON",
     ];
@@ -143,14 +145,17 @@ fn winnable_scenario_completes_headless() {
     }
     assert!(first.contains("outcome: WON"), "the win is reported");
     assert!(
-        first.contains("attacks taken 2"),
-        "the adversary meaningfully threatened the player (two landed attacks)"
+        first.contains("attacks taken 4"),
+        "the adversary meaningfully threatened the player (four landed attacks — \
+         the R1xR2 combined semantics: B's canonical logical-tick cooldown \
+         attacks on a ~26-tick cycle; the R1-era value was 2)"
     );
     assert!(first.contains("fires 4"), "exactly four fires");
     assert!(first.contains("refused=0"), "no refused movement steps");
     assert!(
-        first.contains("player: hp 60/100"),
-        "the player survives wounded: {}",
+        first.contains("player: hp 20/100"),
+        "the player survives wounded (barely — a maximally threatened win; \
+         the R1-era value was 60/100): {}",
         first
             .lines()
             .find(|l| l.starts_with("player:"))
@@ -218,11 +223,14 @@ fn combat_scenario_trace_pinned() {
         .find_map(|line| line.strip_prefix("player-trace="))
         .expect("the failure summary carries the trace fingerprint");
     assert_eq!(
-        trace, "18e578ef87eec296",
-        "the failure scenario trace — RE-MEASURED at the B-swap (the \
-         review-F1 honest re-measurement: the walk's stop became the \
-         player-only z ≤ 1.0 line; the old provisional pin was \
-         494ade50b21d43cc)"
+        trace, "0ddc141d7e3c53c1",
+        "the failure scenario trace — the ONE COMBINED R1xR2 remeasure \
+         (B's canonical logical-tick cooldown defeats the passive player \
+         earlier — LOST at tick 162 vs 274 — so the run records fewer \
+         idle movement ticks; the R1-era value was 18e578ef87eec296, \
+         the pre-B-swap provisional 494ade50b21d43cc; both preserved as \
+         evidence — a further divergence is an investigation, never a \
+         silent re-pin)"
     );
 }
 
