@@ -221,8 +221,8 @@ jobs:
           # ignored 1→2 and result lines 30→31 measured with it.
           # Windows 999 = the prior 960 + the same 39 (platform-uniform
           # inference — this run confirms it).
-          expected=1050
-          if [ "$(uname -s)" != "Linux" ]; then expected=999; fi
+          expected=1052
+          if [ "$(uname -s)" != "Linux" ]; then expected=1001; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -700,8 +700,8 @@ jobs:
           # run (the 513 inference was corrected from actuals: one of
           # D's +2 does not pass on Windows; never by weakening a
           # test).
-          expected=512
-          if [ "$(uname -s)" != "Linux" ]; then expected=511; fi
+          expected=514
+          if [ "$(uname -s)" != "Linux" ]; then expected=513; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
