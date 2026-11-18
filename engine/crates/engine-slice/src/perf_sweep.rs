@@ -95,6 +95,22 @@ pub enum Activity {
     /// Exactly ONE adversary (index 0) activated at the given (1-based)
     /// tick via the C3.1-blessed `activation_spec` mechanism.
     OneActive { activation_tick: u64 },
+    /// Phase 1 (COMBATANTS-INTERFACE v1 §2): the first `active_count`
+    /// adversaries remain PATROL at construction (naturally active) and
+    /// are served by the RECONCILED installer (eligible-only); the rest
+    /// are composed DORMANT first and never scheduled. `active_count ==
+    /// population` is the fully-active population.
+    InstallerServed { active_count: usize },
+    /// Phase 1 (the encounter-realistic wave): ALL adversaries start
+    /// dormant; `active_count` of them activate at staggered ticks
+    /// (`start_tick + index * stagger_ticks`) through per-adversary
+    /// `activation_spec` — the contract's individually-schedulable
+    /// activation surface.
+    ActivationFront {
+        active_count: usize,
+        start_tick: u64,
+        stagger_ticks: u64,
+    },
 }
 
 impl PerfSweepSpec {
@@ -116,6 +132,81 @@ impl PerfSweepSpec {
                 population,
                 activity: Activity::OneActive {
                     activation_tick: 30,
+                },
+                player_orbit: COMBAT_ORBIT,
+                duration_ticks: 1800,
+                seed: 0xE_CEEE,
+            });
+        }
+        cells
+    }
+
+    /// The Phase-1 population cell list (the k-of-N contract cells —
+    /// RUN AGAINST THE INTEGRATED TREE ONLY: the cells exercise the
+    /// COMBATANTS-INTERFACE v1 semantics (the reconciled installer and
+    /// the per-adversary activation surface), which SEAT A's
+    /// implementation delivers; running them against a
+    /// pre-reconciliation tree measures the defective semantics, so no
+    /// evidence is recorded from this tree).
+    pub fn phase1_cells() -> Vec<PerfSweepSpec> {
+        let mut cells = Vec::new();
+        // The fully-active populations in both regimes — the combat
+        // regime brackets the saturation knee (512 × AGGRO cadence 2 ≈
+        // 256 near events/tick > the 200 budget; 256 ≈ 128/tick under
+        // it; the geometry accumulates every adversary into AGGRO
+        // within ~one player orbit because the de-aggro radius is
+        // unreachable at these orbit/circuit radii).
+        for population in [1usize, 4, 32, 128, 256, 512] {
+            cells.push(PerfSweepSpec {
+                name: format!("full-{population}-patrol"),
+                population,
+                activity: Activity::InstallerServed {
+                    active_count: population,
+                },
+                player_orbit: PATROL_ORBIT,
+                duration_ticks: 1800,
+                seed: 0xE_CEEE,
+            });
+            cells.push(PerfSweepSpec {
+                name: format!("full-{population}-combat"),
+                population,
+                activity: Activity::InstallerServed {
+                    active_count: population,
+                },
+                player_orbit: COMBAT_ORBIT,
+                duration_ticks: 1800,
+                seed: 0xE_CEEE,
+            });
+        }
+        // The mixed dormant/active compositions (installer flavor) at
+        // the 1/4 and 1/2 ratios — the active-set scaling axis.
+        for population in [4usize, 32, 128, 256, 512] {
+            for (ratio_label, numerator, denominator) in [("4th", 1u64, 4u64), ("half", 1u64, 2u64)]
+            {
+                let active_count = ((population as u64 * numerator) / denominator).max(1) as usize;
+                cells.push(PerfSweepSpec {
+                    name: format!("mix-{population}-k{active_count}-{ratio_label}"),
+                    population,
+                    activity: Activity::InstallerServed { active_count },
+                    player_orbit: COMBAT_ORBIT,
+                    duration_ticks: 1800,
+                    seed: 0xE_CEEE,
+                });
+            }
+        }
+        // The encounter-realistic activation front at the 1/16 ratio —
+        // the per-adversary staggered activation wave (the contract's
+        // individually-schedulable surface; the front completes well
+        // inside the 1800-tick window at every listed population).
+        for population in [32usize, 128, 256, 512] {
+            let active_count = (population / 16).max(1);
+            cells.push(PerfSweepSpec {
+                name: format!("mixfront-{population}-k{active_count}"),
+                population,
+                activity: Activity::ActivationFront {
+                    active_count,
+                    start_tick: 30,
+                    stagger_ticks: 7,
                 },
                 player_orbit: COMBAT_ORBIT,
                 duration_ticks: 1800,
@@ -184,6 +275,10 @@ pub struct CellOutcome {
     /// spine's ledger at the same spec).
     pub late_count: u64,
     pub max_lateness: u64,
+    /// Executed counts per event class (the per-adversary scheduling
+    /// split on the integrated tree, where the contract's per-adversary
+    /// `EventClass` carries the adversary index).
+    pub per_class_counts: Vec<(u16, u64)>,
 }
 
 /// The empty collision world for the spine-side cells (obstacle cost is
@@ -286,8 +381,23 @@ fn per_tick_deltas(samples: &[TickSample], field: fn(&TickSample) -> u64) -> Vec
     deltas
 }
 
-/// Runs one population cell (floor-P / one-P) and returns the measured
-/// outcome. Deterministic on the logical counters for a given spec.
+/// The C3.1 dormant-start composition: every adversary dormant,
+/// nothing scheduled. `set_dormant` returns the COMBATANTS-INTERFACE
+/// v1 refusal bool on the integrated tree (unit on the
+/// pre-reconciliation tree); the plain statement form compiles against
+/// BOTH signatures — and a refusal is impossible at this point by
+/// composition ordering (nothing is scheduled yet; contract §1). The
+/// post-integration run relay strengthens these sites to assert the
+/// bool.
+fn compose_all_dormant(spine: &mut Spine<AdversaryWorld>, population: usize) {
+    for index in 0..population {
+        spine.world_mut().set_dormant(index);
+    }
+}
+
+/// Runs one population cell (floor-P / one-P / the Phase-1 k-of-N
+/// profiles) and returns the measured outcome. Deterministic on the
+/// logical counters for a given spec.
 pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
     let rss_start = rss_kb();
     let mut spine = Spine::with_reservation(
@@ -298,16 +408,53 @@ pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
         BUDGET,
         NEAR_RESERVE,
     );
-    // The C3.1 dormant-start composition: every adversary dormant,
-    // NOTHING scheduled at construction.
-    for index in 0..spec.population {
-        spine.world_mut().set_dormant(index);
-    }
-    let mut samples = Vec::with_capacity(spec.duration_ticks as usize);
-    let activation_due_tick = match spec.activity {
-        Activity::OneActive { activation_tick } => Some(activation_tick),
-        Activity::DormantFloor => None,
+    // The composition (COMBATANTS-INTERFACE v1 §2): dormancy is a
+    // PRE-SCHEDULING state — the dormant set is composed FIRST, then
+    // the installer serves the naturally-active remainder (the
+    // reconciled eligible-only form), then per-adversary activations
+    // are scheduled at their own moments.
+    let activation_due: Vec<Option<u64>> = match spec.activity {
+        Activity::DormantFloor => {
+            compose_all_dormant(&mut spine, spec.population);
+            vec![None; spec.population]
+        }
+        Activity::OneActive { activation_tick } => {
+            compose_all_dormant(&mut spine, spec.population);
+            let mut schedule = vec![None; spec.population];
+            if let Some(slot) = schedule.first_mut() {
+                *slot = Some(activation_tick);
+            }
+            schedule
+        }
+        Activity::InstallerServed { active_count } => {
+            for index in active_count..spec.population {
+                // The plain statement form compiles against both the
+                // pre-reconciliation (unit) and integrated (bool)
+                // `set_dormant` signatures; refusal is impossible here
+                // by composition ordering (contract §1).
+                spine.world_mut().set_dormant(index);
+            }
+            engine_core::adversary::install_adversary_schedules(&mut spine);
+            vec![None; spec.population]
+        }
+        Activity::ActivationFront {
+            active_count,
+            start_tick,
+            stagger_ticks,
+        } => {
+            compose_all_dormant(&mut spine, spec.population);
+            (0..spec.population)
+                .map(|index| {
+                    if index < active_count {
+                        Some(start_tick + index as u64 * stagger_ticks)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
     };
+    let mut samples = Vec::with_capacity(spec.duration_ticks as usize);
     for tick_index in 1..=spec.duration_ticks {
         // The once-per-tick player sample (this tick's position), the
         // same driver discipline as the demo.
@@ -316,14 +463,19 @@ pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
             tick_index,
             spec.player_orbit,
         ));
-        // The single blessed activation (the C3.1 mechanism), scheduled
-        // at the NEXT spine tick exactly as the demo's activation line.
-        if activation_due_tick == Some(tick_index) {
-            let due = Tick(spine.run_ticks(0).0 + 1);
-            if let Some(activation) = spine.world().activation_spec(0, due) {
-                spine
-                    .schedule(activation)
-                    .expect("the activation schedule is dependency-free");
+        // The per-adversary activation wave (the contract's
+        // individually-schedulable surface), each scheduled at the NEXT
+        // spine tick exactly as the demo's activation line. The scan is
+        // harness-side bookkeeping OUTSIDE the measured `run_tick`
+        // window.
+        for (index, due_tick) in activation_due.iter().enumerate() {
+            if *due_tick == Some(tick_index) {
+                let due = Tick(spine.run_ticks(0).0 + 1);
+                if let Some(activation) = spine.world().activation_spec(index, due) {
+                    spine
+                        .schedule(activation)
+                        .expect("the activation schedule is dependency-free");
+                }
             }
         }
         let started = Instant::now();
@@ -350,7 +502,13 @@ pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
     let totals = spine.lane_totals();
     let mut late_count = 0u64;
     let mut max_lateness = 0u64;
+    // The per-event-class executed counts (the contract's per-adversary
+    // EventClass makes this the per-adversary scheduling split on the
+    // integrated tree; on a pre-reconciliation tree it is whatever the
+    // legacy classes are — labeled honestly either way).
+    let mut per_class: std::collections::BTreeMap<u16, u64> = Default::default();
     for record in spine.ledger() {
+        *per_class.entry(record.class.0).or_default() += 1;
         if record.late {
             late_count += 1;
             let lateness = record.executed_tick.0.saturating_sub(record.intended_due.0);
@@ -380,6 +538,7 @@ pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
         ledger_len: spine.ledger().len(),
         late_count,
         max_lateness,
+        per_class_counts: per_class.into_iter().collect(),
     }
 }
 
@@ -442,6 +601,14 @@ pub fn print_cell_outcome(outcome: &CellOutcome) {
     println!(
         "lateness: late_count={} max_lateness_ticks={}",
         outcome.late_count, outcome.max_lateness
+    );
+    let class_counts: Vec<u64> = outcome.per_class_counts.iter().map(|(_, n)| *n).collect();
+    let (cmin, _, _, _, cmax, cmean) = series_summary(&class_counts);
+    println!(
+        "per_class: classes={} per_class_min={} per_class_max={} per_class_mean={cmean:.1}",
+        outcome.per_class_counts.len(),
+        cmin,
+        cmax
     );
     println!(
         "active_adversaries_final={} world_fingerprint={}",
@@ -644,11 +811,27 @@ impl engine_core::spine::World for NoopWorld {
     }
 }
 
-/// Runs a named Phase-0 cell (the CLI entry: `--benchmark-perf-sweep
-/// <name>`); one cell per process keeps RSS attribution clean.
+/// Runs a named Phase-0 or Phase-1 cell (the CLI entry:
+/// `--benchmark-perf-sweep <cell>`); one cell per process keeps RSS
+/// attribution clean. The Phase-1 cells are registered here so the
+/// post-integration relay can run them by name — but their EVIDENCE is
+/// recorded only against the integrated tree (COMBATANTS-INTERFACE v1
+/// semantics; a pre-reconciliation run measures the defective
+/// scheduler and is never recorded).
 pub fn run_named(name: &str) -> bool {
     for spec in PerfSweepSpec::phase0_cells() {
         if spec.name == name {
+            let outcome = run_population_cell(&spec);
+            print_cell_outcome(&outcome);
+            return true;
+        }
+    }
+    for spec in PerfSweepSpec::phase1_cells() {
+        if spec.name == name {
+            println!(
+                "# phase-1 cell (COMBATANTS-INTERFACE v1) — record evidence \
+                 only against the integrated tree"
+            );
             let outcome = run_population_cell(&spec);
             print_cell_outcome(&outcome);
             return true;
@@ -773,6 +956,69 @@ mod tests {
         // The dormant majority stays dormant: only one adversary is
         // active of the four.
         assert_eq!(outcome.active_adversaries, 1);
+    }
+
+    /// The Phase-1 cell list is well-formed data (unique names; every
+    /// activation front completes inside its window; every installer
+    /// cell serves at most its population) — pure data checks that hold
+    /// on ANY tree. The SEMANTIC assertions (only-k-active, the guard
+    /// matrix) are SEAT A's tests and the integrated run's —
+    /// deliberately not asserted on a pre-reconciliation tree.
+    #[test]
+    fn the_phase1_cell_list_is_well_formed() {
+        let cells = PerfSweepSpec::phase1_cells();
+        assert!(!cells.is_empty());
+        let mut names: Vec<&str> = cells.iter().map(|cell| cell.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "cell names must be unique");
+        for cell in &cells {
+            match cell.activity {
+                Activity::ActivationFront {
+                    active_count,
+                    start_tick,
+                    stagger_ticks,
+                } => {
+                    let last = start_tick + (active_count as u64 - 1) * stagger_ticks;
+                    assert!(
+                        last < cell.duration_ticks,
+                        "the front must complete inside the window: {}",
+                        cell.name
+                    );
+                    assert!(active_count <= cell.population);
+                }
+                Activity::InstallerServed { active_count } => {
+                    assert!(active_count <= cell.population);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A Phase-1 activation-front cell double-runs deterministically —
+    /// the harness's own reproducibility on the per-adversary wave
+    /// surface (the semantics are the integrated run's to prove).
+    #[test]
+    fn an_activation_front_cell_double_runs_deterministically() {
+        let spec = PerfSweepSpec {
+            name: "front-tiny".into(),
+            population: 8,
+            activity: Activity::ActivationFront {
+                active_count: 3,
+                start_tick: 5,
+                stagger_ticks: 4,
+            },
+            player_orbit: COMBAT_ORBIT,
+            duration_ticks: 90,
+            seed: 0xE_CEEE,
+        };
+        let first = run_population_cell(&spec);
+        let second = run_population_cell(&spec);
+        assert_eq!(first.executed, second.executed);
+        assert_eq!(first.scheduled, second.scheduled);
+        assert_eq!(first.world_fingerprint, second.world_fingerprint);
+        assert_eq!(first.per_class_counts, second.per_class_counts);
     }
 
     /// The queued cell's chain executes exactly once per tick and the
