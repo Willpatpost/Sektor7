@@ -94,14 +94,21 @@ impl AudioStatus {
 }
 
 /// The audio capability: a default playback device plus one bound
-/// stream per cue, carrying prebuilt procedural waveforms. Drop tears
-/// everything down in order (streams unbind and destroy first, then
-/// the device closes, then the refcounted SDL audio subsystem quits
-/// when the last handle goes).
+/// stream per cue, carrying prebuilt procedural waveforms. Drop
+/// follows Rust's declaration-order field drops: the device closes
+/// first — `SDL_CloseAudioDevice` unbinds the still-bound streams
+/// without destroying them (SDL 3.4.18, `DestroyLogicalAudioDevice`)
+/// — then each stream destroys itself, and the refcounted SDL audio
+/// subsystem quits only after the last stream's refcount clone drops
+/// (every stream owner holds one). The reverse order is equally
+/// SDL-safe: the mid-run failure path in `play` releases the streams
+/// before the device.
 pub struct Audio {
     status: AudioStatus,
-    /// The open device — declared first so it drops LAST (streams
-    /// must unbind before the device closes).
+    /// The open device — Rust drops fields in declaration order, so
+    /// this closes FIRST; `SDL_CloseAudioDevice` unbinds the
+    /// still-bound streams without destroying them, so the later
+    /// stream drops operate on already-unbound streams.
     device: Option<AudioDevice>,
     /// One stream per cue, bound to the device (SDL mixes them).
     streams: Option<Vec<AudioStreamOwner>>,
@@ -273,8 +280,10 @@ fn complete_sample(t: f32, _index: u32) -> f32 {
     (std::f32::consts::TAU * freq * t).sin() * envelope * 0.5
 }
 
-/// Synthesizes one cue's waveform — a pure function of the cue (the
-/// same bytes on every platform and every run).
+/// Synthesizes one cue's waveform — a pure function of the cue,
+/// deterministic on every run. Cross-platform float bit-identity is not
+/// asserted (libm `sin`/`exp` are not guaranteed bit-portable); audio sits
+/// outside every determinism pin, so only per-run determinism is claimed.
 fn cue_samples(cue: Cue) -> Vec<f32> {
     let (duration_s, generator): (f32, fn(f32, u32) -> f32) = match cue {
         Cue::Fire => (0.09, fire_sample),
