@@ -40,6 +40,7 @@
 //! second diagnostics implementation).
 
 pub mod app;
+pub mod audio;
 pub mod input;
 pub mod platform;
 
@@ -59,6 +60,8 @@ pub use engine_core::diag::{Diagnostics, Level};
 /// platform-independent.
 pub use sdl3::keyboard::Keycode;
 pub use sdl3::mouse::MouseButton;
+
+pub use audio::{Audio, AudioStatus, CUES, Cue};
 
 /// The SDL3 version linked into this binary (the vendored build).
 pub fn linked_sdl_version() -> sdl3::version::Version {
