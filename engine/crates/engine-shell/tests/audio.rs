@@ -40,18 +40,21 @@ fn the_device_path_dispatch_and_lifecycle_are_clean() {
     //    path, repeatedly, with bounded wall cost (each play is one
     //    non-blocking buffered SDL call plus SDL's internal copy).
     let start = std::time::Instant::now();
+    let pushes = 100 * CUES.len() as u64;
     for _ in 0..100 {
         for cue in CUES {
             audio.play(cue);
         }
     }
-    let five_hundred = start.elapsed();
+    let dispatch_window = start.elapsed();
     assert!(
-        five_hundred.as_millis() < 2_000,
-        "500 cue pushes are bounded: {five_hundred:?}"
+        dispatch_window.as_millis() < 2_000,
+        "{pushes} cue pushes are bounded: {dispatch_window:?}"
     );
-    let per_push_us = five_hundred.as_micros() / 500;
-    println!("[audio-smoke] 500 cue pushes in {five_hundred:?} (~{per_push_us} µs per push)");
+    let per_push_us = dispatch_window.as_micros() / u128::from(pushes);
+    println!(
+        "[audio-smoke] {pushes} cue pushes in {dispatch_window:?} (~{per_push_us} µs per push)"
+    );
     assert!(
         audio.status().is_active(),
         "the dummy device stays active after playback"

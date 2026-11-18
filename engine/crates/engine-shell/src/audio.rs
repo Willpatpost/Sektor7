@@ -52,15 +52,31 @@ pub enum Cue {
     Interact,
     /// An encounter completed.
     EncounterComplete,
+    /// A weapon selection change (the Cycle-4 F proposal, approved by
+    /// the orchestrator 2026-11-18: a short mechanical click — the
+    /// selection is a control event, not an interaction-confirmed).
+    WeaponSwitch,
+    /// A single adversary defeated — the partial-victory beat (the
+    /// Cycle-4 F proposal, approved: a brief descending sting,
+    /// distinct from the encounter's completion).
+    AdversaryDefeated,
+    /// The player defeated — the encounter's failure terminal (the
+    /// Cycle-4 F proposal, approved: a longer descending resolution,
+    /// the failure counterpart of `EncounterComplete`'s rising
+    /// arpeggio).
+    Defeat,
 }
 
 /// Every cue, in the stable index order used internally.
-pub const CUES: [Cue; 5] = [
+pub const CUES: [Cue; 8] = [
     Cue::Fire,
     Cue::Impact,
     Cue::Damage,
     Cue::Interact,
     Cue::EncounterComplete,
+    Cue::WeaponSwitch,
+    Cue::AdversaryDefeated,
+    Cue::Defeat,
 ];
 
 impl Cue {
@@ -71,6 +87,9 @@ impl Cue {
             Cue::Damage => 2,
             Cue::Interact => 3,
             Cue::EncounterComplete => 4,
+            Cue::WeaponSwitch => 5,
+            Cue::AdversaryDefeated => 6,
+            Cue::Defeat => 7,
         }
     }
 }
@@ -280,6 +299,36 @@ fn complete_sample(t: f32, _index: u32) -> f32 {
     (std::f32::consts::TAU * freq * t).sin() * envelope * 0.5
 }
 
+fn weapon_switch_sample(t: f32, index: u32) -> f32 {
+    // A short mechanical click: a brief high tick over a low thock —
+    // the two-layer selection sound (a control event, ~70 ms).
+    let tick = (std::f32::consts::TAU * 1250.0 * t).sin() * (-t * 90.0).exp() * 0.35;
+    let thock = (std::f32::consts::TAU * 165.0 * t).sin() * (-t * 38.0).exp() * 0.4;
+    let latch = deterministic_noise(index) * (-t * 70.0).exp() * 0.15;
+    tick + thock + latch
+}
+
+fn adversary_defeated_sample(t: f32, _index: u32) -> f32 {
+    // A brief descending sting: 400 Hz falling to 200 Hz over the
+    // cue — the partial-victory beat, distinct from the encounter's
+    // completion arpeggio.
+    let sweep = 400.0 - 200.0 * (t / 0.2);
+    let tone = (std::f32::consts::TAU * sweep * t).sin();
+    let envelope = (-t * 9.0).exp() * (t * 250.0).min(1.0);
+    tone * envelope * 0.55
+}
+
+fn defeat_sample(t: f32, _index: u32) -> f32 {
+    // A longer descending resolution: A4, F4, D4, each ~170 ms — the
+    // failure counterpart of the completion arpeggio.
+    let notes = [440.0, 349.23, 293.66];
+    let note = (t / 0.17).floor() as usize;
+    let local = t - note as f32 * 0.17;
+    let freq = notes[note.min(2)];
+    let envelope = (-local * 10.0).exp() * (local * 180.0).min(1.0);
+    (std::f32::consts::TAU * freq * t).sin() * envelope * 0.5
+}
+
 /// Synthesizes one cue's waveform — a pure function of the cue,
 /// deterministic on every run. Cross-platform float bit-identity is not
 /// asserted (libm `sin`/`exp` are not guaranteed bit-portable); audio sits
@@ -291,6 +340,9 @@ fn cue_samples(cue: Cue) -> Vec<f32> {
         Cue::Damage => (0.18, damage_sample),
         Cue::Interact => (0.11, interact_sample),
         Cue::EncounterComplete => (0.45, complete_sample),
+        Cue::WeaponSwitch => (0.07, weapon_switch_sample),
+        Cue::AdversaryDefeated => (0.2, adversary_defeated_sample),
+        Cue::Defeat => (0.51, defeat_sample),
     };
     let count = (duration_s * SAMPLE_RATE as f32) as usize;
     (0..count)
