@@ -1329,6 +1329,12 @@ mod tests {
             None,
             "a neighboring tag is foreign"
         );
+        assert_eq!(
+            adversary_parts(crate::combat::COMBAT_MAGIC << 48),
+            None,
+            "combat event payloads never decode as adversary chains (the \
+             contract §8 namespace table — the 0xB00B/0xC0AB reconciliation)"
+        );
 
         // execute ignores out-of-range indices and foreign tags.
         let mut spine = Spine::with_reservation(
