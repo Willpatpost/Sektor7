@@ -393,26 +393,42 @@ impl AdversaryWorld {
     }
 
     /// Move `adversary` one wake-up step toward `target` on the ground
-    /// plane, through the collision world: the straight step is
-    /// LOS-checked (`segment_hit` with the body margin) and a blocked
-    /// step is REFUSED in place (the patrol circuit routes around; the
-    /// pursuit stops at cover — the collide-what-you-stop-at minimal
-    /// semantics; full sweep movement is a later refinement, stated).
+    /// plane, through the collision world. The destination this wake
+    /// is exactly ON the target when it lies within one step (the
+    /// snap — bit-exact waypoint/spot arrival), else one step along
+    /// the direction; BOTH destinations pass the SAME blocking check
+    /// (`segment_hit` with the body margin) — the snap is NOT a
+    /// teleport (review F1: at the default cadences the step is 0.8 m
+    /// aggro / 4.8 m patrol, larger than the 0.4 m body margin, so an
+    /// unblocked straight line is the only way to land on the target).
+    /// A blocked move is REFUSED in place (the patrol circuit routes
+    /// around; the pursuit stops at cover — the collide-what-you-stop-
+    /// at minimal semantics; full sweep movement is a later
+    /// refinement, stated).
     fn move_toward(&mut self, index: usize, target: [f32; 3], cadence: u64) {
         let adversary = &mut self.adversaries[index];
         let step = self.config.speed * self.config.tick_seconds * cadence as f32;
         let dx = target[0] - adversary.position[0];
         let dz = target[2] - adversary.position[2];
         let length = (dx * dx + dz * dz).sqrt();
-        if length <= f32::EPSILON || length <= step {
+        if length <= f32::EPSILON {
+            // The sub-EPSILON residue normalization: assign the
+            // target's bits without the blocking check — a ≤ ~1.2e-7 m
+            // displacement, six orders of magnitude below the body
+            // margin, unable to cross geometry (kept for bit-exact
+            // arrival; NOT the F1 snap, which is checked below).
             adversary.position = [target[0], adversary.position[1], target[2]];
             return;
         }
-        let next = [
-            adversary.position[0] + dx / length * step,
-            adversary.position[1],
-            adversary.position[2] + dz / length * step,
-        ];
+        let destination = if length <= step {
+            [target[0], adversary.position[1], target[2]]
+        } else {
+            [
+                adversary.position[0] + dx / length * step,
+                adversary.position[1],
+                adversary.position[2] + dz / length * step,
+            ]
+        };
         let blocked = self
             .collision
             .segment_hit(
@@ -421,12 +437,12 @@ impl AdversaryWorld {
                     adversary.position[1] + 0.5,
                     adversary.position[2],
                 ],
-                [next[0], next[1] + 0.5, next[2]],
+                [destination[0], destination[1] + 0.5, destination[2]],
                 0.4,
             )
             .is_some();
         if !blocked {
-            adversary.position = next;
+            adversary.position = destination;
         }
     }
 
@@ -1305,6 +1321,83 @@ mod tests {
             spine.world().adversary(0).last_attack,
             spine2.world().adversary(0).last_attack,
             "the surfaced occlusion double-runs identical"
+        );
+    }
+
+    /// Review F1 (the snap-branch teleport), at the DEFAULT cadences:
+    /// the aggro wake step is 0.8 m (speed 4.0 × 0.1 s × cadence 2) —
+    /// larger than the 0.4 m body margin — so the `<= step` snap
+    /// branch could displace an adversary through blocking geometry.
+    /// The knee wall (y 0..1.0 at x 0.3..0.7) blocks the ground
+    /// movement line (y 0.5 inside its margin-inflated span) while
+    /// the eye-to-eye perception line (y ≈ 1.5..1.6) passes clear
+    /// above it: the adversary aggros and attacks across the wall,
+    /// and its post-attack pursuit — the remembered player position
+    /// 0.6 m away, inside one 0.8 m step — must be REFUSED in place,
+    /// never snapped through the wall. The no-wall control proves the
+    /// unblocked snap still lands bit-exactly.
+    #[test]
+    fn snap_branch_respects_colliders_at_default_cadences() {
+        let config = AdversaryConfig {
+            waypoint_radius: 0.0,
+            ..AdversaryConfig::default()
+        };
+        let spawn = circuit_waypoint(&config, 0, 0);
+        let player = [spawn[0] + 0.6, spawn[1], spawn[2]];
+
+        // The walled run: the pursuit never leaves the spawn spot.
+        let knee_wall = StaticCollider {
+            min: [spawn[0] + 0.3, 0.0, spawn[2] - 2.0],
+            max: [spawn[0] + 0.7, 1.0, spawn[2] + 2.0],
+        };
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(
+                config.clone(),
+                CollisionWorld::new(0.0).with_collider(knee_wall),
+            ),
+            200,
+            60,
+        );
+        install_adversary_schedules(&mut spine);
+        for _ in 0..40 {
+            spine.world_mut().set_player_position(player);
+            spine.run_tick();
+        }
+        let adversary = spine.world().adversary(0);
+        assert_eq!(
+            adversary.position, spawn,
+            "the snap must not teleport through the knee wall"
+        );
+        assert!(
+            adversary.attacks_emitted >= 1,
+            "the adversary still fights across the wall — the refusal is \
+             movement discipline, not a dead machine"
+        );
+        assert!(
+            matches!(
+                adversary.state,
+                AdversaryState::Aggro | AdversaryState::Attack | AdversaryState::Recover
+            ),
+            "the encounter stays engaged ({:?})",
+            adversary.state
+        );
+
+        // The no-wall control: the same pursuit snaps onto the player
+        // position bit-exactly (the unblocked snap is legitimate).
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        install_adversary_schedules(&mut spine);
+        for _ in 0..40 {
+            spine.world_mut().set_player_position(player);
+            spine.run_tick();
+        }
+        assert_eq!(
+            spine.world().adversary(0).position,
+            player,
+            "the unblocked snap still lands on the target exactly"
         );
     }
 
