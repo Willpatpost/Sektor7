@@ -700,8 +700,13 @@ jobs:
           # run (the 513 inference was corrected from actuals: one of
           # D's +2 does not pass on Windows; never by weakening a
           # test).
-          expected=514
-          if [ "$(uname -s)" != "Linux" ]; then expected=513; fi
+          # Cycle 3.1 (e24ac9b): Linux 517/6/53 MEASURED at the
+          # corrective candidate (the encounter-lifecycle battery adds 3
+          # combat_world tests — the five regression classes). Windows
+          # 516 = the prior 513 + the same 3 (platform-uniform
+          # inference — this run confirms it).
+          expected=517
+          if [ "$(uname -s)" != "Linux" ]; then expected=516; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
