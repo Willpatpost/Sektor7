@@ -69,6 +69,7 @@
 
 use std::time::Duration;
 
+use crate::collision::RotatedCollider;
 use crate::fingerprint::Fingerprinter;
 
 /// Contact separation skin: swept targets clamp this far short of a
@@ -195,12 +196,14 @@ impl StaticCollider {
     }
 }
 
-/// The static collision world: boxes, a ground plane, optional bounds.
-/// This is the reusable query contract — a future physics backend
-/// implements the same queries.
+/// The static collision world: axis-aligned boxes, yaw-rotated boxes
+/// (Cycle 4 C — see [`crate::collision`]), a ground plane, optional
+/// bounds. This is the reusable query contract — a future physics
+/// backend implements the same queries.
 #[derive(Debug, Clone, Default)]
 pub struct CollisionWorld {
     colliders: Vec<StaticCollider>,
+    rotated: Vec<RotatedCollider>,
     bounds: Option<StaticCollider>,
     ground_y: f32,
 }
@@ -210,6 +213,7 @@ impl CollisionWorld {
     pub fn new(ground_y: f32) -> CollisionWorld {
         CollisionWorld {
             colliders: Vec::new(),
+            rotated: Vec::new(),
             bounds: None,
             ground_y,
         }
@@ -236,6 +240,43 @@ impl CollisionWorld {
         self
     }
 
+    /// Adds one yaw-rotated box collider (Cycle 4 C — the
+    /// [`crate::collision`] representation). Construction is available
+    /// from this revision; the rotated-aware QUERY wiring lands with
+    /// the swept implementation, and until it does every geometry
+    /// query refuses a world that carries rotated colliders LOUDLY
+    /// (the all-or-nothing coexistence rule — never the forbidden
+    /// half-rotated state where line-of-sight sees a shape movement
+    /// passes through). A `None` (a collider refused as
+    /// degenerate/non-finite by [`RotatedCollider::new`]'s validation)
+    /// is skipped: world literals should assert construction at their
+    /// own site so a refused cover piece is never silently missing.
+    pub fn with_rotated_collider(mut self, collider: Option<RotatedCollider>) -> CollisionWorld {
+        if let Some(collider) = collider {
+            self.rotated.push(collider);
+        }
+        self
+    }
+
+    /// The rotated colliders (empty in every pre-Cycle-4 world — the
+    /// byte-identity guarantee: the empty list takes the exact
+    /// existing query paths).
+    pub fn rotated(&self) -> &[RotatedCollider] {
+        &self.rotated
+    }
+
+    /// The skeleton coexistence guard: refuses rotated worlds in the
+    /// geometry queries until the Cycle-4 C wiring lands (replaced by
+    /// the real rotated paths in the implementation commit — an empty
+    /// list never reaches this branch's failure, so every existing
+    /// test and frozen trace is unchanged).
+    fn assert_rotated_wired(&self) {
+        assert!(
+            self.rotated.is_empty(),
+            "this world carries rotated colliders, which are not queryable at the Cycle-4 C skeleton revision — the movement/LOS wiring lands with the swept implementation (cycle4/interfaces/COLLISION-INTERFACE.md §2)"
+        );
+    }
+
     pub fn colliders(&self) -> &[StaticCollider] {
         &self.colliders
     }
@@ -251,6 +292,7 @@ impl CollisionWorld {
     /// Whether the given box strictly overlaps any collider (the
     /// nonpenetration check; contact at the [`SKIN`] margin is clear).
     pub fn box_overlaps(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        self.assert_rotated_wired();
         self.colliders
             .iter()
             .any(|col| (0..3).all(|a| min[a] < col.max[a] && max[a] > col.min[a]))
@@ -266,6 +308,7 @@ impl CollisionWorld {
     /// collider. The ground plane and bounds are NOT consulted (this
     /// is a line-of-sight/pull-in query over the box world).
     pub fn segment_hit(&self, from: [f32; 3], to: [f32; 3], margin: f32) -> Option<f32> {
+        self.assert_rotated_wired();
         let direction = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let mut best: Option<f32> = None;
         for col in &self.colliders {
@@ -321,6 +364,7 @@ impl CollisionWorld {
         axis: usize,
         delta: f32,
     ) -> (f32, bool) {
+        self.assert_rotated_wired();
         if delta == 0.0 {
             return (0.0, false);
         }
@@ -372,6 +416,7 @@ impl CollisionWorld {
     /// mathematically equal pushes resolve by iteration order —
     /// identically on every run and platform.
     pub fn depenetration(&self, player_min: [f32; 3], player_max: [f32; 3]) -> Option<[f32; 3]> {
+        self.assert_rotated_wired();
         let mut best: Option<(usize, f32, f32)> = None;
         for col in &self.colliders {
             let overlapping =
@@ -1162,6 +1207,25 @@ mod tests {
     use super::*;
 
     const DT: f32 = 1.0 / 60.0;
+
+    /// The Cycle-4 C skeleton coexistence guard, pinned: a world that
+    /// carries rotated colliders is REFUSED by the geometry queries
+    /// until the rotated wiring lands (the all-or-nothing rule — the
+    /// forbidden half-rotated state must fail loudly, never silently
+    /// misbehave). This test is REPLACED by the real rotated-query
+    /// battery when the wiring lands (COLLISION-INTERFACE §2).
+    #[test]
+    #[should_panic(expected = "not queryable at the Cycle-4 C skeleton revision")]
+    fn geometry_queries_refuse_rotated_worlds_until_the_wiring_lands() {
+        let world = CollisionWorld::new(0.0).with_rotated_collider(RotatedCollider::from_base_yaw(
+            [0.0, 0.0, 0.0],
+            2.0,
+            1.0,
+            2.0,
+            0.785,
+        ));
+        let _ = world.segment_hit([0.0, 1.0, 0.0], [10.0, 1.0, 0.0], 0.0);
+    }
 
     fn bits(values: [f32; 3]) -> [u32; 3] {
         values.map(f32::to_bits)
