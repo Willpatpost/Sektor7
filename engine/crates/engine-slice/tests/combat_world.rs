@@ -15,7 +15,7 @@ use engine_core::StaticCollider;
 use engine_shell::{InputSnapshot, MouseButton};
 use engine_slice::combat_demo::{
     ACTIVATION_Z, ADVERSARY_SPAWN, ARENA_BOXES, ArenaRole, CombatDemo, EncounterPhase,
-    PLAYER_SPAWN, adversary_body, arena_world, combat_config, map_combat_input,
+    PLAYER_SPAWN, adversary_body, arena_world, combat_config, health_bar, map_combat_input,
     run_combat_failure_headless, run_combat_headless, run_winnable_script,
 };
 
@@ -1429,4 +1429,43 @@ fn terminal_states_freeze_everything_and_reset_restores() {
         matches!(demo.encounter.phase, EncounterPhase::Won { .. }),
         "a full fresh round is playable after the WON reset"
     );
+}
+
+/// The Cycle-4 HUD health bar (F's feedback design §2): the ASCII
+/// cells under the overlay's ASCII-only font constraint — the exact
+/// filled/empty pattern at the boundary fractions, the clamping, and
+/// the degenerate born-defeated maximum. Presentation-only rounding
+/// (the nearest of 10 cells).
+#[test]
+fn hud_health_bar_renders_the_ascii_cells() {
+    assert_eq!(health_bar(100.0, 100.0), "[##########]", "full");
+    assert_eq!(health_bar(0.0, 100.0), "[----------]", "empty");
+    assert_eq!(
+        health_bar(62.0, 100.0),
+        "[######----]",
+        "0.62 rounds to 6 cells"
+    );
+    assert_eq!(
+        health_bar(65.0, 100.0),
+        "[#######---]",
+        "0.65 rounds to 7 cells"
+    );
+    assert_eq!(
+        health_bar(-5.0, 100.0),
+        "[----------]",
+        "negative clamps to empty"
+    );
+    assert_eq!(
+        health_bar(120.0, 100.0),
+        "[##########]",
+        "over-full clamps to full"
+    );
+    assert_eq!(
+        health_bar(50.0, 0.0),
+        "[----------]",
+        "a born-defeated maximum renders empty"
+    );
+    // The bar is ASCII-only (the overlay's font8x8 constraint — the
+    // non-ASCII glyphs render as '?' on screen).
+    assert!(health_bar(74.0, 100.0).is_ascii());
 }

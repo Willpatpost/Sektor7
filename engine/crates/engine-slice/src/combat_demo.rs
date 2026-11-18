@@ -1482,6 +1482,24 @@ impl Default for CombatOptions {
     }
 }
 
+/// The HUD health bar — the Cycle-4 feedback design §2's ASCII form
+/// (the overlay's glyph source is font8x8's ASCII-only legacy font:
+/// every non-ASCII code point renders as `?`, so the bar is
+/// `[####------]`-style `#`/`-` cells). A presentation-only rounding
+/// to the nearest of 10 cells; the numeric value beside the bar
+/// carries the precision. The degenerate `maximum == 0` (a
+/// born-defeated combatant) renders the empty bar.
+pub fn health_bar(current: f32, maximum: f32) -> String {
+    const CELLS: usize = 10;
+    let fraction = if maximum > 0.0 {
+        (current / maximum).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = ((fraction * CELLS as f32).round() as usize).min(CELLS);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(CELLS - filled))
+}
+
 /// The event→cue mapping (C's published table, F's wiring): every
 /// fire plays `Cue::Fire`, a landed hit adds `Cue::Impact`, an
 /// adversary attack on the player plays `Cue::Damage`, the
