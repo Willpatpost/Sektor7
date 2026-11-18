@@ -73,12 +73,10 @@
 
 use std::time::{Duration, Instant};
 
-use engine_core::adversary::{
-    AdversaryConfig, AdversaryState, AdversaryWorld, install_adversary_schedules,
-};
+use engine_core::adversary::{AdversaryConfig, AdversaryState, AdversaryWorld};
 use engine_core::{
     AttackProfile, AttackRequest, CameraMode, CollisionWorld, Combatant, DamageOutcome, Health,
-    HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider,
+    HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider, Tick,
     camera_pose_obstructed, health_full, look_direction, player_box, resolve_attack,
 };
 use engine_renderer::scene::SceneVertex;
@@ -363,7 +361,24 @@ fn adversary_spine(config: &CombatConfig) -> Spine<AdversaryWorld> {
         200,
         60,
     );
-    install_adversary_schedules(&mut spine);
+    // The Cycle-3.1 defect-A fix: the encounter's adversaries start
+    // DORMANT (B's opt-in composition surface) and NOTHING is
+    // scheduled at construction — the dormant adversary's ONLY entry
+    // is the `activation_spec` first wake-up that the activation
+    // line schedules (the deterministic event-driven mechanism; the
+    // wake transitions DORMANT → PATROL and the cadence chains carry
+    // it onward). NOTE: `install_adversary_schedules` is NOT called
+    // — its schedules are unconditional over `count` (its
+    // "non-dormant only" doc does not match the code at this tree),
+    // so it would wake the dormant adversary early; a dormant-start
+    // encounter composes through the activation event alone. This
+    // is the ENCOUNTER's composition policy; B's naturally-active
+    // worlds (the default PATROL start + the installer) are
+    // untouched.
+    let count = spine.world().count();
+    for index in 0..count {
+        spine.world_mut().set_dormant(index);
+    }
     spine
 }
 
@@ -564,22 +579,65 @@ impl CombatDemo {
         tick: u64,
         fire: bool,
     ) {
+        // 0. THE TERMINAL GUARD (the Cycle-3.1 defect-B fix): WON and
+        //    LOST are GENUINE terminal states — the result and its
+        //    logical timestamp are preserved, the counters freeze,
+        //    and ALL combat effects stop (no further damage, no
+        //    weapon resolution, no AI combat effects — the spine
+        //    stops advancing; the encounter is over). The
+        //    presentation continues normally OUTSIDE this transition
+        //    (the render loop, the camera, the overlay); R is the
+        //    explicit fresh-round reset. A post-terminal fire press
+        //    gets the honest refusal line (feedback, not a counter).
+        if encounter.phase.is_terminal() {
+            if fire {
+                Self::log(
+                    encounter,
+                    tick,
+                    "fire refused — the encounter is over ([R] reset)",
+                );
+            }
+            return;
+        }
         // 1. Activation: the contact trigger on the z-line (once —
         //    the DORMANT phase gate makes it single-shot). The
-        //    encounter phase is F's ORCHESTRATION marker (feedback,
-        //    cues, the scenario structure); the adversary's own wake
-        //    is B's perception (AGGRO on distance + LOS at a
-        //    wake-up) — it patrols from spawn, self-governing.
+        //    Cycle-3.1 defect-A fix makes the contract REAL: the
+        //    adversary is DORMANT (no chain — nothing was scheduled
+        //    at construction), and the activation schedules B's
+        //    `activation_spec` first wake-up at the NEXT spine tick
+        //    — the deterministic event-driven mechanism (the wake
+        //    transitions DORMANT → PATROL; the cadence chains then
+        //    carry the machine onward). No idle per-frame adversary
+        //    processing exists anywhere.
         if encounter.phase == EncounterPhase::Dormant && player.position[2] <= ACTIVATION_Z {
             encounter.phase = EncounterPhase::Active;
+            let due = Tick(spine.run_ticks(0).0 + 1);
+            if let Some(spec) = spine.world().activation_spec(0, due) {
+                spine
+                    .schedule(spec)
+                    .expect("the activation schedule is dependency-free");
+            }
             Self::log(encounter, tick, "encounter activated — the adversary stirs");
         }
         // 2. The cooldown advance (one transition per logical tick).
         if encounter.cooldown_remaining > 0 {
             encounter.cooldown_remaining -= 1;
         }
-        // 3. The fire edge (one press, one resolution).
-        if fire {
+        // 3. The fire edge. Pre-activation (the Cycle-3.1 defect-A
+        //    companion): the weapon does NOT resolve before the
+        //    line — no incoherent damage on a dormant adversary, no
+        //    kill-in-its-sleep path, no permanently-dormant
+        //    unwinnable state (the encounter starts at the line, and
+        //    the activation at step 1 happens FIRST within the same
+        //    tick, so a press on the crossing tick resolves
+        //    normally).
+        if fire && encounter.phase == EncounterPhase::Dormant {
+            Self::log(
+                encounter,
+                tick,
+                "fire refused — the adversary is dormant (cross the line)",
+            );
+        } else if fire {
             Self::fire_weapon(
                 encounter,
                 spine,

@@ -370,6 +370,24 @@ impl AdversaryWorld {
         )
     }
 
+    /// Sets the adversary to DORMANT (the Cycle-3.1 encounter-
+    /// composition surface, paired with [`Self::activation_spec`]):
+    /// an encounter that gates its start on its own line begins its
+    /// adversaries dormant — `install_adversary_schedules` then
+    /// schedules NOTHING for them (it schedules only non-dormant
+    /// adversaries), and the encounter schedules the first wake-up
+    /// through `activation_spec` at its activation moment. This is
+    /// an OPT-IN composition policy: naturally-active worlds (the
+    /// default PATROL start) never call it. Minimal and additive —
+    /// flagged for the Cycle-3.1 reviewer.
+    pub fn set_dormant(&mut self, index: usize) {
+        if let Some(adversary) = self.adversaries.get_mut(index) {
+            adversary.state = AdversaryState::Dormant;
+            adversary.perceived = None;
+            adversary.los_lost = 0;
+        }
+    }
+
     /// The distance on the ground plane (the perception metric).
     fn ground_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
         let dx = a[0] - b[0];

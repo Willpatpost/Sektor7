@@ -124,14 +124,13 @@ fn winnable_scenario_completes_headless() {
 
     let expected_sequence = [
         "settled on the arena ground",
-        "adversary attack — player takes 20 (80/100)",
         "encounter activated — the adversary stirs",
-        "adversary attack — player takes 20 (60/100)",
+        "adversary attack — player takes 20 (80/100)",
         "fire 1: HIT — adversary 75/100",
+        "adversary attack — player takes 20 (60/100)",
         "fire 2: HIT — adversary 50/100",
         "adversary attack — player takes 20 (40/100)",
         "fire 3: HIT — adversary 25/100",
-        "adversary attack — player takes 20 (20/100)",
         "fire 4: HIT — adversary 0/100",
         "ADVERSARY DEFEATED — encounter WON",
     ];
@@ -145,17 +144,16 @@ fn winnable_scenario_completes_headless() {
     }
     assert!(first.contains("outcome: WON"), "the win is reported");
     assert!(
-        first.contains("attacks taken 4"),
-        "the adversary meaningfully threatened the player (four landed attacks — \
-         the R1xR2 combined semantics: B's canonical logical-tick cooldown \
-         attacks on a ~26-tick cycle; the R1-era value was 2)"
+        first.contains("attacks taken 3"),
+        "the adversary meaningfully threatened the player (three landed attacks — \
+         the Cycle-3.1 lifecycle: NO attacks before the activation; the adversary \
+         wakes at the line, pursues, and fights on the canonical cooldown)"
     );
     assert!(first.contains("fires 4"), "exactly four fires");
     assert!(first.contains("refused=0"), "no refused movement steps");
     assert!(
-        first.contains("player: hp 20/100"),
-        "the player survives wounded (barely — a maximally threatened win; \
-         the R1-era value was 60/100): {}",
+        first.contains("player: hp 40/100"),
+        "the player survives wounded: {}",
         first
             .lines()
             .find(|l| l.starts_with("player:"))
@@ -173,8 +171,8 @@ fn failure_scenario_reproduces_headless() {
 
     let expected_sequence = [
         "settled on the arena ground",
-        "adversary attack — player takes 20 (80/100)",
         "encounter activated — the adversary stirs",
+        "adversary attack — player takes 20 (80/100)",
         "adversary attack — player takes 20 (60/100)",
         "adversary attack — player takes 20 (40/100)",
         "adversary attack — player takes 20 (20/100)",
@@ -202,7 +200,12 @@ fn failure_scenario_reproduces_headless() {
 /// scripted courses never look, so yaw and pitch stay exactly zero —
 /// frozen constants, cross-platform; the walk stops are PLAYER-ONLY
 /// lines, so the traces cannot drift with the seeded circuit
-/// arithmetic inside B's module).
+/// arithmetic inside B's module). Both pins are the CYCLE-3.1
+/// lifecycle remeasures: the defective pre-activation attacks and
+/// post-terminal mutations are gone, so the encounters now run
+/// longer (the adversary wakes only at the activation line) — the
+/// run lengths moved, moving the digests; the old values are
+/// preserved as defective-semantics evidence.
 #[test]
 fn combat_scenario_trace_pinned() {
     let winnable = run_combat_headless();
@@ -211,10 +214,13 @@ fn combat_scenario_trace_pinned() {
         .find_map(|line| line.strip_prefix("player-trace="))
         .expect("the winnable summary carries the trace fingerprint");
     assert_eq!(
-        trace, "d2ef688081dbc659",
-        "the winnable scenario trace — UNCHANGED through the B-swap \
-         (the player-only walk; a divergence is an investigation, \
-         never a silent re-pin)"
+        trace, "e134e82fe6aea0b1",
+        "the winnable scenario trace — the Cycle-3.1 lifecycle remeasure \
+         (the adversary wakes at the activation line, so the encounter \
+         runs to WON at tick 203 vs 147 — the recorded run is longer; \
+         the old value d2ef688081dbc659 was the DEFECTIVE \
+         pre-activation-attacks semantics, preserved as evidence — a \
+         further divergence is an investigation, never a silent re-pin)"
     );
 
     let failure = run_combat_failure_headless();
@@ -223,13 +229,14 @@ fn combat_scenario_trace_pinned() {
         .find_map(|line| line.strip_prefix("player-trace="))
         .expect("the failure summary carries the trace fingerprint");
     assert_eq!(
-        trace, "0ddc141d7e3c53c1",
-        "the failure scenario trace — the ONE COMBINED R1xR2 remeasure \
-         (B's canonical logical-tick cooldown defeats the passive player \
-         earlier — LOST at tick 162 vs 274 — so the run records fewer \
-         idle movement ticks; the R1-era value was 18e578ef87eec296, \
-         the pre-B-swap provisional 494ade50b21d43cc; both preserved as \
-         evidence — a further divergence is an investigation, never a \
+        trace, "96a42525fe95b3e9",
+        "the failure scenario trace — the Cycle-3.1 lifecycle remeasure \
+         (no pre-activation attacks: the passive player is defeated at \
+         tick 218 vs 162 — the recorded run is longer; the old values \
+         0ddc141d7e3c53c1 (the R1xR2 combined) and 18e578ef87eec296 (the \
+         R1 era) and 494ade50b21d43cc (the pre-B-swap provisional) are \
+         preserved as evidence — a further divergence is an \
+         investigation, never a \
          silent re-pin)"
     );
 }
@@ -327,11 +334,16 @@ fn fire_refused_out_of_range_and_occluded() {
 
     // The pillar occlusion: the seed-32 circuit spawn (2.500,
     // −3.956) sits dead on the east (2.5, 3.0) pillar's line; the
-    // player north of that pillar fires dead-ahead at tick 2 (the
-    // seeded first patrol wake is later, so the spawn holds) — the
-    // exact-slab query blocks the eye→entry segment through the
-    // pillar. A blocked shot does no damage (B's machine never sees
-    // it — the patrolling state is untouched).
+    // player north of that pillar fires dead-ahead — the exact-slab
+    // query blocks the eye→entry segment through the pillar. A
+    // blocked shot does no damage (B's machine never sees it). The
+    // Cycle-3.1 staging: the encounter ACTIVATES first (the player
+    // crosses the line via a tick at z = 1.5, then the setup
+    // teleport places them behind the pillar — the phase gate is
+    // one-shot, the position staging is the test's own); the
+    // adversary wakes at the activation+1 tick and its first PATROL
+    // wake is ~12 ticks later, so the spawn position holds at the
+    // early fire.
     let mut config = combat_config();
     config.adversary_seed = 32;
     let mut demo = CombatDemo::new_with_config(config);
@@ -342,10 +354,17 @@ fn fire_refused_out_of_range_and_occluded() {
          the default seed's value)"
     );
     let state = demo.driver.state_mut();
-    state.position = [2.5, 0.0, 4.2];
+    state.position = [2.5, 0.0, 1.5];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
-    demo.tick(engine_core::MoveIntent::default(), false);
+    demo.tick(engine_core::MoveIntent::default(), false); // the activation tick
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Active,
+        "the crossing activates the encounter"
+    );
+    let state = demo.driver.state_mut();
+    state.position = [2.5, 0.0, 4.2]; // the staging: north of the pillar
     demo.tick(engine_core::MoveIntent::default(), true);
     assert_eq!(demo.encounter.blocked, 1, "the covered shot is blocked");
     assert_eq!(demo.encounter.hits, 0, "no damage through cover");
@@ -354,24 +373,27 @@ fn fire_refused_out_of_range_and_occluded() {
         last.starts_with("fire 1: BLOCKED"),
         "the occlusion refusal is logged: {last}"
     );
-    assert_eq!(
+    assert_ne!(
         demo.spine.world().adversary(0).state,
-        engine_core::adversary::AdversaryState::Patrol,
+        engine_core::adversary::AdversaryState::Aggro,
         "the blocked shot does not provoke (no damage received)"
     );
 
     // The low wall never blocks the standing shot: the dead-ahead
     // line over the left low wall (its top 1.1 m is below the eye).
-    // The landed hit on the PATROLLING adversary provokes AGGRO
-    // (B's wired rule: damage received forces AGGRO from any
-    // non-dormant state).
+    // The landed hit on the woken adversary provokes AGGRO (B's
+    // wired rule: damage received forces AGGRO from any non-dormant
+    // state). The Cycle-3.1 staging: activate first (the phase
+    // gate), then the north-of-wall placement.
     let mut demo = CombatDemo::new();
     let adversary_x = demo.spine.world().adversary(0).position[0];
     let state = demo.driver.state_mut();
-    state.position = [adversary_x, 0.0, 4.2];
+    state.position = [adversary_x, 0.0, 1.5];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
-    demo.tick(engine_core::MoveIntent::default(), false);
+    demo.tick(engine_core::MoveIntent::default(), false); // the activation tick
+    let state = demo.driver.state_mut();
+    state.position = [adversary_x, 0.0, 4.2]; // the staging: north of the wall
     demo.tick(engine_core::MoveIntent::default(), true);
     assert_eq!(demo.encounter.hits, 1, "the shot passes over the low wall");
     assert_eq!(demo.encounter.blocked, 0, "the low wall does not block");
@@ -387,8 +409,10 @@ fn fire_refused_out_of_range_and_occluded() {
     );
     assert_eq!(
         demo.encounter.phase,
-        EncounterPhase::Dormant,
-        "the encounter's own marker stays at the line's authority"
+        EncounterPhase::Active,
+        "the encounter is live (the staging crossed the line first — the \
+         Cycle-3.1 lifecycle: pre-activation fire is refused, so the hit \
+         only lands on an ACTIVE encounter)"
     );
 }
 
@@ -1040,7 +1064,12 @@ fn ordering_pursuit_samples_each_tick_during_multi_tick_frames() {
 
     // The outcomes must agree: the attack landed in both, at the
     // same logical tick, with the same event log and the same
-    // adversary state.
+    // adversary state. The Cycle-3.1 class-5 extension: continue
+    // BOTH cadences to the TERMINAL outcome (the same idle loop per
+    // tick — the single-tick cadence via tick(), the coarse via one
+    // single-tick frame per iteration, keeping the per-tick
+    // interleaving identical) — the terminal transition must land
+    // identically too.
     let fine_attack = fine
         .encounter
         .events
@@ -1069,5 +1098,335 @@ fn ordering_pursuit_samples_each_tick_during_multi_tick_frames() {
         coarse.spine.world().adversary(0).position.map(f32::to_bits),
         fine.spine.world().adversary(0).position.map(f32::to_bits),
         "the pursuit observed each tick's own sample"
+    );
+    // To the terminal: the same per-tick interleaving in both
+    // cadences — BOTH sides on the single-tick FRAME path (the
+    // headless tick() path labels events 0-based while the frame
+    // path labels them 1-based — the owner's recorded timestamp-
+    // convention follow-up; comparing logs across the two label
+    // bases would diverge by one, so the terminal extension keeps
+    // both cadences on the frame path, which is also the live-loop
+    // path this regression protects).
+    for _ in 0..3_000 {
+        if fine.encounter.phase.is_terminal() && coarse.encounter.phase.is_terminal() {
+            break;
+        }
+        if !fine.encounter.phase.is_terminal() {
+            fine.advance_frame(tick_frame, idle, false);
+        }
+        if !coarse.encounter.phase.is_terminal() {
+            coarse.advance_frame(tick_frame, idle, false);
+        }
+    }
+    assert_eq!(
+        coarse.encounter.phase, fine.encounter.phase,
+        "the terminal outcome is identical across the cadences"
+    );
+    assert_eq!(
+        coarse.encounter.events, fine.encounter.events,
+        "the full combat log including the terminal is cadence-independent"
+    );
+}
+
+/// The Cycle-3.1 defect-A regression, class 1 — PRE-ACTIVATION: an
+/// extended idle at the spawn is GENUINELY dormant: the phase stays
+/// Dormant, the player keeps full health, zero attacks land, no
+/// terminal declares, the adversary never leaves DORMANT (nothing
+/// was scheduled — zero idle cost), and pre-activation weapon
+/// presses are REFUSED (no incoherent damage, no kill-in-its-sleep
+/// path — the counters do not move and the adversary does not wake).
+/// Fail-first: at the defective candidate the adversary was
+/// PATROL-scheduled at construction — the idle player took attacks
+/// (the owner's Run 2: 17 attacks taken, 0 HP, still DORMANT).
+#[test]
+fn pre_activation_is_genuinely_dormant() {
+    let mut demo = CombatDemo::new();
+    let idle = engine_core::MoveIntent::default();
+
+    // The adversary starts DORMANT with nothing scheduled.
+    assert_eq!(
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Dormant,
+        "the composed encounter starts its adversary dormant"
+    );
+
+    // Extended idle at the spawn: 400 ticks, with fire presses
+    // throughout — nothing happens.
+    for _ in 0..400 {
+        demo.tick(idle, true);
+    }
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Dormant,
+        "the idle player never activates the encounter"
+    );
+    assert_eq!(
+        demo.encounter.player.current, 100.0,
+        "full health — no pre-activation damage"
+    );
+    assert_eq!(
+        demo.encounter.attacks_taken, 0,
+        "zero pre-activation attacks (the owner's Run 2 defect: 17)"
+    );
+    assert_eq!(
+        demo.encounter.fires, 0,
+        "pre-activation presses are refused, not resolved"
+    );
+    assert_eq!(demo.encounter.hits, 0);
+    assert_eq!(demo.encounter.cooldown_remaining, 0);
+    assert_eq!(
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Dormant,
+        "the adversary never woke (nothing was scheduled)"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(0).health.current,
+        100.0,
+        "no kill-in-its-sleep path"
+    );
+    // The refusal is honest feedback, once per press.
+    let refusals = demo
+        .encounter
+        .events
+        .iter()
+        .filter(|(_, line)| line.starts_with("fire refused — the adversary is dormant"))
+        .count();
+    assert_eq!(
+        refusals, 400,
+        "every pre-activation press is refused visibly"
+    );
+    assert!(
+        !demo
+            .encounter
+            .events
+            .iter()
+            .any(|(_, line)| line.starts_with("adversary attack")),
+        "no attack events pre-activation"
+    );
+}
+
+/// The Cycle-3.1 defect-A regression, class 2 — THE GENUINE-MOVEMENT
+/// CROSSING through the real spine: the activation lands on the
+/// crossing tick, the wake-up event fires on the NEXT spine tick
+/// (the deterministic event-driven mechanism), the adversary
+/// transitions DORMANT → PATROL → (perception) AGGRO, and the fight
+/// proceeds through the real machine — all from genuine movement.
+#[test]
+fn activation_wakes_the_adversary_through_the_spine() {
+    let mut demo = CombatDemo::new();
+    let forward = engine_core::MoveIntent {
+        forward: 1,
+        ..engine_core::MoveIntent::default()
+    };
+
+    // Walk to the line (genuine movement from the spawn): the
+    // activation lands on the crossing tick.
+    let mut activation_tick = None;
+    for _ in 0..200 {
+        let before = demo.encounter.phase;
+        demo.tick(forward, false);
+        if before == EncounterPhase::Dormant && demo.encounter.phase == EncounterPhase::Active {
+            activation_tick = Some(demo.tick_index() - 1);
+            break;
+        }
+    }
+    let activation_tick = activation_tick.expect("the walk crosses the activation line");
+    assert!(
+        demo.driver.state().position[2] <= 2.0,
+        "the activation came from real movement"
+    );
+    // The wake-up event is scheduled at THIS tick's spine run (the
+    // due arithmetic lands on the activation tick's own run_tick —
+    // step 4 below), so the adversary is already PATROL by the end
+    // of the activation tick: the deterministic event-driven
+    // mechanism, firing within the qualifying tick itself.
+    assert_eq!(
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Patrol,
+        "the activation event fired within the activation tick's spine run \
+         (DORMANT → PATROL)"
+    );
+    assert_eq!(demo.tick_index() - 1, activation_tick);
+
+    // The perception: the patrol wake-ups perceive the player
+    // (the ~3 m gap is inside the 8 m radius) — the real machine
+    // turns threatening, bounded and loud on stall.
+    let mut aggroed = false;
+    for _ in 0..100 {
+        if matches!(
+            demo.spine.world().adversary(0).state,
+            engine_core::adversary::AdversaryState::Aggro
+                | engine_core::adversary::AdversaryState::Attack
+                | engine_core::adversary::AdversaryState::Recover
+        ) {
+            aggroed = true;
+            break;
+        }
+        demo.tick(engine_core::MoveIntent::default(), false);
+    }
+    assert!(
+        aggroed,
+        "the woken adversary perceives and pursues the player"
+    );
+}
+
+/// The Cycle-3.1 defect-B regression, classes 3+4 — TERMINAL STATES
+/// FREEZE EVERYTHING: after LOST, many further ticks and fire
+/// presses change NOTHING (the outcome, its logical timestamp, the
+/// health, and the counters are stable; only the honest fire
+/// refusals are logged; no further AI combat effects); after WON
+/// the same holds over a substantial interval; and the R reset
+/// restores a FULL fresh round from BOTH outcomes (the pre-activation
+/// protection included — the restored adversary is dormant again).
+/// Fail-first: at the defective candidate the post-defeat attacks
+/// kept incrementing (the owner's Run 2: attacks past 0 HP) and the
+/// post-victory fires/hits kept counting.
+#[test]
+fn terminal_states_freeze_everything_and_reset_restores() {
+    let idle = engine_core::MoveIntent::default();
+
+    // === The LOST side: the failure miniature. ===
+    let mut demo = CombatDemo::new();
+    let state = demo.driver.state_mut();
+    state.position = [0.0, 0.0, 1.0];
+    state.velocity = [0.0, 0.0, 0.0];
+    state.on_ground = true;
+    for _ in 0..3_000 {
+        if demo.encounter.phase.is_terminal() {
+            break;
+        }
+        demo.tick(idle, false);
+    }
+    let (lost_tick, lost_events) = match demo.encounter.phase {
+        EncounterPhase::Lost { tick } => (tick, demo.encounter.events.clone()),
+        other => panic!("the miniature must lose (got {other:?})"),
+    };
+    let lost_counters = (
+        demo.encounter.attacks_taken,
+        demo.encounter.fires,
+        demo.encounter.hits,
+        demo.encounter.player.current,
+    );
+
+    // Many further ticks WITH fire presses: nothing moves.
+    for _ in 0..300 {
+        demo.tick(idle, true);
+    }
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Lost { tick: lost_tick },
+        "the LOST outcome and its timestamp are preserved"
+    );
+    assert_eq!(
+        (
+            demo.encounter.attacks_taken,
+            demo.encounter.fires,
+            demo.encounter.hits,
+            demo.encounter.player.current
+        ),
+        lost_counters,
+        "the counters and health are frozen post-defeat"
+    );
+    // Only the honest fire refusals were added — no new attacks,
+    // no weapon resolution, no AI effects.
+    let new_lines: Vec<&str> = demo
+        .encounter
+        .events
+        .iter()
+        .skip(lost_events.len())
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert!(
+        new_lines
+            .iter()
+            .all(|line| line.starts_with("fire refused — the encounter is over")),
+        "post-terminal events are only the honest refusals: {new_lines:?}"
+    );
+    assert!(
+        !demo
+            .encounter
+            .events
+            .iter()
+            .skip(lost_events.len())
+            .any(|(_, line)| line.starts_with("adversary attack")),
+        "no further AI combat effects post-defeat"
+    );
+
+    // The reset after LOST: a full fresh round with the
+    // pre-activation protection restored.
+    demo.reset();
+    assert_eq!(demo.encounter.phase, EncounterPhase::Dormant);
+    assert_eq!(demo.encounter.player.current, 100.0);
+    assert_eq!(
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Dormant,
+        "the reset restored the dormant adversary (the pre-activation protection)"
+    );
+    for _ in 0..200 {
+        demo.tick(idle, true);
+    }
+    assert_eq!(
+        demo.encounter.attacks_taken, 0,
+        "the reset restored the pre-activation protection (dormant adversary)"
+    );
+    assert_eq!(demo.encounter.fires, 0);
+    run_winnable_script(&mut demo);
+    assert!(
+        matches!(demo.encounter.phase, EncounterPhase::Won { .. }),
+        "a full fresh round is playable after the LOST reset"
+    );
+
+    // === The WON side: the victory, then a substantial interval of
+    // further ticks and fires — nothing moves; then the reset. ===
+    let mut demo = CombatDemo::new();
+    run_winnable_script(&mut demo);
+    let (won_tick, won_events) = match demo.encounter.phase {
+        EncounterPhase::Won { tick } => (tick, demo.encounter.events.clone()),
+        other => panic!("the winnable script must win (got {other:?})"),
+    };
+    let won_counters = (
+        demo.encounter.attacks_taken,
+        demo.encounter.fires,
+        demo.encounter.hits,
+        demo.encounter.player.current,
+    );
+    for _ in 0..300 {
+        demo.tick(idle, true);
+    }
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Won { tick: won_tick },
+        "the WON outcome and its timestamp are preserved"
+    );
+    assert_eq!(
+        (
+            demo.encounter.attacks_taken,
+            demo.encounter.fires,
+            demo.encounter.hits,
+            demo.encounter.player.current
+        ),
+        won_counters,
+        "the counters and health are frozen post-victory"
+    );
+    let new_lines: Vec<&str> = demo
+        .encounter
+        .events
+        .iter()
+        .skip(won_events.len())
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert!(
+        new_lines
+            .iter()
+            .all(|line| line.starts_with("fire refused — the encounter is over")),
+        "post-victory events are only the honest refusals: {new_lines:?}"
+    );
+    demo.reset();
+    assert_eq!(demo.encounter.phase, EncounterPhase::Dormant);
+    assert_eq!(demo.encounter.player.current, 100.0);
+    run_winnable_script(&mut demo);
+    assert!(
+        matches!(demo.encounter.phase, EncounterPhase::Won { .. }),
+        "a full fresh round is playable after the WON reset"
     );
 }
