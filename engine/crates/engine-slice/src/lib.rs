@@ -5,6 +5,7 @@
 
 pub mod backup;
 pub mod benchmark;
+pub mod combat_demo;
 pub mod crossing;
 pub mod frame_timing;
 pub mod math;
