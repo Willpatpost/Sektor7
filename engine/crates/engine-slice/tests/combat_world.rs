@@ -676,3 +676,127 @@ fn combat_mapping_preserves_mouse_look() {
     // The same snapshot carries no fire edge without a mouse press.
     assert!(!mapped.fire_pressed);
 }
+
+/// The review-F2 pacing regression: the combat transition advances
+/// PER EXECUTED LOGICAL TICK, decoupled from the frame cadence —
+/// (a) three 2-tick frames and six 1-tick frames reach BIT-IDENTICAL
+/// encounter state (the same logical ticks, the same cooldown and
+/// adversary steps, whatever the frame rate); (b) a fire press on a
+/// 0-tick frame (frames outpacing the 60 Hz tick rate) is BUFFERED
+/// to the next executed tick — input never dropped, exactly one fire
+/// at the correct logical index; (c) a fire edge on a multi-tick
+/// frame lands ONCE, on the first executed tick.
+#[test]
+fn combat_pacing_advances_per_executed_tick_not_per_frame() {
+    let idle = engine_core::MoveIntent::default();
+    let tick_frame = std::time::Duration::from_nanos(16_666_666); // 1/60 s → 1 tick
+    let two_tick_frame = std::time::Duration::from_nanos(33_333_333); // 2/60 s → 2 ticks
+    let zero_tick_frame = std::time::Duration::from_nanos(8_000_000); // 8 ms → 0 ticks at 60 Hz
+
+    // (a) The cadence equivalence: 3×2-tick frames == 6×1-tick
+    //     frames. The adversary is live (teleport past the line,
+    //     activate, let it pursue) so the rate-dependent state
+    //     (pursuit position + cooldown) is part of the comparison.
+    let mut coarse = CombatDemo::new();
+    let mut fine = CombatDemo::new();
+    for demo in [&mut coarse, &mut fine] {
+        let state = demo.driver.state_mut();
+        state.position = [0.0, 0.0, 1.5];
+        state.velocity = [0.0, 0.0, 0.0];
+        state.on_ground = true;
+        demo.tick(idle, false);
+    }
+    for _ in 0..3 {
+        coarse.advance_frame(two_tick_frame, idle, false);
+    }
+    for _ in 0..6 {
+        fine.advance_frame(tick_frame, idle, false);
+    }
+    assert_eq!(
+        coarse.tick_index(),
+        7,
+        "3×2-tick frames execute 6 ticks (+1 activation tick)"
+    );
+    assert_eq!(
+        fine.tick_index(),
+        7,
+        "6×1-tick frames execute 6 ticks (+1 activation tick)"
+    );
+    assert_eq!(
+        coarse.encounter.adversary.position.map(f32::to_bits),
+        fine.encounter.adversary.position.map(f32::to_bits),
+        "the pursuit advances per logical tick — bit-identical across cadences"
+    );
+    assert_eq!(
+        coarse.encounter.events, fine.encounter.events,
+        "the event log (timestamps included) is cadence-independent"
+    );
+
+    // (b) The buffered press: fire on 0-tick frames until a tick
+    //     executes — exactly ONE fire lands, at the correct index.
+    let mut demo = CombatDemo::new();
+    let state = demo.driver.state_mut();
+    state.position = [0.0, 0.0, 1.5];
+    state.velocity = [0.0, 0.0, 0.0];
+    state.on_ground = true;
+    demo.tick(idle, false); // tick 1: the activation
+    // 8 ms frames: no tick executes on any single frame — the press
+    // buffers; two consecutive frames accumulate 16 ms < 16.67 ms
+    // (still 0 ticks); the cadence eventually reaches the boundary.
+    demo.advance_frame(zero_tick_frame, idle, true);
+    assert_eq!(demo.encounter.fires, 0, "a 0-tick frame runs no transition");
+    demo.advance_frame(zero_tick_frame, idle, false);
+    assert_eq!(
+        demo.encounter.fires, 0,
+        "the buffered press waits for a tick"
+    );
+    let mut executed = 0;
+    for _ in 0..10 {
+        let step = demo.advance_frame(zero_tick_frame, idle, false);
+        executed += u64::from(step.executed_ticks);
+        if executed > 0 {
+            break;
+        }
+    }
+    assert!(
+        executed >= 1,
+        "an 8 ms frame cadence eventually executes a tick"
+    );
+    assert_eq!(
+        demo.encounter.fires, 1,
+        "the buffered press resolves exactly once on the executed tick"
+    );
+    let (fire_tick, _) = demo
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("fire 1:"))
+        .expect("the fire event");
+    assert_eq!(
+        *fire_tick,
+        demo.tick_index(),
+        "the fire logs against the tick index that executed it (no repeated index)"
+    );
+
+    // (c) A fire edge on a 2-tick frame lands ONCE (the first
+    //     executed tick).
+    let mut demo = CombatDemo::new();
+    let state = demo.driver.state_mut();
+    state.position = [0.0, 0.0, 1.5];
+    state.velocity = [0.0, 0.0, 0.0];
+    state.on_ground = true;
+    demo.tick(idle, false);
+    demo.advance_frame(two_tick_frame, idle, true);
+    assert_eq!(
+        demo.encounter.fires, 1,
+        "one press, one fire — even on a multi-tick frame"
+    );
+    assert_eq!(demo.tick_index(), 3, "the frame executed both ticks");
+    let (fire_tick, _) = demo
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("fire 1:"))
+        .expect("the fire event");
+    assert_eq!(*fire_tick, 2, "the edge lands on the FIRST executed tick");
+}

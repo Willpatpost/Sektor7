@@ -581,6 +581,11 @@ pub struct CombatDemo {
     pub encounter: EncounterState,
     config: CombatConfig,
     ticks: u64,
+    /// A fire press observed on a frame that executed no logical tick
+    /// (possible when frames outpace the 60 Hz tick rate): buffered to
+    /// the next executed tick's transition — input is never dropped
+    /// (the review-F2 pacing discipline).
+    pending_fire: bool,
 }
 
 impl Default for CombatDemo {
@@ -608,6 +613,7 @@ impl CombatDemo {
             encounter: EncounterState::fresh(&config),
             config,
             ticks: 0,
+            pending_fire: false,
         }
     }
 
@@ -785,8 +791,34 @@ impl CombatDemo {
         fire: bool,
     ) -> engine_core::DriveStep {
         let step = self.driver.advance(elapsed, intent);
-        self.ticks += u64::from(step.executed_ticks);
-        self.apply_combat_transition(self.ticks, fire);
+        let executed = u64::from(step.executed_ticks);
+        self.ticks += executed;
+        // The combat transition advances PER EXECUTED LOGICAL TICK
+        // (the review-F2 fix: the cooldown decrement, the pursuit
+        // step, the attack gate, and the DEFEATED drain are
+        // rate-dependent — a frame-rate-coupled once-per-frame call
+        // would pace them by the render cadence, against the GO §6
+        // binding standard). A 0-tick frame (frames outpacing the
+        // tick rate) runs NO transition, buffering the fire press to
+        // the next executed tick; the frame's fire edge lands on the
+        // FIRST executed tick — one press, one resolution, at the
+        // correct logical index. At the 1:1 cadence (60 fps frames,
+        // one tick each) the single transition receives exactly the
+        // post-advance tick index — byte-identical to the headless
+        // semantics (the equivalence the scenarios and the connected
+        // route already pin).
+        if executed == 0 {
+            if fire {
+                self.pending_fire = true;
+            }
+            return step;
+        }
+        let fire_edge = fire || self.pending_fire;
+        self.pending_fire = false;
+        for index in 0..executed {
+            let tick = self.ticks - executed + index + 1;
+            self.apply_combat_transition(tick, fire_edge && index == 0);
+        }
         step
     }
 
@@ -950,6 +982,7 @@ impl CombatDemo {
         self.encounter = EncounterState::fresh(&self.config);
         self.encounter.rounds = rounds;
         self.ticks = 0;
+        self.pending_fire = false;
         self.log_public(
             0,
             format!("encounter reset — transient state, round {rounds}"),
