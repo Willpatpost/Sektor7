@@ -45,6 +45,7 @@
 //! modes, a fixed-step driver), exercised by its own tests and the
 //! engine-slice demo application.
 
+pub mod adversary;
 pub mod clock;
 pub mod diag;
 pub mod event;
