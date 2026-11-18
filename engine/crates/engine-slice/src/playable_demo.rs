@@ -38,7 +38,9 @@ use engine_core::{
     look_direction, player_box, select_target,
 };
 use engine_renderer::scene::SceneVertex;
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+};
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
 use crate::frame_timing::FrameTiming;
@@ -1002,6 +1004,29 @@ fn push_rect_box(vertices: &mut Vec<SceneVertex>, min: [f32; 3], max: [f32; 3], 
     );
 }
 
+/// Assembles one playable frame's scene geometry into `out` (cleared
+/// first): the courtyard floor — the collision ground plane made
+/// visible — then the layout's current render boxes. The shared seam
+/// the scene-separation regression drives headlessly and the
+/// encounter presentation builds on. The floor is render-only
+/// presentation: the plane at y = 0 already collides
+/// (`CollisionWorld::new(0.0)`), so no collider and no layout box is
+/// added (the 21-box census and collide-what-you-see are untouched);
+/// its extent tucks under the perimeter walls so no face is coplanar
+/// with a wall face.
+pub fn build_scene_vertices_into(out: &mut Vec<SceneVertex>, demo: &PlayableDemo) {
+    out.clear();
+    push_rect_box(
+        out,
+        [-5.85, -0.5, -23.85],
+        [5.85, 0.0, 9.85],
+        [0.32, 0.30, 0.28],
+    );
+    for (min, max, color) in demo.render_boxes() {
+        push_rect_box(out, min, max, color);
+    }
+}
+
 /// The interactive playable demo (`--playable`): the Cycle-1 demo
 /// skeleton over the gatehouse — fixed-step movement on the full raw
 /// interval, the obstructed third-person camera, E to interact, C to
@@ -1017,10 +1042,15 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
     let mut app = ShellApp::new(shell_config)?;
     app.set_relative_mouse(true);
 
+    // The P3 omission, stated explicitly: the playable world renders
+    // the gatehouse and its courtyard floor — its OWN geometry — and
+    // nothing the renderer would otherwise impose. The original
+    // Stage-2 demonstration stays available through `--render`.
     let render_config = RenderConfig {
         present_mode: options.present,
         validation: options.validation,
         replace_pipelines: false,
+        demo_scene: DemoScenePreference::Omitted,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
@@ -1044,6 +1074,11 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
             stats.extent.0,
             stats.extent.1,
             stats.validation_active
+        );
+        println!(
+            "  scene: the playable world renders its own geometry (gatehouse + \
+             courtyard floor) — the Stage-2 demo scene is omitted; --render keeps \
+             the original demonstration"
         );
         println!(
             "  controls: WASD move · Space jump · Shift sprint · E interact · \
@@ -1108,11 +1143,9 @@ pub fn run_playable_demo(options: PlayableOptions) -> Result<(), String> {
         let projection = math::perspective(std::f32::consts::FRAC_PI_3, aspect, 0.1, 200.0);
         let view_proj = math::mul(&projection, &view);
 
-        // The visible gatehouse + the player proxy (retained buffer).
-        scene_vertices.clear();
-        for (min, max, color) in demo.render_boxes() {
-            push_rect_box(&mut scene_vertices, min, max, color);
-        }
+        // The visible gatehouse + the courtyard floor (retained
+        // buffer, through the shared presentation seam).
+        build_scene_vertices_into(&mut scene_vertices, &demo);
 
         let state = demo.driver.state();
         let overlay_text = renderer.overlay_enabled().then(|| {

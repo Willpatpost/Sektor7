@@ -134,7 +134,11 @@ impl Renderer {
         // The depth format is chosen once and shared by the render pass
         // and every depth attachment (corrective finding F).
         let depth_format = pick_depth_format(&ctx.instance, ctx.physical_device);
-        let mut pipes = match PipelineState::new(&ctx, format, depth_format) {
+        // The demo-scene preference is fixed at construction (P3): the
+        // static Stage-2 demonstration scene uploads only on the
+        // explicit opt-in, and every later pipeline replacement is
+        // built with this same live preference.
+        let mut pipes = match PipelineState::new(&ctx, format, depth_format, config.demo_scene) {
             Ok(pipes) => pipes,
             Err(error) => {
                 ctx.destroy();
@@ -253,6 +257,7 @@ impl Renderer {
             window_size,
             self.config.present_mode,
             self.config.replace_pipelines,
+            self.config.demo_scene,
             view_proj,
             region_scene,
             overlay,

@@ -21,7 +21,8 @@
 
 use engine_renderer::scene::push_box;
 use engine_renderer::{
-    CaptureFormat, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+    CaptureFormat, DemoScenePreference, PresentModePreference, RenderConfig, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, ShellApp, ShellConfig};
 use engine_slice::math;
@@ -97,11 +98,16 @@ fn world_renders_right_side_up_offscreen() {
 
     // Renderer configuration, stated for checkability (the offscreen
     // smokes' discipline): FIFO via Auto, validation ON, overlay
-    // enabled (the glyph-position assertions depend on it).
+    // enabled (the glyph-position assertions depend on it), and the
+    // P3 explicit demo-scene opt-in — this smoke's scene and its
+    // pinned pixel counts were authored with the static Stage-2
+    // scene drawn beneath the region geometry, so the opt-in keeps
+    // the rendered image (and the pinned evidence) byte-identical.
     let config = RenderConfig {
         present_mode: PresentModePreference::Auto,
         validation: ValidationPreference::On,
         replace_pipelines: false,
+        demo_scene: DemoScenePreference::Included,
     };
     let mut app = ShellApp::new(ShellConfig {
         title: "Sektor7 orientation smoke".to_string(),

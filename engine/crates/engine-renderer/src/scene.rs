@@ -1,7 +1,10 @@
 //! The Stage 2 demo scene: a ground grid and a field of shaded cubes with
 //! deliberately overlapping depth demonstrators. Scene *content* is first
 //! application data, not an engine mechanism — the renderer only knows
-//! the vertex format.
+//! the vertex format. Since Cycle 3 (P3) the renderer enforces that
+//! statement: this scene uploads and draws only through the explicit
+//! `RenderConfig::demo_scene = DemoScenePreference::Included` opt-in —
+//! never by default, never on a game's scene.
 
 use crate::config::FRAMES_IN_FLIGHT;
 

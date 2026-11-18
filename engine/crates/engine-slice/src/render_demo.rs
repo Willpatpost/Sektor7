@@ -6,7 +6,8 @@
 use std::time::{Duration, Instant};
 
 use engine_renderer::{
-    PresentModePreference, RenderConfig, RenderStats, Renderer, ValidationPreference,
+    DemoScenePreference, PresentModePreference, RenderConfig, RenderStats, Renderer,
+    ValidationPreference,
 };
 use engine_shell::{DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig};
 
@@ -252,10 +253,13 @@ pub fn run_render_demo(options: RenderOptions) -> Result<(), String> {
     let mut app = ShellApp::new(shell_config)?;
     app.set_relative_mouse(true);
 
+    // The explicit opt-in (P3): this IS the rendering demonstration —
+    // the Stage-2 scene it presents is its subject, not an imposition.
     let render_config = RenderConfig {
         present_mode: options.present,
         validation: options.validation,
         replace_pipelines: options.replace_pipelines,
+        demo_scene: DemoScenePreference::Included,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;

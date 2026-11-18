@@ -64,6 +64,22 @@ impl ValidationPreference {
     }
 }
 
+/// The Stage-2 demonstration scene preference (Cycle 3, P3): scene
+/// content is application data, not an engine mechanism — the
+/// renderer must not impose the demonstration scene (ground plate,
+/// grid, cube field) on a game's scene. `Omitted` — the DEFAULT —
+/// uploads and draws no static demo scene; `Included` is the explicit
+/// opt-in that preserves the original rendering demonstration
+/// (`--render`, `--player`, `--demo-persist`, the render smokes)
+/// exactly. The preference is per-renderer-instance and is carried
+/// across every pipeline replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DemoScenePreference {
+    #[default]
+    Omitted,
+    Included,
+}
+
 /// Renderer configuration. Presentation *pacing* (frame-rate targets,
 /// uncapped measurement) stays in the application — the renderer never
 /// imposes an engine-wide frame-rate ceiling, and rendering cadence is
@@ -81,6 +97,11 @@ pub struct RenderConfig {
     /// produce (the CI resize smoke keeps the surface format). Never
     /// set by normal operation.
     pub replace_pipelines: bool,
+    /// The static Stage-2 demonstration scene draws only on explicit
+    /// opt-in (Cycle 3, P3) — see [`DemoScenePreference`]. The
+    /// default omits it: a game's scene is the dynamic geometry the
+    /// application supplies, never content the renderer imposes.
+    pub demo_scene: DemoScenePreference,
 }
 
 /// Frames simultaneously in flight (sync objects per slot). Fixed at 2 for
@@ -239,6 +260,21 @@ mod tests {
             ValidationPreference::parse("off"),
             Some(ValidationPreference::Off)
         );
+    }
+
+    #[test]
+    fn the_default_configuration_omits_the_demo_scene() {
+        // The P3 owner-observable contract, pinned at the type level:
+        // a renderer constructed with no explicit preference must not
+        // opt the demonstration scene in — flipping this default back
+        // to Included would re-impose demo content on every game
+        // scene (the pixel-level proof is the render_scene_separation
+        // smoke; this pin fails the build first).
+        assert_eq!(
+            RenderConfig::default().demo_scene,
+            DemoScenePreference::Omitted
+        );
+        assert_eq!(DemoScenePreference::default(), DemoScenePreference::Omitted);
     }
 
     #[test]

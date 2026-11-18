@@ -69,8 +69,8 @@ use ash::vk;
 use ash::{Device, Entry, Instance};
 
 use crate::config::{
-    DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig, dynamic_geometry_clamp,
-    resolve_present_mode,
+    DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig,
+    dynamic_geometry_clamp, resolve_present_mode,
 };
 use crate::overlay::OverlayVertex;
 use crate::scene::SceneVertex;
@@ -1179,11 +1179,15 @@ pub(crate) struct PipelineState {
 impl PipelineState {
     /// `depth_format` comes from the renderer's single pick (corrective
     /// finding F) so the render pass matches the swapchain's depth
-    /// attachments exactly.
+    /// attachments exactly. `demo_scene` is the P3 preference: the
+    /// static Stage-2 demonstration scene is uploaded ONLY on the
+    /// explicit opt-in — an omitted renderer owns no scene buffers and
+    /// the record step's guarded draw skips the static scene.
     pub(crate) fn new(
         ctx: &VulkanContext,
         color_format: vk::Format,
         depth_format: vk::Format,
+        demo_scene: DemoScenePreference,
     ) -> Result<PipelineState, RendererError> {
         // Partial-initialization cleanup (corrective finding G): handles
         // start dead; on failure `destroy` releases exactly what exists.
@@ -1209,7 +1213,7 @@ impl PipelineState {
             region_slot_bytes: 0,
             region_mapped: core::ptr::null_mut(),
         };
-        if let Err(error) = state.build(ctx, color_format, depth_format) {
+        if let Err(error) = state.build(ctx, color_format, depth_format, demo_scene) {
             state.destroy(ctx);
             return Err(error);
         }
@@ -1221,27 +1225,35 @@ impl PipelineState {
         ctx: &VulkanContext,
         color_format: vk::Format,
         depth_format: vk::Format,
+        demo_scene: DemoScenePreference,
     ) -> Result<(), RendererError> {
         Self::create_pipelines(ctx, color_format, depth_format, self)?;
 
         // Scene buffers: upload once through a staging buffer into
-        // device-local memory.
-        let (vertices, indices) = crate::scene::build_scene();
-        self.scene_index_count = indices.len() as u32;
-        let (scene_vbo, scene_vbo_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            bytemuck::cast_slice(&vertices),
-        )?;
-        self.scene_vbo = scene_vbo;
-        self.scene_vbo_memory = scene_vbo_memory;
-        let (scene_ibo, scene_ibo_memory) = create_device_local_buffer_with_data(
-            ctx,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            bytemuck::cast_slice(&indices),
-        )?;
-        self.scene_ibo = scene_ibo;
-        self.scene_ibo_memory = scene_ibo_memory;
+        // device-local memory — ONLY on the explicit opt-in (Cycle 3
+        // P3): the reusable renderer must not impose the Stage-2
+        // demonstration content on a game's scene. `Omitted` leaves
+        // the handles null and `scene_index_count` 0, so the record
+        // step's guarded draw skips the static scene entirely and the
+        // renderer pays no scene-buffer allocation at all.
+        if demo_scene == DemoScenePreference::Included {
+            let (vertices, indices) = crate::scene::build_scene();
+            self.scene_index_count = indices.len() as u32;
+            let (scene_vbo, scene_vbo_memory) = create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                bytemuck::cast_slice(&vertices),
+            )?;
+            self.scene_vbo = scene_vbo;
+            self.scene_vbo_memory = scene_vbo_memory;
+            let (scene_ibo, scene_ibo_memory) = create_device_local_buffer_with_data(
+                ctx,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                bytemuck::cast_slice(&indices),
+            )?;
+            self.scene_ibo = scene_ibo;
+            self.scene_ibo_memory = scene_ibo_memory;
+        }
 
         // Overlay buffer: persistently mapped host-visible with one
         // disjoint region per frame slot (corrective finding B) — a
@@ -2381,6 +2393,7 @@ pub(crate) fn render_frame(
     window_size: (u32, u32),
     present_preference: PresentModePreference,
     replace_pipelines: bool,
+    demo_scene: DemoScenePreference,
     view_proj: &[[f32; 4]; 4],
     region_vertices: &[SceneVertex],
     overlay_vertices: &[OverlayVertex],
@@ -2428,6 +2441,7 @@ pub(crate) fn render_frame(
             window_size,
             present_preference,
             replace_pipelines,
+            demo_scene,
         )?;
         outcome.recreated = true;
     }
@@ -2443,6 +2457,7 @@ pub(crate) fn render_frame(
             window_size,
             present_preference,
             replace_pipelines,
+            demo_scene,
         )?;
         outcome.recreated = true;
     }
@@ -2497,6 +2512,7 @@ pub(crate) fn render_frame(
             window_size,
             present_preference,
             replace_pipelines,
+            demo_scene,
         )?;
         outcome.recreated = true;
         acquire_result = unsafe {
@@ -2646,12 +2662,19 @@ pub(crate) fn render_frame(
             0,
             bytemuck::bytes_of(view_proj),
         );
-        ctx.device
-            .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
-        ctx.device
-            .cmd_bind_index_buffer(command, pipes.scene_ibo, 0, vk::IndexType::UINT32);
-        ctx.device
-            .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+        // The static demonstration scene draws only when the explicit
+        // opt-in uploaded it (`scene_index_count > 0`, P3) — an
+        // omitted renderer binds nothing and draws nothing here; the
+        // scene pipeline below still draws the dynamic region
+        // geometry through the same bound state.
+        if pipes.scene_index_count > 0 {
+            ctx.device
+                .cmd_bind_vertex_buffers(command, 0, &[pipes.scene_vbo], &[0]);
+            ctx.device
+                .cmd_bind_index_buffer(command, pipes.scene_ibo, 0, vk::IndexType::UINT32);
+            ctx.device
+                .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
+        }
 
         // Dynamic region scene (Stage 4 graphical integration): drawn
         // through the already-bound scene pipeline (same vertex layout
@@ -2859,6 +2882,7 @@ pub(crate) fn render_frame(
                 window_size,
                 present_preference,
                 replace_pipelines,
+                demo_scene,
             )?;
             outcome.recreated = true;
         }
@@ -2912,6 +2936,7 @@ fn read_timestamps(ctx: &VulkanContext, frames: &FrameState, slot: usize) -> Opt
 /// When the surface format changed, the replacement pipelines are built
 /// first — framebuffers are always created against the render pass that
 /// will be current after the swap, never a stale one.
+#[allow(clippy::too_many_arguments)]
 fn recreate_swapchain(
     ctx: &mut VulkanContext,
     swapchain: &mut SwapchainState,
@@ -2920,6 +2945,7 @@ fn recreate_swapchain(
     window_size: (u32, u32),
     present_preference: PresentModePreference,
     replace_pipelines: bool,
+    demo_scene: DemoScenePreference,
 ) -> Result<(), RendererError> {
     unsafe { ctx.device.device_wait_idle() }
         .map_err(|error| RendererError::vk(error, "device_wait_idle"))?;
@@ -2931,9 +2957,13 @@ fn recreate_swapchain(
     // format-change lifecycle without a real format change; the CI
     // resize smoke cannot otherwise reach it because resizing keeps
     // the surface format). On failure the old state is untouched and
-    // the partial replacement cleans itself up (finding G).
+    // the partial replacement cleans itself up (finding G). The
+    // replacement is built with the LIVE demo-scene preference (P3):
+    // a recreated pipeline renders exactly what its predecessor did —
+    // an omitted renderer must not gain demo content by recreating,
+    // and an opted-in demonstration must not lose it.
     let replacement_pipes = if replace_pipelines || new_format != swapchain.format {
-        let mut replacement = PipelineState::new(ctx, new_format, depth_format)?;
+        let mut replacement = PipelineState::new(ctx, new_format, depth_format, demo_scene)?;
         // Stage 4 final-review finding A: a replacement pipeline must
         // be fully prepared for dynamic region drawing BEFORE it
         // becomes active. If the outgoing state owns a lazily

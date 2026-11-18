@@ -81,7 +81,9 @@ use engine_persist::{
     AuthorityMode, CanonicalMedium, CommitOutcome, ConsequenceId, Hash, RevisionRecord, SyncTier,
     T1Journal, UnknownReason,
 };
-use engine_renderer::{PresentModePreference, RenderConfig, Renderer, ValidationPreference};
+use engine_renderer::{
+    DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
+};
 use engine_shell::{
     DriverPreference, InputSnapshot, Keycode, ShellApp, ShellConfig, resident_set_kib,
 };
@@ -2474,10 +2476,13 @@ pub fn run_persist_demo(options: DemoOptions) -> Result<(), String> {
     let mut app = ShellApp::new(shell_config)?;
     app.set_relative_mouse(true);
 
+    // The explicit opt-in (P3): the campaign visualization presents
+    // over the Stage-2 demonstration scene, as it always has.
     let render_config = RenderConfig {
         present_mode: options.present,
         validation: options.validation,
         replace_pipelines: false,
+        demo_scene: DemoScenePreference::Included,
     };
     let mut renderer =
         Renderer::new(app.window(), render_config).map_err(|error| error.to_string())?;
