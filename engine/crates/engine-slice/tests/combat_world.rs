@@ -3,6 +3,13 @@
 //! GPU, no process spawns — the deterministic scenarios, the mapping,
 //! and the demo's public surfaces (the same discipline as the
 //! Cycle-2 playable battery).
+//!
+//! The encounter drives SEAT B's reviewed adversary module (the
+//! spine composition); the scenario expectations were RE-MEASURED at
+//! the swap (the review-F1 honest re-measurement: the winnable keeps
+//! its tick-147 resolution and its UNCHANGED player trace; the
+//! failure's player trace is a NEW pinned value — the walk's stop
+//! became player-only, cross-platform-safe).
 
 use engine_core::StaticCollider;
 use engine_shell::{InputSnapshot, MouseButton};
@@ -62,8 +69,8 @@ fn arena_layout_pinned() {
         );
     }
 
-    // The spawn geometry: the adversary dead-ahead of the player
-    // (both on the centerline), the activation line between them.
+    // The spawn geometry: the player and the adversary's home ground
+    // on the centerline, the activation line between them.
     assert_eq!(PLAYER_SPAWN, [0.0, 2.0, 6.0]);
     assert_eq!(ADVERSARY_SPAWN, [0.0, 0.0, -4.0]);
     assert_eq!(ACTIVATION_Z, 2.0);
@@ -88,10 +95,27 @@ fn arena_layout_pinned() {
     }
 }
 
+/// B's seeded circuit spawn (the adversary's position at
+/// construction, per the composed `AdversaryConfig`: seed 0xA11CE,
+/// the circuit of radius 2.5 around the home ground) — MEASURED and
+/// pinned (a divergence is an investigation, never a silent re-pin;
+/// the value feeds the placement literals below).
+#[test]
+fn adversary_circuit_spawn_pinned() {
+    let demo = CombatDemo::new();
+    let position = demo.spine.world().adversary(0).position;
+    assert_eq!(
+        position,
+        [-1.2500001, 0.0, -1.8349366], // MEASURED at the swap (fail-first captured).
+        "the seeded circuit spawn (measured at the swap)"
+    );
+}
+
 /// The full WINNABLE scenario, headless and deterministic: the event
-/// sequence in order, activation, the fire ladder, the one attack
-/// taken, the defeat, and the completion — byte-identical across
-/// invocations.
+/// sequence in order — B's machine catches the walking player (the
+/// first attack lands BEFORE the activation line: the adversary is
+/// self-governing, perception-driven), the exchange, and the
+/// completion — byte-identical across invocations.
 #[test]
 fn winnable_scenario_completes_headless() {
     let first = run_combat_headless();
@@ -100,11 +124,12 @@ fn winnable_scenario_completes_headless() {
 
     let expected_sequence = [
         "settled on the arena ground",
-        "encounter activated — the adversary wakes",
+        "adversary attack — player takes 20 (80/100)",
+        "encounter activated — the adversary stirs",
         "fire 1: HIT — adversary 75/100",
         "fire 2: HIT — adversary 50/100",
+        "adversary attack — player takes 20 (60/100)",
         "fire 3: HIT — adversary 25/100",
-        "adversary attack — player takes 20",
         "fire 4: HIT — adversary 0/100",
         "ADVERSARY DEFEATED — encounter WON",
     ];
@@ -118,13 +143,13 @@ fn winnable_scenario_completes_headless() {
     }
     assert!(first.contains("outcome: WON"), "the win is reported");
     assert!(
-        first.contains("attacks taken 1"),
-        "the adversary meaningfully threatened the player (one landed attack)"
+        first.contains("attacks taken 2"),
+        "the adversary meaningfully threatened the player (two landed attacks)"
     );
     assert!(first.contains("fires 4"), "exactly four fires");
     assert!(first.contains("refused=0"), "no refused movement steps");
     assert!(
-        first.contains("player: hp 80/100"),
+        first.contains("player: hp 60/100"),
         "the player survives wounded: {}",
         first
             .lines()
@@ -143,8 +168,8 @@ fn failure_scenario_reproduces_headless() {
 
     let expected_sequence = [
         "settled on the arena ground",
-        "encounter activated — the adversary wakes",
         "adversary attack — player takes 20 (80/100)",
+        "encounter activated — the adversary stirs",
         "adversary attack — player takes 20 (60/100)",
         "adversary attack — player takes 20 (40/100)",
         "adversary attack — player takes 20 (20/100)",
@@ -163,15 +188,16 @@ fn failure_scenario_reproduces_headless() {
     assert!(first.contains("fires 0"), "the player never fired");
     assert!(first.contains("attacks taken 5"), "five attacks to defeat");
     assert!(
-        first.contains("adversary: ACTIVE · hp 100/100"),
+        first.contains("adversary: RECOVER · hp 100/100"),
         "the adversary survives the failure"
     );
 }
 
 /// The scenarios' player traces, pinned (the libm-free class: the
 /// scripted courses never look, so yaw and pitch stay exactly zero —
-/// frozen constants, cross-platform; measured at the scaffold
-/// delivery and pinned here).
+/// frozen constants, cross-platform; the walk stops are PLAYER-ONLY
+/// lines, so the traces cannot drift with the seeded circuit
+/// arithmetic inside B's module).
 #[test]
 fn combat_scenario_trace_pinned() {
     let winnable = run_combat_headless();
@@ -181,7 +207,8 @@ fn combat_scenario_trace_pinned() {
         .expect("the winnable summary carries the trace fingerprint");
     assert_eq!(
         trace, "d2ef688081dbc659",
-        "the winnable scenario trace (a divergence is an investigation, \
+        "the winnable scenario trace — UNCHANGED through the B-swap \
+         (the player-only walk; a divergence is an investigation, \
          never a silent re-pin)"
     );
 
@@ -191,9 +218,11 @@ fn combat_scenario_trace_pinned() {
         .find_map(|line| line.strip_prefix("player-trace="))
         .expect("the failure summary carries the trace fingerprint");
     assert_eq!(
-        trace, "494ade50b21d43cc",
-        "the failure scenario trace (a divergence is an investigation, \
-         never a silent re-pin)"
+        trace, "18e578ef87eec296",
+        "the failure scenario trace — RE-MEASURED at the B-swap (the \
+         review-F1 honest re-measurement: the walk's stop became the \
+         player-only z ≤ 1.0 line; the old provisional pin was \
+         494ade50b21d43cc)"
     );
 }
 
@@ -220,18 +249,20 @@ fn fire_edge_fires_once_per_press() {
     };
     assert!(!map_combat_input(&lost, false).fire_pressed);
 
-    // Demo level: teleport past the activation line, activate, and
-    // press once (the adversary is dead-ahead — the shot hits).
+    // Demo level: teleport past the activation line onto the
+    // adversary's spawn x-line (the zero-angle aim), activate, and
+    // press once (the shot hits the patrolling adversary).
     let mut demo = CombatDemo::new();
+    let adversary_x = demo.spine.world().adversary(0).position[0];
     let state = demo.driver.state_mut();
-    state.position = [0.0, 0.0, 1.5];
+    state.position = [adversary_x, 0.0, 1.5];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
     demo.tick(engine_core::MoveIntent::default(), false);
     assert_eq!(
         demo.encounter.phase,
         EncounterPhase::Active,
-        "crossing the line activates the encounter"
+        "crossing the line activates the encounter's marker"
     );
     demo.tick(engine_core::MoveIntent::default(), true);
     assert_eq!(demo.encounter.fires, 1, "one press, one fire");
@@ -261,15 +292,20 @@ fn fire_edge_fires_once_per_press() {
 /// The fire refusals: out of range (with the measured distance), the
 /// pillar occlusion (BLOCKED behind cover), and the low wall that
 /// never blocks a standing eye-level shot (the honest cover model).
+/// The placements ride the MEASURED circuit position (read from the
+/// live world at setup — the pinned spawn test guards the value),
+/// keeping the zero-angle aim discipline.
 #[test]
 fn fire_refused_out_of_range_and_occluded() {
     // Out of range: the shrunken-range config against the dead-ahead
-    // spawn geometry (the entry distance ~5.55 m > the 5.0 m range).
+    // geometry (the measured circuit spawn sits ~3.4 m from the z=2
+    // placement; the 3.0 m range refuses the shot).
     let mut config = combat_config();
-    config.weapon_range = 5.0;
+    config.weapon_range = 3.0;
     let mut demo = CombatDemo::new_with_config(config);
+    let adversary_x = demo.spine.world().adversary(0).position[0];
     let state = demo.driver.state_mut();
-    state.position = [0.0, 0.0, 2.0];
+    state.position = [adversary_x, 0.0, 2.0];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
     demo.tick(engine_core::MoveIntent::default(), false);
@@ -277,45 +313,54 @@ fn fire_refused_out_of_range_and_occluded() {
     assert_eq!(demo.encounter.out_of_range, 1, "the far shot is refused");
     let last = demo.encounter.events.last().expect("an event").1.clone();
     assert!(
-        last.starts_with("fire 1: OUT OF RANGE") && last.contains("m > 5 m"),
+        last.starts_with("fire 1: OUT OF RANGE") && last.contains("m > 3 m"),
         "the refusal names the distance: {last}"
     );
 
-    // The pillar occlusion: the adversary behind the (3.5, −1.0)
-    // pillar, the player dead-ahead of it on the same line — the
-    // exact-slab query blocks the eye→entry segment. A blocked shot
-    // does no damage, so the DORMANT adversary stays dormant (the
-    // provocation rule requires damage).
-    let mut demo = CombatDemo::new();
-    demo.encounter.adversary.position = [3.5, 0.0, -4.0];
+    // The pillar occlusion: the seed-32 circuit spawn (2.500,
+    // −3.956) sits dead on the east (2.5, 3.0) pillar's line; the
+    // player north of that pillar fires dead-ahead at tick 2 (the
+    // seeded first patrol wake is later, so the spawn holds) — the
+    // exact-slab query blocks the eye→entry segment through the
+    // pillar. A blocked shot does no damage (B's machine never sees
+    // it — the patrolling state is untouched).
+    let mut config = combat_config();
+    config.adversary_seed = 32;
+    let mut demo = CombatDemo::new_with_config(config);
+    assert_eq!(
+        demo.spine.world().adversary(0).position,
+        [2.4996192, 0.0, -3.956369],
+        "the seed-32 circuit spawn (measured; the pinned spawn test guards \
+         the default seed's value)"
+    );
     let state = demo.driver.state_mut();
-    state.position = [3.5, 0.0, 3.5];
+    state.position = [2.5, 0.0, 4.2];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
     demo.tick(engine_core::MoveIntent::default(), false);
     demo.tick(engine_core::MoveIntent::default(), true);
     assert_eq!(demo.encounter.blocked, 1, "the covered shot is blocked");
+    assert_eq!(demo.encounter.hits, 0, "no damage through cover");
     let last = demo.encounter.events.last().expect("an event").1.clone();
     assert!(
         last.starts_with("fire 1: BLOCKED"),
         "the occlusion refusal is logged: {last}"
     );
     assert_eq!(
-        demo.encounter.phase,
-        EncounterPhase::Dormant,
-        "a blocked shot does not provoke"
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Patrol,
+        "the blocked shot does not provoke (no damage received)"
     );
 
     // The low wall never blocks the standing shot: the dead-ahead
-    // line over the left low wall (its top 1.1 m is below the eye);
-    // the player stands at z = 4.2, clear of the (−2.5, 3.0) pillar's
-    // footprint. The landed hit damages the DORMANT adversary WITHOUT
-    // waking it — SEAT B's wired DORMANT rule: activation is the
-    // encounter line's authority, not damage.
+    // line over the left low wall (its top 1.1 m is below the eye).
+    // The landed hit on the PATROLLING adversary provokes AGGRO
+    // (B's wired rule: damage received forces AGGRO from any
+    // non-dormant state).
     let mut demo = CombatDemo::new();
-    demo.encounter.adversary.position = [-3.0, 0.0, -4.0];
+    let adversary_x = demo.spine.world().adversary(0).position[0];
     let state = demo.driver.state_mut();
-    state.position = [-3.0, 0.0, 4.2];
+    state.position = [adversary_x, 0.0, 4.2];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
     demo.tick(engine_core::MoveIntent::default(), false);
@@ -323,81 +368,81 @@ fn fire_refused_out_of_range_and_occluded() {
     assert_eq!(demo.encounter.hits, 1, "the shot passes over the low wall");
     assert_eq!(demo.encounter.blocked, 0, "the low wall does not block");
     assert_eq!(
-        demo.encounter.adversary.health.current, 75.0,
-        "the contract's Health transition applies the damage"
+        demo.spine.world().adversary(0).health.current,
+        75.0,
+        "the contract's Health transition applies the damage (through B's module)"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(0).state,
+        engine_core::adversary::AdversaryState::Aggro,
+        "damage received provokes AGGRO (B's wired rule)"
     );
     assert_eq!(
         demo.encounter.phase,
         EncounterPhase::Dormant,
-        "damage does not wake the DORMANT adversary (B's wired rule: \
-         the activation line is the authority)"
-    );
-    assert!(
-        !demo.encounter.adversary.active,
-        "the adversary itself stays dormant"
+        "the encounter's own marker stays at the line's authority"
     );
 }
 
-/// The adversary's threat contract: the melee attack is range-gated
-/// and line-of-sight-gated (cover protects the player), and the
-/// cooldown spaces the attacks.
+/// B's surfaced-attack application (the Health-ownership seam): the
+/// resolved attacks apply to the player's `Health` with F's damage
+/// policy — the failure shape in miniature (idle in the adversary's
+/// ground, never fire): the health ladder descends by the policy
+/// damage per surfaced Hit, the attacks are cadence-spaced, and the
+/// engine's Defeated declaration decides the loss.
 #[test]
-fn adversary_attack_respects_range_and_los() {
-    // In range but occluded: the adversary adjacent to the pillar
-    // with the player on its far side — the attack is refused.
+fn surfaced_attacks_apply_player_damage() {
     let mut demo = CombatDemo::new();
-    demo.encounter.adversary.activate();
-    demo.encounter.phase = EncounterPhase::Active;
-    demo.encounter.adversary.position = [3.1, 0.0, -0.4];
+    // The failure scenario's proven stop: the centerline inside the
+    // adversary's aggro ground (the player-only z ≤ 1.0 line).
     let state = demo.driver.state_mut();
-    state.position = [4.6, 0.0, -1.4];
+    state.position = [0.0, 0.0, 1.0];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
-    // The pillar (x ∈ [3.1, 3.9], z ∈ [−1.4, −0.6]) sits between the
-    // adversary eye (3.1, 1.6, −0.4) and the player eye (4.6, 1.6, −1.4).
-    for _ in 0..30 {
-        demo.tick(engine_core::MoveIntent::default(), false);
-    }
-    assert!(
-        demo.encounter
-            .events
-            .iter()
-            .any(|(_, line)| line.contains("adversary attack BLOCKED")),
-        "the occluded attack is refused with feedback"
-    );
-    assert_eq!(demo.encounter.attacks_taken, 0, "no damage through cover");
-    assert!(
-        demo.encounter.player.current > 99.0,
-        "the player is unhurt behind cover"
-    );
 
-    // The clear line: the same adjacency without the pillar between
-    // lands cooldown-spaced attacks (the pursuit closes the gap, so
-    // the exact tick spacing is behavior, not a pinned constant).
-    let mut demo = CombatDemo::new();
-    demo.encounter.adversary.activate();
-    demo.encounter.phase = EncounterPhase::Active;
-    demo.encounter.adversary.position = [0.0, 0.0, -3.0];
-    let state = demo.driver.state_mut();
-    state.position = [0.0, 0.0, -1.5];
-    state.velocity = [0.0, 0.0, 0.0];
-    state.on_ground = true;
-    for _ in 0..30 {
+    // The miniature: idle until the encounter resolves (the player
+    // who does not fight back loses; the loop breaks only on a
+    // TERMINAL phase — the Dormant marker at entry must not stop it).
+    for _ in 0..3_000 {
+        if demo.encounter.phase.is_terminal() {
+            break;
+        }
         demo.tick(engine_core::MoveIntent::default(), false);
     }
     assert!(
-        demo.encounter.attacks_taken >= 1,
-        "the clear-line attack lands"
+        matches!(demo.encounter.phase, EncounterPhase::Lost { .. }),
+        "the idle player is defeated"
     );
-    assert!(
-        demo.encounter.player.current < 100.0,
-        "the player takes damage"
+    assert_eq!(demo.encounter.fires, 0, "the player never fired");
+    assert_eq!(
+        demo.encounter.attacks_taken, 5,
+        "exactly five landed attacks (100 hp / 20 damage)"
     );
+    assert_eq!(demo.encounter.player.current, 0.0);
+    // The ladder: 80/60/40/20/0 in order.
+    let ladder: Vec<&str> = demo
+        .encounter
+        .events
+        .iter()
+        .filter(|(_, line)| line.starts_with("adversary attack — player takes"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    let expected = [
+        "adversary attack — player takes 20 (80/100)",
+        "adversary attack — player takes 20 (60/100)",
+        "adversary attack — player takes 20 (40/100)",
+        "adversary attack — player takes 20 (20/100)",
+        "adversary attack — player takes 20 (0/100)",
+    ];
+    assert_eq!(ladder, expected, "the health ladder, in order");
+    // The cadence spacing (B's wake-cycle: the cooldown decrements
+    // per wake-up, the recover window, then the re-aggro — the
+    // measured 54-tick cycle at these placeholders).
     let attack_ticks: Vec<u64> = demo
         .encounter
         .events
         .iter()
-        .filter(|(_, line)| line.starts_with("adversary attack —"))
+        .filter(|(_, line)| line.starts_with("adversary attack — player takes"))
         .map(|(tick, _)| *tick)
         .collect();
     for pair in attack_ticks.windows(2) {
@@ -414,8 +459,9 @@ fn adversary_attack_respects_range_and_los() {
 fn fire_works_in_both_camera_modes() {
     for third_person in [false, true] {
         let mut demo = CombatDemo::new();
+        let adversary_x = demo.spine.world().adversary(0).position[0];
         let state = demo.driver.state_mut();
-        state.position = [0.0, 0.0, 2.0];
+        state.position = [adversary_x, 0.0, 2.0];
         state.velocity = [0.0, 0.0, 0.0];
         state.on_ground = true;
         if third_person {
@@ -430,7 +476,7 @@ fn fire_works_in_both_camera_modes() {
             if third_person { "third" } else { "first" }
         );
         assert_eq!(
-            demo.encounter.adversary.health.current,
+            demo.spine.world().adversary(0).health.current,
             75.0,
             "the damage applies in {} person",
             if third_person { "third" } else { "first" }
@@ -458,7 +504,8 @@ fn encounter_reset_is_transient_and_repeatable() {
         "the player is restored"
     );
     assert_eq!(
-        demo.encounter.adversary.health.current, 100.0,
+        demo.spine.world().adversary(0).health.current,
+        100.0,
         "the adversary is restored"
     );
     assert_eq!(demo.encounter.fires, 0, "the counters are restored");
@@ -482,29 +529,28 @@ fn encounter_reset_is_transient_and_repeatable() {
 }
 
 /// The visible feedback: the render census and the state-dependent
-/// colors (the adversary by phase and hit-flash, the pad by phase,
-/// the player proxy in third person).
+/// colors (the adversary by B's live state and the hit-flash, the
+/// pad by phase, the player proxy in third person).
 #[test]
 fn arena_render_feedback_pinned() {
-    // Dormant, first person: 12 arena boxes + the gray adversary.
+    // Fresh (B's adversary patrols — the non-threatening gray), first
+    // person: 12 arena boxes + the adversary body.
     let demo = CombatDemo::new();
     let boxes = demo.render_boxes();
     assert_eq!(boxes.len(), 13, "12 arena boxes + the adversary body");
     let adversary = boxes.last().expect("the adversary body");
-    assert_eq!(adversary.2, [0.50, 0.50, 0.55], "the dormant gray");
+    assert_eq!(adversary.2, [0.50, 0.50, 0.55], "the patrolling gray");
 
-    // Active: the adversary turns red; the pad turns green (the
-    // activation recolor, read through the box list).
+    // The activation recolors the pad (read through the box list).
     let mut demo = CombatDemo::new();
+    let adversary_x = demo.spine.world().adversary(0).position[0];
     let state = demo.driver.state_mut();
-    state.position = [0.0, 0.0, ACTIVATION_Z];
+    state.position = [adversary_x, 0.0, ACTIVATION_Z];
     state.velocity = [0.0, 0.0, 0.0];
     state.on_ground = true;
     demo.tick(engine_core::MoveIntent::default(), false);
     assert_eq!(demo.encounter.phase, EncounterPhase::Active);
     let boxes = demo.render_boxes();
-    let adversary = boxes.last().expect("the adversary body");
-    assert_eq!(adversary.2, [0.75, 0.25, 0.20], "the active red");
     let pad = boxes
         .iter()
         .find(|(_, max, _)| *max == [1.5, 0.05, 2.2])
@@ -517,13 +563,18 @@ fn arena_render_feedback_pinned() {
     let adversary = boxes.last().expect("the adversary body");
     assert_eq!(adversary.2, [0.95, 0.95, 0.95], "the hit-flash white");
 
-    // The flash decays back to the active red after the window.
-    for _ in 0..7 {
+    // The flash decays back to the threatening red once B's machine
+    // aggros (the landed hit provoked it), after the flash window.
+    for _ in 0..12 {
         demo.tick(engine_core::MoveIntent::default(), false);
     }
     let boxes = demo.render_boxes();
     let adversary = boxes.last().expect("the adversary body");
-    assert_eq!(adversary.2, [0.75, 0.25, 0.20], "the flash decays");
+    assert_eq!(
+        adversary.2,
+        [0.75, 0.25, 0.20],
+        "the flash decays to the threatening red (provoked AGGRO)"
+    );
 
     // Defeated: the dark body; third person adds the player proxy.
     let mut demo = CombatDemo::new();
@@ -596,19 +647,18 @@ fn connected_live_frame_route_wins_the_encounter() {
 
     // 3. Hold position and fire on cooldown through the frame path
     //    (the fire edge on single frames, exactly as the interactive
-    //    loop maps the mouse press).
+    //    loop maps the mouse press — only when the adversary crosses
+    //    the dead-ahead aim line, the zero-angle discipline).
     for _ in 0..3_000 {
         if demo.encounter.phase != EncounterPhase::Active {
             break;
         }
-        let fire = demo.weapon_ready();
+        let on_line = demo.spine.world().adversary(0).position[0].abs() <= 0.4;
+        let fire = demo.weapon_ready() && on_line;
         demo.advance_frame(frame, idle, fire);
     }
-    assert_eq!(
-        demo.encounter.phase,
-        EncounterPhase::Won {
-            tick: demo.tick_index()
-        },
+    assert!(
+        matches!(demo.encounter.phase, EncounterPhase::Won { .. }),
         "the connected route wins the encounter"
     );
 
@@ -643,45 +693,11 @@ fn connected_live_frame_route_wins_the_encounter() {
     );
 }
 
-/// The interactive input mapping keeps the corrected mouse-look
-/// behavior (the playable mapping is reused verbatim — only the fire
-/// edge is added), so the combat camera turns exactly as the
-/// playable camera does.
-#[test]
-fn combat_mapping_preserves_mouse_look() {
-    use engine_core::player::look_direction;
-
-    // Mouse-RIGHT through map_combat_input + advance_frame turns the
-    // look direction toward world +X (the H2 hardening, unchanged).
-    let snapshot = InputSnapshot {
-        look_delta: (100.0, 0.0),
-        ..InputSnapshot::default()
-    };
-    let mapped = map_combat_input(&snapshot, false);
-    let mut demo = CombatDemo::new();
-    for _ in 0..3 {
-        demo.advance_frame(
-            std::time::Duration::from_nanos(16_666_666),
-            mapped.intent,
-            false,
-        );
-    }
-    let state = demo.driver.state();
-    let look = look_direction(state.yaw, state.pitch);
-    assert!(
-        look[0] > 0.2,
-        "mouse-right turns the combat camera toward world +X: {look:?}"
-    );
-
-    // The same snapshot carries no fire edge without a mouse press.
-    assert!(!mapped.fire_pressed);
-}
-
 /// The review-F2 pacing regression: the combat transition advances
 /// PER EXECUTED LOGICAL TICK, decoupled from the frame cadence —
 /// (a) three 2-tick frames and six 1-tick frames reach BIT-IDENTICAL
 /// encounter state (the same logical ticks, the same cooldown and
-/// adversary steps, whatever the frame rate); (b) a fire press on a
+/// adversary state, whatever the frame rate); (b) a fire press on a
 /// 0-tick frame (frames outpacing the 60 Hz tick rate) is BUFFERED
 /// to the next executed tick — input never dropped, exactly one fire
 /// at the correct logical index; (c) a fire edge on a multi-tick
@@ -694,9 +710,9 @@ fn combat_pacing_advances_per_executed_tick_not_per_frame() {
     let zero_tick_frame = std::time::Duration::from_nanos(8_000_000); // 8 ms → 0 ticks at 60 Hz
 
     // (a) The cadence equivalence: 3×2-tick frames == 6×1-tick
-    //     frames. The adversary is live (teleport past the line,
-    //     activate, let it pursue) so the rate-dependent state
-    //     (pursuit position + cooldown) is part of the comparison.
+    //     frames. B's spine advances on MY transition calls — the
+    //     same six run_ticks in the same order reach the identical
+    //     adversary state, whatever the frame cadence.
     let mut coarse = CombatDemo::new();
     let mut fine = CombatDemo::new();
     for demo in [&mut coarse, &mut fine] {
@@ -723,9 +739,9 @@ fn combat_pacing_advances_per_executed_tick_not_per_frame() {
         "6×1-tick frames execute 6 ticks (+1 activation tick)"
     );
     assert_eq!(
-        coarse.encounter.adversary.position.map(f32::to_bits),
-        fine.encounter.adversary.position.map(f32::to_bits),
-        "the pursuit advances per logical tick — bit-identical across cadences"
+        coarse.spine.world().adversary(0).position.map(f32::to_bits),
+        fine.spine.world().adversary(0).position.map(f32::to_bits),
+        "the adversary advances per logical tick — bit-identical across cadences"
     );
     assert_eq!(
         coarse.encounter.events, fine.encounter.events,
@@ -770,7 +786,7 @@ fn combat_pacing_advances_per_executed_tick_not_per_frame() {
         .encounter
         .events
         .iter()
-        .find(|(_, line)| line.starts_with("fire 1:"))
+        .find(|(_, line)| line.starts_with("fire "))
         .expect("the fire event");
     assert_eq!(
         *fire_tick,
@@ -796,7 +812,41 @@ fn combat_pacing_advances_per_executed_tick_not_per_frame() {
         .encounter
         .events
         .iter()
-        .find(|(_, line)| line.starts_with("fire 1:"))
+        .find(|(_, line)| line.starts_with("fire "))
         .expect("the fire event");
     assert_eq!(*fire_tick, 2, "the edge lands on the FIRST executed tick");
+}
+
+/// The interactive input mapping keeps the corrected mouse-look
+/// behavior (the playable mapping is reused verbatim — only the fire
+/// edge is added), so the combat camera turns exactly as the
+/// playable camera does.
+#[test]
+fn combat_mapping_preserves_mouse_look() {
+    use engine_core::player::look_direction;
+
+    // Mouse-RIGHT through map_combat_input + advance_frame turns the
+    // look direction toward world +X (the H2 hardening, unchanged).
+    let snapshot = InputSnapshot {
+        look_delta: (100.0, 0.0),
+        ..InputSnapshot::default()
+    };
+    let mapped = map_combat_input(&snapshot, false);
+    let mut demo = CombatDemo::new();
+    for _ in 0..3 {
+        demo.advance_frame(
+            std::time::Duration::from_nanos(16_666_666),
+            mapped.intent,
+            false,
+        );
+    }
+    let state = demo.driver.state();
+    let look = look_direction(state.yaw, state.pitch);
+    assert!(
+        look[0] > 0.2,
+        "mouse-right turns the combat camera toward world +X: {look:?}"
+    );
+
+    // The same snapshot carries no fire edge without a mouse press.
+    assert!(!mapped.fire_pressed);
 }

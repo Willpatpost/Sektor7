@@ -73,9 +73,12 @@
 
 use std::time::{Duration, Instant};
 
+use engine_core::adversary::{
+    AdversaryConfig, AdversaryState, AdversaryWorld, install_adversary_schedules,
+};
 use engine_core::{
     AttackProfile, AttackRequest, CameraMode, CollisionWorld, Combatant, DamageOutcome, Health,
-    HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, StaticCollider,
+    HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider,
     camera_pose_obstructed, health_full, look_direction, player_box, resolve_attack,
 };
 use engine_renderer::scene::SceneVertex;
@@ -207,17 +210,16 @@ pub const ARENA_BOXES: &[ArenaBox] = &[
 
 /// The player's spawn (dropped 2 m, like the gatehouse; settles).
 pub const PLAYER_SPAWN: [f32; 3] = [0.0, 2.0, 6.0];
-/// The adversary's DORMANT spawn (centerline, dead-ahead).
+/// The adversary's home ground (the patrol circuit's center,
+/// centerline, dead-ahead — B's `AdversaryConfig::spawn_center`).
 pub const ADVERSARY_SPAWN: [f32; 3] = [0.0, 0.0, -4.0];
-/// The activation line: the encounter starts when the player's z
-/// crosses down through this (the demo-layer contact trigger).
+/// The activation line: the encounter's orchestration marker flips
+/// when the player's z crosses down through this (the demo-layer
+/// contact trigger).
 pub const ACTIVATION_Z: f32 = 2.0;
 /// The adversary's body half-extent (the axis-aligned-box body
 /// model, mirroring `StaticCollider`'s shape discipline).
 pub const ADVERSARY_HALF: [f32; 3] = [0.45, 0.9, 0.45];
-/// The adversary's body height offset (the box spans y ∈ [0, 1.8] at
-/// a flat-floor position).
-pub const ADVERSARY_EYE_LIFT: f32 = 1.6;
 /// The encounter's combatant ids — GAME-OWNED per the contract §4
 /// (the engine only carries them; F defines the convention).
 pub const PLAYER_ID: u32 = 1;
@@ -275,25 +277,30 @@ pub struct CombatConfig {
     pub player_hp: f32,
     /// The adversary's maximum (and starting) health.
     pub adversary_hp: f32,
-    /// The adversary's pursuit speed (m/s, straight-line; the
-    /// provisional model has no pathing).
+    /// The adversary's pursuit speed (m/s; B's wake-cadenced
+    /// movement — the placeholder tuning).
     pub adversary_speed: f32,
     /// The adversary's melee reach (horizontal, center-to-center).
     pub adversary_attack_range: f32,
     /// The adversary's attack cooldown in ticks.
     pub adversary_attack_cooldown_ticks: u32,
-    /// The adversary's melee damage per landed attack.
+    /// The adversary's melee damage per landed attack (F's policy,
+    /// applied from B's surfaced resolution).
     pub adversary_damage: f32,
-    /// The DEFEATED drain length in ticks (mirrors SEAT B's
-    /// published drain-to-zero read surface).
+    /// The DEFEATED drain length in ticks (F's presentation window
+    /// over B's terminal state).
     pub defeated_drain_ticks: u32,
     /// The adversary hit-flash length in ticks (visual feedback).
     pub hit_flash_ticks: u32,
+    /// The adversary world's deterministic seed (B's circuit phase,
+    /// spawn spread, and perception jitter — a placeholder knob the
+    /// refusal-path tests also use to place the circuit spawn).
+    pub adversary_seed: u64,
 }
 
-/// The placeholder combat values (the scenario tuning: activation gap
-/// 6 m; the winnable script lands 4 fires / 4 hits with exactly one
-/// adversary attack taken — a threatened, meaningful win).
+/// The placeholder combat values (the scenario tuning: the winnable
+/// script lands 4 fires / 4 hits with two adversary attacks taken —
+/// a threatened, meaningful win; B's machine pressures the walk).
 pub fn combat_config() -> CombatConfig {
     CombatConfig {
         weapon_range: 30.0,
@@ -307,186 +314,55 @@ pub fn combat_config() -> CombatConfig {
         adversary_damage: 20.0,
         defeated_drain_ticks: 6,
         hit_flash_ticks: 6,
+        adversary_seed: 0xA11CE,
     }
 }
 
-// ==================================================== the provisional adversary
+// ==================================================== the adversary composition (SEAT B's module)
 
-/// One adversary step's outcome (the F-facing attack read surface).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AdversaryEvent {
-    /// A landed melee attack — the RESOLVED damage the encounter
-    /// applies to the player's `Health` (the adversary never mutates
-    /// it; the contract's Health-ownership convention).
-    AttackLanded { damage: f32 },
-    /// An attack attempt foiled by cover (honest feedback: the
-    /// contract's `MissKind::Occluded`).
-    AttackBlocked,
+/// The encounter's adversary configuration — SEAT B's
+/// `AdversaryConfig` with the demo's placeholder policy values (the
+/// mapping from [`CombatConfig`] is explicit and labeled: EVERY
+/// number is a placeholder; B's structural defaults are adopted
+/// where the arena's tuning does not bind). The adversary world runs
+/// on the SAME spine discipline B delivered (the 200/60 reservation
+/// — the owner-gated default, untouched) over the SAME arena
+/// collision content.
+fn adversary_config(config: &CombatConfig) -> AdversaryConfig {
+    AdversaryConfig {
+        seed: config.adversary_seed, // The demo's placeholder knob (deterministic).
+        count: 1,                    // ONE adversary — the encounter's shape.
+        tick_seconds: 1.0 / 60.0,    // The demo's 60 Hz fixed step.
+        aggro_radius: 8.0,           // B's placeholder perception.
+        deaggro_radius: 10.0,        // B's placeholder hysteresis.
+        los_loss_ticks: 24,          // B's placeholder tolerance.
+        patrol_cadence: 12,          // B's placeholder idle cadence.
+        aggro_cadence: 2,            // B's placeholder threat cadence.
+        recover_cadence: 6,          // B's placeholder recovery window.
+        attack_cooldown: u64::from(config.adversary_attack_cooldown_ticks),
+        attack_range: config.adversary_attack_range,
+        speed: config.adversary_speed,
+        waypoint_radius: 2.5, // Fits the arena's clear interior around the spawn center.
+        spawn_center: ADVERSARY_SPAWN, // The circuit's center (the arena's adversary ground).
+        max_health: config.adversary_hp,
+        eye_height: 1.5, // B's placeholder (≠ half the player body height).
+        player: playable_player_config(), // B's player view matches the demo's actual player.
+        player_id: PLAYER_ID, // The game-owned id convention (the contract §4).
+        adversary_id_base: ADVERSARY_ID,
+    }
 }
 
-/// The PROVISIONAL demo-local adversary — SEAT B's remaining seam.
-/// Shaped like B's published F-facing hooks: F activates (DORMANT →
-/// wake), F spawns/resets, F reads DEFEATED (the drain), and it
-/// conforms to B's wired DORMANT rule — damage does NOT wake a
-/// dormant adversary (the activation line is the encounter's
-/// authority). Straight-line pursuit with axis slide against the
-/// arena colliders (no pathing — it can stall behind cover in edge
-/// cases; B's state machine owns real movement). Walks the flat
-/// arena floor (no vertical movement). The body is non-solid for the
-/// player (walk-through, labeled). The ATTACK itself resolves
-/// through SEAT A's contract (`resolve_attack` against the player's
-/// `player_box` body — B's wired ATTACK-seam shape).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ProvisionalAdversary {
-    /// The flat-floor position (y is always 0).
-    pub position: [f32; 3],
-    /// The adversary's health — the contract's transition domain
-    /// (constructed via `health_full`; DEFEATED comes only from
-    /// `DamageOutcome::Defeated`).
-    pub health: Health,
-    /// Whether the DORMANT adversary has been activated.
-    pub active: bool,
-    /// Whether DEFEATED was declared (the drain then runs down).
-    pub defeated: bool,
-    /// The remaining DEFEATED drain ticks.
-    pub drain_remaining: u32,
-    /// The remaining attack cooldown ticks.
-    pub attack_cooldown: u32,
-}
-
-impl ProvisionalAdversary {
-    /// The DORMANT adversary at its spawn (the encounter's initial
-    /// round state). Panics only on an invalid placeholder maximum
-    /// (the config constructor's documented contract).
-    pub fn at_spawn(config: &CombatConfig) -> ProvisionalAdversary {
-        ProvisionalAdversary {
-            position: ADVERSARY_SPAWN,
-            health: health_full(config.adversary_hp)
-                .expect("the placeholder adversary maximum is finite and nonnegative"),
-            active: false,
-            defeated: false,
-            drain_remaining: 0,
-            attack_cooldown: 0,
-        }
-    }
-
-    /// F-driven activation (B's DORMANT → wake hook).
-    pub fn activate(&mut self) {
-        self.active = true;
-    }
-
-    /// One tick of adversary behavior: pursue the player (straight
-    /// line, axis slide) and attack when in reach — the attack
-    /// resolves ONE `AttackRequest` through the contract (the
-    /// adversary eye toward the player's body center, B's wired
-    /// shape) against the caller-supplied player `Combatant`.
-    /// Returns the attack event, if any. Never touches the player's
-    /// health — the encounter applies the resolved damage.
-    fn step(
-        &mut self,
-        player: &PlayerState,
-        player_target: Combatant,
-        world: &CollisionWorld,
-        config: &CombatConfig,
-    ) -> Option<AdversaryEvent> {
-        if !self.active || self.defeated {
-            return None;
-        }
-        if self.attack_cooldown > 0 {
-            self.attack_cooldown -= 1;
-        }
-        // The horizontal gap (center-to-center) — the melee-reach
-        // gate: pursue while beyond it, attempt the contract attack
-        // within it (the box entry at this gap sits well inside the
-        // profile range, so a clear-line attempt lands; the
-        // resolution is still the authority — cover blocks, and a
-        // just-out-of-reach attempt is a silent retry).
-        let dx = player.position[0] - self.position[0];
-        let dz = player.position[2] - self.position[2];
-        let horizontal = (dx * dx + dz * dz).sqrt();
-        if horizontal <= config.adversary_attack_range {
-            if self.attack_cooldown == 0 {
-                self.attack_cooldown = config.adversary_attack_cooldown_ticks;
-                // THE ATTACK SEAM (the contract's §5 B-row): one
-                // request from the adversary's eye toward the
-                // player's body center, the placeholder melee
-                // profile; the resolution decides.
-                let adversary_eye = [self.position[0], ADVERSARY_EYE_LIFT, self.position[2]];
-                let player_center = [
-                    (player_target.hit_box.min[0] + player_target.hit_box.max[0]) / 2.0,
-                    (player_target.hit_box.min[1] + player_target.hit_box.max[1]) / 2.0,
-                    (player_target.hit_box.min[2] + player_target.hit_box.max[2]) / 2.0,
-                ];
-                let request = AttackRequest {
-                    attacker: ADVERSARY_ID,
-                    origin: adversary_eye,
-                    direction: [
-                        player_center[0] - adversary_eye[0],
-                        player_center[1] - adversary_eye[1],
-                        player_center[2] - adversary_eye[2],
-                    ],
-                    profile: AttackProfile {
-                        range: config.adversary_attack_range,
-                        occlusion_margin: 0.0,
-                    },
-                };
-                return match resolve_attack(world, &request, &[player_target]) {
-                    HitResolution::Hit { .. } => Some(AdversaryEvent::AttackLanded {
-                        damage: config.adversary_damage,
-                    }),
-                    HitResolution::Miss {
-                        kind: MissKind::Occluded { .. },
-                    } => Some(AdversaryEvent::AttackBlocked),
-                    // Just out of reach (a refused request is
-                    // impossible with these finite inputs): no
-                    // event; the cadence retries.
-                    _ => None,
-                };
-            }
-            return None;
-        }
-        // Pursuit: one 60 Hz tick's straight-line step, axis slide
-        // against the solid arena boxes, clamped to the arena bounds.
-        let step = config.adversary_speed / 60.0;
-        let length = horizontal.max(1e-9);
-        let unit = [dx / length, dz / length];
-        let try_move = |position: [f32; 3]| -> Option<[f32; 3]> {
-            let candidate = [
-                position[0] + unit[0] * step,
-                0.0,
-                position[2] + unit[1] * step,
-            ];
-            let (min, max) = adversary_body(candidate);
-            let blocked = ARENA_BOXES
-                .iter()
-                .filter(|class_box| class_box.role.is_solid())
-                .any(|class_box| {
-                    min[0] < class_box.max[0]
-                        && max[0] > class_box.min[0]
-                        && min[1] < class_box.max[1]
-                        && max[1] > class_box.min[1]
-                        && min[2] < class_box.max[2]
-                        && max[2] > class_box.min[2]
-                });
-            if blocked {
-                None
-            } else {
-                Some([
-                    candidate[0].clamp(-7.2, 7.2),
-                    0.0,
-                    candidate[2].clamp(-7.2, 7.2),
-                ])
-            }
-        };
-        self.position = try_move(self.position)
-            .or_else(|| {
-                // Axis slide: the x-only step, then the z-only step.
-                try_move([self.position[0] + unit[0] * step, 0.0, self.position[2]])
-            })
-            .or_else(|| try_move([self.position[0], 0.0, self.position[2] + unit[1] * step]))
-            .unwrap_or(self.position);
-        None
-    }
+/// Builds the encounter's spine over B's adversary world: the seeded
+/// schedules installed, the 200/60 reservation (the owner-gated
+/// default budget — B's delivered discipline, untouched).
+fn adversary_spine(config: &CombatConfig) -> Spine<AdversaryWorld> {
+    let mut spine = Spine::with_reservation(
+        AdversaryWorld::new(adversary_config(config), arena_world()),
+        200,
+        60,
+    );
+    install_adversary_schedules(&mut spine);
+    spine
 }
 
 // ==================================================== the encounter state
@@ -517,6 +393,9 @@ impl EncounterPhase {
 
 /// The transient encounter state (never persisted; the counters and
 /// the event log are the evidence record the headless runners print).
+/// The adversary's live state lives in the spine's
+/// [`AdversaryWorld`] (SEAT B's module); the encounter holds only
+/// F's orchestration reads.
 #[derive(Debug, Clone)]
 pub struct EncounterState {
     pub phase: EncounterPhase,
@@ -524,8 +403,6 @@ pub struct EncounterState {
     /// by the encounter per the Health-ownership convention (the
     /// player's owning simulation is F's encounter state).
     pub player: Health,
-    /// The adversary's live state (SEAT B's seam).
-    pub adversary: ProvisionalAdversary,
     /// Fire counters (the feedback inventory).
     pub fires: u32,
     pub hits: u32,
@@ -534,6 +411,14 @@ pub struct EncounterState {
     pub out_of_range: u32,
     /// Landed adversary attacks against the player.
     pub attacks_taken: u32,
+    /// The surfaced attacks already applied (B's `attacks_emitted`
+    /// read — the delta detection).
+    pub attacks_seen: u64,
+    /// Whether B's DEFEATED declaration was observed (the drain then
+    /// runs down in the encounter — F's read surface).
+    pub adversary_defeated: bool,
+    /// The remaining DEFEATED drain ticks (the completion window).
+    pub drain_remaining: u32,
     /// The completed round count (incremented by each reset).
     pub rounds: u32,
     /// The remaining weapon cooldown ticks.
@@ -552,13 +437,15 @@ impl EncounterState {
             phase: EncounterPhase::Dormant,
             player: health_full(config.player_hp)
                 .expect("the placeholder player maximum is finite and nonnegative"),
-            adversary: ProvisionalAdversary::at_spawn(config),
             fires: 0,
             hits: 0,
             misses: 0,
             blocked: 0,
             out_of_range: 0,
             attacks_taken: 0,
+            attacks_seen: 0,
+            adversary_defeated: false,
+            drain_remaining: 0,
             rounds: 0,
             cooldown_remaining: 0,
             last_hit_tick: None,
@@ -579,6 +466,10 @@ impl EncounterState {
 pub struct CombatDemo {
     pub driver: PlayerDriver,
     pub encounter: EncounterState,
+    /// SEAT B's adversary world, driven on the spine (the reviewed
+    /// six-state behavior machine; the F-facing hooks are the reads
+    /// and `apply_player_hit`).
+    pub spine: Spine<AdversaryWorld>,
     config: CombatConfig,
     ticks: u64,
     /// A fire press observed on a frame that executed no logical tick
@@ -611,6 +502,7 @@ impl CombatDemo {
         CombatDemo {
             driver,
             encounter: EncounterState::fresh(&config),
+            spine: adversary_spine(&config),
             config,
             ticks: 0,
             pending_fire: false,
@@ -632,26 +524,29 @@ impl CombatDemo {
     }
 
     /// The SINGLE application-level combat transition: the activation
-    /// check, the cooldown advance, the fire edge, the adversary
-    /// step, the DEFEATED drain, and the terminal declarations —
-    /// applied to the post-movement state by BOTH progression paths
-    /// (the scripted logical tick and the frame-sampled live frame),
-    /// exactly as the playable demo deduplicates its gameplay
-    /// semantics. The order within a tick is part of the provisional
-    /// contract: activation → player fire → adversary step →
-    /// terminals (the player acts first; SEAT A's contract may
-    /// sequence differently — the seam note).
+    /// check, the cooldown advance, the fire edge, SEAT B's adversary
+    /// tick (the spine over the reviewed six-state machine), the
+    /// surfaced-attack application, the DEFEATED drain, and the
+    /// terminal declarations — applied to the post-movement state by
+    /// BOTH progression paths (the scripted logical tick and the
+    /// per-executed-tick frame loop), exactly as the playable demo
+    /// deduplicates its gameplay semantics. The order within a tick:
+    /// activation → player fire → B's adversary tick → the surfaced
+    /// attack's application → the terminals (the player acts first).
     fn apply_combat_transition(&mut self, tick: u64, fire: bool) {
         // 1. Activation: the contact trigger on the z-line (once —
-        //    the DORMANT phase gate makes it single-shot).
+        //    the DORMANT phase gate makes it single-shot). The
+        //    encounter phase is F's ORCHESTRATION marker (feedback,
+        //    cues, the scenario structure); the adversary's own wake
+        //    is B's perception (AGGRO on distance + LOS at a
+        //    wake-up) — it patrols from spawn, self-governing.
         if self.encounter.phase == EncounterPhase::Dormant
             && self.driver.state().position[2] <= ACTIVATION_Z
         {
             self.encounter.phase = EncounterPhase::Active;
-            self.encounter.adversary.activate();
-            self.log(tick, "encounter activated — the adversary wakes");
+            self.log(tick, "encounter activated — the adversary stirs");
         }
-        // 2. The cooldown advance (one transition per tick/frame).
+        // 2. The cooldown advance (one transition per logical tick).
         if self.encounter.cooldown_remaining > 0 {
             self.encounter.cooldown_remaining -= 1;
         }
@@ -659,30 +554,32 @@ impl CombatDemo {
         if fire {
             self.fire_weapon(tick);
         }
-        // 4. The adversary step (live fights only). The attack, if
-        //    any, resolves through the contract inside the step; the
-        //    encounter — the player's owning simulation — applies
-        //    the resolved damage to the player's `Health`.
-        if self.encounter.phase == EncounterPhase::Active {
-            let player_box_extent = player_box(self.driver.state().position, self.driver.config());
-            let player_target = Combatant {
-                id: PLAYER_ID,
-                hit_box: StaticCollider {
-                    min: player_box_extent.0,
-                    max: player_box_extent.1,
-                },
-            };
-            let event = self.encounter.adversary.step(
-                self.driver.state(),
-                player_target,
-                self.driver.world(),
-                &self.config,
-            );
-            match event {
-                Some(AdversaryEvent::AttackLanded { damage }) => {
-                    // THE CONTRACT'S TRANSITION: the engine's only
-                    // defeat declaration (`DamageOutcome::Defeated`)
-                    // decides the failure scenario.
+        // 4. SEAT B's adversary tick: the once-per-tick player
+        //    sample, then the spine's logical tick (the routine
+        //    chains advance on their own cadences — the reviewed
+        //    behavior machine, the 200/60 reservation).
+        let player_position = self.driver.state().position;
+        self.spine.world_mut().set_player_position(player_position);
+        self.spine.run_tick();
+        // 5. The surfaced attack (B's F-facing seam): when
+        //    `attacks_emitted` advanced this tick, the encounter —
+        //    the player's owning simulation — applies the RESOLVED
+        //    outcome with F's damage policy (the Health-ownership
+        //    convention: B surfaces, F applies).
+        let (emitted, last_attack, state, health) = {
+            let adversary = self.spine.world().adversary(0);
+            (
+                adversary.attacks_emitted,
+                adversary.last_attack,
+                adversary.state,
+                adversary.health,
+            )
+        };
+        if emitted > self.encounter.attacks_seen {
+            self.encounter.attacks_seen = emitted;
+            match last_attack {
+                Some(HitResolution::Hit { .. }) => {
+                    let damage = self.config.adversary_damage;
                     match self.encounter.player.apply_damage(damage) {
                         Ok(DamageOutcome::Wounded { remaining, .. }) => {
                             self.encounter.attacks_taken += 1;
@@ -721,19 +618,37 @@ impl CombatDemo {
                         }
                     }
                 }
-                Some(AdversaryEvent::AttackBlocked) => {
+                Some(HitResolution::Miss {
+                    kind: MissKind::Occluded { .. },
+                }) => {
                     self.log(tick, "adversary attack BLOCKED — cover protects the player");
+                }
+                // The honest just-out-of-reach line (review F5): the
+                // strike was emitted and fell short.
+                Some(HitResolution::Miss {
+                    kind: MissKind::Clear,
+                }) => {
+                    self.log(tick, "adversary attack misses — the strike falls short");
+                }
+                Some(HitResolution::Refused(reason)) => {
+                    self.log(tick, format!("adversary attack refused — {reason:?}"));
                 }
                 None => {}
             }
         }
-        // 5. The DEFEATED drain (B's read surface: F polls the drain
-        //    to zero, then declares the win).
-        if self.encounter.phase == EncounterPhase::Active && self.encounter.adversary.defeated {
-            if self.encounter.adversary.drain_remaining > 0 {
-                self.encounter.adversary.drain_remaining -= 1;
+        // 6. The DEFEATED read (B's terminal state; the engine's
+        //    declaration entered it through `apply_player_hit`): F
+        //    arms the presentation drain, then declares the win when
+        //    it completes.
+        if self.encounter.phase == EncounterPhase::Active && state == AdversaryState::Defeated {
+            if !self.encounter.adversary_defeated {
+                self.encounter.adversary_defeated = true;
+                self.encounter.drain_remaining = self.config.defeated_drain_ticks;
             }
-            if self.encounter.adversary.drain_remaining == 0 {
+            if self.encounter.drain_remaining > 0 {
+                self.encounter.drain_remaining -= 1;
+            }
+            if self.encounter.drain_remaining == 0 {
                 self.encounter.phase = EncounterPhase::Won { tick };
                 self.log(
                     tick,
@@ -748,10 +663,11 @@ impl CombatDemo {
                 );
             }
         }
-        // 6. The player's terminal (checked after the adversary's
-        //    attack — the same-tick simultaneity resolves
-        //    player-first via the step order above). The defeated
-        //    read agrees exactly with the engine's declaration.
+        // 7. The player's terminal (checked after the surfaced
+        //    attack's application — the same-tick simultaneity
+        //    resolves player-first via the step order above). The
+        //    defeated read agrees exactly with the engine's
+        //    declaration.
         if self.encounter.phase == EncounterPhase::Active && self.encounter.player.is_defeated() {
             self.encounter.phase = EncounterPhase::Lost { tick };
             self.log(
@@ -759,9 +675,7 @@ impl CombatDemo {
                 format!(
                     "PLAYER DEFEATED — encounter LOST at tick {} \
                      (adversary {:.0}/{:.0})",
-                    tick,
-                    self.encounter.adversary.health.current,
-                    self.encounter.adversary.health.maximum
+                    tick, health.current, health.maximum
                 ),
             );
         }
@@ -858,7 +772,7 @@ impl CombatDemo {
                 occlusion_margin: 0.0,
             },
         };
-        let (body_min, body_max) = adversary_body(self.encounter.adversary.position);
+        let (body_min, body_max) = adversary_body(self.spine.world().adversary(0).position);
         let targets = [Combatant {
             id: ADVERSARY_ID,
             hit_box: StaticCollider {
@@ -871,52 +785,60 @@ impl CombatDemo {
             HitResolution::Hit { .. } => {
                 self.encounter.hits += 1;
                 self.encounter.last_hit_tick = Some(tick);
-                // THE CONTRACT'S TRANSITION: the engine's only defeat
-                // declaration arms the drain. A DORMANT adversary
-                // takes the damage WITHOUT waking (B's wired rule —
-                // the activation line is the encounter's authority).
+                // THE CONTRACT'S TRANSITION, routed through B's
+                // application API (the Health-ownership convention:
+                // the adversary's Health lives in B's world; the
+                // engine's only defeat declaration —
+                // `DamageOutcome::Defeated` — enters B's terminal
+                // DEFEATED state there, and the encounter's step 6
+                // reads it). Damage on a PATROLLING adversary
+                // provokes AGGRO (B's wired rule); a DEFEATED
+                // adversary refuses further damage (None).
                 match self
-                    .encounter
-                    .adversary
-                    .health
-                    .apply_damage(self.config.weapon_damage)
+                    .spine
+                    .world_mut()
+                    .apply_player_hit(0, self.config.weapon_damage)
                 {
-                    Ok(DamageOutcome::Wounded { remaining, .. }) => {
+                    Some(Ok(DamageOutcome::Wounded { remaining, .. })) => {
                         self.log(
                             tick,
                             format!(
                                 "fire {fire_index}: HIT — adversary {:.0}/{:.0}",
-                                remaining, self.encounter.adversary.health.maximum
+                                remaining,
+                                self.spine.world().adversary(0).health.maximum
                             ),
                         );
                     }
-                    Ok(DamageOutcome::Defeated { .. }) => {
+                    Some(Ok(DamageOutcome::Defeated { .. })) => {
                         self.log(
                             tick,
                             format!(
                                 "fire {fire_index}: HIT — adversary 0/{:.0}",
-                                self.encounter.adversary.health.maximum
+                                self.spine.world().adversary(0).health.maximum
                             ),
                         );
-                        if !self.encounter.adversary.defeated {
-                            self.encounter.adversary.defeated = true;
-                            self.encounter.adversary.drain_remaining =
-                                self.config.defeated_drain_ticks;
-                            self.encounter.adversary.active = false;
-                        }
                     }
-                    Ok(DamageOutcome::Graze) => {
+                    Some(Ok(DamageOutcome::Graze)) => {
                         self.log(
                             tick,
                             format!("fire {fire_index}: HIT — a graze (no damage)"),
                         );
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         // Impossible with these finite placeholder
                         // values — surfaced, never panicked.
                         self.log(
                             tick,
                             format!("fire {fire_index}: damage refused ({error:?})"),
+                        );
+                    }
+                    None => {
+                        // The body was hit but the adversary is
+                        // already DEFEATED (terminal — B's module
+                        // refuses further damage): honest feedback.
+                        self.log(
+                            tick,
+                            format!("fire {fire_index}: HIT — the adversary is already defeated"),
                         );
                     }
                 }
@@ -937,7 +859,7 @@ impl CombatDemo {
                 // the contract's range is structural (a beyond-range
                 // target is a Clear miss); the demo distinguishes the
                 // OUT-OF-RANGE line with a local ray-box probe.
-                let (min, max) = adversary_body(self.encounter.adversary.position);
+                let (min, max) = adversary_body(self.spine.world().adversary(0).position);
                 match ray_box_entry(request.origin, request.direction, min, max) {
                     Some(entry) if entry > self.config.weapon_range => {
                         self.encounter.out_of_range += 1;
@@ -981,6 +903,7 @@ impl CombatDemo {
         self.driver = driver;
         self.encounter = EncounterState::fresh(&self.config);
         self.encounter.rounds = rounds;
+        self.spine = adversary_spine(&self.config);
         self.ticks = 0;
         self.pending_fire = false;
         self.log_public(
@@ -1039,24 +962,29 @@ impl CombatDemo {
             };
             boxes.push((class_box.min, class_box.max, color));
         }
-        // The adversary's body: dormant gray, active red, hit-flash
-        // white, defeated dark.
-        let adversary_color = if self.encounter.adversary.defeated {
+        // The adversary's body (B's live state): patrolling gray,
+        // threatening red, hit-flash white, defeated dark.
+        let adversary = self.spine.world().adversary(0);
+        let threatening = matches!(
+            adversary.state,
+            AdversaryState::Aggro | AdversaryState::Attack | AdversaryState::Recover
+        );
+        let adversary_color = if adversary.state == AdversaryState::Defeated {
             [0.20, 0.20, 0.25]
-        } else if let (Some(last), Some(now)) = (self.encounter.last_hit_tick, Some(self.ticks)) {
-            if now.saturating_sub(last) <= u64::from(self.config.hit_flash_ticks) {
+        } else if let Some(last) = self.encounter.last_hit_tick {
+            if self.ticks.saturating_sub(last) <= u64::from(self.config.hit_flash_ticks) {
                 [0.95, 0.95, 0.95]
-            } else if self.encounter.adversary.active {
+            } else if threatening {
                 [0.75, 0.25, 0.20]
             } else {
                 [0.50, 0.50, 0.55]
             }
-        } else if self.encounter.adversary.active {
+        } else if threatening {
             [0.75, 0.25, 0.20]
         } else {
             [0.50, 0.50, 0.55]
         };
-        let (min, max) = adversary_body(self.encounter.adversary.position);
+        let (min, max) = adversary_body(adversary.position);
         boxes.push((min, max, adversary_color));
         // The player proxy in third person (the playable demo's rule).
         if self.driver.state().camera_mode == CameraMode::ThirdPerson {
@@ -1163,9 +1091,11 @@ fn run_until(
 }
 
 /// The WINNABLE script over an existing demo (used by the headless
-/// entry and the reset battery): settle → cross the activation line →
-/// hold position and fire on cooldown → the adversary closes, lands
-/// exactly one attack, and is DEFEATED → the drain → WON.
+/// entry and the reset battery): settle → cross the activation line
+/// → hold position → wait for B's machine to turn threatening
+/// (perception AGGRO — bounded, loud on stall) → fire on cooldown
+/// whenever the adversary crosses the dead-ahead aim line → DEFEATED
+/// → the drain → WON.
 pub fn run_winnable_script(demo: &mut CombatDemo) {
     // 1. Settle to the arena floor.
     run_until(
@@ -1178,8 +1108,8 @@ pub fn run_winnable_script(demo: &mut CombatDemo) {
     let settle_tick = demo.tick_index();
     demo.log_public(settle_tick, "settled on the arena ground");
 
-    // 2. Walk forward to the activation line (the encounter starts
-    //    in-transition when the player crosses it).
+    // 2. Walk forward to the activation line (the encounter's
+    //    orchestration marker flips in-transition).
     run_until(
         demo,
         forward(),
@@ -1188,14 +1118,35 @@ pub fn run_winnable_script(demo: &mut CombatDemo) {
         "activate the encounter",
     );
 
-    // 3. Hold position and fire on cooldown until the encounter
-    //    resolves (the fire edge only when the weapon is ready — one
-    //    press, one resolution; the cooldown gates the cadence).
+    // 3. Hold position and wait for the adversary's own wake (B's
+    //    perception — AGGRO or beyond on its wake-up cadence).
+    run_until(
+        demo,
+        idle(),
+        false,
+        |d| {
+            matches!(
+                d.spine.world().adversary(0).state,
+                AdversaryState::Aggro
+                    | AdversaryState::Attack
+                    | AdversaryState::Recover
+                    | AdversaryState::Defeated
+            )
+        },
+        "wait for the adversary's aggro",
+    );
+
+    // 4. Fire on cooldown whenever the adversary is dead-ahead (the
+    //    zero-angle discipline: the scripted player only shoots when
+    //    the target crosses the aim line — B's pursuit converges on
+    //    the player's position, so it crosses repeatedly) until the
+    //    encounter resolves.
     for _ in 0..3_000 {
         if demo.encounter.phase != EncounterPhase::Active {
             break;
         }
-        let fire = demo.weapon_ready();
+        let on_line = demo.spine.world().adversary(0).position[0].abs() <= 0.4;
+        let fire = demo.weapon_ready() && on_line;
         demo.tick(idle(), fire);
     }
     assert!(
@@ -1221,9 +1172,13 @@ pub fn run_combat_headless() -> String {
 }
 
 /// The FAILURE headless scenario (`--combat-failure-headless`):
-/// settle → walk through activation and keep closing to melee →
-/// stand still, never fire → the adversary's cooldown-gated attacks
-/// defeat the player. The reproducible failure.
+/// settle → walk through activation, well inside the adversary's
+/// perception ground → stand still, never fire → B's machine aggros,
+/// pursues, and the cooldown-gated attacks defeat the player. The
+/// reproducible failure. The walk's stop condition is PLAYER-ONLY
+/// (a fixed z-line, never the adversary's position) so the player
+/// trace stays cross-platform bit-stable regardless of the seeded
+/// circuit arithmetic inside B's module.
 pub fn run_combat_failure_headless() -> String {
     let mut demo = CombatDemo::new();
 
@@ -1238,22 +1193,18 @@ pub fn run_combat_failure_headless() -> String {
     let settle_tick = demo.tick_index();
     demo.log_public(settle_tick, "settled on the arena ground");
 
-    // 2. Walk forward until melee range (the activation fires en
-    //    route; the adversary closes the rest of the gap).
+    // 2. Walk forward past the activation line, well inside the
+    //    adversary's aggro ground (the player-only stop: z ≤ 1.0).
     run_until(
         &mut demo,
         forward(),
         false,
-        |d| {
-            let dx = d.driver.state().position[0] - d.encounter.adversary.position[0];
-            let dz = d.driver.state().position[2] - d.encounter.adversary.position[2];
-            (dx * dx + dz * dz).sqrt() <= d.config().adversary_attack_range + 0.2
-        },
-        "close to melee",
+        |d| d.driver.state().position[2] <= 1.0,
+        "enter the adversary's ground",
     );
 
     // 3. Stand still and take it (fires 0 — the player who does not
-    //    fight back loses).
+    //    fight back loses; B's machine does the closing).
     run_until(
         &mut demo,
         idle(),
@@ -1283,12 +1234,14 @@ fn encounter_evidence(demo: &CombatDemo, scenario: &str, done_tick: u64) -> Stri
         out.push_str(&format!("  tick {tick}: {line}\n"));
     }
     let state = demo.driver.state();
-    let adversary_word = if demo.encounter.adversary.defeated {
-        "DEFEATED"
-    } else if demo.encounter.adversary.active {
-        "ACTIVE"
-    } else {
-        "DORMANT"
+    let adversary = demo.spine.world().adversary(0);
+    let adversary_word = match adversary.state {
+        AdversaryState::Defeated => "DEFEATED",
+        AdversaryState::Dormant => "DORMANT",
+        AdversaryState::Patrol => "PATROL",
+        AdversaryState::Aggro => "AGGRO",
+        AdversaryState::Attack => "ATTACK",
+        AdversaryState::Recover => "RECOVER",
     };
     out.push_str(&format!(
         "player: hp {:.0}/{:.0} · pos ({:.3}, {:.3}, {:.3}) on_ground {} mode {}\n",
@@ -1305,10 +1258,10 @@ fn encounter_evidence(demo: &CombatDemo, scenario: &str, done_tick: u64) -> Stri
     ));
     out.push_str(&format!(
         "adversary: {adversary_word} · hp {:.0}/{:.0} · pos ({:.3}, {:.3})\n",
-        demo.encounter.adversary.health.current,
-        demo.encounter.adversary.health.maximum,
-        demo.encounter.adversary.position[0],
-        demo.encounter.adversary.position[2],
+        adversary.health.current,
+        adversary.health.maximum,
+        adversary.position[0],
+        adversary.position[2],
     ));
     out.push_str(&format!(
         "outcome: {} at tick {done_tick} (fires {} · hits {} · blocked {} · \
@@ -1385,7 +1338,7 @@ fn play_cues_for(audio: &mut Audio, line: &str) {
         audio.play(Cue::Damage);
         return;
     }
-    if line == "encounter activated — the adversary wakes" {
+    if line.starts_with("encounter activated") {
         audio.play(Cue::Interact);
         return;
     }
@@ -1598,12 +1551,13 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                     format!("LOST at tick {tick} — [R] reset and fight back")
                 }
             };
-            let adversary_state = if demo.encounter.adversary.defeated {
-                "defeated"
-            } else if demo.encounter.adversary.active {
-                "active"
-            } else {
-                "dormant"
+            let adversary_state = match demo.spine.world().adversary(0).state {
+                AdversaryState::Defeated => "defeated",
+                AdversaryState::Dormant => "dormant",
+                AdversaryState::Patrol => "patrol",
+                AdversaryState::Aggro => "aggro",
+                AdversaryState::Attack => "attack",
+                AdversaryState::Recover => "recover",
             };
             let last_fire = demo
                 .encounter
@@ -1647,8 +1601,8 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 demo.encounter.rounds + 1,
                 demo.encounter.player.current,
                 demo.encounter.player.maximum,
-                demo.encounter.adversary.health.current,
-                demo.encounter.adversary.health.maximum,
+                demo.spine.world().adversary(0).health.current,
+                demo.spine.world().adversary(0).health.maximum,
                 last_fire,
                 damage_line,
                 demo.encounter.fires,
