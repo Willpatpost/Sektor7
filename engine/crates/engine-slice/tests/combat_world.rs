@@ -309,9 +309,9 @@ fn fire_refused_out_of_range_and_occluded() {
     // The low wall never blocks the standing shot: the dead-ahead
     // line over the left low wall (its top 1.1 m is below the eye);
     // the player stands at z = 4.2, clear of the (−2.5, 3.0) pillar's
-    // footprint. The landed hit on the DORMANT adversary provokes it
-    // (SEAT B's published rule: damage wakes regardless of distance
-    // or LOS).
+    // footprint. The landed hit damages the DORMANT adversary WITHOUT
+    // waking it — SEAT B's wired DORMANT rule: activation is the
+    // encounter line's authority, not damage.
     let mut demo = CombatDemo::new();
     demo.encounter.adversary.position = [-3.0, 0.0, -4.0];
     let state = demo.driver.state_mut();
@@ -323,16 +323,18 @@ fn fire_refused_out_of_range_and_occluded() {
     assert_eq!(demo.encounter.hits, 1, "the shot passes over the low wall");
     assert_eq!(demo.encounter.blocked, 0, "the low wall does not block");
     assert_eq!(
+        demo.encounter.adversary.health.current, 75.0,
+        "the contract's Health transition applies the damage"
+    );
+    assert_eq!(
         demo.encounter.phase,
-        EncounterPhase::Active,
-        "the landed hit provokes the dormant adversary"
+        EncounterPhase::Dormant,
+        "damage does not wake the DORMANT adversary (B's wired rule: \
+         the activation line is the authority)"
     );
     assert!(
-        demo.encounter
-            .events
-            .iter()
-            .any(|(_, line)| line == "provoked — the adversary wakes"),
-        "the provocation is logged"
+        !demo.encounter.adversary.active,
+        "the adversary itself stays dormant"
     );
 }
 
@@ -365,7 +367,7 @@ fn adversary_attack_respects_range_and_los() {
     );
     assert_eq!(demo.encounter.attacks_taken, 0, "no damage through cover");
     assert!(
-        demo.encounter.player_hp > 99.0,
+        demo.encounter.player.current > 99.0,
         "the player is unhurt behind cover"
     );
 
@@ -387,7 +389,10 @@ fn adversary_attack_respects_range_and_los() {
         demo.encounter.attacks_taken >= 1,
         "the clear-line attack lands"
     );
-    assert!(demo.encounter.player_hp < 100.0, "the player takes damage");
+    assert!(
+        demo.encounter.player.current < 100.0,
+        "the player takes damage"
+    );
     let attack_ticks: Vec<u64> = demo
         .encounter
         .events
@@ -425,7 +430,7 @@ fn fire_works_in_both_camera_modes() {
             if third_person { "third" } else { "first" }
         );
         assert_eq!(
-            demo.encounter.adversary.hp,
+            demo.encounter.adversary.health.current,
             75.0,
             "the damage applies in {} person",
             if third_person { "third" } else { "first" }
@@ -448,9 +453,12 @@ fn encounter_reset_is_transient_and_repeatable() {
     demo.reset();
     assert_eq!(demo.encounter.phase, EncounterPhase::Dormant);
     assert_eq!(demo.encounter.rounds, 1, "the round counter advanced");
-    assert_eq!(demo.encounter.player_hp, 100.0, "the player is restored");
     assert_eq!(
-        demo.encounter.adversary.hp, 100.0,
+        demo.encounter.player.current, 100.0,
+        "the player is restored"
+    );
+    assert_eq!(
+        demo.encounter.adversary.health.current, 100.0,
         "the adversary is restored"
     );
     assert_eq!(demo.encounter.fires, 0, "the counters are restored");
@@ -627,7 +635,7 @@ fn connected_live_frame_route_wins_the_encounter() {
         demo.encounter.attacks_taken >= 1,
         "the adversary threatened through the frame path"
     );
-    assert!(demo.encounter.player_hp > 0.0, "the player survives");
+    assert!(demo.encounter.player.current > 0.0, "the player survives");
     let (_, won_line) = events.last().expect("the WON event");
     assert!(
         won_line.contains("ADVERSARY DEFEATED — encounter WON"),
