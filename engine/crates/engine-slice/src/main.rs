@@ -711,6 +711,96 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--encounter") {
+        // [cycle4-D] The integrated encounter (the crossfire
+        // courtyard): the Cycle-4 capability-D demonstration — the
+        // lifecycle-gated multi-mechanism scenario (delimited
+        // wiring; the weapons/population/geometry stages land with
+        // their interface contracts).
+        let mut options = engine_slice::encounter_demo::EncounterOptions::default();
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--present" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(mode) = engine_renderer::PresentModePreference::parse(value)
+                    {
+                        options.present = mode;
+                        index += 1;
+                    }
+                }
+                "--fps" => {
+                    if let Some(value) = args.get(index + 1) {
+                        match parse_fps(value) {
+                            Ok(Some(fps)) => {
+                                options.fps = fps;
+                                index += 1;
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                eprintln!("error: {message}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                "--frames" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Ok(frames) = value.parse::<u64>()
+                    {
+                        options.frames = Some(frames.clamp(1, 1_000_000));
+                        index += 1;
+                    }
+                }
+                "--no-overlay" => options.overlay = false,
+                "--validation" => {
+                    if let Some(value) = args.get(index + 1)
+                        && let Some(preference) =
+                            engine_renderer::ValidationPreference::parse(value)
+                    {
+                        options.validation = preference;
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if let Err(message) = engine_slice::encounter_demo::run_encounter_demo(options) {
+            eprintln!("error: {message}");
+            if message.contains("Vulkan loader") {
+                eprintln!(
+                    "(no Vulkan runtime installed? headless smoke uses \
+                     SDL_VIDEODRIVER=offscreen plus a software ICD)"
+                );
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args.iter().any(|arg| arg == "--encounter-headless") {
+        // [cycle4-D] The deterministic WINNABLE encounter scenario:
+        // the event log, the healths, the terminal record, and the
+        // trace fingerprints (no GPU, no window) — labels per the
+        // ratified EVENT-TIMESTAMPS contract.
+        println!(
+            "{}",
+            engine_slice::encounter_demo::run_encounter_winnable_headless()
+        );
+        return;
+    }
+
+    if args.iter().any(|arg| arg == "--encounter-failure-headless") {
+        // [cycle4-D] The reproducible FAILURE scenario (the player
+        // who does not fight back loses).
+        println!(
+            "{}",
+            engine_slice::encounter_demo::run_encounter_failure_headless()
+        );
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--combat") {
         // [cycle3-P6] The integrated playable combat encounter (the
         // arena): movement + camera + fire + the adversary + visible
