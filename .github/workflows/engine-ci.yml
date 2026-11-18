@@ -214,18 +214,22 @@ jobs:
           # Final cache-validation corrective (2026-11-17): +2
           # engine-renderer lib tests (the cache-reuse full-extent and
           # transfer-source-capability regressions, platform-uniform).
-          # Linux 1011 MEASURED at the final corrective candidate with
-          # this step's own awk; Windows 960 = the prior 958 + the
-          # same 2.
-          expected=1011
-          if [ "$(uname -s)" != "Linux" ]; then expected=960; fi
+          # Linux 1050 MEASURED at the Cycle-3 integrated candidate
+          # (a0d3f93) with this step's own awk — the Cycle-3 deltas over
+          # the prior 1011: combat +21 (A) + adversary +13 (B) + audio
+          # +3 (C) + scene +1 (D) + the exclusion-witness +1 (E);
+          # ignored 1→2 and result lines 30→31 measured with it.
+          # Windows 999 = the prior 960 + the same 39 (platform-uniform
+          # inference — this run confirms it).
+          expected=1050
+          if [ "$(uname -s)" != "Linux" ]; then expected=999; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
-          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 1 / 30)"
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 31)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 1 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 1"; exit 1; }
-          [ "$results" -eq 30 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 30"; exit 1; }
+          [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
+          [ "$results" -eq 31 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 31"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
       # tests are cfg(test)-only (never feature-gated), and this
@@ -687,15 +691,22 @@ jobs:
           # unchanged. Linux 498/5/51 MEASURED at the hardening
           # candidate with this step's own awk; Windows 497 = the prior
           # 494 + the same 3.
-          expected=498
-          if [ "$(uname -s)" != "Linux" ]; then expected=497; fi
+          # Cycle 3 (a0d3f93): Linux 512/6/53 MEASURED at the
+          # integrated candidate — the deltas over 498/5/51: the
+          # combat_world battery (F, +12 passed +1 line at its tree)
+          # + the scene-separation battery (D, +2 passed +1
+          # lavapipe-gated ignored +1 line). Windows 513 = the prior
+          # 497 + the same 16 (platform-uniform inference — this run
+          # confirms it).
+          expected=512
+          if [ "$(uname -s)" != "Linux" ]; then expected=513; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 5 / 51)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 6 / 53)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 5 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 5"; exit 1; }
-          [ "$results" -eq 51 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 51"; exit 1; }
+          [ "$ignored" -eq 6 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 6"; exit 1; }
+          [ "$results" -eq 53 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 53"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the

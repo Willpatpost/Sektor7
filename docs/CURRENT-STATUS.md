@@ -105,12 +105,18 @@ re-measured from actual output on every change, never estimated):
 
 | CI partition | Linux | Windows |
 |---|---:|---:|
-| Main shard (`--workspace --exclude engine-slice`) | 1011 | 960 |
-| Heavy shard (`-p engine-slice --features crash-test-seams`) | 498 | 497 |
-| **Combined** | **1509** | **1457** |
+| Main shard (`--workspace --exclude engine-slice`) | 1050 | 999 |
+| Heavy shard (`-p engine-slice --features crash-test-seams`) | 512 | 513 |
+| **Combined** | **1562** | **1512** |
 
 (The macOS job runs its own execution partition — no combined count is
-defined for it. Ignored: 1 main / 5 heavy, all deliberate measurement soaks.)
+defined for it. Ignored: 2 main / 6 heavy, all deliberate measurement soaks.
+**The Cycle-3 integrated candidate** (`s7-cycle3-integration`, §9) moved
+the pins from 1011/960 + 498/497: combat +21 main (A), adversary +13 main
+(B), audio +3 main (C), scene separation +1 main/+2 heavy (D), the
+exclusion witness +1 main (E), the combat_world battery +12 heavy (F) —
+all MEASURED at the integrated tree; the Windows values are the
+platform-uniform inference this candidate's CI confirms.)
 
 **The Cycle-1 candidate** (was `s7-cycle1-integration`;
 **merged to `main` 2026-11-15**, superseded by the Cycle-2 merge below)
@@ -442,6 +448,37 @@ corrective followed via **PR #4** (2026-11-17, `main` =
 Ti). The post-orientation hardening candidate (§4) is the active
 review cycle. Standing owner decisions: the F-03 Step-2 policy
 ratification and the simulation default-budget change.
+
+**Cycle 3 (2026-11-17/18, the GO directive hash-verified at the ledger)**
+— six parallel implementation seats + three independent reviewer seats
+(the owner-authorized parallel expansion), all six packages
+review-accepted and integrated on `s7-cycle3-integration` (the
+candidate documented in §4's pins): **P1a** the reusable combat
+mechanics (`engine-core/combat.rs`: the pure `resolve_attack` with
+exact-slab occlusion + the Health/Defeated domain + the 0xC0AB codec);
+**P1b** the adversary behavior (`engine-core/adversary.rs`: the
+six-state cadence-driven machine over the spine, LOS/hysteresis
+perception, the 0xB00B namespace proof); **P2** the event-driven SDL3
+audio (`engine-shell/audio.rs`: callback-free cue streams, procedural
+placeholders, zero per-frame API, observable silent degradation); **P3**
+the scene separation (the Stage-2 test scene now EXPLICIT opt-in —
+`DemoScenePreference::Omitted` the default; the renderer imposes no
+demo content on game scenes); **P4** the macOS exclusion-test flake fix
+(the deterministic complete witness; the failure independently
+replicated at P = 1/185.1); **P6** the integrated playable combat
+encounter (`engine-slice/combat_demo.rs` + the `combat_world` battery:
+the winnable encounter + the reproducible failure scenario, the
+per-tick combat transition, B's adversary through the spine, the audio
+cues at the observation points, the NEW `engine-core/combat-world/1`
+trace domain `d2ef688081dbc659`). All combat/adversary/encounter state
+TRANSIENT (round resets, honestly labeled — no checkpoint claims);
+provisional values are placeholders. The review chain: every package
+independently reviewed (G/H/I), every MAJOR corrective landed and
+confirmed (B's snap-branch blocking check; F's per-tick pacing + the
+B-seam swap), plus the orchestrator's composition fix (combat_demo's
+RenderConfig gained D's demo_scene field). The candidate CI at the
+exact SHA is the closing gate; the owner's playtest commands:
+`--combat` (the encounter) and `--playable` (the gatehouse, unchanged).
 
 ## 10. The authoritative coordination ledger
 
