@@ -705,8 +705,17 @@ jobs:
           # combat_world tests — the five regression classes). Windows
           # 516 = the prior 513 + the same 3 (platform-uniform
           # inference — this run confirms it).
-          expected=517
-          if [ "$(uname -s)" != "Linux" ]; then expected=516; fi
+          # Cycle 4 (8c7164a): Linux 521/6/53 MEASURED at the integrated
+          # tree with this step's own awk (E's capability-E Phase-0 adds
+          # 4 engine-slice lib tests — the perf-sweep battery;
+          # platform-uniform, no new result lines; the local integration
+          # gates at 8c7164a: main 1052/2/31 unchanged, heavy 521/6/53,
+          # zero failures, every selftest pin byte-identical —
+          # /var/tmp/s7-cycle4-targets/int-gates-run1.log). Windows 520 =
+          # the prior 516 + the same 4 (platform-uniform inference — the
+          # candidate CI run confirms it).
+          expected=521
+          if [ "$(uname -s)" != "Linux" ]; then expected=520; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
