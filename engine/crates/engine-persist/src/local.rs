@@ -9406,38 +9406,44 @@ mod exclusion_tests {
             };
             let object = StoredObject::new(genuine.canonical_bytes()).unwrap();
             // The record codec canonically ORDERS the content
-            // references, so the second object is CHOSEN to keep
-            // the plan payload as the canonical first reference
-            // (the discovery's read) — the shape violation is the
-            // reference COUNT, never a misdirected first read.
+            // references, and the plan discovery reads whichever
+            // object that order makes FIRST — so BOTH references
+            // are campaign-bound plan payloads, identical in every
+            // binding field and differing only in the inert
+            // ledger_byte_limit (the freely doctorable content
+            // case (e) already exercises): whichever reference the
+            // discovery reads, it decodes a bound plan that passes
+            // the binding and the ceiling, and the refusal
+            // provably comes from the reference COUNT alone. The
+            // construction is deterministic — it consults no
+            // per-run hash luck (a nonce search for an
+            // order-preserving second object can fail on rare
+            // runs, because the campaign's plan hash is
+            // per-run-random through the pid-and-nanos-seeded
+            // journal-root binding).
+            let variant = crate::reclaim::ReclaimPlan {
+                mk,
+                sk: metadata.sk,
+                range_digest: metadata.range_digest,
+                seed: metadata.seed,
+                ledger_byte_limit: 461,
+                batches: vec![crate::reclaim::PlanBatch {
+                    index: 0,
+                    records: members,
+                }],
+                journal_files: Vec::new(),
+            };
+            let variant_object = StoredObject::new(variant.canonical_bytes()).unwrap();
             let head = medium.head().unwrap().unwrap();
             let epoch = medium.read_record(&head).unwrap().epoch;
-            let mut second = None;
-            for nonce in 0..64u64 {
-                let candidate = StoredObject::new({
-                    let mut enc = Encoder::new();
-                    enc.write_str("sektor7/save/1");
-                    enc.write_bytes(format!("v2x-cp2-f2-shape-second-{nonce}").as_bytes());
-                    enc.into_bytes()
-                })
-                .unwrap();
-                let probe = RevisionRecord::regular(head, epoch, 256)
-                    .with_idempotency_key(crate::reclaim::reclamation_plan_idempotency_key(&mk))
-                    .with_content_refs(vec![object.hash(), candidate.hash()]);
-                let canonical = RevisionRecord::decode(&probe.canonical_bytes()).unwrap();
-                if canonical.content_refs[0] == object.hash() {
-                    second = Some(candidate);
-                    break;
-                }
-            }
-            let second =
-                second.expect("a canonical-order-preserving second object exists (64 candidates)");
             let record = RevisionRecord::regular(head, epoch, 256)
                 .with_idempotency_key(crate::reclaim::reclamation_plan_idempotency_key(&mk))
-                .with_content_refs(vec![object.hash(), second.hash()]);
+                .with_content_refs(vec![object.hash(), variant_object.hash()]);
             let record_id = record.id();
-            let admitted =
-                crate::medium::AdmittedAppend::generic(&record, vec![object, second].as_slice());
+            let admitted = crate::medium::AdmittedAppend::generic(
+                &record,
+                vec![object, variant_object].as_slice(),
+            );
             medium.append_admitted(admitted, Some(head)).unwrap();
             v2x_install_begin(&mut medium, &mk, record_id);
             let error = medium.verify_begin_authority_v2(&mk).unwrap_err();
