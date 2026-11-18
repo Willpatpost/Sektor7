@@ -56,6 +56,7 @@ pub mod lod;
 pub mod npc_world_save;
 pub mod player;
 pub mod spine;
+pub mod weapons;
 pub mod wire;
 
 mod sha256;
@@ -103,5 +104,9 @@ pub use npc_world_save::{NPC_WORLD_SAVE_DOMAIN, NpcSaveWorld, NpcWorldSection};
 pub use spine::{
     CompactionError, ExecCtx, HistoryKind, LaneReport, LaneTotals, ObligationLocation,
     ObligationView, ScheduleError, Spine, Stats, SuspensionStats, World,
+};
+pub use weapons::{
+    Arsenal, FireContext, FireOutcome, FireRefusal, FiringPattern, MAX_SPREAD_RAYS, Shot,
+    SpreadField, WEAPON_COUNT, WeaponId, WeaponSet, WeaponSpec, try_fire,
 };
 pub use wire::{Decoder, Encoder, SaveError, SaveWorld};
