@@ -472,6 +472,18 @@ pub struct CombatDemo {
     /// six-state behavior machine; the F-facing hooks are the reads
     /// and `apply_player_hit`).
     pub spine: Spine<AdversaryWorld>,
+    /// The fire resolution's collision copy — the SAME arena content
+    /// as the driver's and the adversary's worlds (built from the
+    /// same literal; the arena is static in the encounter, so the
+    /// three copies never diverge). The C3-R1 split-borrow
+    /// composition needs a collision reference the observer closure
+    /// can hold while the driver advances; B's module exposes no
+    /// collision accessor (adversary.rs is out of this corrective's
+    /// file ownership), and the driver's world is mutably borrowed
+    /// by the advance — hence this owned copy (flagged for the
+    /// reviewer; a future public accessor on the adversary world
+    /// could replace it).
+    fire_world: CollisionWorld,
     config: CombatConfig,
     ticks: u64,
     /// A fire press observed on a frame that executed no logical tick
@@ -505,6 +517,7 @@ impl CombatDemo {
             driver,
             encounter: EncounterState::fresh(&config),
             spine: adversary_spine(&config),
+            fire_world: arena_world(),
             config,
             ticks: 0,
             pending_fire: false,
@@ -529,47 +542,68 @@ impl CombatDemo {
     /// check, the cooldown advance, the fire edge, SEAT B's adversary
     /// tick (the spine over the reviewed six-state machine), the
     /// surfaced-attack application, the DEFEATED drain, and the
-    /// terminal declarations — applied to the post-movement state by
-    /// BOTH progression paths (the scripted logical tick and the
-    /// per-executed-tick frame loop), exactly as the playable demo
-    /// deduplicates its gameplay semantics. The order within a tick:
-    /// activation → player fire → B's adversary tick → the surfaced
-    /// attack's application → the terminals (the player acts first).
-    fn apply_combat_transition(&mut self, tick: u64, fire: bool) {
+    /// terminal declarations. An ASSOCIATED fn over the PARTS (the
+    /// encounter, the spine, the config) plus THIS tick's post-step
+    /// player state — the C3-R1 form: the frame path interleaves it
+    /// between the driver's movement steps (the `advance_observed`
+    /// seam, each call observing THAT tick's own resulting state,
+    /// never the frame's final state), and the headless tick path
+    /// calls it with the post-tick state — one implementation, both
+    /// progression routes, the semantics existing exactly once. The
+    /// order within a tick: activation → player fire → B's adversary
+    /// tick → the surfaced attack's application → the terminals (the
+    /// player acts first).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_combat_transition(
+        encounter: &mut EncounterState,
+        spine: &mut Spine<AdversaryWorld>,
+        fire_world: &CollisionWorld,
+        config: &CombatConfig,
+        player: &PlayerState,
+        player_eye_height: f32,
+        tick: u64,
+        fire: bool,
+    ) {
         // 1. Activation: the contact trigger on the z-line (once —
         //    the DORMANT phase gate makes it single-shot). The
         //    encounter phase is F's ORCHESTRATION marker (feedback,
         //    cues, the scenario structure); the adversary's own wake
         //    is B's perception (AGGRO on distance + LOS at a
         //    wake-up) — it patrols from spawn, self-governing.
-        if self.encounter.phase == EncounterPhase::Dormant
-            && self.driver.state().position[2] <= ACTIVATION_Z
-        {
-            self.encounter.phase = EncounterPhase::Active;
-            self.log(tick, "encounter activated — the adversary stirs");
+        if encounter.phase == EncounterPhase::Dormant && player.position[2] <= ACTIVATION_Z {
+            encounter.phase = EncounterPhase::Active;
+            Self::log(encounter, tick, "encounter activated — the adversary stirs");
         }
         // 2. The cooldown advance (one transition per logical tick).
-        if self.encounter.cooldown_remaining > 0 {
-            self.encounter.cooldown_remaining -= 1;
+        if encounter.cooldown_remaining > 0 {
+            encounter.cooldown_remaining -= 1;
         }
         // 3. The fire edge (one press, one resolution).
         if fire {
-            self.fire_weapon(tick);
+            Self::fire_weapon(
+                encounter,
+                spine,
+                fire_world,
+                config,
+                player,
+                player_eye_height,
+                tick,
+            );
         }
         // 4. SEAT B's adversary tick: the once-per-tick player
-        //    sample, then the spine's logical tick (the routine
-        //    chains advance on their own cadences — the reviewed
-        //    behavior machine, the 200/60 reservation).
-        let player_position = self.driver.state().position;
-        self.spine.world_mut().set_player_position(player_position);
-        self.spine.run_tick();
+        //    sample (THIS tick's post-step position), then the
+        //    spine's logical tick (the routine chains advance on
+        //    their own cadences — the reviewed behavior machine,
+        //    the 200/60 reservation).
+        spine.world_mut().set_player_position(player.position);
+        spine.run_tick();
         // 5. The surfaced attack (B's F-facing seam): when
         //    `attacks_emitted` advanced this tick, the encounter —
         //    the player's owning simulation — applies the RESOLVED
         //    outcome with F's damage policy (the Health-ownership
         //    convention: B surfaces, F applies).
         let (emitted, last_attack, state, health) = {
-            let adversary = self.spine.world().adversary(0);
+            let adversary = spine.world().adversary(0);
             (
                 adversary.attacks_emitted,
                 adversary.last_attack,
@@ -577,43 +611,46 @@ impl CombatDemo {
                 adversary.health,
             )
         };
-        if emitted > self.encounter.attacks_seen {
-            self.encounter.attacks_seen = emitted;
+        if emitted > encounter.attacks_seen {
+            encounter.attacks_seen = emitted;
             match last_attack {
                 Some(HitResolution::Hit { .. }) => {
-                    let damage = self.config.adversary_damage;
-                    match self.encounter.player.apply_damage(damage) {
+                    let damage = config.adversary_damage;
+                    match encounter.player.apply_damage(damage) {
                         Ok(DamageOutcome::Wounded { remaining, .. }) => {
-                            self.encounter.attacks_taken += 1;
-                            self.encounter.last_damage_tick = Some(tick);
-                            self.log(
+                            encounter.attacks_taken += 1;
+                            encounter.last_damage_tick = Some(tick);
+                            Self::log(
+                                encounter,
                                 tick,
                                 format!(
                                     "adversary attack — player takes {:.0} ({:.0}/{:.0})",
-                                    damage, remaining, self.encounter.player.maximum
+                                    damage, remaining, encounter.player.maximum
                                 ),
                             );
                         }
                         Ok(DamageOutcome::Defeated { .. }) => {
-                            self.encounter.attacks_taken += 1;
-                            self.encounter.last_damage_tick = Some(tick);
-                            self.log(
+                            encounter.attacks_taken += 1;
+                            encounter.last_damage_tick = Some(tick);
+                            Self::log(
+                                encounter,
                                 tick,
                                 format!(
                                     "adversary attack — player takes {:.0} (0/{:.0})",
-                                    damage, self.encounter.player.maximum
+                                    damage, encounter.player.maximum
                                 ),
                             );
                         }
                         Ok(DamageOutcome::Graze) => {
-                            self.encounter.attacks_taken += 1;
-                            self.log(tick, "adversary attack — a graze (no damage)");
+                            encounter.attacks_taken += 1;
+                            Self::log(encounter, tick, "adversary attack — a graze (no damage)");
                         }
                         Err(error) => {
                             // Impossible with these finite
                             // placeholder values — surfaced, never
                             // panicked (the contract's discipline).
-                            self.log(
+                            Self::log(
+                                encounter,
                                 tick,
                                 format!("adversary attack — damage refused ({error:?})"),
                             );
@@ -623,17 +660,29 @@ impl CombatDemo {
                 Some(HitResolution::Miss {
                     kind: MissKind::Occluded { .. },
                 }) => {
-                    self.log(tick, "adversary attack BLOCKED — cover protects the player");
+                    Self::log(
+                        encounter,
+                        tick,
+                        "adversary attack BLOCKED — cover protects the player",
+                    );
                 }
                 // The honest just-out-of-reach line (review F5): the
                 // strike was emitted and fell short.
                 Some(HitResolution::Miss {
                     kind: MissKind::Clear,
                 }) => {
-                    self.log(tick, "adversary attack misses — the strike falls short");
+                    Self::log(
+                        encounter,
+                        tick,
+                        "adversary attack misses — the strike falls short",
+                    );
                 }
                 Some(HitResolution::Refused(reason)) => {
-                    self.log(tick, format!("adversary attack refused — {reason:?}"));
+                    Self::log(
+                        encounter,
+                        tick,
+                        format!("adversary attack refused — {reason:?}"),
+                    );
                 }
                 None => {}
             }
@@ -642,25 +691,26 @@ impl CombatDemo {
         //    declaration entered it through `apply_player_hit`): F
         //    arms the presentation drain, then declares the win when
         //    it completes.
-        if self.encounter.phase == EncounterPhase::Active && state == AdversaryState::Defeated {
-            if !self.encounter.adversary_defeated {
-                self.encounter.adversary_defeated = true;
-                self.encounter.drain_remaining = self.config.defeated_drain_ticks;
+        if encounter.phase == EncounterPhase::Active && state == AdversaryState::Defeated {
+            if !encounter.adversary_defeated {
+                encounter.adversary_defeated = true;
+                encounter.drain_remaining = config.defeated_drain_ticks;
             }
-            if self.encounter.drain_remaining > 0 {
-                self.encounter.drain_remaining -= 1;
+            if encounter.drain_remaining > 0 {
+                encounter.drain_remaining -= 1;
             }
-            if self.encounter.drain_remaining == 0 {
-                self.encounter.phase = EncounterPhase::Won { tick };
-                self.log(
+            if encounter.drain_remaining == 0 {
+                encounter.phase = EncounterPhase::Won { tick };
+                Self::log(
+                    encounter,
                     tick,
                     format!(
                         "ADVERSARY DEFEATED — encounter WON at tick {} \
                          (fires {}, hits {}, damage taken {:.0})",
                         tick,
-                        self.encounter.fires,
-                        self.encounter.hits,
-                        self.encounter.attacks_taken as f32 * self.config.adversary_damage
+                        encounter.fires,
+                        encounter.hits,
+                        encounter.attacks_taken as f32 * config.adversary_damage
                     ),
                 );
             }
@@ -670,9 +720,10 @@ impl CombatDemo {
         //    resolves player-first via the step order above). The
         //    defeated read agrees exactly with the engine's
         //    declaration.
-        if self.encounter.phase == EncounterPhase::Active && self.encounter.player.is_defeated() {
-            self.encounter.phase = EncounterPhase::Lost { tick };
-            self.log(
+        if encounter.phase == EncounterPhase::Active && encounter.player.is_defeated() {
+            encounter.phase = EncounterPhase::Lost { tick };
+            Self::log(
+                encounter,
                 tick,
                 format!(
                     "PLAYER DEFEATED — encounter LOST at tick {} \
@@ -683,57 +734,91 @@ impl CombatDemo {
         }
     }
 
+    /// The parts-scoped event log push (the transition and the fire
+    /// resolution operate on the split fields).
+    fn log(encounter: &mut EncounterState, tick: u64, line: impl Into<String>) {
+        encounter.events.push((tick, line.into()));
+    }
+
     /// The scripted-logical-tick path: one movement tick plus the
-    /// combat transition. `fire` is the FIRE EDGE for this tick (the
-    /// mapping layer derives it from the mouse press; holding is not
-    /// a new press).
+    /// combat transition (observing that tick's post-step state).
+    /// `fire` is the FIRE EDGE for this tick (the mapping layer
+    /// derives it from the mouse press; holding is not a new press).
     pub fn tick(&mut self, intent: MoveIntent, fire: bool) {
         let tick = self.ticks;
         self.ticks += 1;
         self.driver.run_headless(1, |_| intent);
-        self.apply_combat_transition(tick, fire);
+        let state = *self.driver.state();
+        let eye_height = self.driver.config().eye_height;
+        Self::apply_combat_transition(
+            &mut self.encounter,
+            &mut self.spine,
+            &self.fire_world,
+            &self.config,
+            &state,
+            eye_height,
+            tick,
+            fire,
+        );
     }
 
     /// The interactive frame path: one frame's elapsed time, the
     /// frame-sampled live intent, and the frame's fire edge. The
-    /// movement stays on the driver's fixed-step accumulator; the
-    /// combat update runs at the frame boundary on the post-advance
-    /// state through the SAME single transition the headless
-    /// [`Self::tick`] uses (the playable demo's R1/R2 discipline).
+    /// C3-R1 interleaved composition: the movement and the combat
+    /// transition advance TOGETHER at each logical tick — the
+    /// `advance_observed` seam invokes the transition BETWEEN the
+    /// driver's catch-up steps, each call observing THAT tick's own
+    /// resulting player state (never the frame's final state), with
+    /// the driver's accumulator, catch-up bound, no-discard drain,
+    /// input-validity refusals, and accounting all preserved inside
+    /// the driver (the demo duplicates none of it). The frame's fire
+    /// edge lands on the FIRST executed tick (one press, one
+    /// resolution, at the correct logical index); a 0-tick frame
+    /// (frames outpacing the tick rate) runs NO transition and
+    /// BUFFERS the press to the next executed tick — input is never
+    /// dropped. The headless [`Self::tick`] path runs the SAME
+    /// transition with the same per-tick state — one implementation,
+    /// consistent ordering.
     pub fn advance_frame(
         &mut self,
         elapsed: Duration,
         intent: MoveIntent,
         fire: bool,
     ) -> engine_core::DriveStep {
-        let step = self.driver.advance(elapsed, intent);
-        let executed = u64::from(step.executed_ticks);
-        self.ticks += executed;
-        // The combat transition advances PER EXECUTED LOGICAL TICK
-        // (the review-F2 fix: the cooldown decrement, the pursuit
-        // step, the attack gate, and the DEFEATED drain are
-        // rate-dependent — a frame-rate-coupled once-per-frame call
-        // would pace them by the render cadence, against the GO §6
-        // binding standard). A 0-tick frame (frames outpacing the
-        // tick rate) runs NO transition, buffering the fire press to
-        // the next executed tick; the frame's fire edge lands on the
-        // FIRST executed tick — one press, one resolution, at the
-        // correct logical index. At the 1:1 cadence (60 fps frames,
-        // one tick each) the single transition receives exactly the
-        // post-advance tick index — byte-identical to the headless
-        // semantics (the equivalence the scenarios and the connected
-        // route already pin).
-        if executed == 0 {
-            if fire {
-                self.pending_fire = true;
-            }
-            return step;
-        }
-        let fire_edge = fire || self.pending_fire;
-        self.pending_fire = false;
-        for index in 0..executed {
-            let tick = self.ticks - executed + index + 1;
-            self.apply_combat_transition(tick, fire_edge && index == 0);
+        // The split-field composition: the observer holds the
+        // encounter, the spine, and the config while the driver
+        // advances — disjoint borrows, no driver access from the
+        // combat side (the state arrives as the seam's snapshot).
+        let CombatDemo {
+            driver,
+            encounter,
+            spine,
+            fire_world,
+            config,
+            ticks,
+            pending_fire,
+        } = self;
+        let pending_before = *pending_fire;
+        *pending_fire = false;
+        let fire_edge = fire || pending_before;
+        let eye_height = driver.config().eye_height;
+        let step = driver.advance_observed(elapsed, intent, |state, index| {
+            *ticks += 1;
+            Self::apply_combat_transition(
+                encounter,
+                spine,
+                fire_world,
+                config,
+                state,
+                eye_height,
+                *ticks,
+                fire_edge && index == 1,
+            );
+        });
+        // A 0-tick frame runs no transition — the press (or a
+        // carried pending press) buffers to the next executed tick.
+        if u64::from(step.executed_ticks) == 0 && fire_edge {
+            *pending_fire = true;
         }
         step
     }
@@ -746,35 +831,47 @@ impl CombatDemo {
     /// profile values, the damage amount routed through the
     /// adversary's `Health`, and the OUT-OF-RANGE feedback
     /// distinction on top of the contract's `Miss::Clear`.
-    fn fire_weapon(&mut self, tick: u64) {
+    fn fire_weapon(
+        encounter: &mut EncounterState,
+        spine: &mut Spine<AdversaryWorld>,
+        fire_world: &CollisionWorld,
+        config: &CombatConfig,
+        player: &PlayerState,
+        player_eye_height: f32,
+        tick: u64,
+    ) {
         // The cooldown refusal (a press during cooldown is one
         // refused event — edge-triggered, never auto-repeat).
-        if self.encounter.cooldown_remaining > 0 {
-            self.log(
+        if encounter.cooldown_remaining > 0 {
+            Self::log(
+                encounter,
                 tick,
                 format!(
                     "fire refused — the weapon is cooling ({} ticks)",
-                    self.encounter.cooldown_remaining
+                    encounter.cooldown_remaining
                 ),
             );
             return;
         }
-        self.encounter.fires += 1;
-        self.encounter.cooldown_remaining = self.config.weapon_cooldown_ticks;
-        let fire_index = self.encounter.fires;
-        // THE REQUEST (the contract's §4 F-flow): eye + look
-        // direction + the placeholder weapon profile.
-        let state = self.driver.state();
+        encounter.fires += 1;
+        encounter.cooldown_remaining = config.weapon_cooldown_ticks;
+        let fire_index = encounter.fires;
+        // THE REQUEST (the contract's §4 F-flow): THIS tick's eye +
+        // look direction + the placeholder weapon profile.
         let request = AttackRequest {
             attacker: PLAYER_ID,
-            origin: self.eye(),
-            direction: look_direction(state.yaw, state.pitch),
+            origin: [
+                player.position[0],
+                player.position[1] + player_eye_height,
+                player.position[2],
+            ],
+            direction: look_direction(player.yaw, player.pitch),
             profile: AttackProfile {
-                range: self.config.weapon_range,
+                range: config.weapon_range,
                 occlusion_margin: 0.0,
             },
         };
-        let (body_min, body_max) = adversary_body(self.spine.world().adversary(0).position);
+        let (body_min, body_max) = adversary_body(spine.world().adversary(0).position);
         let targets = [Combatant {
             id: ADVERSARY_ID,
             hit_box: StaticCollider {
@@ -782,11 +879,16 @@ impl CombatDemo {
                 max: body_max,
             },
         }];
-        let resolution = resolve_attack(self.driver.world(), &request, &targets);
+        // C3-R1 note: the trace resolves against the demo's static
+        // arena copy (the SAME content the adversary moves and
+        // perceives through and the player collides with — identical
+        // boxes, built from the same literal; the split-borrow
+        // composition's flagged copy).
+        let resolution = resolve_attack(fire_world, &request, &targets);
         match resolution {
             HitResolution::Hit { .. } => {
-                self.encounter.hits += 1;
-                self.encounter.last_hit_tick = Some(tick);
+                encounter.hits += 1;
+                encounter.last_hit_tick = Some(tick);
                 // THE CONTRACT'S TRANSITION, routed through B's
                 // application API (the Health-ownership convention:
                 // the adversary's Health lives in B's world; the
@@ -796,32 +898,31 @@ impl CombatDemo {
                 // reads it). Damage on a PATROLLING adversary
                 // provokes AGGRO (B's wired rule); a DEFEATED
                 // adversary refuses further damage (None).
-                match self
-                    .spine
-                    .world_mut()
-                    .apply_player_hit(0, self.config.weapon_damage)
-                {
+                match spine.world_mut().apply_player_hit(0, config.weapon_damage) {
                     Some(Ok(DamageOutcome::Wounded { remaining, .. })) => {
-                        self.log(
+                        Self::log(
+                            encounter,
                             tick,
                             format!(
                                 "fire {fire_index}: HIT — adversary {:.0}/{:.0}",
                                 remaining,
-                                self.spine.world().adversary(0).health.maximum
+                                spine.world().adversary(0).health.maximum
                             ),
                         );
                     }
                     Some(Ok(DamageOutcome::Defeated { .. })) => {
-                        self.log(
+                        Self::log(
+                            encounter,
                             tick,
                             format!(
                                 "fire {fire_index}: HIT — adversary 0/{:.0}",
-                                self.spine.world().adversary(0).health.maximum
+                                spine.world().adversary(0).health.maximum
                             ),
                         );
                     }
                     Some(Ok(DamageOutcome::Graze)) => {
-                        self.log(
+                        Self::log(
+                            encounter,
                             tick,
                             format!("fire {fire_index}: HIT — a graze (no damage)"),
                         );
@@ -829,7 +930,8 @@ impl CombatDemo {
                     Some(Err(error)) => {
                         // Impossible with these finite placeholder
                         // values — surfaced, never panicked.
-                        self.log(
+                        Self::log(
+                            encounter,
                             tick,
                             format!("fire {fire_index}: damage refused ({error:?})"),
                         );
@@ -838,7 +940,8 @@ impl CombatDemo {
                         // The body was hit but the adversary is
                         // already DEFEATED (terminal — B's module
                         // refuses further damage): honest feedback.
-                        self.log(
+                        Self::log(
+                            encounter,
                             tick,
                             format!("fire {fire_index}: HIT — the adversary is already defeated"),
                         );
@@ -848,8 +951,9 @@ impl CombatDemo {
             HitResolution::Miss {
                 kind: MissKind::Occluded { .. },
             } => {
-                self.encounter.blocked += 1;
-                self.log(
+                encounter.blocked += 1;
+                Self::log(
+                    encounter,
                     tick,
                     format!("fire {fire_index}: BLOCKED — cover blocks the line"),
                 );
@@ -861,21 +965,23 @@ impl CombatDemo {
                 // the contract's range is structural (a beyond-range
                 // target is a Clear miss); the demo distinguishes the
                 // OUT-OF-RANGE line with a local ray-box probe.
-                let (min, max) = adversary_body(self.spine.world().adversary(0).position);
+                let (min, max) = adversary_body(spine.world().adversary(0).position);
                 match ray_box_entry(request.origin, request.direction, min, max) {
-                    Some(entry) if entry > self.config.weapon_range => {
-                        self.encounter.out_of_range += 1;
-                        self.log(
+                    Some(entry) if entry > config.weapon_range => {
+                        encounter.out_of_range += 1;
+                        Self::log(
+                            encounter,
                             tick,
                             format!(
                                 "fire {fire_index}: OUT OF RANGE — {:.1} m > {:.0} m",
-                                entry, self.config.weapon_range
+                                entry, config.weapon_range
                             ),
                         );
                     }
                     _ => {
-                        self.encounter.misses += 1;
-                        self.log(
+                        encounter.misses += 1;
+                        Self::log(
+                            encounter,
                             tick,
                             format!("fire {fire_index}: MISS — the aim is off the target"),
                         );
@@ -885,7 +991,11 @@ impl CombatDemo {
             HitResolution::Refused(reason) => {
                 // Impossible with these finite inputs — surfaced,
                 // never panicked (the contract's discipline).
-                self.log(tick, format!("fire {fire_index}: refused — {reason:?}"));
+                Self::log(
+                    encounter,
+                    tick,
+                    format!("fire {fire_index}: refused — {reason:?}"),
+                );
             }
         }
     }
@@ -930,10 +1040,6 @@ impl CombatDemo {
             self.driver.config(),
             self.driver.world(),
         )
-    }
-
-    fn log(&mut self, tick: u64, line: impl Into<String>) {
-        self.encounter.events.push((tick, line.into()));
     }
 
     /// Public event logging for the scripted scenarios' own markers.

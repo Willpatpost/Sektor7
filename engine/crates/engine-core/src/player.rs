@@ -1040,6 +1040,28 @@ impl PlayerDriver {
     /// beyond the remaining [`MAX_TOTAL_ADVANCE_NS`] domain is
     /// clamped to the boundary and REPORTED via `domain_clamped`.
     pub fn advance(&mut self, elapsed: Duration, intent: MoveIntent) -> DriveStep {
+        self.advance_observed(elapsed, intent, |_state, _index| {})
+    }
+
+    /// Advances by elapsed monotonic time — IDENTICAL accounting to
+    /// [`Self::advance`] (the accumulator's bounded catch-up, the
+    /// domain clamp, the no-discard drain, the per-step input
+    /// validity inside [`Self::tick`]) — with `after_step` invoked
+    /// after EACH executed movement step, receiving the POST-STEP
+    /// player state and the 1-based step count within this call.
+    /// The fixed-step composition seam (the C3-R1 corrective):
+    /// gameplay logic that must observe each logical tick's own
+    /// resulting state interleaves HERE, between the driver's
+    /// steps — never against the frame's final state. The observer
+    /// receives a read-only state snapshot and cannot reach the
+    /// driver, so the movement accounting is structurally
+    /// untouched (a no-op observer makes this exactly `advance`).
+    pub fn advance_observed(
+        &mut self,
+        elapsed: Duration,
+        intent: MoveIntent,
+        mut after_step: impl FnMut(&PlayerState, u64),
+    ) -> DriveStep {
         let requested = elapsed.as_nanos();
         let remaining = MAX_TOTAL_ADVANCE_NS - self.total_advanced_ns;
         let granted = requested.min(remaining);
@@ -1048,8 +1070,9 @@ impl PlayerDriver {
         self.accumulator_ns += granted;
         let due = self.accumulator_ns / self.period_ns;
         let executed = due.min(u128::from(self.max_catchup_per_frame));
-        for _ in 0..executed {
+        for index in 0..executed {
             self.tick(intent);
+            after_step(&self.state, index as u64 + 1);
         }
         self.accumulator_ns -= executed * self.period_ns;
         DriveStep {

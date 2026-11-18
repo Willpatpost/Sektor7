@@ -850,3 +850,216 @@ fn combat_mapping_preserves_mouse_look() {
     // The same snapshot carries no fire edge without a mouse press.
     assert!(!mapped.fire_pressed);
 }
+
+/// The C3-R1 ordering regression (fail-first at the defective
+/// candidate `3a31627`): TWO single-tick frames with held movement
+/// must agree with ONE double-tick frame carrying the same intent —
+/// the combat transition observes EACH logical tick's own resulting
+/// player state, never the frame's final state. The staged boundary:
+/// the player starts at z = 2.1 walking −Z at full speed — one tick
+/// lands at 2.0333 (NOT past the activation line), the second at
+/// 1.9667 (past it): the activation must flip on the SECOND logical
+/// tick, and everything downstream (the event log, the adversary's
+/// per-tick samples, the final state) must match the single-tick
+/// cadence exactly.
+#[test]
+fn ordering_two_single_tick_frames_match_one_double_tick_frame() {
+    let forward = engine_core::MoveIntent {
+        forward: 1,
+        ..engine_core::MoveIntent::default()
+    };
+    let tick_frame = std::time::Duration::from_nanos(16_666_666); // 1/60 s → 1 tick
+    let double_frame = std::time::Duration::from_nanos(33_333_333); // 2/60 s → 2 ticks
+
+    fn staged_demo() -> CombatDemo {
+        let mut demo = CombatDemo::new();
+        let state = demo.driver.state_mut();
+        state.position = [0.0, 0.0, 2.1];
+        state.velocity = [0.0, 0.0, -4.0]; // At full walk speed: 0.0667 m/tick.
+        state.on_ground = true;
+        demo
+    }
+
+    // Two single-tick frames: the transition of tick 1 sees z ≈
+    // 2.0333 (no activation), tick 2 sees z ≈ 1.9667 (activation).
+    let mut fine = staged_demo();
+    fine.advance_frame(tick_frame, forward, false);
+    assert_eq!(
+        fine.encounter.phase,
+        EncounterPhase::Dormant,
+        "tick 1 does not cross the line (z = {:.4})",
+        fine.driver.state().position[2]
+    );
+    fine.advance_frame(tick_frame, forward, false);
+    assert_eq!(
+        fine.encounter.phase,
+        EncounterPhase::Active,
+        "tick 2 crosses the line (z = {:.4})",
+        fine.driver.state().position[2]
+    );
+
+    // One double-tick frame: the SAME logical ticks, the SAME
+    // result — the activation still on the SECOND tick, the event
+    // log identical, the adversary state identical.
+    let mut coarse = staged_demo();
+    coarse.advance_frame(double_frame, forward, false);
+    assert_eq!(
+        coarse.tick_index(),
+        fine.tick_index(),
+        "the same logical ticks"
+    );
+    assert_eq!(
+        coarse.encounter.phase,
+        EncounterPhase::Active,
+        "the double-tick frame activates — on its SECOND tick, not the first"
+    );
+    let fine_activation = fine
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("encounter activated"))
+        .expect("the fine activation");
+    let coarse_activation = coarse
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("encounter activated"))
+        .expect("the coarse activation");
+    assert_eq!(
+        fine_activation.0, coarse_activation.0,
+        "the activation lands on the same logical tick in both cadences"
+    );
+    assert_eq!(fine_activation.0, 2, "the crossing is on the SECOND tick");
+    assert_eq!(
+        coarse.encounter.events, fine.encounter.events,
+        "the event log (timestamps included) is cadence-independent"
+    );
+    assert_eq!(
+        coarse.spine.world().adversary(0).position.map(f32::to_bits),
+        fine.spine.world().adversary(0).position.map(f32::to_bits),
+        "the adversary saw each tick's own player sample"
+    );
+    assert_eq!(
+        coarse.driver.state().position,
+        fine.driver.state().position,
+        "the player's final state agrees"
+    );
+}
+
+/// The C3-R1 ordering regression, the pursuit/attack outcome: a
+/// MOVING player during multi-tick frames — the adversary's
+/// perception samples and pursuit path must observe each tick's own
+/// position (the single-tick cadence), producing the same combat
+/// outcome (the same attack events at the same logical ticks).
+/// At the defective candidate, the double-tick frame's early
+/// transitions sample the frame-final position — the pursuit chases
+/// a jumped target and the combat outcome (the attack timing/log)
+/// diverges.
+#[test]
+fn ordering_pursuit_samples_each_tick_during_multi_tick_frames() {
+    let idle = engine_core::MoveIntent::default();
+    let strafe_left = engine_core::MoveIntent { strafe: -1, ..idle };
+    let tick_frame = std::time::Duration::from_nanos(16_666_666); // 1/60 s → 1 tick
+    let double_frame = std::time::Duration::from_nanos(33_333_333); // 2/60 s → 2 ticks
+
+    // The staged start: the player inside the adversary's aggro
+    // ground, the adversary woken to AGGRO (the same deterministic
+    // setup in both cadences).
+    fn staged_demo() -> CombatDemo {
+        let mut demo = CombatDemo::new();
+        let state = demo.driver.state_mut();
+        state.position = [0.0, 0.0, 1.0];
+        state.velocity = [0.0, 0.0, 0.0];
+        state.on_ground = true;
+        for _ in 0..200 {
+            if matches!(
+                demo.spine.world().adversary(0).state,
+                engine_core::adversary::AdversaryState::Aggro
+                    | engine_core::adversary::AdversaryState::Attack
+                    | engine_core::adversary::AdversaryState::Recover
+            ) {
+                break;
+            }
+            demo.tick(idle_like(), false);
+        }
+        demo
+    }
+    // A local idle (the closure above cannot capture the outer idle
+    // before its declaration).
+    fn idle_like() -> engine_core::MoveIntent {
+        engine_core::MoveIntent::default()
+    }
+
+    // The fine cadence: seven single-tick frames of strafing left,
+    // then idle until an attack lands.
+    let mut fine = staged_demo();
+    for _ in 0..7 {
+        fine.advance_frame(tick_frame, strafe_left, false);
+    }
+    for _ in 0..600 {
+        if fine
+            .encounter
+            .events
+            .iter()
+            .any(|(_, line)| line.starts_with("adversary attack — player takes"))
+        {
+            break;
+        }
+        fine.tick(idle, false);
+    }
+
+    // The coarse cadence: ONE single-tick frame (aligning the frame
+    // parity so the adversary's wake-ups land on the double frames'
+    // FIRST ticks — where the premature final-position sample
+    // actually diverges) then three double-tick frames — the SAME
+    // seven logical ticks, the same held strafe — then the same idle.
+    let mut coarse = staged_demo();
+    coarse.advance_frame(tick_frame, strafe_left, false);
+    for _ in 0..3 {
+        coarse.advance_frame(double_frame, strafe_left, false);
+    }
+    for _ in 0..600 {
+        if coarse
+            .encounter
+            .events
+            .iter()
+            .any(|(_, line)| line.starts_with("adversary attack — player takes"))
+        {
+            break;
+        }
+        coarse.tick(idle, false);
+    }
+
+    // The outcomes must agree: the attack landed in both, at the
+    // same logical tick, with the same event log and the same
+    // adversary state.
+    let fine_attack = fine
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("adversary attack — player takes"))
+        .map(|(tick, _)| *tick);
+    let coarse_attack = coarse
+        .encounter
+        .events
+        .iter()
+        .find(|(_, line)| line.starts_with("adversary attack — player takes"))
+        .map(|(tick, _)| *tick);
+    assert!(
+        fine_attack.is_some(),
+        "the adversary catches the strafing player (the fine cadence)"
+    );
+    assert_eq!(
+        coarse_attack, fine_attack,
+        "the attack lands at the same logical tick in both cadences"
+    );
+    assert_eq!(
+        coarse.encounter.events, fine.encounter.events,
+        "the combat outcome (the event log) is cadence-independent"
+    );
+    assert_eq!(
+        coarse.spine.world().adversary(0).position.map(f32::to_bits),
+        fine.spine.world().adversary(0).position.map(f32::to_bits),
+        "the pursuit observed each tick's own sample"
+    );
+}
