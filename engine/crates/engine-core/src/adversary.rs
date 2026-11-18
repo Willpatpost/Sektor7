@@ -9,11 +9,17 @@
 //! Design note: `cycle3/interfaces/ADVERSARY-DESIGN.md` (the persisted
 //! contract with seats A/F). **Every numeric value here is a PLACEHOLDER
 //! parameter (`AdversaryConfig`) — no balance or difficulty approval is
-//! claimed.** The ATTACK/DEFEATED seams are STUBS pending seat A's
-//! `COMBAT-INTERFACE.md`: attacks are counted (`attacks_emitted`) but
-//! resolve through A's hit-resolution contract once it lands; adversary
-//! health/DEFEATED use placeholder fields that A's damage/health
-//! transition contract will govern. No spine semantic changes; no
+//! claimed.** The ATTACK/DEFEATED seams are WIRED through seat A's
+//! combat contract v1 (`cycle3/interfaces/COMBAT-INTERFACE.md`, merged
+//! at the `s7-cycle3-a-combat` skeleton commit): each ATTACK wake
+//! resolves ONE `AttackRequest` through `combat::resolve_attack` (from
+//! the adversary's eye toward the player body's center, B's placeholder
+//! profile) and SURFACES the `HitResolution` per-adversary — F applies
+//! player damage (the Health-ownership convention: B never mutates
+//! player Health); adversary `Health` lives here as `combat::Health`,
+//! player-fired damage routes through the public `apply_player_hit`,
+//! and DEFEATED enters ONLY from `DamageOutcome::Defeated` — the
+//! engine's single defeat declaration. No spine semantic changes; no
 //! persistence-schema changes (encounter state is transient, honestly
 //! labeled); the 200/60 budget is owner-gated and untouched.
 //!
@@ -24,9 +30,13 @@
 //! time never enters logical state.
 
 use crate::clock::Tick;
+use crate::combat::{
+    AttackProfile, AttackRefusal, AttackRequest, Combatant, CombatantId, DamageOutcome,
+    HealthError, HitResolution, MissKind, resolve_attack,
+};
 use crate::event::{Event, EventClass, EventSpec, Field, Schedule};
 use crate::fingerprint::Fingerprinter;
-use crate::player::CollisionWorld;
+use crate::player::{CollisionWorld, PlayerConfig, StaticCollider, player_box};
 use crate::spine::{ExecCtx, Spine, World};
 
 /// The adversary chain codec's type tag — namespaced away from the
@@ -132,9 +142,28 @@ pub struct AdversaryConfig {
     pub waypoint_radius: f32,
     /// The spawn center (the encounter area's origin).
     pub spawn_center: [f32; 3],
-    /// Placeholder health until A's damage/health contract governs
-    /// (contract item 2).
-    pub max_health: u32,
+    /// Full-health construction value for every adversary
+    /// (`combat::health_full` — finite, >= 0; the damage/health
+    /// transition contract governs the domain).
+    pub max_health: f32,
+    /// The adversary's eye height above the ground (m) — the
+    /// perception LOS origin and the attack trace origin. Must
+    /// differ from half the player body height or a converged
+    /// adversary's aim degenerates to the zero vector (the resolver
+    /// would surface `Refused(ZeroDirection)` honestly).
+    pub eye_height: f32,
+    /// B's placeholder view of the player's body — the `Combatant`
+    /// box the ATTACK seam resolves against is `player_box(sample,
+    /// &this)` over the per-tick player sample.
+    pub player: PlayerConfig,
+    /// The id the ATTACK seam attributes to the player target it
+    /// builds (id spaces are game-owned — F's convention overrides
+    /// this placeholder; the surfaced resolution carries it).
+    pub player_id: CombatantId,
+    /// The ATTACK seam's attacker ids are `base + index` (the same
+    /// game-owned-id placeholder discipline; the id is carried for
+    /// feedback, never consulted by geometry).
+    pub adversary_id_base: CombatantId,
 }
 
 impl Default for AdversaryConfig {
@@ -154,7 +183,11 @@ impl Default for AdversaryConfig {
             speed: 4.0,
             waypoint_radius: 12.0,
             spawn_center: [0.0, 0.0, 0.0],
-            max_health: 100,
+            max_health: 100.0,
+            eye_height: 1.5,
+            player: PlayerConfig::default(),
+            player_id: 1,
+            adversary_id_base: 0,
         }
     }
 }
@@ -174,14 +207,20 @@ pub struct Adversary {
     pub cooldown: u32,
     /// Consecutive perception wake-ups with LOS lost (hysteresis).
     pub los_lost: u32,
-    /// Placeholder health — A's contract governs (contract item 2).
-    pub health: u32,
+    /// The adversary's health — `combat::Health` (the contract's
+    /// transition domain; transitions happen only through
+    /// `AdversaryWorld::apply_player_hit`).
+    pub health: crate::combat::Health,
     /// The LAST-PERCEIVED player position (sampled on wake-up only —
     /// never per-frame).
     pub perceived: Option<[f32; 3]>,
-    /// The STUBBED attack seam: hit-resolution requests emitted
-    /// (A's contract turns these into damage once it lands).
+    /// Hit-resolution requests emitted (one per ATTACK window).
     pub attacks_emitted: u64,
+    /// The SURFACED resolution of the last ATTACK wake (the contract
+    /// §5 seam: F reads this — and applies player damage with F's
+    /// policy — on encounter-relevant ticks; `attacks_emitted` counts
+    /// the fires).
+    pub last_attack: Option<HitResolution>,
 }
 
 /// The adversary world: per-adversary state over the player module's
@@ -199,9 +238,13 @@ pub struct AdversaryWorld {
 
 impl AdversaryWorld {
     /// Spawns `config.count` adversaries at seeded positions on their
-    /// waypoint circuits, PATROL state, full health.
+    /// waypoint circuits, PATROL state, full health. `max_health` is
+    /// validated by `combat::health_full` (fail-visible at
+    /// construction — the placeholder contract: finite, >= 0).
     pub fn new(config: AdversaryConfig, collision: CollisionWorld) -> Self {
         let spawn_center = config.spawn_center;
+        let full_health =
+            crate::combat::health_full(config.max_health).expect("AdversaryConfig.max_health");
         let adversaries = (0..config.count)
             .map(|index| {
                 let position = circuit_waypoint(&config, index, 0);
@@ -212,9 +255,10 @@ impl AdversaryWorld {
                     cursor: 0,
                     cooldown: 0,
                     los_lost: 0,
-                    health: config.max_health,
+                    health: full_health,
                     perceived: None,
                     attacks_emitted: 0,
+                    last_attack: None,
                 }
             })
             .collect();
@@ -266,26 +310,36 @@ impl AdversaryWorld {
         self.player_position
     }
 
-    /// The STUBBED incoming-damage seam (contract item 2): placeholder
-    /// health decrement + provocation (damage received forces AGGRO).
-    /// A's damage/health transition contract will govern the real
-    /// semantics; this seam keeps the behavior machine testable now.
-    pub fn apply_damage(&mut self, index: usize, amount: u32) {
-        let Some(adversary) = self.adversaries.get_mut(index) else {
-            return;
-        };
+    /// The incoming-damage seam (the contract §3/§5 Health-ownership
+    /// convention): player-fired damage routes through the adversary's
+    /// `combat::Health::apply_damage` HERE, inside the owning module.
+    /// `Some(Ok(DamageOutcome::Defeated {..}))` is the ONLY entry into
+    /// DEFEATED (the engine's single defeat declaration); `Wounded`/
+    /// `Graze` provoke (damage received forces AGGRO — a DORMANT
+    /// adversary takes the damage but stays dormant: activation is
+    /// F's scripting authority); `Err(_)` is the Health refusal
+    /// passthrough with the value bit-identical. `None` = no such
+    /// adversary, or already DEFEATED (terminal — refuses further
+    /// damage).
+    pub fn apply_player_hit(
+        &mut self,
+        index: usize,
+        amount: f32,
+    ) -> Option<Result<DamageOutcome, HealthError>> {
+        let adversary = self.adversaries.get_mut(index)?;
         if adversary.state == AdversaryState::Defeated {
-            return;
+            return None;
         }
-        adversary.health = adversary.health.saturating_sub(amount);
-        if adversary.health == 0 {
+        let outcome = adversary.health.apply_damage(amount);
+        if let Ok(DamageOutcome::Defeated { .. }) = outcome {
             adversary.state = AdversaryState::Defeated;
             adversary.perceived = None;
-        } else if adversary.state != AdversaryState::Dormant {
+        } else if outcome.is_ok() && adversary.state != AdversaryState::Dormant {
             // Provocation: damage received forces AGGRO.
             adversary.state = AdversaryState::Aggro;
             adversary.los_lost = 0;
         }
+        Some(outcome)
     }
 
     /// F's activation schedule for a DORMANT adversary (the encounter
@@ -315,8 +369,10 @@ impl AdversaryWorld {
 
     /// One adversary's perception at a wake-up: distance gate, then a
     /// LOS query through the collision world (`segment_hit` from the
-    /// adversary's eye height to the player). Hysteresis bookkeeping
-    /// (`los_lost`) is the caller's — this returns the raw perception.
+    /// adversary's eye to the player's eye — the contract §2
+    /// recommendation: the exact-slab discipline, margin 0.0).
+    /// Hysteresis bookkeeping (`los_lost`) is the caller's — this
+    /// returns the raw perception.
     fn perceives(&self, index: usize) -> bool {
         let adversary = &self.adversaries[index];
         let player = self.player_position;
@@ -325,11 +381,15 @@ impl AdversaryWorld {
         }
         let eye = [
             adversary.position[0],
-            adversary.position[1] + 1.5,
+            adversary.position[1] + self.config.eye_height,
             adversary.position[2],
         ];
-        let target = [player[0], player[1] + 1.5, player[2]];
-        self.collision.segment_hit(eye, target, 0.05).is_none()
+        let target = [
+            player[0],
+            player[1] + self.config.player.eye_height,
+            player[2],
+        ];
+        self.collision.segment_hit(eye, target, 0.0).is_none()
     }
 
     /// Move `adversary` one wake-up step toward `target` on the ground
@@ -368,6 +428,47 @@ impl AdversaryWorld {
         if !blocked {
             adversary.position = next;
         }
+    }
+
+    /// The ATTACK seam (the contract §1/§5): ONE hit-resolution
+    /// request per attack window — from the adversary's eye toward
+    /// the player body's center (the box over the per-tick sample,
+    /// `player_box` with B's placeholder player view), through the
+    /// shared collision world, with B's placeholder profile (range =
+    /// `attack_range`, exact-face occlusion). The aim is valid by
+    /// construction (the eye sits above the box center on the ground
+    /// plane and all positions are validity-checked upstream), so a
+    /// `Refused` outcome would surface honestly rather than occur by
+    /// design. The outcome is SURFACED per-adversary (`last_attack`)
+    /// — F applies player damage with F's policy; B never mutates
+    /// player Health (the Health-ownership convention).
+    fn resolve_adversary_attack(&self, index: usize) -> HitResolution {
+        let adversary = &self.adversaries[index];
+        let eye = [
+            adversary.position[0],
+            adversary.position[1] + self.config.eye_height,
+            adversary.position[2],
+        ];
+        let (min, max) = player_box(self.player_position, &self.config.player);
+        let center = [
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        ];
+        let request = AttackRequest {
+            attacker: self.config.adversary_id_base + index as CombatantId,
+            origin: eye,
+            direction: [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]],
+            profile: AttackProfile {
+                range: self.config.attack_range,
+                occlusion_margin: 0.0,
+            },
+        };
+        let targets = [Combatant {
+            id: self.config.player_id,
+            hit_box: StaticCollider { min, max },
+        }];
+        resolve_attack(&self.collision, &request, &targets)
     }
 
     /// One adversary's wake-up: the state machine step (a pure
@@ -438,9 +539,12 @@ impl AdversaryWorld {
                 }
             }
             AdversaryState::Attack => {
-                // The STUBBED attack seam: one hit-resolution request
-                // per window (counted; A's contract resolves). The
-                // cooldown gate lives here.
+                // The attack seam: ONE hit-resolution request per
+                // window through the combat contract — resolved and
+                // SURFACED (F applies player damage). The cooldown
+                // gate lives here.
+                let resolution = self.resolve_adversary_attack(index);
+                self.adversaries[index].last_attack = Some(resolution);
                 self.adversaries[index].attacks_emitted += 1;
                 self.adversaries[index].cooldown = self.config.attack_cooldown as u32;
                 transition = Some(AdversaryState::Recover);
@@ -503,9 +607,41 @@ impl World for AdversaryWorld {
             fp.write_u64(adversary.cursor);
             fp.write_u32(adversary.cooldown);
             fp.write_u32(adversary.los_lost);
-            fp.write_u32(adversary.health);
+            fp.write_u32(adversary.health.current.to_bits());
+            fp.write_u32(adversary.health.maximum.to_bits());
             fp.write_u64(adversary.attacks_emitted);
             fp.write_u8(u8::from(adversary.perceived.is_some()));
+            // The surfaced last resolution (bit-stable per the
+            // contract's §6 float discipline — the resolution path is
+            // IEEE exactly-rounded arithmetic only).
+            match adversary.last_attack {
+                None => fp.write_u8(0),
+                Some(HitResolution::Hit {
+                    target, distance, ..
+                }) => {
+                    fp.write_u8(1);
+                    fp.write_u32(target);
+                    fp.write_u32(distance.to_bits());
+                }
+                Some(HitResolution::Miss {
+                    kind: MissKind::Occluded { distance, .. },
+                }) => {
+                    fp.write_u8(2);
+                    fp.write_u32(distance.to_bits());
+                }
+                Some(HitResolution::Miss {
+                    kind: MissKind::Clear,
+                }) => fp.write_u8(3),
+                Some(HitResolution::Refused(reason)) => {
+                    fp.write_u8(4);
+                    fp.write_u8(match reason {
+                        AttackRefusal::NonFiniteOrigin => 0,
+                        AttackRefusal::NonFiniteDirection => 1,
+                        AttackRefusal::ZeroDirection => 2,
+                        AttackRefusal::InvalidProfile(_) => 3,
+                    });
+                }
+            }
         }
     }
 }
@@ -690,16 +826,27 @@ mod tests {
             "9 m never crosses the 8 m aggro radius from PATROL"
         );
 
-        // Provocation forces AGGRO regardless of distance.
+        // Provocation forces AGGRO regardless of distance — the damage
+        // routes through the contract's Health transition.
         let mut spine = Spine::with_reservation(
             AdversaryWorld::new(config.clone(), CollisionWorld::new(0.0)),
             200,
             60,
         );
         install_adversary_schedules(&mut spine);
-        spine.world_mut().apply_damage(0, 10);
+        let outcome = spine
+            .world_mut()
+            .apply_player_hit(0, 10.0)
+            .expect("the adversary exists");
+        assert_eq!(
+            outcome,
+            Ok(DamageOutcome::Wounded {
+                remaining: 90.0,
+                dealt: 10.0
+            })
+        );
         assert_eq!(spine.world().adversary(0).state, AdversaryState::Aggro);
-        assert_eq!(spine.world().adversary(0).health, 90);
+        assert_eq!(spine.world().adversary(0).health.current, 90.0);
 
         // (LOS-loss) the player at 9 m behind a wall: distance < deaggro
         // so only the LOS-loss window can fire — PATROL exactly at the
@@ -709,7 +856,14 @@ mod tests {
         let mut spine =
             Spine::with_reservation(AdversaryWorld::new(config.clone(), walled), 200, 60);
         install_adversary_schedules(&mut spine);
-        spine.world_mut().apply_damage(0, 10);
+        assert_eq!(
+            spine.world_mut().apply_player_hit(0, 10.0),
+            Some(Ok(DamageOutcome::Wounded {
+                remaining: 90.0,
+                dealt: 10.0
+            })),
+            "provocation lands"
+        );
         for tick in 0..30 {
             spine.world_mut().set_player_position(far);
             spine.run_tick();
@@ -738,7 +892,14 @@ mod tests {
             60,
         );
         install_adversary_schedules(&mut spine);
-        spine.world_mut().apply_damage(0, 10);
+        assert_eq!(
+            spine.world_mut().apply_player_hit(0, 10.0),
+            Some(Ok(DamageOutcome::Wounded {
+                remaining: 90.0,
+                dealt: 10.0
+            })),
+            "provocation lands"
+        );
         let mut deaggroed = false;
         for tick in 0..60 {
             let retreat = [spawn[0] + 9.0 + 0.5 * tick as f32, spawn[1], spawn[2]];
@@ -861,8 +1022,17 @@ mod tests {
             spine.world_mut().set_player_position(nowhere);
             spine.run_tick();
         }
-        spine.world_mut().apply_damage(0, 100);
+        let outcome = spine
+            .world_mut()
+            .apply_player_hit(0, 100.0)
+            .expect("the adversary exists");
+        assert_eq!(outcome, Ok(DamageOutcome::Defeated { dealt: 100.0 }));
         assert_eq!(spine.world().adversary(0).state, AdversaryState::Defeated);
+        assert_eq!(
+            spine.world_mut().apply_player_hit(0, 50.0),
+            None,
+            "DEFEATED refuses further damage"
+        );
         for _ in 0..40 {
             spine.world_mut().set_player_position(nowhere);
             spine.run_tick();
@@ -1056,6 +1226,88 @@ mod tests {
         );
     }
 
+    /// The ATTACK seam through the combat contract: the attack wake
+    /// resolves ONE request (adversary eye → the player body's center,
+    /// B's placeholder profile) and SURFACES the outcome per-adversary.
+    /// (Hit) the milestone chase attacks from x = 3.2 with the eye at
+    /// +1.5; the player box (the default body: x 4.65..5.35, y 0..1.7)
+    /// is entered at its near face. (Occluded) a LOW wall — under the
+    /// eye-to-eye perception line (y ≈ 1.5..1.6 passes above its 1.2
+    /// top) but across the descending attack trace (the aim drops
+    /// toward the body center at y 0.85) — occludes before the box;
+    /// the pursuit itself passes under it (the movement check rides
+    /// y 0.5, below the wall's margin-inflated floor at 0.6). Both
+    /// double-run identical.
+    #[test]
+    fn attack_seam_resolves_through_the_combat_contract() {
+        let mut config = scenario_config(1);
+        config.waypoint_radius = 0.0;
+        let spawn = circuit_waypoint(&config, 0, 0);
+        let player = [spawn[0] + 5.0, spawn[1], spawn[2]];
+
+        // (Hit) the empty-world chase.
+        let (spine, trace) = run_scenario(config.clone(), CollisionWorld::new(0.0), player, 20);
+        let adversary = spine.world().adversary(0);
+        assert_eq!(adversary.attacks_emitted, 1, "one fire in 20 ticks");
+        match adversary.last_attack {
+            Some(HitResolution::Hit {
+                target,
+                distance,
+                point,
+            }) => {
+                assert_eq!(target, 1, "the surfaced player target id");
+                assert!(
+                    (1.52..1.56).contains(&distance),
+                    "the box near-face distance from the eye (got {distance})"
+                );
+                assert!(
+                    (4.64..4.66).contains(&point[0]) && (0.96..0.99).contains(&point[1]),
+                    "the impact at the box's near face (got {point:?})"
+                );
+            }
+            other => panic!("expected a surfaced Hit, got {other:?}"),
+        }
+        let (spine2, trace2) = run_scenario(config.clone(), CollisionWorld::new(0.0), player, 20);
+        assert_eq!(trace, trace2, "the chase double-runs identical");
+        assert_eq!(
+            spine.world().adversary(0).last_attack,
+            spine2.world().adversary(0).last_attack,
+            "the surfaced resolution double-runs identical"
+        );
+
+        // (Occluded) the low wall across the descending trace.
+        let walled = CollisionWorld::new(0.0).with_collider(StaticCollider {
+            min: [spawn[0] + 4.2, 1.0, spawn[2] - 2.0],
+            max: [spawn[0] + 4.6, 1.2, spawn[2] + 2.0],
+        });
+        let (spine, trace) = run_scenario(config.clone(), walled.clone(), player, 20);
+        let adversary = spine.world().adversary(0);
+        assert_eq!(adversary.attacks_emitted, 1, "the same chase and fire");
+        match adversary.last_attack {
+            Some(HitResolution::Miss {
+                kind: MissKind::Occluded { distance, point },
+            }) => {
+                assert!(
+                    (1.0..1.12).contains(&distance),
+                    "the low wall's entry before the box face (got {distance})"
+                );
+                assert!(
+                    (4.15..4.25).contains(&point[0]),
+                    "the wall's near face (got {})",
+                    point[0]
+                );
+            }
+            other => panic!("expected a surfaced Occluded miss, got {other:?}"),
+        }
+        let (spine2, trace2) = run_scenario(config, walled, player, 20);
+        assert_eq!(trace, trace2, "the occluded chase double-runs identical");
+        assert_eq!(
+            spine.world().adversary(0).last_attack,
+            spine2.world().adversary(0).last_attack,
+            "the surfaced occlusion double-runs identical"
+        );
+    }
+
     /// The chain codec and world guards: payloads round-trip across the
     /// full index/cursor range; any tag ≠ `ADVERSARY_MAGIC` decodes to
     /// `None`; `execute` ignores foreign payloads and out-of-range
@@ -1115,22 +1367,54 @@ mod tests {
             "a patrolling adversary has no activation spec"
         );
 
-        // apply_damage refuses the defeated and the out-of-range.
+        // apply_player_hit: the Health refusals pass through with the
+        // value bit-identical; the defeated and the out-of-range are
+        // refused; a DORMANT adversary takes damage without provoking
+        // (activation is F's scripting authority).
         let mut world = AdversaryWorld::new(scenario_config(2), CollisionWorld::new(0.0));
-        world.apply_damage(0, 100);
-        assert_eq!(world.adversary(0).state, AdversaryState::Defeated);
-        world.apply_damage(0, 50);
         assert_eq!(
-            world.adversary(0).health,
-            0,
+            world.apply_player_hit(999, 50.0),
+            None,
+            "out-of-range damage is refused"
+        );
+        assert_eq!(
+            world.apply_player_hit(0, f32::NAN),
+            Some(Err(HealthError::NonFiniteAmount))
+        );
+        assert_eq!(
+            world.apply_player_hit(0, -5.0),
+            Some(Err(HealthError::NegativeAmount))
+        );
+        assert_eq!(
+            world.adversary(0).health.current,
+            100.0,
+            "refusals leave the value bit-identical"
+        );
+        world.adversaries[0].state = AdversaryState::Dormant;
+        assert_eq!(
+            world.apply_player_hit(0, 10.0),
+            Some(Ok(DamageOutcome::Wounded {
+                remaining: 90.0,
+                dealt: 10.0
+            })),
+            "a dormant adversary takes the damage"
+        );
+        assert_eq!(
+            world.adversary(0).state,
+            AdversaryState::Dormant,
+            "without provoking"
+        );
+        let outcome = world
+            .apply_player_hit(0, 90.0)
+            .expect("the adversary exists");
+        assert_eq!(outcome, Ok(DamageOutcome::Defeated { dealt: 90.0 }));
+        assert_eq!(world.adversary(0).state, AdversaryState::Defeated);
+        assert_eq!(
+            world.apply_player_hit(0, 50.0),
+            None,
             "the defeated refuse further damage"
         );
-        world.apply_damage(999, 50);
-        assert_eq!(
-            world.adversary(1).state,
-            AdversaryState::Patrol,
-            "out-of-range damage is ignored"
-        );
+        assert_eq!(world.adversary(1).state, AdversaryState::Patrol);
     }
 
     /// The namespaced world fingerprint: double-run identical, and
