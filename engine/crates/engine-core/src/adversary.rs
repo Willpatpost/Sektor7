@@ -131,7 +131,13 @@ pub struct AdversaryConfig {
     pub aggro_cadence: u64,
     /// RECOVER wake-up cadence (placeholder 6 ticks).
     pub recover_cadence: u64,
-    /// ATTACK cooldown in ticks (placeholder 18).
+    /// ATTACK cooldown in LOGICAL TICKS (placeholder 18) — the
+    /// canonical unit (C3-R2): the attack-readiness deadline is set
+    /// at the ATTACK emit as `emit_tick + cooldown` (saturating) and
+    /// compared against the execution tick at the AGGRO gate; it is
+    /// NEVER decremented per wake (the old per-wake decrement made
+    /// the effective duration a function of the wake frequency,
+    /// silently changing units between states).
     pub attack_cooldown: u64,
     /// ATTACK range (placeholder 2.0 m — must be ≤ aggro_radius).
     pub attack_range: f32,
@@ -203,8 +209,12 @@ pub struct Adversary {
     pub waypoint: usize,
     /// The chain cursor (payload bookkeeping — also fingerprinted).
     pub cursor: u64,
-    /// Ticks of attack cooldown remaining.
-    pub cooldown: u32,
+    /// The logical tick at which the adversary is attack-eligible
+    /// again (C3-R2: the canonical logical-tick DEADLINE — set at the
+    /// ATTACK emit, read at the AGGRO gate as a pure comparison;
+    /// never decremented, so zero idle per-wake bookkeeping and no
+    /// wake-frequency-dependent unit drift).
+    pub cooldown_until: u64,
     /// Consecutive perception wake-ups with LOS lost (hysteresis).
     pub los_lost: u32,
     /// The adversary's health — `combat::Health` (the contract's
@@ -253,7 +263,7 @@ impl AdversaryWorld {
                     position,
                     waypoint: 1,
                     cursor: 0,
-                    cooldown: 0,
+                    cooldown_until: 0,
                     los_lost: 0,
                     health: full_health,
                     perceived: None,
@@ -489,12 +499,17 @@ impl AdversaryWorld {
 
     /// One adversary's wake-up: the state machine step (a pure
     /// function of logical state, the player sample, and the seeded
-    /// circuit — deterministic, headless-reproducible). DEFEATED is
-    /// terminal (no transition, and `execute` schedules no follow-up —
-    /// the chain stops); a DORMANT adversary's activation wake-up (the
-    /// spec F schedules) TRANSITIONS it to PATROL, whose cadence then
-    /// carries the chain onward.
-    fn wake(&mut self, index: usize) {
+    /// circuit — deterministic, headless-reproducible). `now` is the
+    /// EXECUTION tick (the event ledger's canonical logical clock —
+    /// never wall-clock). DEFEATED is terminal (no transition, and
+    /// `execute` schedules no follow-up — the chain stops); a DORMANT
+    /// adversary's activation wake-up (the spec F schedules)
+    /// TRANSITIONS it to PATROL, whose cadence then carries the chain
+    /// onward. Attack readiness is the `cooldown_until` logical-tick
+    /// DEADLINE (C3-R2): set at the ATTACK emit, compared at the AGGRO
+    /// gate — never decremented, so the effective duration is the
+    /// configured value in ticks regardless of the wake cadences.
+    fn wake(&mut self, index: usize, now: Tick) {
         if self.adversaries[index].state == AdversaryState::Defeated {
             return;
         }
@@ -529,7 +544,7 @@ impl AdversaryWorld {
                 let distance =
                     Self::ground_distance(self.adversaries[index].position, self.player_position);
                 if distance <= self.config.attack_range
-                    && self.adversaries[index].cooldown == 0
+                    && now.0 >= self.adversaries[index].cooldown_until
                     && self.perceives(index)
                 {
                     self.adversaries[index].perceived = Some(self.player_position);
@@ -558,11 +573,16 @@ impl AdversaryWorld {
                 // The attack seam: ONE hit-resolution request per
                 // window through the combat contract — resolved and
                 // SURFACED (F applies player damage). The cooldown
-                // gate lives here.
+                // gate is the canonical logical-tick DEADLINE (C3-R2):
+                // saturating so a huge configured cooldown never wraps
+                // into instant re-eligibility, and never decremented —
+                // readiness is a pure comparison at the next AGGRO
+                // gate.
                 let resolution = self.resolve_adversary_attack(index);
                 self.adversaries[index].last_attack = Some(resolution);
                 self.adversaries[index].attacks_emitted += 1;
-                self.adversaries[index].cooldown = self.config.attack_cooldown as u32;
+                self.adversaries[index].cooldown_until =
+                    now.saturating_add(self.config.attack_cooldown).0;
                 transition = Some(AdversaryState::Recover);
             }
             AdversaryState::Recover => {
@@ -579,9 +599,6 @@ impl AdversaryWorld {
         if let Some(next) = transition {
             self.adversaries[index].state = next;
         }
-        if self.adversaries[index].cooldown > 0 {
-            self.adversaries[index].cooldown -= 1;
-        }
     }
 }
 
@@ -594,7 +611,7 @@ impl World for AdversaryWorld {
             return;
         }
         self.adversaries[index].cursor += 1;
-        self.wake(index);
+        self.wake(index, ctx.executed_tick());
         let state = self.adversaries[index].state;
         let cadence = state.cadence(&self.config);
         if cadence > 0 {
@@ -621,7 +638,7 @@ impl World for AdversaryWorld {
                 fp.write_u32(value.to_bits());
             }
             fp.write_u64(adversary.cursor);
-            fp.write_u32(adversary.cooldown);
+            fp.write_u64(adversary.cooldown_until);
             fp.write_u32(adversary.los_lost);
             fp.write_u32(adversary.health.current.to_bits());
             fp.write_u32(adversary.health.maximum.to_bits());
@@ -793,9 +810,12 @@ mod tests {
     /// wake-up (unit cadence → tick 1), pursues at 0.4 m/tick from
     /// 5 m, ATTACKS exactly at tick 11 (in range at tick 10's wake —
     /// distance 1.8 ≤ 2.0 — the attack lands on the ATTACK wake),
-    /// RECOVERS 6 ticks, re-agpros, and the 18-tick cooldown gates
-    /// attack #2 to exactly tick 36. The whole trace double-runs
-    /// identical.
+    /// RECOVERS 6 ticks, re-agpros, and the 18-tick LOGICAL-TICK
+    /// cooldown deadline (C3-R2: set at the emit, never decremented)
+    /// gates the gate wake to exactly tick 29 and attack #2 to tick
+    /// 30 — then #3 at 49 and #4 at 68 (the 19-tick attack cycle:
+    /// 18 cooldown + 1 ATTACK-cadence emit wake). The whole trace
+    /// double-runs identical.
     #[test]
     fn state_machine_transitions_and_attack_cadence_are_deterministic() {
         let config = scenario_config(1);
@@ -808,15 +828,21 @@ mod tests {
             AdversaryState::Aggro.code(),
             "perceives at tick 1"
         );
-        assert_eq!(adversary.attacks_emitted, 3, "attacks at ticks 11, 36, 61");
-        // The exact milestone ticks (fail-first calibrated).
+        assert_eq!(
+            adversary.attacks_emitted, 4,
+            "attacks at ticks 11, 30, 49, 68"
+        );
+        // The exact milestone ticks (fail-first calibrated; the C3-R2
+        // deadline indices supersede the defective per-wake-decrement
+        // values 36/61).
         assert_eq!(trace[10].3, 1, "attack #1 lands at tick 11 (index 10)");
         assert_eq!(
             trace[28].3, 1,
-            "still one attack before the cooldown clears"
+            "still one attack at the tick-29 gate wake (the deadline)"
         );
-        assert_eq!(trace[35].3, 2, "attack #2 lands at tick 36 (index 35)");
-        assert_eq!(trace[60].3, 3, "attack #3 lands at tick 61 (index 60)");
+        assert_eq!(trace[29].3, 2, "attack #2 lands at tick 30 (index 29)");
+        assert_eq!(trace[48].3, 3, "attack #3 lands at tick 49 (index 48)");
+        assert_eq!(trace[67].3, 4, "attack #4 lands at tick 68 (index 67)");
         let (_spine2, trace2) =
             run_scenario(scenario_config(1), CollisionWorld::new(0.0), player, 70);
         assert_eq!(trace, trace2, "the scenario double-runs identical");
@@ -1398,6 +1424,112 @@ mod tests {
             spine.world().adversary(0).position,
             player,
             "the unblocked snap still lands on the target exactly"
+        );
+    }
+
+    /// C3-R2 (the cooldown time-unit corrective): attack readiness is
+    /// enforced in CANONICAL LOGICAL-TICK units. The same configured
+    /// `attack_cooldown` (18) under different AGGRO/RECOVER cadence
+    /// mixes must yield the same logical-tick readiness boundary: the
+    /// GATE wake (the AGGRO wake that passes the eligibility gate —
+    /// the emit lands one ATTACK-cadence wake later, so gate = t2 −
+    /// aggro_cadence) never fires before t1 + 18 and never later than
+    /// one AGGRO-cadence quantum past that deadline. The DEFECTIVE
+    /// per-wake decrement made the effective duration a function of
+    /// the wake frequency (units silently changing between states:
+    /// AGGRO wakes 1/2-tick, RECOVER 1/6-tick at the defaults) — this
+    /// regression FAILS at the reviewed candidate 3a31627.
+    #[test]
+    fn cooldown_is_canonical_logical_ticks_across_cadence_mixes() {
+        for (aggro_cadence, recover_cadence) in [(1u64, 6u64), (3, 6), (4, 6)] {
+            let mut config = scenario_config(1);
+            config.waypoint_radius = 0.0;
+            config.aggro_cadence = aggro_cadence;
+            config.recover_cadence = recover_cadence;
+            let spawn = circuit_waypoint(&config, 0, 0);
+            // Within attack range from the spawn — no chase: the
+            // timing under test is purely the cooldown cycle.
+            let player = [spawn[0] + 2.0, spawn[1], spawn[2]];
+            let (_spine, trace) = run_scenario(config, CollisionWorld::new(0.0), player, 120);
+            let t1 = trace
+                .iter()
+                .position(|record| record.3 == 1)
+                .expect("the first attack lands") as u64
+                + 1;
+            let t2 = trace
+                .iter()
+                .position(|record| record.3 == 2)
+                .expect("the second attack lands") as u64
+                + 1;
+            let gate = t2 - aggro_cadence;
+            assert!(
+                gate - t1 >= 18,
+                "aggro {aggro_cadence}/recover {recover_cadence}: never before \
+                 the configured logical-tick cooldown (t1 {t1}, t2 {t2})"
+            );
+            assert!(
+                gate - t1 <= 18 + aggro_cadence,
+                "aggro {aggro_cadence}/recover {recover_cadence}: eligible at \
+                 the first wake at/after the deadline — the wake quantization \
+                 is the only slack (t1 {t1}, t2 {t2})"
+            );
+        }
+    }
+
+    /// C3-R2 edge cases: ZERO cooldown re-arms at the state machine's
+    /// floor (the ATTACK→RECOVER→AGGRO cycle — recover 6 + the first
+    /// AGGRO wake 1 = gate at t1+7; no cooldown wait at all); a
+    /// cooldown ≥ 2^32 does NOT silently truncate into a small
+    /// per-wake count (the old `as u32` cast read 2^32+5 as 5 — the
+    /// large-value sub-case FAILS at the reviewed candidate); and a
+    /// u64::MAX cooldown SATURATES the deadline (a naive add would
+    /// wrap past u64::MAX into instant re-eligibility — saturating
+    /// prevents exactly that).
+    #[test]
+    fn cooldown_edge_cases_zero_and_large_values() {
+        let mut config = scenario_config(1);
+        config.waypoint_radius = 0.0;
+        let spawn = circuit_waypoint(&config, 0, 0);
+        let player = [spawn[0] + 2.0, spawn[1], spawn[2]];
+        let emit_tick = |trace: &[TraceRecord], ordinal: u64| {
+            trace
+                .iter()
+                .position(|record| record.3 == ordinal)
+                .expect("the attack lands") as u64
+                + 1
+        };
+
+        // (zero) the floor is the recover cycle plus one aggro wake.
+        let mut zeroed = config.clone();
+        zeroed.attack_cooldown = 0;
+        let (_spine, trace) = run_scenario(zeroed, CollisionWorld::new(0.0), player, 60);
+        let t1 = emit_tick(&trace, 1);
+        let t2 = emit_tick(&trace, 2);
+        assert_eq!(
+            t2 - 1 - t1,
+            7,
+            "zero cooldown: the gate re-arms at the state machine's floor"
+        );
+
+        // (large, no truncation) 2^32 + 5 must NOT read as 5.
+        let mut large = config.clone();
+        large.attack_cooldown = u64::from(u32::MAX) + 5;
+        let (_spine, trace) = run_scenario(large, CollisionWorld::new(0.0), player, 200);
+        assert_eq!(
+            trace.last().expect("the run completed").3,
+            1,
+            "a cooldown of 2^32 + 5 keeps exactly one attack in 200 ticks — \
+             no u32 truncation"
+        );
+
+        // (large, saturating) u64::MAX never wraps into re-eligibility.
+        let mut saturating = config;
+        saturating.attack_cooldown = u64::MAX;
+        let (_spine, trace) = run_scenario(saturating, CollisionWorld::new(0.0), player, 200);
+        assert_eq!(
+            trace.last().expect("the run completed").3,
+            1,
+            "the saturated deadline never re-arms"
         );
     }
 
