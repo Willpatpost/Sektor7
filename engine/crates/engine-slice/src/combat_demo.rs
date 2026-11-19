@@ -1500,6 +1500,17 @@ pub fn health_bar(current: f32, maximum: f32) -> String {
     format!("[{}{}]", "#".repeat(filled), "-".repeat(CELLS - filled))
 }
 
+/// The overlay-boundary ASCII sanitizer (the MINOR-1 fix, SEAT I's
+/// review): the embedded event-log text carries non-ASCII punctuation
+/// (the em-dash `—`, the middle dot `·`), and font8x8's ASCII-only
+/// legacy font renders every non-ASCII code point as `?` on screen —
+/// so the OVERLAY BOUNDARY maps the known vocabulary to ASCII
+/// equivalents. The console evidence records are NOT affected (they
+/// keep the original text — only the on-screen line is sanitized).
+pub fn overlay_ascii(line: &str) -> String {
+    line.replace('—', "-").replace('·', "|")
+}
+
 /// The event→cue mapping (C's published table + the Cycle-4 F
 /// additions, orchestrator-approved 2026-11-18): every fire plays
 /// `Cue::Fire`, a landed hit adds `Cue::Impact`, an adversary attack
@@ -1820,6 +1831,13 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 .rev()
                 .find_map(|(_, line)| line.starts_with("fire ").then(|| line.clone()))
                 .unwrap_or_else(|| "no fire yet".to_string());
+            // The MINOR-1 fix (SEAT I's review): the embedded event
+            // text carries non-ASCII punctuation (the em-dash —
+            // font8x8 renders every non-ASCII code point as '?'),
+            // so the OVERLAY BOUNDARY maps the vocabulary to ASCII
+            // (the console evidence records keep the original text —
+            // only the on-screen line is sanitized).
+            let last_fire = overlay_ascii(&last_fire);
             let damage_line = match (demo.encounter.last_damage_tick, demo.tick_index()) {
                 (Some(last), now) if now.saturating_sub(last) <= 90 => {
                     format!(

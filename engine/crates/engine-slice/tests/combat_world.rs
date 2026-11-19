@@ -16,7 +16,7 @@ use engine_shell::{InputSnapshot, MouseButton};
 use engine_slice::combat_demo::{
     ACTIVATION_Z, ADVERSARY_SPAWN, ARENA_BOXES, ArenaRole, CombatDemo, EncounterPhase,
     PLAYER_SPAWN, adversary_body, arena_world, combat_config, health_bar, map_combat_input,
-    run_combat_failure_headless, run_combat_headless, run_winnable_script,
+    overlay_ascii, run_combat_failure_headless, run_combat_headless, run_winnable_script,
 };
 
 /// The layout literal's invariants (the F2 rule: an independent
@@ -1468,4 +1468,30 @@ fn hud_health_bar_renders_the_ascii_cells() {
     // The bar is ASCII-only (the overlay's font8x8 constraint — the
     // non-ASCII glyphs render as '?' on screen).
     assert!(health_bar(74.0, 100.0).is_ascii());
+}
+
+/// The MINOR-1 fix (SEAT I's review): the overlay-boundary ASCII
+/// sanitizer — the embedded event text's non-ASCII punctuation (the
+/// em-dash, the middle dot) maps to ASCII equivalents at the boundary
+/// (font8x8 renders every non-ASCII code point as '?' on screen).
+#[test]
+fn overlay_boundary_sanitizes_the_embedded_event_text() {
+    assert_eq!(
+        overlay_ascii("fire 2: HIT — adversary 50/100"),
+        "fire 2: HIT - adversary 50/100",
+        "the em-dash maps to the ASCII hyphen"
+    );
+    assert_eq!(
+        overlay_ascii("settled · the courtyard"),
+        "settled | the courtyard",
+        "the middle dot maps to the ASCII pipe"
+    );
+    assert_eq!(
+        overlay_ascii("fire 1: HIT — adversary 75/100"),
+        "fire 1: HIT - adversary 75/100"
+    );
+    // The sanitized line is ASCII-only (the on-screen guarantee).
+    assert!(overlay_ascii("fire 2: HIT — adversary 50/100").is_ascii());
+    // Pure-ASCII text passes through unchanged.
+    assert_eq!(overlay_ascii("no fire yet"), "no fire yet");
 }
