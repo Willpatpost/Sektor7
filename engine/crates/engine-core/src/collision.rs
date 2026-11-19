@@ -30,16 +30,15 @@
 //!
 //! Coexistence with the axis-aligned world (the byte-identity
 //! guarantee): a [`CollisionWorld`] whose rotated list is EMPTY takes
-//! the exact existing code paths — not one additional floating-point
-//! operation — so every existing test and frozen trace is unchanged
-//! by construction. A world that DOES carry rotated colliders gets
-//! every query rotated-aware together (the all-or-nothing rule): the
-//! movement wiring lands with the swept implementation, and until it
-//! does the world queries REFUSE rotated worlds loudly (never the
-//! forbidden half-rotated state where line-of-sight sees a shape
-//! movement passes through).
+//! the exact existing code paths — the rotated query arms are
+//! zero-iteration loops that add no floating-point operations — so
+//! every existing test and frozen trace is unchanged by construction.
+//! A world that DOES carry rotated colliders gets every query
+//! rotated-aware together (the all-or-nothing rule, now wired): the
+//! axis-aligned list is consulted first with byte-identical behavior,
+//! then the rotated list through the exact narrow phase here.
 
-use crate::player::StaticCollider;
+use crate::player::{SKIN, StaticCollider};
 
 /// One yaw-rotated static box collider: a vertical prism whose
 /// horizontal cross-section is a rectangle of half-extents
@@ -69,6 +68,12 @@ pub struct RotatedCollider {
     /// recomputed per query.
     cos_yaw: f32,
     sin_yaw: f32,
+    /// The cached world AABB (the broad-phase rejection volume) —
+    /// derived in the constructor from the same corner transform
+    /// [`RotatedCollider::world_aabb`] returns, so every pretest is
+    /// six compares with zero per-query trigonometry.
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
 }
 
 impl RotatedCollider {
@@ -85,12 +90,30 @@ impl RotatedCollider {
         if !valid {
             return None;
         }
+        let cos_yaw = yaw.cos();
+        let sin_yaw = yaw.sin();
+        let mut aabb_min = [f32::INFINITY; 3];
+        let mut aabb_max = [f32::NEG_INFINITY; 3];
+        for corner_x in [-half[0], half[0]] {
+            for corner_z in [-half[2], half[2]] {
+                let world_x = center[0] + corner_x * cos_yaw + corner_z * sin_yaw;
+                let world_z = center[2] - corner_x * sin_yaw + corner_z * cos_yaw;
+                aabb_min[0] = aabb_min[0].min(world_x);
+                aabb_max[0] = aabb_max[0].max(world_x);
+                aabb_min[2] = aabb_min[2].min(world_z);
+                aabb_max[2] = aabb_max[2].max(world_z);
+            }
+        }
+        aabb_min[1] = center[1] - half[1];
+        aabb_max[1] = center[1] + half[1];
         Some(RotatedCollider {
             center,
             half,
             yaw,
-            cos_yaw: yaw.cos(),
-            sin_yaw: yaw.sin(),
+            cos_yaw,
+            sin_yaw,
+            aabb_min,
+            aabb_max,
         })
     }
 
@@ -158,78 +181,253 @@ impl RotatedCollider {
     /// The world-axis-aligned bounding box of this collider — the
     /// BROAD-PHASE rejection volume: exact (the four transformed
     /// horizontal corners, minimized/maximized; the vertical interval
-    /// is rotation-invariant). Every rotated narrow-phase query
-    /// pretests against this box first (six compares), so distant
-    /// colliders cost one cheap rejection, never the SAT.
+    /// is rotation-invariant), computed once at construction and
+    /// cached. Every rotated narrow-phase query pretests against this
+    /// box (six compares), so distant colliders cost one cheap
+    /// rejection, never the SAT.
     pub fn world_aabb(&self) -> StaticCollider {
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for corner_x in [-self.half[0], self.half[0]] {
-            for corner_z in [-self.half[2], self.half[2]] {
-                let world_x = self.center[0] + corner_x * self.cos_yaw + corner_z * self.sin_yaw;
-                let world_z = self.center[2] - corner_x * self.sin_yaw + corner_z * self.cos_yaw;
-                min[0] = min[0].min(world_x);
-                max[0] = max[0].max(world_x);
-                min[2] = min[2].min(world_z);
-                max[2] = max[2].max(world_z);
-            }
+        StaticCollider {
+            min: self.aabb_min,
+            max: self.aabb_max,
         }
-        min[1] = self.center[1] - self.half[1];
-        max[1] = self.center[1] + self.half[1];
-        StaticCollider { min, max }
     }
 
     /// Whether the given axis-aligned box overlaps this rotated
     /// collider (strict overlap — contact at the skin margin is
     /// clear, mirroring [`CollisionWorld::box_overlaps`]).
     ///
-    /// Contract: the world-AABB pretest rejects first; the narrow
-    /// phase is the exact 2D separating-axis test between the player
-    /// footprint rectangle (axis-aligned) and the rotated rectangle,
-    /// gated by the vertical interval overlap (both shapes are
-    /// vertical prisms, so vertical overlap is a 1D interval test).
-    ///
-    /// **Skeleton stub** — the exact SAT lands with the movement
-    /// implementation (the interface contract §2 fixes the
-    /// semantics; the world wiring refuses rotated worlds until it
-    /// lands, so this is never silently wrong).
-    pub fn overlaps_box(&self, _min: [f32; 3], _max: [f32; 3]) -> bool {
-        todo!("the Cycle-4 C horizontal SAT narrow phase (COLLISION-INTERFACE §2)")
+    /// The broad phase (the cached world AABB, six compares) rejects
+    /// first; the narrow phase is the exact 2D separating-axis test
+    /// between the box's horizontal rectangle (axis-aligned) and the
+    /// rotated rectangle over the FOUR separating axes (world X,
+    /// world Z, the collider's local X, its local Z), gated by the
+    /// vertical interval overlap (both shapes are vertical prisms,
+    /// so vertical overlap is a 1D interval test). Deterministic:
+    /// fixed axis order, pure arithmetic.
+    pub fn overlaps_box(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        if (0..3).any(|a| min[a] >= self.aabb_max[a] || max[a] <= self.aabb_min[a]) {
+            return false;
+        }
+        if min[1] >= self.center[1] + self.half[1] || max[1] <= self.center[1] - self.half[1] {
+            return false;
+        }
+        let (projection, extent_sum) = self.horizontal_sat(min, max);
+        (0..4).all(|u| projection[u].abs() < extent_sum[u])
     }
 
     /// The minimal push that clears an overlapping axis-aligned box
-    /// from this rotated collider: the smallest-magnitude translation
-    /// along ONE of the four world-frame face normals (the rotated
-    /// analog of the AABB depenetration's minimal-axis push — the
-    /// push direction is the face normal, not a world axis).
+    /// from this rotated collider, as `(push_vector, magnitude)`: the
+    /// smallest-magnitude translation along ONE candidate face
+    /// direction — the AWAY side of each horizontal face axis (the
+    /// rotated analog of the AABB depenetration's minimal-axis push:
+    /// the push direction is a face normal, not a world axis) or the
+    /// two vertical faces (down through the bottom, up onto the top).
+    /// Every push lands [`SKIN`]-clear of the face it exits through,
+    /// never merely re-aligned with it. `ground_y` carries the
+    /// world's ground plane for the AABB path's validity rule: a
+    /// downward push that would cross it is not a candidate (the
+    /// ground clamp would push the box straight back in).
     /// Deterministic: strictly-smaller magnitudes win; mathematical
-    /// ties resolve by the fixed face order (local −X, +X, −Z, +Z).
-    ///
-    /// **Skeleton stub** — lands with the movement implementation.
-    pub fn push_out_box(&self, _min: [f32; 3], _max: [f32; 3]) -> Option<([f32; 3], f32)> {
-        todo!("the Cycle-4 C minimal-normal depenetration (COLLISION-INTERFACE §2)")
+    /// ties resolve by the fixed candidate order (local X, local Z,
+    /// down, up) — identically on every run and platform. `None`
+    /// when the box does not overlap this collider (that overlap is
+    /// this query's own gate).
+    pub fn push_out_box(
+        &self,
+        min: [f32; 3],
+        max: [f32; 3],
+        ground_y: f32,
+    ) -> Option<([f32; 3], f32)> {
+        if !self.overlaps_box(min, max) {
+            return None;
+        }
+        let (projection, extent_sum) = self.horizontal_sat(min, max);
+        let (c, s) = (self.cos_yaw, self.sin_yaw);
+        let mut best: Option<([f32; 3], f32)> = None;
+        // The horizontal face axes, in the fixed candidate order: the
+        // collider's local X, then its local Z. The push runs along
+        // the AWAY side of the axis — the sign of the projection,
+        // which side of the box the player center sits on.
+        for (u, axis_x, axis_z) in [(2, c, -s), (3, s, c)] {
+            let depth = extent_sum[u] - projection[u].abs() + SKIN;
+            let sign = if projection[u] >= 0.0 { 1.0 } else { -1.0 };
+            let push = [axis_x * sign * depth, 0.0, axis_z * sign * depth];
+            keep_smaller(&mut best, push, depth);
+        }
+        // The vertical faces: down through the bottom (the ground
+        // rule mirrors the AABB path's `neg_valid`), then up onto the
+        // top.
+        let bottom = self.center[1] - self.half[1];
+        let top = self.center[1] + self.half[1];
+        let down = max[1] - bottom + SKIN;
+        if min[1] - down >= ground_y {
+            keep_smaller(&mut best, [0.0, -down, 0.0], down);
+        }
+        let up = top - min[1] + SKIN;
+        keep_smaller(&mut best, [0.0, up, 0.0], up);
+        best
     }
 
-    /// Swept movement along one world axis: the largest displacement
-    /// not exceeding `delta` along `axis` that keeps the given
-    /// axis-aligned box out of this rotated collider — the exact
-    /// per-axis time-of-impact against the rotated faces (swept, not
-    /// sampled: tunneling is impossible at any speed, exactly like
-    /// the AABB `sweep_axis`). Returns `None` when the movement along
-    /// this axis cannot contact the collider at all.
-    ///
-    /// Contract: the world-AABB pretest rejects first; the narrow
-    /// phase is the closed-form swept SAT along the axis direction.
-    ///
-    /// **Skeleton stub** — lands with the movement implementation.
+    /// Swept movement along one world axis against this collider: the
+    /// [`SKIN`]-short contact displacement (signed — positive along
+    /// `+axis`, negative along `−axis`) such that moving the box by
+    /// up to that value keeps it out of this collider. The exact
+    /// per-axis time-of-impact against the rotated faces — the swept
+    /// separating-axis form: for each of the four horizontal axes,
+    /// the closing rate of the projected gap gives the displacement
+    /// at which that axis closes, and the LAST axis to close governs
+    /// the contact. Swept, not sampled: tunneling is impossible at
+    /// any speed, exactly like the AABB `sweep_axis`. `None` when
+    /// this movement cannot contact the collider — a broad-phase
+    /// miss, a perpendicular axis whose gap never closes within the
+    /// skin (resting contact does not block), a trajectory that opens
+    /// a gapped axis, or an existing SAT overlap (the
+    /// depenetration's to resolve). The returned value may exceed
+    /// `|delta|` (a contact farther than this move — the caller's
+    /// comparison decides) or sit slightly negative (resting within
+    /// [`SKIN`] of the face — the tiny back-push the AABB path also
+    /// produces).
     pub fn sweep_axis_box(
         &self,
-        _min: [f32; 3],
-        _max: [f32; 3],
-        _axis: usize,
-        _delta: f32,
+        min: [f32; 3],
+        max: [f32; 3],
+        axis: usize,
+        delta: f32,
     ) -> Option<f32> {
-        todo!("the Cycle-4 C per-axis swept TOI (COLLISION-INTERFACE §2)")
+        if delta == 0.0 {
+            return None;
+        }
+        // The broad phase: the SWEPT box vs the cached world AABB.
+        let mut swept_min = min;
+        let mut swept_max = max;
+        if delta > 0.0 {
+            swept_max[axis] += delta;
+        } else {
+            swept_min[axis] += delta;
+        }
+        if (0..3).any(|a| swept_min[a] >= self.aabb_max[a] || swept_max[a] <= self.aabb_min[a]) {
+            return None;
+        }
+        let bottom = self.center[1] - self.half[1];
+        let top = self.center[1] + self.half[1];
+        if axis == 1 {
+            // The vertical sweep: the horizontal SAT is the
+            // perpendicular gate (each axis SKIN-relaxed, mirroring
+            // the AABB path's perpendicular SKIN margins — resting
+            // contact against a rotated wall never blocks a fall),
+            // and the faces are the horizontal top/bottom.
+            let (projection, extent_sum) = self.horizontal_sat(min, max);
+            if (0..4).any(|u| projection[u].abs() >= extent_sum[u] - SKIN) {
+                return None;
+            }
+            if delta < 0.0 {
+                if min[1] >= top {
+                    return Some(top + SKIN - min[1]);
+                }
+            } else if max[1] <= bottom {
+                return Some(bottom - SKIN - max[1]);
+            }
+            return None;
+        }
+        // A horizontal sweep: the vertical interval is the
+        // perpendicular gate (the AABB path's SKIN margins).
+        if min[1] >= top - SKIN || max[1] <= bottom + SKIN {
+            return None;
+        }
+        // The swept SAT over the four horizontal axes. The velocity
+        // per unit displacement along each axis: world X = (1, 0),
+        // world Z = (0, 1), local X = (c, −s), local Z = (s, c).
+        let (projection, extent_sum) = self.horizontal_sat(min, max);
+        let (c, s) = (self.cos_yaw, self.sin_yaw);
+        let velocity: [f32; 4] = if axis == 0 {
+            if delta > 0.0 {
+                [1.0, 0.0, c, s]
+            } else {
+                [-1.0, 0.0, -c, -s]
+            }
+        } else if delta > 0.0 {
+            [0.0, 1.0, -s, c]
+        } else {
+            [0.0, -1.0, s, -c]
+        };
+        let mut contact = 0.0f32;
+        let mut constrained = false;
+        for u in 0..4 {
+            let separation = projection[u].abs() - extent_sum[u];
+            let velocity_along = velocity[u];
+            if velocity_along == 0.0 {
+                // The perpendicular world axis: a gap at or beyond
+                // the skin means this collider is never reached;
+                // resting contact (within it) imposes no constraint.
+                if separation >= SKIN {
+                    return None;
+                }
+                continue;
+            }
+            if separation <= 0.0 {
+                continue;
+            }
+            if projection[u] * velocity_along >= 0.0 {
+                // This gapped axis only opens along the trajectory:
+                // it can never close, so contact is impossible.
+                return None;
+            }
+            let displacement = separation / velocity_along.abs();
+            if displacement > contact {
+                contact = displacement;
+            }
+            constrained = true;
+        }
+        if !constrained {
+            // No axis closes a gap: the boxes already overlap (the
+            // depenetration's to resolve) or rest in contact — never
+            // a sweep clamp from this collider.
+            return None;
+        }
+        if delta > 0.0 {
+            Some(contact - SKIN)
+        } else {
+            Some(SKIN - contact)
+        }
+    }
+
+    /// The 2D separating-axis data between the given axis-aligned box
+    /// and this collider's rotated rectangle: for each of the four
+    /// axes (world X, world Z, the collider's local X, its local Z)
+    /// the SIGNED projection of the box center onto the axis and the
+    /// sum of the two rectangles' projected half-extents. The
+    /// rectangles overlap horizontally iff every axis satisfies
+    /// `|projection| < extent_sum` (the separating-axis theorem for
+    /// two rectangles — exact, closed-form, fixed axis order).
+    fn horizontal_sat(&self, min: [f32; 3], max: [f32; 3]) -> ([f32; 4], [f32; 4]) {
+        let player_center_x = (min[0] + max[0]) / 2.0;
+        let player_center_z = (min[2] + max[2]) / 2.0;
+        let player_half_x = (max[0] - min[0]) / 2.0;
+        let player_half_z = (max[2] - min[2]) / 2.0;
+        let dx = player_center_x - self.center[0];
+        let dz = player_center_z - self.center[2];
+        let (c, s) = (self.cos_yaw, self.sin_yaw);
+        let (absolute_c, absolute_s) = (c.abs(), s.abs());
+        let (hx, hz) = (self.half[0], self.half[2]);
+        (
+            [dx, dz, dx * c - dz * s, dx * s + dz * c],
+            [
+                player_half_x + hx * absolute_c + hz * absolute_s,
+                player_half_z + hx * absolute_s + hz * absolute_c,
+                player_half_x * absolute_c + player_half_z * absolute_s + hx,
+                player_half_x * absolute_s + player_half_z * absolute_c + hz,
+            ],
+        )
+    }
+}
+
+/// The depenetration candidate rule: strictly-smaller magnitudes win,
+/// so the fixed candidate order resolves mathematical ties — the
+/// first candidate achieving the minimum is kept (deterministic on
+/// every run and platform, mirroring the AABB path's rule).
+fn keep_smaller(best: &mut Option<([f32; 3], f32)>, push: [f32; 3], magnitude: f32) {
+    if best.is_none_or(|(_, best_magnitude)| magnitude < best_magnitude) {
+        *best = Some((push, magnitude));
     }
 }
 
@@ -256,6 +454,22 @@ pub fn segment_rotated_hit(
     collider: &RotatedCollider,
     margin: f32,
 ) -> Option<(f32, [f32; 3])> {
+    // The broad phase: the segment's margin-expanded bounding box vs
+    // the cached world AABB (six compares after six min/max) —
+    // distant colliders never pay the local-frame transform.
+    let lo = [
+        from[0].min(to[0]) - margin,
+        from[1].min(to[1]) - margin,
+        from[2].min(to[2]) - margin,
+    ];
+    let hi = [
+        from[0].max(to[0]) + margin,
+        from[1].max(to[1]) + margin,
+        from[2].max(to[2]) + margin,
+    ];
+    if (0..3).any(|a| hi[a] <= collider.aabb_min[a] || lo[a] >= collider.aabb_max[a]) {
+        return None;
+    }
     let local_from = collider.to_local(from);
     let local_to = collider.to_local(to);
     let direction = [
