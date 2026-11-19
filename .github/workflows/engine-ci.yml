@@ -776,8 +776,17 @@ jobs:
           # failures, every selftest pin byte-identical —
           # /var/tmp/s7-cycle4-targets/int-gates-run7.log; the prior pin
           # 539/6/54 preserved above).
-          expected=545
-          if [ "$(uname -s)" != "Linux" ]; then expected=545; fi
+          # Cycle 4 batch 9 (the rotated-cover merge 002b0b7): Linux+Windows
+          # 549/6/54 MEASURED at the integrated tree with this step's own
+          # awk (D's rotated-cover increment grows the encounter_world
+          # battery 18 -> 22 within its existing result line — the cover
+          # discriminator + protective-effect tests; platform-uniform; the
+          # local integration gates: main 1096/2/31 unchanged, heavy
+          # 549/6/54, zero failures, every selftest pin byte-identical —
+          # /var/tmp/s7-cycle4-targets/int-gates-run9.log; the prior pin
+          # 545/6/54 preserved above).
+          expected=549
+          if [ "$(uname -s)" != "Linux" ]; then expected=549; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
