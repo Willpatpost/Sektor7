@@ -58,6 +58,7 @@ use engine_shell::{
     ShellConfig,
 };
 
+use crate::combat_demo::{health_bar, overlay_ascii};
 use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::playable_demo::{map_playable_input, playable_player_config};
@@ -1958,6 +1959,13 @@ fn play_cues_for(audio: &mut Audio, line: &str) {
         audio.play(Cue::Fire);
         if line.contains("HIT") && !line.contains("graze") {
             audio.play(Cue::Impact);
+            // F's activation (R-0118): the per-adversary defeat beat —
+            // a fire line whose hit DEFEATED an adversary carries the
+            // partial-victory sting (distinct from the encounter's
+            // completion, which the terminal line handles below).
+            if line.contains("(DEFEATED)") {
+                audio.play(Cue::AdversaryDefeated);
+            }
         }
         return;
     }
@@ -2286,6 +2294,19 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     };
     let mut timing = FrameTiming::new();
     let mut scene_vertices: Vec<SceneVertex> = Vec::new();
+    // F's activation (R-0118) — the presentation-local state, the same
+    // discipline the --combat vignette review verified:
+    // (a) the defeat vignette's wall-clock anchor (the LOST
+    //     observation moment; the R reset clears it; NEVER in the
+    //     encounter state — the terminal guard stays the single
+    //     writer; the headless paths never construct it);
+    // (b) the weapon-selection observation cursor (the previous
+    //     frame's selection line — the WeaponSwitch cue fires when
+    //     D's HUD data shows a NEW "weapon selected" line; the
+    //     selection is HUD data, never an event-log line, so the
+    //     observation point is the HUD read, not the event drain).
+    let mut defeat_started_at: Option<std::time::Instant> = None;
+    let mut prev_selection_line: Option<String> = None;
 
     loop {
         let frame_start = std::time::Instant::now();
@@ -2309,6 +2330,8 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             // live input is not a determinism surface).
             demo.driver.set_trace_recording(false);
             event_cursor = 0;
+            defeat_started_at = None;
+            prev_selection_line = None;
         }
         // The weapon-selection edges (policy state — the honest
         // lifecycle refusals live in `apply_selection`): the direct
@@ -2340,7 +2363,49 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             event_cursor += 1;
         }
 
-        let pose = demo.camera_pose();
+        // F's activation (R-0118): the WeaponSwitch cue at the
+        // selection observation point — D's HUD data carries the
+        // selection feedback line (never an event-log line), so the
+        // cue fires when a NEW "weapon selected" line appears in the
+        // HUD read (the refused switches play nothing — the honest
+        // text-only feedback, the established refusal discipline).
+        let hud_peek = demo.hud();
+        if hud_peek
+            .last_selection_line
+            .as_ref()
+            .is_some_and(|selection| {
+                selection.starts_with("weapon selected")
+                    && prev_selection_line.as_deref() != Some(selection.as_str())
+            })
+        {
+            audio.play(Cue::WeaponSwitch);
+        }
+        prev_selection_line = hud_peek.last_selection_line.clone();
+
+        // F's activation (R-0118): the defeat vignette's presentation
+        // parameter — 0 at the LOST observation, 1 after ~2 s of wall
+        // clock. PRESENTATION-ONLY (a render-loop read of the frozen
+        // phase; the guard's record/counters/timestamps untouched;
+        // the headless paths never reach here — the byte-identical
+        // encounter traces are the no-logical-effect proof).
+        if defeat_started_at.is_none() && matches!(hud_peek.phase, EncounterPhase::Lost { .. }) {
+            defeat_started_at = Some(frame_start);
+        }
+        let vignette = defeat_started_at.map(|lost_at| {
+            (frame_start.duration_since(lost_at).as_secs_f32() / 2.0).clamp(0.0, 1.0)
+        });
+
+        let mut pose = demo.camera_pose();
+        let third_person = demo.driver.state().camera_mode == CameraMode::ThirdPerson;
+        if let (Some(vignette), true) = (vignette, third_person) {
+            // The third-person defeat treatment (the --combat
+            // vignette's exact form): a slow descent and tilt of the
+            // camera toward the fallen player, composing AFTER the
+            // obstruction handling. First person keeps the
+            // overlay-only treatment.
+            pose.position[1] -= 1.2 * vignette;
+            pose.pitch += 0.35 * vignette;
+        }
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
             16.0 / 9.0
@@ -2357,58 +2422,120 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
             let hud = demo.hud();
+            // F's activation (R-0118): the refined presentation, the
+            // feedback design §2's layout over D's EncounterHud data
+            // — ASCII throughout (the font8x8 constraint), the health
+            // bars, the weapon block with the readiness surface, the
+            // per-adversary lines with the defeat tally, and the
+            // terminal record display. The embedded HUD lines (the
+            // fire/selection feedback) route through the
+            // overlay_ascii boundary sanitizer.
             let phase_word = match hud.phase {
-                EncounterPhase::Dormant => "DORMANT (cross the line)".to_string(),
-                EncounterPhase::Active => "ACTIVE".to_string(),
-                EncounterPhase::Won { tick } => format!("WON @ {tick}"),
-                EncounterPhase::Lost { tick } => format!("LOST @ {tick}"),
+                EncounterPhase::Dormant => "DORMANT - cross the line to start".to_string(),
+                EncounterPhase::Active => "ACTIVE - the adversaries pursue".to_string(),
+                EncounterPhase::Won { tick } => {
+                    format!("VICTORY at tick {tick} - [R] reset for another round")
+                }
+                EncounterPhase::Lost { tick } => {
+                    // The defeat banner (the vignette's HUD side):
+                    // composed from the FROZEN terminal record.
+                    format!("DEFEAT at tick {tick} - the adversaries prevail | [R] try again")
+                }
             };
+            let defeated = hud
+                .adversaries
+                .iter()
+                .filter(|line| line.state == "DEFEATED")
+                .count();
             let mut text = format!(
-                "Sektor7 C4-D - integrated encounter\nFPS {:.0} (cpu work p95 {:.2} ms)\n\
+                "Sektor7 C4 - integrated encounter\nFPS {:.0} (cpu work p95 {:.2} ms)\n\
                  {} {} / Vulkan {}\n\
-                 phase {phase_word} · round {}\n\
-                 player {:.0}/{:.0} hp · {} person\n",
+                 ------------------------------------------------\n\
+                 encounter {} | round {} | adversaries {}/{} defeated\n",
                 presented as f64 / elapsed,
                 math::percentile(&cpu_work_ms, 0.95),
                 stats.device_type,
                 stats.gpu_name,
                 stats.api_version,
+                phase_word,
                 hud.rounds + 1,
-                hud.player_health.0,
-                hud.player_health.1,
-                hud.player_mode,
+                defeated,
+                hud.adversaries.len(),
             );
+            // The weapon block (WEAPONS-INTERFACE §3): the selected
+            // weapon's identity + readiness; the readiness bar's
+            // target tick when cooling.
+            let weapon_block = if hud.weapon.ready {
+                format!("WEAPON  {} READY", weapon_word(hud.weapon.selected))
+            } else {
+                format!(
+                    "WEAPON  {} cooling (ready at tick {})",
+                    weapon_word(hud.weapon.selected),
+                    hud.weapon.ready_at
+                )
+            };
+            text.push_str(&weapon_block);
+            text.push_str(" | [1] precision | [2] spread | Q cycle\n");
+            // The per-adversary lines (COMBATANTS-INTERFACE §4): the
+            // identity, the state word, the health bar, and the
+            // threat marker (the attack-ready read).
             for adversary in &hud.adversaries {
                 text.push_str(&format!(
-                    "adversary {} · {} · {:.0}/{:.0} hp{}\n",
+                    "  adversary {} {} hp {} {:.0}/{:.0}{}\n",
                     adversary.id,
                     adversary.state,
+                    health_bar(adversary.health.0, adversary.health.1),
                     adversary.health.0,
                     adversary.health.1,
                     if adversary.attack_ready {
-                        " · ready"
+                        " *READY*"
                     } else {
                         ""
                     }
                 ));
             }
+            // The player block.
             text.push_str(&format!(
-                "weapon {} · [1] precision · [2] spread · {}\n",
-                weapon_word(hud.weapon.selected),
-                if hud.weapon.ready { "ready" } else { "cooling" }
+                "PLAYER  hp {} {:.0}/{:.0} | {} person\n",
+                health_bar(hud.player_health.0, hud.player_health.1),
+                hud.player_health.0,
+                hud.player_health.1,
+                hud.player_mode,
+            ));
+            // The counters + the embedded feedback lines (the
+            // boundary-sanitized event text).
+            text.push_str(&format!(
+                "fires {} | hits {} | blocked {} | out of range {} | attacks taken {}\n",
+                hud.counters.fires,
+                hud.counters.hits,
+                hud.counters.blocked,
+                hud.counters.out_of_range,
+                hud.counters.attacks_taken,
             ));
             if let Some(line) = &hud.last_selection_line {
-                text.push_str(&format!("{line}\n"));
+                text.push_str(&overlay_ascii(line));
+                text.push('\n');
             }
             if let Some(line) = &hud.last_fire_line {
-                text.push_str(&format!("{line}\n"));
+                text.push_str(&overlay_ascii(line));
+                text.push('\n');
             }
+            // The terminal record display (the frozen read).
             if let Some(record) = hud.terminal {
+                let outcome_word = match record.outcome {
+                    EncounterOutcome::Won => "VICTORY",
+                    EncounterOutcome::Lost => "DEFEAT",
+                };
                 text.push_str(&format!(
-                    "encounter {:?} @ tick {} — [R] reset\n",
-                    record.outcome, record.tick
+                    "encounter {} at tick {} | fires {} | hits {} | attacks taken {}\n",
+                    outcome_word,
+                    record.tick,
+                    record.counters.fires,
+                    record.counters.hits,
+                    record.counters.attacks_taken
                 ));
             }
+            text.push_str("[R] reset | [C] camera | [O] overlay\n");
             text
         });
 
