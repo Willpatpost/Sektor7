@@ -460,23 +460,31 @@ pub fn segment_rotated_hit(
     collider: &RotatedCollider,
     margin: f32,
 ) -> Option<(f32, [f32; 3])> {
-    // The broad phase: the segment's margin-expanded bounding box vs
-    // the cached world AABB (six compares after six min/max) —
-    // STRICTLY-DISJOINT rejection only, so a segment whose range
-    // merely TOUCHES the box (the exact corner/boundary-contact class
-    // the AABB slab path reports) still reaches the narrow phase: the
-    // pretest must never be stricter than the query it guards.
-    let lo = [
-        from[0].min(to[0]) - margin,
-        from[1].min(to[1]) - margin,
-        from[2].min(to[2]) - margin,
-    ];
-    let hi = [
-        from[0].max(to[0]) + margin,
-        from[1].max(to[1]) + margin,
-        from[2].max(to[2]) + margin,
-    ];
-    if (0..3).any(|a| hi[a] < collider.aabb_min[a] || lo[a] > collider.aabb_max[a]) {
+    // The broad phase (C4-R1, the owner's final-review corrective):
+    // reject only when the segment's RAW bounding box is strictly
+    // disjoint from the collider's MARGIN-EXPANDED world AABB — the
+    // exact-tight world enclosure of the LOCAL-axis expansion the
+    // narrow phase actually performs. The local expansion by `margin`
+    // projects to a horizontal world reach of
+    // `margin·(|cos yaw| + |sin yaw|)` (≥ `margin` at every nonzero
+    // yaw — the projection the defective pretest missed, granting the
+    // query only `margin` on the world axes) and a vertical reach of
+    // `margin` (the Y axis is rotation-invariant). Because the
+    // enclosure is the TRUE AABB of the expanded box, the pretest
+    // rejects nothing the narrow phase could hit — no false
+    // negatives — while remaining a strict six-compare rejection for
+    // genuinely-far segments; the boundary-TOUCH class still reaches
+    // the narrow phase (a pretest must never be stricter than the
+    // query it guards); and zero margin reduces to the unexpanded
+    // pretest bit-identically.
+    let (cos_yaw, sin_yaw) = collider.frame();
+    let horizontal_reach = margin * (cos_yaw.abs() + sin_yaw.abs());
+    let reach = [horizontal_reach, margin, horizontal_reach];
+    let lo = [from[0].min(to[0]), from[1].min(to[1]), from[2].min(to[2])];
+    let hi = [from[0].max(to[0]), from[1].max(to[1]), from[2].max(to[2])];
+    if (0..3)
+        .any(|a| hi[a] < collider.aabb_min[a] - reach[a] || lo[a] > collider.aabb_max[a] + reach[a])
+    {
         return None;
     }
     let local_from = collider.to_local(from);
@@ -1376,5 +1384,267 @@ mod tests {
             hit && (0.0..90.0).contains(&allowed),
             "the rotated grid resolves a bounded clamp: hit={hit} allowed={allowed}"
         );
+    }
+
+    /// **C4-R1 (the owner's final-review corrective): the margin
+    /// broad-phase false negative.** The narrow phase expands the
+    /// collider by `margin` along its LOCAL axes; at nonzero yaw that
+    /// expansion projects to a LARGER world-axis reach than the
+    /// `margin` the defective broad phase granted the query box — so
+    /// the pretest rejected genuine hits before the narrow phase ran.
+    /// This is the directive's counterexample VERBATIM: center
+    /// [0, 1, 0], half [1, 1, 1], yaw 45°, the query POINT [1.6, 1, 0]
+    /// (a zero-length segment), margin 0.15 — the point's local
+    /// coordinates ≈ (1.13137, 1.13137) sit inside the
+    /// margin-expanded local half-extents (1.15), an inside-start hit;
+    /// the defective pretest rejected it because 1.6 − 0.15 > √2.
+    /// The nonzero-length form: a segment ending at the same point
+    /// enters the expanded box at t ≈ 0.9814 — also falsely rejected
+    /// (the segment's expanded box ended at x = 1.45 > √2).
+    #[test]
+    fn c4r1_the_directive_counterexample_reports_the_true_hits() {
+        let collider = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        // Regression 1 + 2 (the zero-length form): the point query.
+        let (t, normal) = segment_rotated_hit([1.6, 1.0, 0.0], [1.6, 1.0, 0.0], &collider, 0.15)
+            .expect("the inside-start hit the defective broad phase rejected");
+        assert_eq!((t, normal), (0.0, [0.0, 0.0, 0.0]));
+        // Regression 2 (the nonzero-length form): approaching the same
+        // point from outside — the entry into the margin-expanded box
+        // happens at t ≈ 0.9814 (the expanded corner reaches world x
+        // = √2 + 0.15·(cos45+sin45) ≈ 1.626 on the query line), and
+        // the entry face is the collider's local +X face — its world
+        // normal (cos45, 0, −sin45). (A segment that ENTERS at t > 0
+        // and ends inside reports the entry face per the documented
+        // contract; the zero-normal sentinel applies only when the
+        // ORIGIN itself starts inside.)
+        let (t, normal) = segment_rotated_hit([3.0, 1.0, 0.0], [1.6, 1.0, 0.0], &collider, 0.15)
+            .expect("the entry hit the defective broad phase rejected");
+        assert!(
+            (t - 0.9814).abs() < 2e-3,
+            "enters at the expanded corner: {t}"
+        );
+        let (c, s) = collider.frame();
+        for axis in 0..3 {
+            assert!(
+                (normal[axis] - [c, 0.0, -s][axis]).abs() < 1e-5,
+                "the entry face's world normal"
+            );
+        }
+        // And the reverse direction: starting inside, moving out —
+        // fully occluded from the start (t = 0).
+        let (t, _) =
+            segment_rotated_hit([1.6, 1.0, 0.0], [3.0, 1.0, 0.0], &collider, 0.15).unwrap();
+        assert_eq!(t, 0.0);
+        // Zero margin at the same geometry: the point at 1.6 is OUTSIDE
+        // the unexpanded box (local 1.131 > 1) — a clean miss, exactly
+        // as before (the zero-margin behavior preserved).
+        assert_eq!(
+            segment_rotated_hit([1.6, 1.0, 0.0], [1.6, 1.0, 0.0], &collider, 0.0),
+            None
+        );
+    }
+
+    /// **C4-R1 regressions 3 + 4:** no false negatives against an
+    /// INDEPENDENT local-coordinate reference (the slab math written
+    /// here in the test, WITHOUT any broad phase), across nonzero
+    /// yaws and positive margins INCLUDING the actual `CAMERA_MARGIN`
+    /// (0.15 — the camera pull-in's real value). The queries sweep
+    /// the corner band — the defect's habitat: the world positions
+    /// whose local coordinates bracket the margin-expanded boundary.
+    #[test]
+    fn c4r1_no_false_negatives_vs_the_local_reference_across_yaws_and_margins() {
+        fn reference(
+            from: [f32; 3],
+            to: [f32; 3],
+            collider: &RotatedCollider,
+            margin: f32,
+        ) -> Option<f32> {
+            // The independent oracle: the local-frame slab method over
+            // the margin-expanded local box — no broad phase at all.
+            let local_from = collider.to_local(from);
+            let local_to = collider.to_local(to);
+            let direction = [
+                local_to[0] - local_from[0],
+                local_to[1] - local_from[1],
+                local_to[2] - local_from[2],
+            ];
+            let mut t_enter = 0.0f32;
+            let mut t_exit = 1.0f32;
+            for axis in 0..3 {
+                let lo = -collider.half[axis] - margin;
+                let hi = collider.half[axis] + margin;
+                let d = direction[axis];
+                let origin = local_from[axis];
+                if d == 0.0 {
+                    if origin < lo || origin > hi {
+                        return None;
+                    }
+                } else {
+                    let (mut t1, mut t2) = ((lo - origin) / d, (hi - origin) / d);
+                    if t1 > t2 {
+                        std::mem::swap(&mut t1, &mut t2);
+                    }
+                    t_enter = t_enter.max(t1);
+                    t_exit = t_exit.min(t2);
+                    if t_enter > t_exit {
+                        return None;
+                    }
+                }
+            }
+            if t_exit < 0.0 || t_enter > 1.0 {
+                None
+            } else {
+                Some(t_enter.max(0.0))
+            }
+        }
+
+        for yaw in [std::f32::consts::FRAC_PI_4, 0.6, 1.0, -0.8, 2.2] {
+            let collider = RotatedCollider::new([0.0, 1.0, 0.0], [1.0, 1.0, 1.0], yaw).unwrap();
+            for margin in [0.05f32, crate::player::CAMERA_MARGIN, 0.3] {
+                // The corner-band sweep: points on the world +X axis
+                // (the local diagonal at 45°-class yaws) bracketing
+                // the margin-expanded boundary, plus a z-axis sweep
+                // and off-axis points.
+                for step in 0..24i32 {
+                    let distance = 1.2 + step as f32 * 0.045;
+                    for (point, far) in [
+                        ([distance, 1.0, 0.0], [distance + 2.0, 1.0, 0.0]),
+                        ([0.0, 1.0, distance], [0.0, 1.0, distance + 2.0]),
+                        (
+                            [distance * 0.7, 1.0, distance * 0.7],
+                            [distance + 2.0, 1.0, distance * 0.7],
+                        ),
+                    ] {
+                        for (from, to) in [(point, point), (far, point), (point, far)] {
+                            let expected = reference(from, to, &collider, margin);
+                            let actual =
+                                segment_rotated_hit(from, to, &collider, margin).map(|(t, _)| t);
+                            // The classification must agree EXACTLY
+                            // (the false-negative concern); the t within
+                            // float noise.
+                            match (expected, actual) {
+                                (Some(e), Some(a)) => assert!(
+                                    (e - a).abs() < 1e-5,
+                                    "yaw {yaw} margin {margin} point {point:?}: {e} vs {a}"
+                                ),
+                                (None, None) => {}
+                                (e, a) => panic!(
+                                    "classification mismatch at yaw {yaw} margin {margin} \
+                                     from {from:?} to {to:?}: reference {e:?} vs actual {a:?}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **C4-R1 regression 5:** the full `CollisionWorld::segment_hit()`
+    /// path (the camera pull-in's actual call form) agrees with the
+    /// direct query and the reference across the same band — the
+    /// world wiring inherits the corrected broad phase with no
+    /// divergence of its own.
+    #[test]
+    fn c4r1_the_world_segment_hit_path_agrees_across_the_margin_band() {
+        use crate::player::CollisionWorld;
+        let collider = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let rotated_world = CollisionWorld::new(0.0).with_rotated_collider(Some(collider));
+        let mixed_world = CollisionWorld::new(0.0)
+            .with_box([8.0, 0.0, 0.0], 1.0, 3.0)
+            .with_rotated_collider(Some(collider));
+        for margin in [0.0f32, 0.05, crate::player::CAMERA_MARGIN, 0.3] {
+            for step in 0..20i32 {
+                let distance = 1.25 + step as f32 * 0.05;
+                let point = [distance, 1.0, 0.0];
+                let far = [distance + 2.0, 1.0, 0.0];
+                for (from, to) in [(point, point), (far, point), (point, far)] {
+                    let direct = segment_rotated_hit(from, to, &collider, margin).map(|(t, _)| t);
+                    let world_t = rotated_world.segment_hit(from, to, margin);
+                    assert_eq!(
+                        direct, world_t,
+                        "the world path agrees at margin {margin} point {point:?}"
+                    );
+                    // The mixed world: the axis-aligned box at x ∈
+                    // [7.5, 8.5] never binds for these queries; the
+                    // rotated cover's result must survive unchanged.
+                    assert_eq!(
+                        mixed_world.segment_hit(from, to, margin),
+                        world_t,
+                        "the mixed world preserves the rotated result"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **C4-R1 regression 6:** third-person camera obstruction where a
+    /// MARGIN-EXPANDED rotated cover causes camera pull-in. The cover
+    /// sits with its corner in the false-negative band — 0.18 m off
+    /// the camera ray, where the margin-expanded corner (reaching
+    /// 0.15·(cos45+sin45) ≈ 0.212 m) crosses the ray but the
+    /// margin-only expansion (0.15 m) the defective pretest granted
+    /// does not. Under the correction the camera pulls in; under the
+    /// defect it stayed at full distance with the expanded cover
+    /// clipping through the frame.
+    #[test]
+    fn c4r1_camera_obstruction_pulls_in_behind_margin_expanded_rotated_cover() {
+        use crate::player::{
+            CameraMode, CollisionWorld, PlayerConfig, PlayerState, camera_pose,
+            camera_pose_obstructed,
+        };
+        let config = PlayerConfig::default();
+        let mut state = PlayerState::spawn([0.0, 0.0, 0.0]);
+        state.camera_mode = CameraMode::ThirdPerson;
+        // yaw 0, pitch 0: the eye at (0, 1.6, 0), the desired pose at
+        // (0, 2.8, 4.5) — the camera ray runs up the +Z axis.
+        let unobstructed = camera_pose(&state, &config);
+        let eye = [0.0, config.eye_height, 0.0];
+        // The cover: a 45° box whose (−1, −1) corner sits 0.18 m off
+        // the ray at its midpoint region (z ≈ 2.25) — the corner's
+        // world offset from the center is (−(c+s), 0, 0) = (−1.414, 0, 0),
+        // so the center goes at x = 0.18 + 1.414.
+        let corner_offset =
+            -(std::f32::consts::FRAC_PI_4.cos() + std::f32::consts::FRAC_PI_4.sin());
+        let cover = RotatedCollider::new(
+            [0.18 - corner_offset, 2.2, 2.25],
+            [1.0, 1.0, 1.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(cover));
+        let obstructed = camera_pose_obstructed(&state, &config, &world);
+        // The pull-in happened: the obstructed camera sits meaningfully
+        // closer to the eye than the desired pose (the hit lands near
+        // the cover's crossing at z ≈ 2.25, t ≈ 0.5 of the ≈ 4.66 m
+        // ray, minus the backoff).
+        let desired = [
+            unobstructed.position[0] - eye[0],
+            unobstructed.position[1] - eye[1],
+            unobstructed.position[2] - eye[2],
+        ];
+        let drawn = [
+            obstructed.position[0] - eye[0],
+            obstructed.position[1] - eye[1],
+            obstructed.position[2] - eye[2],
+        ];
+        let desired_length =
+            (desired[0] * desired[0] + desired[1] * desired[1] + desired[2] * desired[2]).sqrt();
+        let drawn_length = (drawn[0] * drawn[0] + drawn[1] * drawn[1] + drawn[2] * drawn[2]).sqrt();
+        assert!(
+            drawn_length < desired_length - 1.0,
+            "the camera pulls in behind the margin-expanded cover: {drawn_length} vs {desired_length}"
+        );
+        assert!(drawn_length > config.tp_min_distance, "above the floor");
     }
 }
