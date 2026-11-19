@@ -47,6 +47,7 @@
 
 pub mod adversary;
 pub mod clock;
+pub mod collision;
 pub mod combat;
 pub mod diag;
 pub mod event;
@@ -62,6 +63,7 @@ pub mod wire;
 mod sha256;
 
 pub use clock::Tick;
+pub use collision::{RotatedCollider, segment_rotated_hit};
 pub use combat::{
     AttackProfile, AttackRefusal, AttackRequest, COMBAT_CLASS, COMBAT_FINGERPRINT_DOMAIN,
     COMBAT_MAGIC, COMBAT_PAYLOAD_ID_BOUND, CombatEventKind, Combatant, CombatantId, DamageOutcome,

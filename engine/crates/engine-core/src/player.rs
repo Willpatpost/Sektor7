@@ -69,6 +69,7 @@
 
 use std::time::Duration;
 
+use crate::collision::{RotatedCollider, segment_rotated_hit};
 use crate::fingerprint::Fingerprinter;
 
 /// Contact separation skin: swept targets clamp this far short of a
@@ -195,12 +196,14 @@ impl StaticCollider {
     }
 }
 
-/// The static collision world: boxes, a ground plane, optional bounds.
-/// This is the reusable query contract — a future physics backend
-/// implements the same queries.
+/// The static collision world: axis-aligned boxes, yaw-rotated boxes
+/// (Cycle 4 C — see [`crate::collision`]), a ground plane, optional
+/// bounds. This is the reusable query contract — a future physics
+/// backend implements the same queries.
 #[derive(Debug, Clone, Default)]
 pub struct CollisionWorld {
     colliders: Vec<StaticCollider>,
+    rotated: Vec<RotatedCollider>,
     bounds: Option<StaticCollider>,
     ground_y: f32,
 }
@@ -210,6 +213,7 @@ impl CollisionWorld {
     pub fn new(ground_y: f32) -> CollisionWorld {
         CollisionWorld {
             colliders: Vec::new(),
+            rotated: Vec::new(),
             bounds: None,
             ground_y,
         }
@@ -236,6 +240,29 @@ impl CollisionWorld {
         self
     }
 
+    /// Adds one yaw-rotated box collider (Cycle 4 C — the
+    /// [`crate::collision`] representation). Every geometry query is
+    /// rotated-aware: the axis-aligned list is consulted first (its
+    /// behavior byte-identical to the pre-rotation engine), then the
+    /// rotated list through the exact narrow phase. A `None` (a
+    /// collider refused as degenerate/non-finite by
+    /// [`RotatedCollider::new`]'s validation) is skipped: world
+    /// literals should assert construction at their own site so a
+    /// refused cover piece is never silently missing.
+    pub fn with_rotated_collider(mut self, collider: Option<RotatedCollider>) -> CollisionWorld {
+        if let Some(collider) = collider {
+            self.rotated.push(collider);
+        }
+        self
+    }
+
+    /// The rotated colliders (empty in every pre-Cycle-4 world — the
+    /// byte-identity guarantee: the empty list takes the exact
+    /// existing query paths).
+    pub fn rotated(&self) -> &[RotatedCollider] {
+        &self.rotated
+    }
+
     pub fn colliders(&self) -> &[StaticCollider] {
         &self.colliders
     }
@@ -250,10 +277,13 @@ impl CollisionWorld {
 
     /// Whether the given box strictly overlaps any collider (the
     /// nonpenetration check; contact at the [`SKIN`] margin is clear).
+    /// The axis-aligned colliders are tested first, then the rotated
+    /// colliders through the exact 2D separating-axis narrow phase.
     pub fn box_overlaps(&self, min: [f32; 3], max: [f32; 3]) -> bool {
         self.colliders
             .iter()
             .any(|col| (0..3).all(|a| min[a] < col.max[a] && max[a] > col.min[a]))
+            || self.rotated.iter().any(|col| col.overlaps_box(min, max))
     }
 
     /// Exact segment-vs-world intersection (C2-P1, challenge F2's
@@ -301,6 +331,14 @@ impl CollisionWorld {
                 if best.is_none_or(|best_t| t < best_t) {
                     best = Some(t);
                 }
+            }
+        }
+        for col in &self.rotated {
+            let Some((t, _)) = segment_rotated_hit(from, to, col, margin) else {
+                continue;
+            };
+            if best.is_none_or(|best_t| t < best_t) {
+                best = Some(t);
             }
         }
         best
@@ -361,6 +399,19 @@ impl CollisionWorld {
                 }
             }
         }
+        for col in &self.rotated {
+            if let Some(face) = col.sweep_axis_box(player_min, player_max, axis, delta) {
+                if delta > 0.0 {
+                    if face < allowed {
+                        allowed = face;
+                        hit = true;
+                    }
+                } else if face > allowed {
+                    allowed = face;
+                    hit = true;
+                }
+            }
+        }
         (allowed, hit)
     }
 
@@ -370,9 +421,12 @@ impl CollisionWorld {
     /// magnitudes compare with pure +/− arithmetic (cross-platform
     /// stable) and the first strictly-smaller candidate wins, so
     /// mathematically equal pushes resolve by iteration order —
-    /// identically on every run and platform.
+    /// identically on every run and platform. Rotated colliders add
+    /// their face-normal candidates after the axis-aligned ones (a
+    /// mathematical tie keeps the axis-aligned push — the stable
+    /// first-wins order).
     pub fn depenetration(&self, player_min: [f32; 3], player_max: [f32; 3]) -> Option<[f32; 3]> {
-        let mut best: Option<(usize, f32, f32)> = None;
+        let mut best: Option<([f32; 3], f32)> = None;
         for col in &self.colliders {
             let overlapping =
                 (0..3).all(|a| player_min[a] < col.max[a] && player_max[a] > col.min[a]);
@@ -396,16 +450,23 @@ impl CollisionWorld {
                 } else {
                     (push_pos, push_pos.abs())
                 };
-                if best.is_none_or(|(_, _, best_magnitude)| magnitude < best_magnitude) {
-                    best = Some((axis, push, magnitude));
+                let mut vector = [0.0f32; 3];
+                vector[axis] = push;
+                if best.is_none_or(|(_, best_magnitude)| magnitude < best_magnitude) {
+                    best = Some((vector, magnitude));
                 }
             }
         }
-        best.map(|(axis, push, _)| {
-            let mut vector = [0.0f32; 3];
-            vector[axis] = push;
-            vector
-        })
+        for col in &self.rotated {
+            let Some((push, magnitude)) = col.push_out_box(player_min, player_max, self.ground_y)
+            else {
+                continue;
+            };
+            if best.is_none_or(|(_, best_magnitude)| magnitude < best_magnitude) {
+                best = Some((push, magnitude));
+            }
+        }
+        best.map(|(vector, _)| vector)
     }
 
     /// Clamps the feet-center position so the player box stays inside
@@ -2514,5 +2575,406 @@ mod tests {
             (distance - config.tp_min_distance).abs() < 0.01,
             "the floor binds: {distance}"
         );
+    }
+
+    /// Cycle-4 C §8, the movement discriminator: walking into a 45°
+    /// cover at z = 2 (the mid-face band) stops the player at the
+    /// TRUE rotated face — SKIN-clear of the actual shape, roughly
+    /// two meters PAST where the world-AABB stand-in would stop it.
+    /// The stand-in control arm (the same walk against
+    /// `world_aabb()`) is the in-vivo form of the GO-forbidden
+    /// "rotated visual over an axis-aligned hitbox" defect: under the
+    /// stand-in the player stops at the band edge and the gap is
+    /// visible. (At z = 0 the approach contacts the AABB-band edge —
+    /// the same clamp under both representations — so z = 2 is the
+    /// discriminating line.)
+    #[test]
+    fn step_player_stops_at_the_true_rotated_face_not_the_aabb_gap() {
+        let config = PlayerConfig::default();
+        let rotated = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(rotated));
+        let mut state = PlayerState::spawn([-6.0, 0.0, 2.0]);
+        state.yaw = -std::f32::consts::FRAC_PI_2; // facing world +X
+        settle(&mut state, &config, &world);
+        let start_x = state.position[0];
+        for _ in 0..120 {
+            step_player(
+                &mut state,
+                &config,
+                &world,
+                &MoveIntent {
+                    forward: 1,
+                    ..idle()
+                },
+                DT,
+            );
+        }
+        let (min, max) = player_box(state.position, &config);
+        assert!(
+            !rotated.overlaps_box(min, max),
+            "SKIN-clear of the true shape"
+        );
+        assert!(
+            max[0] > -2.0,
+            "the player pressed past the stand-in gap: max.x = {}",
+            max[0]
+        );
+        assert!(
+            state.position[0] > start_x + 2.0,
+            "the walk actually happened"
+        );
+        // The control arm: the same walk against the AABB stand-in.
+        let stand_in = CollisionWorld::new(0.0).with_collider(rotated.world_aabb());
+        let mut control = PlayerState::spawn([-6.0, 0.0, 2.0]);
+        control.yaw = -std::f32::consts::FRAC_PI_2;
+        settle(&mut control, &config, &stand_in);
+        for _ in 0..120 {
+            step_player(
+                &mut control,
+                &config,
+                &stand_in,
+                &MoveIntent {
+                    forward: 1,
+                    ..idle()
+                },
+                DT,
+            );
+        }
+        let (_, control_max) = player_box(control.position, &config);
+        assert!(
+            control_max[0] < max[0] - 1.0,
+            "the stand-in stops more than a meter earlier: {} vs {}",
+            control_max[0],
+            max[0]
+        );
+    }
+
+    /// Cycle-4 C §8, no-tunneling: one meter of movement per tick
+    /// (sprint 60 m/s) against a 45° wall whose extent along the
+    /// approach axis is ~0.28 m — far beyond any sampled collision's
+    /// ability to catch. The swept per-axis TOI stops the player
+    /// SKIN-short of the TRUE face every tick; the box never passes
+    /// through, at any speed.
+    #[test]
+    fn step_player_never_tunnels_through_a_thin_rotated_wall_at_speed() {
+        let config = PlayerConfig {
+            sprint_speed: 60.0,
+            ..Default::default()
+        };
+        let wall = RotatedCollider::from_base_yaw(
+            [0.0, 0.0, 0.0],
+            0.4,
+            6.0,
+            3.0,
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(wall));
+        let mut state = PlayerState::spawn([-5.0, 0.0, 0.0]);
+        state.yaw = -std::f32::consts::FRAC_PI_2;
+        settle(&mut state, &config, &world);
+        for tick in 0..40 {
+            step_player(
+                &mut state,
+                &config,
+                &world,
+                &MoveIntent {
+                    forward: 1,
+                    sprint: true,
+                    ..idle()
+                },
+                DT,
+            );
+            let (min, max) = player_box(state.position, &config);
+            assert!(
+                !wall.overlaps_box(min, max),
+                "tick {tick}: never inside the wall at {:?}",
+                state.position
+            );
+        }
+        assert!(
+            state.position[0] + config.radius < -0.2,
+            "the player rests against the true face, left of the wall: {:?}",
+            state.position
+        );
+        assert!(
+            state.position[0] > -1.5,
+            "and not flung back by a conservative gap: {:?}",
+            state.position
+        );
+    }
+
+    /// Cycle-4 C §8, step-up over a rotated top: approaching the 0.5 m
+    /// 45° slab at z = 0.7 (the mid-face, where the local-X axis
+    /// governs contact) climbs exactly like the axis-aligned case —
+    /// the raised probe clears (tops are horizontal), the raised sweep
+    /// is unclamped above the slab, and the snap-down lands SKIN above
+    /// the true top. DOCUMENTED LIMITATION (the corner reaches): near
+    /// the diagonal face's ends the contact is governed by the
+    /// world-X band axis and the one-probe climb cannot land on the
+    /// top (the footprint has not reached the SAT overlap region) —
+    /// the player slides in axis-decomposed probes instead; the
+    /// nonpenetration invariant holds everywhere (pinned by the
+    /// chaotic-walk test below).
+    #[test]
+    fn step_player_climbs_onto_a_rotated_top_at_the_mid_face() {
+        let config = PlayerConfig {
+            step_height: 0.55,
+            ..Default::default()
+        };
+        let slab = RotatedCollider::from_base_yaw(
+            [1.5, 0.0, 0.0],
+            2.0,
+            2.0,
+            0.5,
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(slab));
+        let mut state = PlayerState::spawn([-1.5, 0.0, 0.7]);
+        state.yaw = -std::f32::consts::FRAC_PI_2;
+        settle(&mut state, &config, &world);
+        let mut climbed = false;
+        for _ in 0..40 {
+            step_player(
+                &mut state,
+                &config,
+                &world,
+                &MoveIntent {
+                    forward: 1,
+                    ..idle()
+                },
+                DT,
+            );
+            let (min, max) = player_box(state.position, &config);
+            assert!(!slab.overlaps_box(min, max), "never inside the slab");
+            if state.on_ground && state.position[1] > 0.4 {
+                climbed = true;
+            }
+        }
+        assert!(climbed, "the player stood on the rotated top");
+        assert!(state.on_ground);
+        assert!(
+            (state.position[1] - (0.5 + SKIN)).abs() < 1e-2,
+            "standing SKIN above the top: {}",
+            state.position[1]
+        );
+        assert!(
+            state.position[0] > 0.3,
+            "moved onto the slab: {:?}",
+            state.position
+        );
+    }
+
+    /// Cycle-4 C §8, sliding: pressed against the 45° face, a
+    /// diagonal intent exactly parallel to the face slides the player
+    /// along it — the X arm re-clamps against the receding face every
+    /// tick while the Z arm advances freely (the documented
+    /// axis-decomposed staircase: sub-0.05 m steps at the demo speed,
+    /// never through the face, the local separation held within a
+    /// tick's worth of the skin).
+    #[test]
+    fn step_player_slides_along_a_rotated_face_in_axis_decomposed_steps() {
+        let config = PlayerConfig::default();
+        let rotated = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(rotated));
+        let mut state = PlayerState::spawn([-3.0, 0.0, 1.0]);
+        state.yaw = -std::f32::consts::FRAC_PI_2; // face +X: press into the face
+        settle(&mut state, &config, &world);
+        for _ in 0..40 {
+            step_player(
+                &mut state,
+                &config,
+                &world,
+                &MoveIntent {
+                    forward: 1,
+                    ..idle()
+                },
+                DT,
+            );
+        }
+        let (min, max) = player_box(state.position, &config);
+        assert!(!rotated.overlaps_box(min, max), "pressed, SKIN-clear");
+        let (pressed_x, pressed_z) = (state.position[0], state.position[2]);
+        // The slide: yaw −3π/4 makes the intent direction (+X, +Z) —
+        // exactly parallel to the upper-left face (whose direction is
+        // (1, 1)/√2).
+        state.yaw = -3.0 * std::f32::consts::FRAC_PI_4;
+        for _ in 0..30 {
+            step_player(
+                &mut state,
+                &config,
+                &world,
+                &MoveIntent {
+                    forward: 1,
+                    ..idle()
+                },
+                DT,
+            );
+            let (min, max) = player_box(state.position, &config);
+            assert!(
+                !rotated.overlaps_box(min, max),
+                "never through the face while sliding"
+            );
+        }
+        assert!(
+            state.position[2] > pressed_z + 1.0,
+            "progressed along the face: z {pressed_z} → {}",
+            state.position[2]
+        );
+        assert!(
+            state.position[0] > pressed_x + 0.8,
+            "the X arm tracked the receding face: x {pressed_x} → {}",
+            state.position[0]
+        );
+        // Still pressed: the local-X separation sits within a tick's
+        // worth of the skin (never negative beyond it).
+        let local = rotated.to_local([state.position[0], 1.0, state.position[2]]);
+        let (c, s) = rotated.frame();
+        let separation = local[0].abs() - (2.0 + config.radius * (c.abs() + s.abs()));
+        assert!(
+            separation > -2.0 * SKIN && separation < 0.05,
+            "pressed against the face while sliding: {separation}"
+        );
+    }
+
+    /// Cycle-4 C §8, the LOS pairs at the world level: the direct ray
+    /// through the rotated cover is blocked at the TRUE edge (the
+    /// analytic entry t), the same-origin ray at a steeper angle is
+    /// clear (it passes the diamond's corner — the blocked-vs-clear
+    /// pair differing only by angle), the world-AABB stand-in
+    /// over-blocks the parallel-offset ray the true shape clears (the
+    /// LOS anti-hitbox discriminator), and a mixed world consults
+    /// both collider kinds with the nearest hit winning.
+    #[test]
+    fn los_blocked_and_clear_pairs_through_one_rotated_cover() {
+        let rotated = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0).with_rotated_collider(Some(rotated));
+        // The blocked ray: along +X at eye height through z = 2 — the
+        // true diamond's upper-left edge crosses z = 2 at x = −0.83.
+        let t = world
+            .segment_hit([-10.0, 1.0, 2.0], [10.0, 1.0, 2.0], 0.0)
+            .expect("the cover blocks the direct line");
+        assert!((t - 0.4586).abs() < 2e-3, "enters at the true edge: {t}");
+        // The clear pair from the SAME origin, differing only in
+        // angle: aimed to pass above the diamond's upper corner.
+        assert_eq!(
+            world.segment_hit([-10.0, 1.0, 2.0], [10.0, 1.0, 5.0], 0.0),
+            None
+        );
+        // The LOS anti-hitbox discriminator: a ray parallel to the
+        // face, offset beyond it — the true shape clears it, the
+        // world-AABB stand-in blocks it.
+        assert_eq!(
+            world.segment_hit([-3.0, 1.0, 0.2], [2.0, 1.0, 5.2], 0.0),
+            None
+        );
+        let stand_in = CollisionWorld::new(0.0).with_collider(rotated.world_aabb());
+        assert!(
+            stand_in
+                .segment_hit([-3.0, 1.0, 0.2], [2.0, 1.0, 5.2], 0.0)
+                .is_some(),
+            "the stand-in over-blocks the clear line"
+        );
+        // The mixed world: both collider kinds consulted; the rotated
+        // cover wins the minimum over the axis-aligned block behind
+        // it. (This ray spans −10 → 20, so the cover's entry — the
+        // same edge point the direct ray hits at t ≈ 0.4586 over its
+        // 20-unit span — lands at t ≈ 0.3057 over this 30-unit span;
+        // the axis-aligned block behind it would hit at t ≈ 0.617.)
+        let mixed = CollisionWorld::new(0.0)
+            .with_box([9.0, 0.0, 0.0], 1.0, 3.0)
+            .with_rotated_collider(Some(rotated));
+        let t_mixed = mixed
+            .segment_hit([-10.0, 1.0, 2.0], [20.0, 1.0, 2.0], 0.0)
+            .expect("the mixed world hits");
+        assert!(
+            (t_mixed - 0.3057).abs() < 2e-3,
+            "the rotated cover wins the min-t: {t_mixed}"
+        );
+    }
+
+    /// Cycle-4 C §8, the movement invariant: a long chaotic scripted
+    /// walk (sprints, jumps, direction changes, a rotating yaw)
+    /// through a mixed world (an axis-aligned box + three rotated
+    /// colliders at different yaws, including a thin wall and a low
+    /// slab) never ends a tick inside any collider — the swept
+    /// SKIN-short clamping and the depenetration hold the
+    /// nonpenetration invariant everywhere, whatever the corner and
+    /// step-up probe behavior does along the way.
+    #[test]
+    fn a_chaotic_walk_never_penetrates_the_rotated_world() {
+        let config = PlayerConfig {
+            sprint_speed: 9.0,
+            step_height: 0.45,
+            ..Default::default()
+        };
+        let big = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let thin = RotatedCollider::from_base_yaw([3.0, 0.0, -2.0], 0.4, 5.0, 2.0, 0.6).unwrap();
+        let slab = RotatedCollider::from_base_yaw(
+            [-2.0, 0.0, 3.0],
+            2.5,
+            2.5,
+            0.5,
+            -std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let world = CollisionWorld::new(0.0)
+            .with_box([0.0, 0.0, -5.0], 1.0, 2.0)
+            .with_rotated_collider(Some(big))
+            .with_rotated_collider(Some(thin))
+            .with_rotated_collider(Some(slab));
+        let mut state = PlayerState::spawn([-6.0, 0.0, -6.0]);
+        let script: [(i8, i8, bool, bool); 8] = [
+            (1, 0, false, false),
+            (1, 1, true, false),
+            (0, 1, false, true),
+            (1, 0, true, true),
+            (-1, 1, false, false),
+            (1, -1, true, false),
+            (0, -1, false, true),
+            (1, 0, false, false),
+        ];
+        for round in 0..16 {
+            state.yaw += 0.37; // a non-cardinal, ever-changing heading
+            for (forward, strafe, sprint, jump) in script {
+                let intent = MoveIntent {
+                    forward,
+                    strafe,
+                    sprint,
+                    jump_pressed: jump,
+                    ..idle()
+                };
+                for _ in 0..4 {
+                    step_player(&mut state, &config, &world, &intent, DT);
+                    let (min, max) = player_box(state.position, &config);
+                    assert!(
+                        !world.box_overlaps(min, max),
+                        "round {round}: never inside any collider at {:?}",
+                        state.position
+                    );
+                }
+            }
+        }
     }
 }
