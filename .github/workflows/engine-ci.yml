@@ -749,8 +749,17 @@ jobs:
           # heavy 535/6/54, zero failures, every selftest pin
           # byte-identical — /var/tmp/s7-cycle4-targets/int-gates-run5.log;
           # the prior pin 533/6/54 preserved above).
-          expected=535
-          if [ "$(uname -s)" != "Linux" ]; then expected=535; fi
+          # Cycle 4 batch 6 (the E-Phase-1 merge e885b02): Linux+Windows
+          # 539/6/54 MEASURED at the integrated tree with this step's own
+          # awk (E's capability-E Phase-1 adds 4 engine-slice lib tests —
+          # the k-of-N cell semantic proofs + the strengthened contract
+          # assertions; platform-uniform, no new result lines; the local
+          # integration gates: main 1073/2/31 unchanged, heavy 539/6/54,
+          # zero failures, every selftest pin byte-identical —
+          # /var/tmp/s7-cycle4-targets/int-gates-run6.log; the prior pin
+          # 535/6/54 preserved above).
+          expected=539
+          if [ "$(uname -s)" != "Linux" ]; then expected=539; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
