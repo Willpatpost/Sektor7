@@ -240,8 +240,17 @@ jobs:
           # /var/tmp/s7-cycle4-targets/int-gates-run3.log). Windows 1022
           # = the prior 1011 + the same 11 (platform-uniform inference —
           # the candidate CI run confirms it).
-          expected=1073
-          if [ "$(uname -s)" != "Linux" ]; then expected=1022; fi
+          # Cycle 4 batch 8 (the C merge 3f8a5eb): Linux 1096/2/31 MEASURED
+          # at the integrated tree with this step's own awk (C's
+          # capability-C adds 23 engine-core lib tests — the rotated
+          # collision battery across the four milestones; platform-uniform,
+          # no new result lines; the local integration gates: main
+          # 1096/2/31, heavy 545/6/54 unchanged, zero failures, every
+          # selftest pin byte-identical —
+          # /var/tmp/s7-cycle4-targets/int-gates-run8.log; the prior pin
+          # 1073/1022 preserved above).
+          expected=1096
+          if [ "$(uname -s)" != "Linux" ]; then expected=1045; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
