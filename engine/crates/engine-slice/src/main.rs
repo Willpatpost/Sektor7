@@ -821,6 +821,30 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--encounter-wave-headless") {
+        // [cycle4-D] The deterministic WAVE winnable scenario: the
+        // 4-adversary 2-wave composition, both weapons (NEW pins —
+        // the single-adversary traces are guards).
+        println!(
+            "{}",
+            engine_slice::encounter_demo::run_encounter_wave_winnable_headless()
+        );
+        return;
+    }
+
+    if args
+        .iter()
+        .any(|arg| arg == "--encounter-wave-failure-headless")
+    {
+        // [cycle4-D] The WAVE failure scenario (the multi-adversary
+        // pressure defeats the standing player).
+        println!(
+            "{}",
+            engine_slice::encounter_demo::run_encounter_wave_failure_headless()
+        );
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--combat") {
         // [cycle3-P6] The integrated playable combat encounter (the
         // arena): movement + camera + fire + the adversary + visible

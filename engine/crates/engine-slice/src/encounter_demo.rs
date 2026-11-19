@@ -44,9 +44,10 @@ use std::time::Duration;
 
 use engine_core::adversary::{AdversaryConfig, AdversaryState, AdversaryWorld};
 use engine_core::{
-    AttackProfile, AttackRequest, CameraMode, CollisionWorld, Combatant, DamageOutcome,
-    Fingerprinter, Health, HitResolution, MissKind, MoveIntent, PlayerDriver, PlayerState, Spine,
-    StaticCollider, Tick, camera_pose_obstructed, health_full, look_direction, resolve_attack,
+    Arsenal, AttackProfile, CameraMode, CollisionWorld, Combatant, DamageOutcome, Fingerprinter,
+    FireContext, FireOutcome, FireRefusal, FiringPattern, Health, HitResolution, MissKind,
+    MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider, Tick, WeaponId, WeaponSet,
+    WeaponSpec, camera_pose_obstructed, health_full, look_direction, try_fire,
 };
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
@@ -158,6 +159,11 @@ pub const PLAYER_SPAWN: [f32; 3] = [0.0, 2.0, 8.0];
 /// The activation line (z ≤ this, once — the Dormant phase gate).
 pub const ACTIVATION_Z: f32 = 2.0;
 
+/// The SECOND activation line (z ≤ this, once while Active): the
+/// deeper crossing that wakes wave 2 while the fight is live — the
+/// per-adversary later-activation staging (the mid-fight ambush).
+pub const ACTIVATION_LINE_B_Z: f32 = -4.0;
+
 /// The adversary half-extents (the hit/visual body).
 pub const ADVERSARY_HALF: [f32; 3] = [0.45, 0.9, 0.45];
 
@@ -239,19 +245,34 @@ pub struct EncounterConfig {
     pub defeated_drain_ticks: u32,
     /// The adversary world's deterministic seed.
     pub adversary_seed: u64,
-    /// How many adversaries the encounter spawns. ONE in this stage
-    /// — the WAVE composition (the mixed dormant/active population)
-    /// is SEAT A's COMBATANTS-INTERFACE consumption point and lands
-    /// with it; the field exists so the composition is a policy
-    /// change, not a structural one.
+    /// How many adversaries the encounter spawns.
     pub adversary_count: usize,
+    /// How many adversaries the FIRST activation line wakes (wave 1);
+    /// the remainder wake at the second, deeper line (wave 2 — the
+    /// mid-fight staging). Must be ≤ `adversary_count`.
+    pub wave1_count: usize,
+    // ---- The spread weapon's policy values (the WEAPONS-INTERFACE
+    // ---- §1 WeaponSet construction; every number a PLACEHOLDER).
+    /// The spread fan's ray count (B's bounded fan; 1..=64).
+    pub spread_rays: u32,
+    /// The spread fan's lateral step (m of perpendicular offset per
+    /// ray index).
+    pub spread_lateral_step: f32,
+    /// The spread weapon's effective range (m).
+    pub spread_range: f32,
+    /// The spread weapon's refire cooldown in logical ticks.
+    pub spread_cooldown_ticks: u64,
+    /// The spread weapon's damage PER RAY (the encounter's per-ray,
+    /// no-dedupe application policy).
+    pub spread_damage: f32,
 }
 
-/// The placeholder encounter values (the scenario tuning — the
-/// accepted combat placeholders adopted where the courtyard's tuning
-/// does not bind; the winnable script's shape is measured and pinned
-/// by the regressions).
-pub fn encounter_config() -> EncounterConfig {
+/// The SINGLE-adversary encounter values — the original pinned
+/// scenario configuration (the winnable/failure headless runners run
+/// THIS explicitly; their traces and pins are guards per the H
+/// review's merge conditions — the wave composition is a SEPARATE
+/// policy, not a repin of these).
+pub fn encounter_single_config() -> EncounterConfig {
     EncounterConfig {
         weapon_range: 30.0,
         weapon_damage: 25.0,
@@ -265,6 +286,71 @@ pub fn encounter_config() -> EncounterConfig {
         defeated_drain_ticks: 6,
         adversary_seed: 0xE4C0u64,
         adversary_count: 1,
+        wave1_count: 1,
+        spread_rays: 5,
+        spread_lateral_step: 0.08,
+        spread_range: 12.0,
+        spread_cooldown_ticks: 30,
+        spread_damage: 8.0,
+    }
+}
+
+/// The WAVE encounter values — the full capability-D composition
+/// (the interactive `--encounter` default): four adversaries in two
+/// activation waves, both weapons, the crossfire courtyard. Every
+/// number a PLACEHOLDER (the owner ratifies balance); tuned so the
+/// wave winnable script wins deterministically (measured + pinned).
+pub fn encounter_config() -> EncounterConfig {
+    EncounterConfig {
+        weapon_range: 30.0,
+        weapon_damage: 25.0,
+        weapon_cooldown_ticks: 18,
+        player_hp: 160.0,
+        adversary_hp: 75.0,
+        adversary_speed: 5.0,
+        adversary_attack_range: 2.0,
+        adversary_attack_cooldown_ticks: 24,
+        adversary_damage: 12.0,
+        defeated_drain_ticks: 6,
+        adversary_seed: 0xE4C0u64,
+        adversary_count: 4,
+        wave1_count: 2,
+        spread_rays: 5,
+        spread_lateral_step: 0.08,
+        spread_range: 12.0,
+        spread_cooldown_ticks: 30,
+        spread_damage: 8.0,
+    }
+}
+
+/// The encounter's weapon policy table — SEAT B's `WeaponSet` built
+/// from the encounter's placeholder values (WEAPONS-INTERFACE §1;
+/// the precision spec reproduces the interim single-weapon values so
+/// the pinned single-adversary traces are preserved by the §6.3
+/// bit-identity).
+fn encounter_weapon_set(config: &EncounterConfig) -> WeaponSet {
+    WeaponSet {
+        specs: [
+            WeaponSpec {
+                pattern: FiringPattern::Precision,
+                profile: AttackProfile {
+                    range: config.weapon_range,
+                    occlusion_margin: 0.0,
+                },
+                cooldown_ticks: config.weapon_cooldown_ticks,
+            },
+            WeaponSpec {
+                pattern: FiringPattern::Spread {
+                    rays: config.spread_rays,
+                    lateral_step: config.spread_lateral_step,
+                },
+                profile: AttackProfile {
+                    range: config.spread_range,
+                    occlusion_margin: 0.0,
+                },
+                cooldown_ticks: config.spread_cooldown_ticks,
+            },
+        ],
     }
 }
 
@@ -400,20 +486,19 @@ pub struct EncounterState {
     pub drain_remaining: u32,
     /// The completed round count (incremented by each reset).
     pub rounds: u32,
-    /// The selected weapon's readiness deadline in the ROUND's
-    /// logical-tick base (the WEAPONS-INTERFACE §4 form: set only on
-    /// a successful fire as `now + cooldown`, compared as
-    /// `now >= deadline`, never decremented; a refusal spends
-    /// nothing). The interim single-weapon bookkeeping SEAT B's
-    /// `Arsenal` replaces at integration — the semantics are
-    /// contract-identical, so the migration is trace-preserving.
-    pub weapon_ready_at: u64,
+    /// Whether wave 2 has been activated (the deeper line's
+    /// once-guard — restored to false by a full-round reset).
+    pub wave2_activated: bool,
     /// The adversary's last hit tick (the hit-flash read).
     pub last_hit_tick: Option<u64>,
     /// The player's last damage tick (the HUD damage line).
     pub last_damage_tick: Option<u64>,
     /// The last fire outcome's HUD line (targeting feedback).
     pub last_fire_line: Option<String>,
+    /// The last weapon-selection feedback line (the HUD surface —
+    /// never the event log; the selection is player policy, not a
+    /// transition event).
+    pub last_selection_line: Option<String>,
     /// (tick, line) — the deterministic event log, labels per the
     /// ratified EVENT-TIMESTAMPS contract (round-scoped, 1-based).
     pub events: Vec<(u64, String)>,
@@ -435,10 +520,11 @@ impl EncounterState {
             adversary_defeated: false,
             drain_remaining: 0,
             rounds: 0,
-            weapon_ready_at: 0,
+            wave2_activated: false,
             last_hit_tick: None,
             last_damage_tick: None,
             last_fire_line: None,
+            last_selection_line: None,
             events: Vec::new(),
             terminal: None,
             round_banner_pending: true,
@@ -461,16 +547,16 @@ pub struct AdversaryHudLine {
 }
 
 /// The weapon's HUD line (the selection discriminant + readiness —
-/// the WEAPONS-INTERFACE's F-facing data; SEAT B's `WeaponId` types
-/// this at integration).
+/// the WEAPONS-INTERFACE's F-facing data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WeaponHudLine {
-    /// The selected weapon's label ("precision" in this stage; the
-    /// spread joins at integration).
-    pub label: &'static str,
-    /// The readiness deadline in the round's tick base.
+    /// The selected weapon (the WEAPONS-INTERFACE identity — the
+    /// HUD discriminant).
+    pub selected: WeaponId,
+    /// The SELECTED weapon's readiness deadline in the round's tick
+    /// base (a readiness bar's target tick).
     pub ready_at: u64,
-    /// Whether the weapon is ready at the read's tick.
+    /// Whether the selected weapon is ready at the read's tick.
     pub ready: bool,
 }
 
@@ -491,6 +577,8 @@ pub struct EncounterHud {
     pub terminal: Option<TerminalRecord>,
     /// The last fire outcome's feedback line (targeting data).
     pub last_fire_line: Option<String>,
+    /// The last weapon-selection feedback line.
+    pub last_selection_line: Option<String>,
 }
 
 // ==================================================== the demo
@@ -516,6 +604,14 @@ pub struct EncounterDemo {
     /// composition (the C3-R1 seam needs a collision reference the
     /// observer closure can hold while the driver advances).
     fire_world: CollisionWorld,
+    /// SEAT B's weapon state: the selection + the per-weapon
+    /// cooldown deadlines (the WEAPONS-INTERFACE §2/§4 surface —
+    /// pure state, zero idle cost; rebuilt to the starting weapon by
+    /// a full-round reset).
+    pub arsenal: Arsenal,
+    /// The encounter's weapon policy table (the §1 WeaponSet —
+    /// static for the demo's lifetime).
+    weapons: WeaponSet,
     config: EncounterConfig,
     /// The ROUND's logical tick counter (restarted by a reset with
     /// the rebuilt spine — the timestamp contract's round scoping).
@@ -550,6 +646,8 @@ impl EncounterDemo {
             encounter: EncounterState::fresh(&config),
             spine: encounter_adversary_spine(&config),
             fire_world: encounter_arena_world(),
+            arsenal: Arsenal::new(WeaponId::Precision),
+            weapons: encounter_weapon_set(&config),
             config,
             ticks: 0,
             pending_fire: false,
@@ -566,10 +664,38 @@ impl EncounterDemo {
         self.ticks
     }
 
-    /// Whether the selected weapon is ready at the given tick (the
-    /// §4 pure comparison).
+    /// Whether the SELECTED weapon is ready at the round's current
+    /// tick (the §4 pure comparison, against B's Arsenal).
     pub fn weapon_ready(&self) -> bool {
-        self.ticks >= self.encounter.weapon_ready_at
+        self.arsenal.is_ready(Tick(self.ticks))
+    }
+
+    /// The weapon-selection edge (the interactive mapping and the
+    /// headless scripts both drive this; POLICY state, not combat
+    /// resolution — it never enters the per-tick transition, so the
+    /// cadence equivalence and the event log's pure transition
+    /// semantics are unaffected). The lifecycle rules are honest: a
+    /// selection while DORMANT or post-terminal is refused with a
+    /// feedback line and changes NOTHING (the fire edge's own
+    /// discipline, mirrored); otherwise the Arsenal's instant,
+    /// cooldown-untouched `select` applies. The feedback surfaces in
+    /// the HUD data (`last_selection_line`), never the event log.
+    pub fn apply_selection(&mut self, weapon: WeaponId) {
+        if self.encounter.phase.is_terminal() {
+            self.encounter.last_selection_line =
+                Some("weapon switch refused — the encounter is over ([R] reset)".to_string());
+            return;
+        }
+        if self.encounter.phase == EncounterPhase::Dormant {
+            self.encounter.last_selection_line = Some(
+                "weapon switch refused — the adversaries are dormant (cross the line)".to_string(),
+            );
+            return;
+        }
+        if self.arsenal.select(weapon) {
+            self.encounter.last_selection_line =
+                Some(format!("weapon selected — {}", weapon_word(weapon)));
+        }
     }
 
     /// The spine's clock (the timestamp contract's T4 alignment
@@ -595,8 +721,13 @@ impl EncounterDemo {
             encounter_arena_world(),
             crate::player_demo::DEMO_TICK_HZ,
         );
+        // G's NB-3 pairing rule (BINDING): the spine is REBUILT, not
+        // in-place reset — the fresh dormant world plus the fresh
+        // Arsenal (the starting weapon, all deadlines ready) and the
+        // fresh encounter state together.
         self.spine = encounter_adversary_spine(&config);
         self.fire_world = encounter_arena_world();
+        self.arsenal = Arsenal::new(WeaponId::Precision);
         self.encounter = EncounterState::fresh(&config);
         self.encounter.rounds = rounds;
         self.ticks = 0;
@@ -627,13 +758,14 @@ impl EncounterDemo {
             },
             adversaries,
             weapon: WeaponHudLine {
-                label: "precision",
-                ready_at: self.encounter.weapon_ready_at,
-                ready: self.ticks >= self.encounter.weapon_ready_at,
+                selected: self.arsenal.selected(),
+                ready_at: self.arsenal.ready_at(self.arsenal.selected()),
+                ready: self.arsenal.is_ready(Tick(self.ticks)),
             },
             counters: self.encounter.counters,
             terminal: self.encounter.terminal,
             last_fire_line: self.encounter.last_fire_line.clone(),
+            last_selection_line: self.encounter.last_selection_line.clone(),
         }
     }
 
@@ -652,6 +784,8 @@ impl EncounterDemo {
         Self::apply_encounter_transition(
             &mut self.encounter,
             &mut self.spine,
+            &mut self.arsenal,
+            &self.weapons,
             &self.fire_world,
             &self.config,
             &state,
@@ -681,6 +815,8 @@ impl EncounterDemo {
             driver,
             encounter,
             spine,
+            arsenal,
+            weapons,
             fire_world,
             config,
             ticks,
@@ -695,6 +831,8 @@ impl EncounterDemo {
             Self::apply_encounter_transition(
                 encounter,
                 spine,
+                arsenal,
+                weapons,
                 fire_world,
                 config,
                 state,
@@ -719,6 +857,8 @@ impl EncounterDemo {
     fn apply_encounter_transition(
         encounter: &mut EncounterState,
         spine: &mut Spine<AdversaryWorld>,
+        arsenal: &mut Arsenal,
+        weapons: &WeaponSet,
         fire_world: &CollisionWorld,
         config: &EncounterConfig,
         player: &PlayerState,
@@ -759,31 +899,64 @@ impl EncounterDemo {
                 ),
             );
         }
-        // 1. Activation: the contact trigger on the z-line (once —
-        //    the Dormant phase gate makes it single-shot). Every
-        //    adversary's first wake-up is scheduled through its own
-        //    `activation_spec` at the NEXT spine tick (the
-        //    deterministic event-driven mechanism — the wake
-        //    transitions DORMANT → PATROL and the cadence chains
-        //    carry the machine onward; nothing is scheduled at
-        //    construction). The multi-adversary WAVE staging (a
-        //    second, deeper activation line) is the A-interface
-        //    consumption point.
+        // 1. Activation: the WAVE staging. Line A (once — the
+        //    Dormant phase gate makes it single-shot) starts the
+        //    encounter and wakes wave 1 (the first `wave1_count`
+        //    adversaries); the DEEPER line B (once while Active)
+        //    wakes wave 2 while the fight is live — the per-adversary
+        //    later activation without duplicate chains (A's
+        //    COMBATANTS-INTERFACE: the activation payload wakes only
+        //    a DORMANT adversary; duplicates are inert). Every first
+        //    wake-up is scheduled through its own `activation_spec`
+        //    at the NEXT spine tick (the deterministic event-driven
+        //    mechanism; nothing is scheduled at construction).
         if encounter.phase == EncounterPhase::Dormant && player.position[2] <= ACTIVATION_Z {
             encounter.phase = EncounterPhase::Active;
             let due = Tick(spine.run_ticks(0).0 + 1);
-            let count = spine.world().count();
-            for index in 0..count {
+            let wave1 = config.wave1_count.min(spine.world().count());
+            for index in 0..wave1 {
                 if let Some(spec) = spine.world().activation_spec(index, due) {
                     spine
                         .schedule(spec)
                         .expect("the activation schedule is dependency-free");
                 }
             }
+            let count = spine.world().count();
+            // The single-wave composition keeps the ORIGINAL event
+            // text (the pinned single-adversary traces fingerprint
+            // the event log — guards per the H-review conditions);
+            // the wave wording appears only when a second wave
+            // exists.
+            let activation_line = if wave1 < count {
+                format!(
+                    "encounter activated — wave 1 of {wave1} adversary stirring \
+                     ({count} total)"
+                )
+            } else {
+                format!("encounter activated — {count} adversary stirring")
+            };
+            Self::log(encounter, tick, activation_line);
+        }
+        if encounter.phase == EncounterPhase::Active
+            && !encounter.wave2_activated
+            && player.position[2] <= ACTIVATION_LINE_B_Z
+        {
+            encounter.wave2_activated = true;
+            let due = Tick(spine.run_ticks(0).0 + 1);
+            let wave1 = config.wave1_count.min(spine.world().count());
+            let mut woken = 0;
+            for index in wave1..spine.world().count() {
+                if let Some(spec) = spine.world().activation_spec(index, due) {
+                    spine
+                        .schedule(spec)
+                        .expect("the activation schedule is dependency-free");
+                    woken += 1;
+                }
+            }
             Self::log(
                 encounter,
                 tick,
-                format!("encounter activated — {count} adversary stirring"),
+                format!("wave 2 stirs — {woken} more adversary awakening mid-fight"),
             );
         }
         // 2. The fire edge. Pre-activation (the Cycle-3.1 defect-A
@@ -803,6 +976,8 @@ impl EncounterDemo {
             Self::fire_weapon(
                 encounter,
                 spine,
+                arsenal,
+                weapons,
                 fire_world,
                 config,
                 player,
@@ -968,58 +1143,35 @@ impl EncounterDemo {
         }
     }
 
-    /// The fire resolution — the ACCEPTED combat contract call (the
-    /// WEAPONS-INTERFACE migration base: this is bit-identical to
-    /// SEAT B's `try_fire` Precision pattern with the same request —
-    /// the contract's §6.3 compatibility invariant — so the Arsenal
-    /// migration preserves the encounter traces by construction).
-    /// The encounter owns the policy: the weapon values, the damage
-    /// routed through the adversary's `Health` (via
-    /// `apply_player_hit`), the cooldown deadline (§4: set only on a
-    /// successful fire; a refused press spends nothing), and the
-    /// out-of-range feedback distinction on top of the contract's
-    /// `Miss::Clear`.
+    /// The fire resolution — SEAT B's `try_fire` through the
+    /// ratified `FireContext` form (WEAPONS-INTERFACE v1): the
+    /// engine derives the rays, resolves each against the targets
+    /// through the combat contract, and keeps the per-weapon
+    /// cooldown deadlines (§4 — set only on a successful fire; a
+    /// refused press spends nothing). The encounter owns the policy:
+    /// the weapon values (the `WeaponSet`), the per-shot damage
+    /// application (PER RAY, no same-target dedupe within a volley —
+    /// the ray count IS the spread weapon's character against a
+    /// single target; the Health-ownership convention: `try_fire`
+    /// never mutates `Health`, the encounter routes through
+    /// `apply_player_hit`), and the out-of-range feedback
+    /// distinction on top of the contract's `Miss::Clear`. The
+    /// single-shot (precision) feedback lines keep the ORIGINAL
+    /// format exactly — the pinned single-adversary traces
+    /// fingerprint the event log (guards); the spread's multi-shot
+    /// volleys carry a per-ray marker.
+    #[allow(clippy::too_many_arguments)]
     fn fire_weapon(
         encounter: &mut EncounterState,
         spine: &mut Spine<AdversaryWorld>,
+        arsenal: &mut Arsenal,
+        weapons: &WeaponSet,
         fire_world: &CollisionWorld,
         config: &EncounterConfig,
         player: &PlayerState,
         player_eye_height: f32,
         tick: u64,
     ) {
-        // The cooldown gate (§4's pure comparison; the refusal spends
-        // NO cooldown — the deadline is bit-unchanged).
-        if tick < encounter.weapon_ready_at {
-            Self::log(
-                encounter,
-                tick,
-                format!(
-                    "fire refused — the weapon is cooling (ready at tick {})",
-                    encounter.weapon_ready_at
-                ),
-            );
-            return;
-        }
-        encounter.counters.fires += 1;
-        encounter.weapon_ready_at = tick + config.weapon_cooldown_ticks;
-        let fire_index = encounter.counters.fires;
-        // THE REQUEST (the contract's §4 flow): THIS tick's eye +
-        // look direction (camera-agnostic — the same request in both
-        // camera modes).
-        let request = AttackRequest {
-            attacker: PLAYER_ID,
-            origin: [
-                player.position[0],
-                player.position[1] + player_eye_height,
-                player.position[2],
-            ],
-            direction: look_direction(player.yaw, player.pitch),
-            profile: AttackProfile {
-                range: config.weapon_range,
-                occlusion_margin: 0.0,
-            },
-        };
         // The target mapping (the encounter's policy): the live
         // adversary boxes, skipping DEFEATED bodies.
         let mut targets = Vec::with_capacity(spine.world().count());
@@ -1037,85 +1189,135 @@ impl EncounterDemo {
                 },
             });
         }
-        // The trace resolves against the encounter's static fire
-        // world — the same courtyard content the driver and the
-        // adversary world hold.
-        let resolution = resolve_attack(fire_world, &request, &targets);
-        let line = match &resolution {
-            HitResolution::Hit {
-                target, distance, ..
-            } => {
-                encounter.counters.hits += 1;
-                encounter.last_hit_tick = Some(tick);
-                let index = usize::try_from(*target - ADVERSARY_ID_BASE)
-                    .unwrap_or(usize::MAX)
-                    .min(spine.world().count().saturating_sub(1));
-                let damage = config.weapon_damage;
-                let applied = spine.world_mut().apply_player_hit(index, damage);
-                match applied {
-                    Some(Ok(DamageOutcome::Wounded { remaining, .. })) => format!(
-                        "fire {fire_index} — HIT adversary {index} at {distance:.1} m \
-                         ({remaining:.0} hp left)"
-                    ),
-                    Some(Ok(DamageOutcome::Defeated { .. })) => format!(
-                        "fire {fire_index} — HIT adversary {index} at {distance:.1} m \
-                         (DEFEATED)"
-                    ),
-                    Some(Ok(DamageOutcome::Graze)) => format!(
-                        "fire {fire_index} — HIT adversary {index} at {distance:.1} m \
-                         (a graze)"
-                    ),
-                    Some(Err(error)) => format!(
-                        "fire {fire_index} — HIT adversary {index} but the damage \
-                         refused ({error:?})"
-                    ),
-                    None => format!(
-                        "fire {fire_index} — HIT adversary {index} at {distance:.1} m \
-                         (already defeated)"
-                    ),
-                }
-            }
-            HitResolution::Miss {
-                kind: MissKind::Occluded { .. },
-            } => {
-                encounter.counters.blocked += 1;
-                format!("fire {fire_index} — BLOCKED by cover")
-            }
-            HitResolution::Miss {
-                kind: MissKind::Clear,
-            } => {
-                // The honest out-of-range distinction (the accepted
-                // demo's feedback policy): an unobstructed ray that
-                // WOULD have reached a live target beyond the range
-                // says so; otherwise the shot was simply wide.
-                let mut reachable = false;
-                for target in &targets {
-                    if ray_box_entry(
-                        &request.origin,
-                        &request.direction,
-                        &target.hit_box.min,
-                        &target.hit_box.max,
-                    )
-                    .is_some()
-                    {
-                        reachable = true;
-                        break;
-                    }
-                }
-                if reachable {
-                    encounter.counters.out_of_range += 1;
-                    format!("fire {fire_index} — out of range")
-                } else {
-                    encounter.counters.misses += 1;
-                    format!("fire {fire_index} — wide (no target on the line)")
-                }
-            }
-            HitResolution::Refused(reason) => {
-                format!("fire {fire_index} — refused ({reason:?})")
-            }
+        // THE CONTEXT (the contract's §3 FireContext form): THIS
+        // tick's eye + look direction (camera-agnostic — the same
+        // request in both camera modes), the targets, the shared
+        // fire world, and the canonical tick.
+        let origin = [
+            player.position[0],
+            player.position[1] + player_eye_height,
+            player.position[2],
+        ];
+        let aim = look_direction(player.yaw, player.pitch);
+        let context = FireContext {
+            attacker: PLAYER_ID,
+            origin,
+            aim,
+            targets: &targets,
+            world: fire_world,
+            now: Tick(tick),
         };
-        encounter.last_fire_line = Some(line.clone());
-        Self::log(encounter, tick, line);
+        let outcome = try_fire(arsenal, weapons, &context);
+        match outcome {
+            FireOutcome::Fired { weapon, shots } => {
+                encounter.counters.fires += 1;
+                let fire_index = encounter.counters.fires;
+                let volley = shots.len();
+                let damage = match weapon {
+                    WeaponId::Precision => config.weapon_damage,
+                    WeaponId::Spread => config.spread_damage,
+                };
+                let mut last_line = None;
+                for (ray, shot) in shots.iter().enumerate() {
+                    // The single-shot volley keeps the ORIGINAL line
+                    // format (the pinned traces); the multi-ray
+                    // spread carries the ray marker.
+                    let prefix = if volley == 1 {
+                        format!("fire {fire_index}")
+                    } else {
+                        format!("fire {fire_index} ray {ray}")
+                    };
+                    let line = match &shot.resolution {
+                        HitResolution::Hit {
+                            target, distance, ..
+                        } => {
+                            encounter.counters.hits += 1;
+                            encounter.last_hit_tick = Some(tick);
+                            let index = usize::try_from(*target - ADVERSARY_ID_BASE)
+                                .unwrap_or(usize::MAX)
+                                .min(spine.world().count().saturating_sub(1));
+                            let applied = spine.world_mut().apply_player_hit(index, damage);
+                            match applied {
+                                Some(Ok(DamageOutcome::Wounded { remaining, .. })) => format!(
+                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                     ({remaining:.0} hp left)"
+                                ),
+                                Some(Ok(DamageOutcome::Defeated { .. })) => format!(
+                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                     (DEFEATED)"
+                                ),
+                                Some(Ok(DamageOutcome::Graze)) => format!(
+                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                     (a graze)"
+                                ),
+                                Some(Err(error)) => format!(
+                                    "{prefix} — HIT adversary {index} but the damage \
+                                     refused ({error:?})"
+                                ),
+                                None => format!(
+                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                     (already defeated)"
+                                ),
+                            }
+                        }
+                        HitResolution::Miss {
+                            kind: MissKind::Occluded { .. },
+                        } => {
+                            encounter.counters.blocked += 1;
+                            format!("{prefix} — BLOCKED by cover")
+                        }
+                        HitResolution::Miss {
+                            kind: MissKind::Clear,
+                        } => {
+                            // The honest out-of-range distinction (the
+                            // accepted demo's feedback policy): an
+                            // unobstructed ray that WOULD have reached a
+                            // live target beyond the range says so;
+                            // otherwise the shot was simply wide.
+                            let mut reachable = false;
+                            for target in &targets {
+                                if ray_box_entry(
+                                    &origin,
+                                    &shot.direction,
+                                    &target.hit_box.min,
+                                    &target.hit_box.max,
+                                )
+                                .is_some()
+                                {
+                                    reachable = true;
+                                    break;
+                                }
+                            }
+                            if reachable {
+                                encounter.counters.out_of_range += 1;
+                                format!("{prefix} — out of range")
+                            } else {
+                                encounter.counters.misses += 1;
+                                format!("{prefix} — wide (no target on the line)")
+                            }
+                        }
+                        HitResolution::Refused(reason) => {
+                            format!("{prefix} — refused ({reason:?})")
+                        }
+                    };
+                    last_line = Some(line.clone());
+                    Self::log(encounter, tick, line);
+                }
+                if let Some(line) = last_line {
+                    encounter.last_fire_line = Some(line);
+                }
+            }
+            FireOutcome::Refused(reason) => {
+                let line = match reason {
+                    FireRefusal::Cooldown { ready_at } => {
+                        format!("fire refused — the weapon is cooling (ready at tick {ready_at})")
+                    }
+                    other => format!("fire refused — {other:?}"),
+                };
+                encounter.last_fire_line = Some(line.clone());
+                Self::log(encounter, tick, line);
+            }
+        }
     }
 
     /// The parts-scoped event log push.
@@ -1158,6 +1360,15 @@ fn adversary_state_word(state: AdversaryState) -> &'static str {
         AdversaryState::Attack => "ATTACK",
         AdversaryState::Recover => "RECOVER",
         AdversaryState::Defeated => "DEFEATED",
+    }
+}
+
+/// The weapon's HUD/feedback word (the selection discriminant's
+/// label).
+pub fn weapon_word(weapon: WeaponId) -> &'static str {
+    match weapon {
+        WeaponId::Precision => "precision",
+        WeaponId::Spread => "spread",
     }
 }
 
@@ -1286,9 +1497,12 @@ pub fn run_encounter_winnable(demo: &mut EncounterDemo) {
 
 /// The WINNABLE headless scenario (`--encounter-headless`): the
 /// script over a fresh demo, returning the printable evidence
-/// record, byte-identical across identical invocations.
+/// record, byte-identical across identical invocations. Runs the
+/// PINNED single-adversary configuration explicitly (the traces and
+/// pins are guards per the H-review merge conditions — the wave
+/// composition is a separate policy).
 pub fn run_encounter_winnable_headless() -> String {
-    let mut demo = EncounterDemo::new();
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     run_encounter_winnable(&mut demo);
     let done_tick = terminal_tick(&demo);
     for _ in 0..5 {
@@ -1303,9 +1517,9 @@ pub fn run_encounter_winnable_headless() -> String {
 /// attacks defeat the player. The reproducible failure. The walk's
 /// stop condition is PLAYER-ONLY (a fixed z-line, never the
 /// adversary's position) so the player trace stays cross-platform
-/// bit-stable.
+/// bit-stable. Runs the PINNED single-adversary configuration.
 pub fn run_encounter_failure_headless() -> String {
-    let mut demo = EncounterDemo::new();
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     run_until(
         &mut demo,
         idle(),
@@ -1332,6 +1546,154 @@ pub fn run_encounter_failure_headless() -> String {
         demo.tick(idle(), false);
     }
     encounter_evidence(&demo, "FAILURE", done_tick)
+}
+
+/// The WAVE winnable scenario (the full capability-D composition,
+/// `--encounter-wave-headless`): the 4-adversary 2-wave encounter —
+/// cross line A (wave 1 wakes), fight with BOTH weapons (the spread
+/// volley when adversaries share the line, the precision pick
+/// otherwise), cross the deeper line B (wave 2 stirs mid-fight),
+/// finish all four → WON. NEW pins (the wave policy is a new
+/// scenario, never a repin of the single-adversary guards).
+pub fn run_encounter_wave_winnable_headless() -> String {
+    let mut demo = EncounterDemo::new();
+    // 1. Settle.
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (wave)",
+    );
+    // 2. Cross line A.
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate wave 1",
+    );
+    // 3. The wave-1 fight: hold and fire on cooldown — the SPREAD
+    //    volley whenever TWO OR MORE live adversaries are close
+    //    (the multi-target discriminator), otherwise whichever
+    //    weapon is ready (the alternating-cooldowns policy — the
+    //    honest both-weapons fight; the zero-angle discipline: fire
+    //    only when a target is dead-ahead). Exits when wave 1 is
+    //    cleared (or the encounter resolved — the failure guard).
+    for _ in 0..6_000 {
+        if demo.encounter.phase != EncounterPhase::Active || wave1_cleared(&demo) {
+            break;
+        }
+        let spread_ready = demo.arsenal.ready_at(WeaponId::Spread) <= demo.tick_index();
+        let live_close = (0..demo.config().wave1_count)
+            .filter(|&index| {
+                let adversary = demo.spine.world().adversary(index);
+                adversary.state != AdversaryState::Defeated
+                    && adversary.position[0].abs() <= 1.2
+                    && (adversary.position[2] - demo.driver.state().position[2]).abs() <= 9.0
+            })
+            .count();
+        let on_line = (0..demo.spine.world().count())
+            .any(|index| demo.spine.world().adversary(index).position[0].abs() <= 0.4);
+        if spread_ready && live_close >= 2 {
+            demo.apply_selection(WeaponId::Spread);
+            demo.tick(idle(), on_line);
+        } else if demo.weapon_ready() {
+            demo.apply_selection(WeaponId::Precision);
+            demo.tick(idle(), on_line);
+        } else if spread_ready {
+            demo.apply_selection(WeaponId::Spread);
+            demo.tick(idle(), on_line);
+        } else {
+            demo.apply_selection(WeaponId::Precision);
+            demo.tick(idle(), false);
+        }
+    }
+    // 4. Cross the deeper line B (wave 2 stirs).
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.wave2_activated,
+        "activate wave 2",
+    );
+    // 5. The full fight to the terminal (the same alternating-
+    //    cooldowns policy over ALL adversaries).
+    for _ in 0..6_000 {
+        if demo.encounter.phase != EncounterPhase::Active {
+            break;
+        }
+        let spread_ready = demo.arsenal.ready_at(WeaponId::Spread) <= demo.tick_index();
+        let live_close = (0..demo.spine.world().count())
+            .filter(|&index| {
+                let adversary = demo.spine.world().adversary(index);
+                adversary.state != AdversaryState::Defeated
+                    && adversary.position[0].abs() <= 1.2
+                    && (adversary.position[2] - demo.driver.state().position[2]).abs() <= 9.0
+            })
+            .count();
+        let on_line = (0..demo.spine.world().count())
+            .any(|index| demo.spine.world().adversary(index).position[0].abs() <= 0.4);
+        if spread_ready && live_close >= 2 {
+            demo.apply_selection(WeaponId::Spread);
+            demo.tick(idle(), on_line);
+        } else if demo.weapon_ready() {
+            demo.apply_selection(WeaponId::Precision);
+            demo.tick(idle(), on_line);
+        } else if spread_ready {
+            demo.apply_selection(WeaponId::Spread);
+            demo.tick(idle(), on_line);
+        } else {
+            demo.apply_selection(WeaponId::Precision);
+            demo.tick(idle(), false);
+        }
+    }
+    let done_tick = terminal_tick(&demo);
+    for _ in 0..5 {
+        demo.tick(idle(), false);
+    }
+    encounter_evidence(&demo, "WAVE-WINNABLE", done_tick)
+}
+
+/// Whether wave 1 is fully defeated (the step-3 exit condition —
+/// both wave-1 adversaries DEFEATED).
+fn wave1_cleared(demo: &EncounterDemo) -> bool {
+    (0..demo.config().wave1_count)
+        .all(|index| demo.spine.world().adversary(index).state == AdversaryState::Defeated)
+}
+
+/// The WAVE failure scenario (`--encounter-wave-failure-headless`):
+/// walk through BOTH lines (all four adversaries wake) and stand
+/// still — the multi-adversary pressure defeats the player. NEW
+/// pins.
+pub fn run_encounter_wave_failure_headless() -> String {
+    let mut demo = EncounterDemo::new();
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (wave failure)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.wave2_activated,
+        "wake all four",
+    );
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.encounter.phase != EncounterPhase::Active,
+        "lose the wave encounter",
+    );
+    let done_tick = terminal_tick(&demo);
+    for _ in 0..5 {
+        demo.tick(idle(), false);
+    }
+    encounter_evidence(&demo, "WAVE-FAILURE", done_tick)
 }
 
 fn terminal_tick(demo: &EncounterDemo) -> u64 {
@@ -1482,18 +1844,36 @@ pub struct EncounterMappedInput {
     pub toggle_camera: bool,
     /// A fresh R press this frame (the full-round reset edge).
     pub reset_pressed: bool,
+    /// A fresh weapon-selection edge this frame (1 = precision,
+    /// 2 = spread — the direct edges).
+    pub select: Option<WeaponId>,
+    /// A fresh Q press this frame (the cycle edge — the loop flips
+    /// to the other weapon; the current selection lives in the
+    /// Arsenal, not the mapping layer).
+    pub cycle_pressed: bool,
 }
 
 /// Maps a shell snapshot onto the encounter intents: the playable
-/// mapping verbatim plus left-mouse fire and R reset.
+/// mapping verbatim plus left-mouse fire, R reset, and the weapon
+/// selection edges.
 pub fn map_encounter_input(snapshot: &InputSnapshot, sprint_held: bool) -> EncounterMappedInput {
     let playable = map_playable_input(snapshot, sprint_held);
     let neutral = snapshot.focus_lost || snapshot.minimized;
+    let pressed = |key: Keycode| !neutral && snapshot.keys_pressed.contains(&key);
+    let select = if pressed(Keycode::_1) {
+        Some(WeaponId::Precision)
+    } else if pressed(Keycode::_2) {
+        Some(WeaponId::Spread)
+    } else {
+        None
+    };
     EncounterMappedInput {
         intent: playable.intent,
         fire_pressed: !neutral && snapshot.mouse_pressed.contains(&MouseButton::Left),
         toggle_camera: playable.toggle_camera,
-        reset_pressed: !neutral && snapshot.keys_pressed.contains(&Keycode::R),
+        reset_pressed: pressed(Keycode::R),
+        select,
+        cycle_pressed: pressed(Keycode::Q),
     }
 }
 
@@ -1763,6 +2143,18 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             demo.driver.set_trace_recording(false);
             event_cursor = 0;
         }
+        // The weapon-selection edges (policy state — the honest
+        // lifecycle refusals live in `apply_selection`): the direct
+        // 1/2 edges, then the Q cycle (flip to the other weapon).
+        if let Some(weapon) = mapped.select {
+            demo.apply_selection(weapon);
+        } else if mapped.cycle_pressed {
+            let other = match demo.arsenal.selected() {
+                WeaponId::Precision => WeaponId::Spread,
+                WeaponId::Spread => WeaponId::Precision,
+            };
+            demo.apply_selection(other);
+        }
 
         // The C3-R1 interleaved advance: movement + the encounter
         // transition together at each executed logical tick.
@@ -1834,10 +2226,13 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
                 ));
             }
             text.push_str(&format!(
-                "weapon {} · {}\n",
-                hud.weapon.label,
+                "weapon {} · [1] precision · [2] spread · {}\n",
+                weapon_word(hud.weapon.selected),
                 if hud.weapon.ready { "ready" } else { "cooling" }
             ));
+            if let Some(line) = &hud.last_selection_line {
+                text.push_str(&format!("{line}\n"));
+            }
             if let Some(line) = &hud.last_fire_line {
                 text.push_str(&format!("{line}\n"));
             }
