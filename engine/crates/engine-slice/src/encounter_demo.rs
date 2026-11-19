@@ -46,8 +46,8 @@ use engine_core::adversary::{AdversaryConfig, AdversaryState, AdversaryWorld};
 use engine_core::{
     Arsenal, AttackProfile, CameraMode, CollisionWorld, Combatant, DamageOutcome, Fingerprinter,
     FireContext, FireOutcome, FireRefusal, FiringPattern, Health, HitResolution, MissKind,
-    MoveIntent, PlayerDriver, PlayerState, Spine, StaticCollider, Tick, WeaponId, WeaponSet,
-    WeaponSpec, camera_pose_obstructed, health_full, look_direction, try_fire,
+    MoveIntent, PlayerDriver, PlayerState, RotatedCollider, Spine, StaticCollider, Tick, WeaponId,
+    WeaponSet, WeaponSpec, camera_pose_obstructed, health_full, look_direction, try_fire,
 };
 use engine_renderer::scene::SceneVertex;
 use engine_renderer::{
@@ -175,8 +175,44 @@ pub const ADVERSARY_SPAWN: [f32; 3] = [0.0, 0.0, -4.0];
 pub const PLAYER_ID: u32 = 1;
 pub const ADVERSARY_ID_BASE: u32 = 10;
 
+/// The ~30° cover slab (the LEFT lane, mid-court): a long thin
+/// rotated wall blocking one engagement angle while the other stays
+/// clear — SEAT C's `RotatedCollider` (the COLLISION-INTERFACE §7
+/// mapping; the worked geometry and the discriminator pairs are in
+/// `D-rotated-cover-ready.md`). Height 2.4 — above the 1.6 m eye, a
+/// true shot blocker. Shared by the collision world AND the render
+/// boxes (collide-what-you-see, parameter for parameter).
+pub fn cover_slab() -> RotatedCollider {
+    RotatedCollider::from_base_yaw(
+        [-5.5, 0.0, -5.0],
+        4.0,
+        0.6,
+        2.4,
+        std::f32::consts::FRAC_PI_6,
+    )
+    .expect("the cover slab is finite and positive")
+}
+
+/// The ~60° cover pillar (near the wave-2 circuit ground): a rotated
+/// square pillar whose TRUE faces the movement, LOS, and fire must
+/// respect. Height 3.0 — above the eye and the TP camera lift.
+pub fn cover_pillar() -> RotatedCollider {
+    RotatedCollider::from_base_yaw(
+        [4.0, 0.0, -10.0],
+        1.6,
+        1.6,
+        3.0,
+        std::f32::consts::FRAC_PI_3,
+    )
+    .expect("the cover pillar is finite and positive")
+}
+
 /// Builds the courtyard collision world (the single literal every
-/// consumer copies — the accepted three-copy composition).
+/// consumer copies — the accepted three-copy composition). The
+/// rotated cover pieces ride BESIDE the axis-aligned structure (the
+/// contract §6.3: mixed worlds are the normal case; the empty
+/// rotated list would take the exact existing paths — this world is
+/// no longer empty, so every query is rotated-aware together).
 pub fn encounter_arena_world() -> CollisionWorld {
     let mut world = CollisionWorld::new(0.0);
     for class_box in ENCOUNTER_BOXES {
@@ -188,6 +224,8 @@ pub fn encounter_arena_world() -> CollisionWorld {
             max: class_box.max,
         });
     }
+    world = world.with_rotated_collider(Some(cover_slab()));
+    world = world.with_rotated_collider(Some(cover_pillar()));
     world.with_bounds([-12.5, 0.0, -15.5], [12.5, 40.0, 9.5])
 }
 
@@ -245,6 +283,10 @@ pub struct EncounterConfig {
     pub defeated_drain_ticks: u32,
     /// The adversary world's deterministic seed.
     pub adversary_seed: u64,
+    /// The adversary circuit's spawn center (the seeded circuits
+    /// disperse around it; the default is the courtyard's adversary
+    /// ground — the focused cover regressions override it).
+    pub adversary_spawn: [f32; 3],
     /// How many adversaries the encounter spawns.
     pub adversary_count: usize,
     /// How many adversaries the FIRST activation line wakes (wave 1);
@@ -285,6 +327,7 @@ pub fn encounter_single_config() -> EncounterConfig {
         adversary_damage: 20.0,
         defeated_drain_ticks: 6,
         adversary_seed: 0xE4C0u64,
+        adversary_spawn: ADVERSARY_SPAWN,
         adversary_count: 1,
         wave1_count: 1,
         spread_rays: 5,
@@ -313,6 +356,7 @@ pub fn encounter_config() -> EncounterConfig {
         adversary_damage: 12.0,
         defeated_drain_ticks: 6,
         adversary_seed: 0xE4C0u64,
+        adversary_spawn: ADVERSARY_SPAWN,
         adversary_count: 4,
         wave1_count: 2,
         spread_rays: 5,
@@ -374,7 +418,7 @@ fn encounter_adversary_config(config: &EncounterConfig) -> AdversaryConfig {
         attack_range: config.adversary_attack_range,
         speed: config.adversary_speed,
         waypoint_radius: 2.5,
-        spawn_center: ADVERSARY_SPAWN,
+        spawn_center: config.adversary_spawn,
         max_health: config.adversary_hp,
         eye_height: 1.5,
         player: playable_player_config(),
@@ -1925,8 +1969,16 @@ fn play_cues_for(audio: &mut Audio, line: &str) {
         audio.play(Cue::Interact);
         return;
     }
-    if line.starts_with("ALL ADVERSARIES DEFEATED") || line.starts_with("PLAYER DEFEATED") {
+    if line.starts_with("ALL ADVERSARIES DEFEATED") {
+        // F's cue split (the presentation-side alignment): the
+        // player's defeat carries its own Defeat cue; the encounter's
+        // completion keeps EncounterComplete.
+        audio.play(Cue::AdversaryDefeated);
         audio.play(Cue::EncounterComplete);
+        return;
+    }
+    if line.starts_with("PLAYER DEFEATED") {
+        audio.play(Cue::Defeat);
     }
 }
 
@@ -1985,10 +2037,11 @@ fn push_rect_box(vertices: &mut Vec<SceneVertex>, min: [f32; 3], max: [f32; 3], 
     );
 }
 
-/// The visible world: the courtyard boxes, the adversaries' bodies
-/// (colored by state — the awareness feedback), and the player
-/// proxy in third person. Collide-what-you-see: the solid list is
-/// the collision list; the adversary bodies are the target boxes.
+/// The visible world: the courtyard boxes, the ROTATED cover pieces
+/// (the visual geometry built from the collider itself — parameter
+/// for parameter, collide-what-you-see with NO axis-aligned
+/// stand-in), the adversaries' bodies (colored by state — the
+/// awareness feedback), and the player proxy in third person.
 pub fn encounter_render_boxes(demo: &EncounterDemo) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     let mut boxes = Vec::new();
     for class_box in ENCOUNTER_BOXES {
@@ -2019,6 +2072,16 @@ pub fn encounter_render_boxes(demo: &EncounterDemo) -> Vec<([f32; 3], [f32; 3], 
     boxes
 }
 
+/// The rotated cover pieces' visual colors (the slab — cool stone;
+/// the pillar — warm stone), matching the axis-aligned structure's
+/// palette discipline.
+pub fn cover_render_pieces() -> [(RotatedCollider, [f32; 3]); 2] {
+    [
+        (cover_slab(), [0.38, 0.42, 0.48]),
+        (cover_pillar(), [0.48, 0.42, 0.34]),
+    ]
+}
+
 /// Assembles one encounter frame's scene geometry into `out`
 /// (cleared first) — the shared presentation seam (the playable
 /// demo's discipline).
@@ -2027,6 +2090,110 @@ pub fn build_encounter_vertices_into(out: &mut Vec<SceneVertex>, demo: &Encounte
     for (min, max, color) in encounter_render_boxes(demo) {
         push_rect_box(out, min, max, color);
     }
+    // The rotated cover pieces: the TRUE rotated visual geometry,
+    // built from the collider's own frame (never an axis-aligned
+    // stand-in — the GO §4 hard rule).
+    for (collider, color) in cover_render_pieces() {
+        push_rotated_box(out, &collider, color);
+    }
+}
+
+/// Appends a rotated box as non-indexed triangle vertices — the
+/// rotated analog of `push_rect_box`: the eight corners from the
+/// collider's own `to_world` over the local ±half corners, the same
+/// six-face decomposition (top ×1.0, bottom ×0.45, the local-X side
+/// faces ×0.80, the local-Z side faces ×0.65), the same winding
+/// discipline per face.
+pub fn push_rotated_box(
+    vertices: &mut Vec<SceneVertex>,
+    collider: &RotatedCollider,
+    color: [f32; 3],
+) {
+    let shade = |multiplier: f32| {
+        [
+            color[0] * multiplier,
+            color[1] * multiplier,
+            color[2] * multiplier,
+        ]
+    };
+    let [hx, hy, hz] = collider.half;
+    // The local-frame corners (y up), mapped to world through the
+    // collider's own cached frame.
+    let corner = |lx: f32, ly: f32, lz: f32| collider.to_world([lx, ly, lz]);
+    let top = hy;
+    let bottom = -hy;
+    // One quad face emitter (two triangles, the established order).
+    let face = |vertices: &mut Vec<SceneVertex>, quad: [[f32; 3]; 4], face_color: [f32; 3]| {
+        for position in [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]] {
+            vertices.push(SceneVertex {
+                pos: position,
+                col: face_color,
+            });
+        }
+    };
+    // Top (local-X × local-Z plane, CCW from above) and bottom.
+    face(
+        vertices,
+        [
+            corner(-hx, top, hz),
+            corner(-hx, top, -hz),
+            corner(hx, top, -hz),
+            corner(hx, top, hz),
+        ],
+        shade(1.0),
+    );
+    face(
+        vertices,
+        [
+            corner(-hx, bottom, -hz),
+            corner(-hx, bottom, hz),
+            corner(hx, bottom, hz),
+            corner(hx, bottom, -hz),
+        ],
+        shade(0.45),
+    );
+    // The local-X side faces.
+    face(
+        vertices,
+        [
+            corner(-hx, bottom, -hz),
+            corner(-hx, top, -hz),
+            corner(hx, top, -hz),
+            corner(hx, bottom, -hz),
+        ],
+        shade(0.80),
+    );
+    face(
+        vertices,
+        [
+            corner(hx, bottom, hz),
+            corner(hx, top, hz),
+            corner(-hx, top, hz),
+            corner(-hx, bottom, hz),
+        ],
+        shade(0.80),
+    );
+    // The local-Z side faces.
+    face(
+        vertices,
+        [
+            corner(-hx, bottom, hz),
+            corner(-hx, top, hz),
+            corner(-hx, top, -hz),
+            corner(-hx, bottom, -hz),
+        ],
+        shade(0.65),
+    );
+    face(
+        vertices,
+        [
+            corner(hx, bottom, -hz),
+            corner(hx, top, -hz),
+            corner(hx, top, hz),
+            corner(hx, bottom, hz),
+        ],
+        shade(0.65),
+    );
 }
 
 /// The interactive integrated encounter (`--encounter`): the

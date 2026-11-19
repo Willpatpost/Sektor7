@@ -931,3 +931,247 @@ fn weapon_selection_battery() {
         "the honest terminal refusal"
     );
 }
+
+// ==================================================== the rotated-cover battery
+// (the R-0115 final increment: the cover pieces live in the arena —
+// the discriminator pairs from D-rotated-cover-ready.md, the worked
+// geometry. The principle: a convex shape's axis projection EQUALS
+// its AABB extent, so the blocked-vs-clear gaps are reachable only
+// by FACE-PARALLEL OFFSET lines — every pair below is that shape.)
+
+/// D4 — the slab's blocked-vs-clear FIRE pair: the shot from behind
+/// the slab is occluded by the TRUE rotated rectangle; the lateral
+/// shot crosses the slab's world AABB yet NEVER enters the true
+/// rectangle (the local-z and local-x windows do not overlap) — an
+/// axis-aligned stand-in would block it. Both lines run through the
+/// UNCHANGED `world.segment_hit` — the exact query the fire
+/// resolution and the adversary perception call (rotated-aware since
+/// C's wiring).
+#[test]
+fn rotated_cover_fire_pair_blocks_and_clears_only_by_rotation() {
+    let world = engine_slice::encounter_demo::encounter_arena_world();
+    let target = [-5.0, 1.6, -9.0];
+    // BLOCKED: from (−5.5, 1.6, −1.0) — the segment crosses the true
+    // rectangle (the crossing window has both |local_x| ≤ 2.0 and
+    // |local_z| ≤ 0.3).
+    let blocked = world.segment_hit([-5.5, 1.6, -1.0], target, 0.0);
+    assert!(blocked.is_some(), "the shot through the slab is occluded");
+    // CLEAR: from (−2.0, 1.6, −2.0) — the segment passes through the
+    // slab's world AABB (t ∈ [0.249, 0.609]) but beyond the rotated
+    // end (local_z ≤ 0.3 only for t ≥ 0.535 vs local_x ≤ 2.0 only
+    // for t ≤ 0.520 — no overlap).
+    let clear = world.segment_hit([-2.0, 1.6, -2.0], target, 0.0);
+    assert!(clear.is_none(), "the shot past the rotated end is clear");
+    // The CONTROL arm: the clear line DOES pass through the slab's
+    // world AABB — a stand-in would block it (the discriminator's
+    // teeth; C's own battery pins the query, this pins MY arena).
+    let slab = engine_slice::encounter_demo::cover_slab();
+    let aabb = slab.world_aabb();
+    let overlaps =
+        aabb.min[0] < -2.0 && aabb.max[0] > -5.0 && aabb.min[2] < -2.0 && aabb.max[2] > -9.0;
+    assert!(
+        overlaps,
+        "the clear line crosses the slab's world AABB (a stand-in would block it)"
+    );
+}
+
+/// D4 — the pillar's LOS pair: the center line is blocked by the
+/// true square; the face-parallel offset ray (local_z = 0.95,
+/// beyond the 0.8 half-footprint) passes through the AABB's corner
+/// region clear — the perception-surface discriminator.
+#[test]
+fn rotated_cover_pillar_los_pair() {
+    let world = engine_slice::encounter_demo::encounter_arena_world();
+    // BLOCKED: the x = 4.0 line through the pillar's center (inside
+    // the true square for z ∈ [−10.924, −9.076]).
+    let blocked = world.segment_hit([4.0, 1.5, -8.5], [4.0, 1.5, -11.5], 0.0);
+    assert!(
+        blocked.is_some(),
+        "the center LOS is occluded by the pillar"
+    );
+    // CLEAR: the face-parallel ray at local_z = 0.95 — from world
+    // (4.073, −8.226) to (5.573, −10.824), entirely beyond the true
+    // square while inside its AABB.
+    let clear = world.segment_hit([4.073, 1.5, -8.226], [5.573, 1.5, -10.824], 0.0);
+    assert!(
+        clear.is_none(),
+        "the face-parallel LOS past the pillar is clear"
+    );
+    // The control arm: the clear ray crosses the pillar's AABB —
+    // the crossing window is s ∈ [−0.714, 0.54] along the local-X
+    // parameter (the segment spans s ∈ [−1.5, 1.5]); the point at
+    // s = 0 (world (4.823, −9.525)) sits inside the AABB.
+    let pillar = engine_slice::encounter_demo::cover_pillar();
+    let aabb = pillar.world_aabb();
+    assert!(
+        aabb.min[0] < 4.823 && aabb.max[0] > 4.823 && aabb.min[2] < -9.525 && aabb.max[2] > -9.525,
+        "the clear ray crosses the pillar's world AABB (a stand-in would block it)"
+    );
+}
+
+/// D4 — the movement respects the TRUE rotated face: the walk
+/// parallel to the slab's long axis (yaw −π/3 — the forward
+/// direction IS the slab's local-X direction (0.866, 0, −0.5)),
+/// offset at constant local_z = 0.93 — beyond the player BOX's
+/// rotated projection (0.478) plus the half-thickness (0.3) plus
+/// margin. The walk crosses ~2.3 m of the slab's world AABB
+/// UNOBSTRUCTED; an axis-aligned stand-in would stop the player at
+/// its face (meters short).
+#[test]
+fn rotated_cover_respects_the_true_face_on_movement() {
+    let mut demo = EncounterDemo::new();
+    // Park the player at the walk's start (a focused movement-line
+    // proof — the connected-route regression stays teleport-free).
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (cover walk)",
+    );
+    let start = [-7.5, 0.0, -2.78];
+    demo.driver.state_mut().position = start;
+    demo.driver.state_mut().yaw = -std::f32::consts::FRAC_PI_3;
+    // The walk: 100 forward ticks at 4 m/s / 60 Hz ≈ 6.67 m along
+    // (0.866, 0, −0.5) — through the AABB corridor and out the far
+    // side.
+    let walk = MoveIntent {
+        forward: 1,
+        ..idle()
+    };
+    for _ in 0..100 {
+        demo.tick(walk, false);
+    }
+    let end = demo.driver.state().position;
+    let expected = [
+        start[0] + 100.0 * 4.0 / 60.0 * 0.866,
+        0.0,
+        start[2] - 100.0 * 4.0 / 60.0 * 0.5,
+    ];
+    let drift = (end[0] - expected[0]).hypot(end[2] - expected[2]);
+    assert!(
+        drift < 0.2,
+        "the walk tracks the free line past the rotated slab (drift {drift:.3} m; \
+         a stand-in would stop it ~2 m short — end {end:?}, expected {expected:?})"
+    );
+}
+
+/// D4 — the cover MEANINGFULLY protects the player: a focused
+/// scenario with the adversary spawning WEST of the slab (4.2 m from
+/// the parked player — WELL inside the 8.0 m aggro radius, so
+/// distance is not the blocker) and the player standing in the
+/// slab's shadow. The adversary's perception LOS is occluded by the
+/// rotated slab (the unchanged-signature `world.segment_hit`, the
+/// exact query the LOS pair pins) — it never aggros, never attacks:
+/// **zero attacks in 3000 ticks, the player untouched, the phase
+/// holds Active** — while the SAME passive player at the DEFAULT
+/// spawn dies at tick 299 (the pinned failure scenario). The
+/// player's westward strafe also STOPS at the TRUE rotated face's
+/// corner contact (the movement half of the proof).
+#[test]
+fn cover_hides_the_player_from_the_adversary() {
+    let mut config = encounter_single_config();
+    config.adversary_spawn = [-8.0, 0.0, -5.0];
+    // The focused config EXTENDS the placeholder attack reach (2.0 →
+    // 3.5) to eliminate the out-of-range confound: the accepted
+    // pursuit has no wall-following, so if the adversary DID aggro
+    // it would stick at the slab's west face ~2.5 m from the player
+    // — INSIDE the extended reach — and attack. Zero attacks
+    // therefore proves the perception occlusion, not the range
+    // (encounter POLICY — the owner ratifies balance; the default
+    // configs are unchanged).
+    config.adversary_attack_range = 3.5;
+    let mut demo = EncounterDemo::new_with_config(config);
+    // 1. Settle and activate (walking south crosses line A).
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (cover protection)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate (cover protection)",
+    );
+    // 2. Walk south to the slab's latitude, then strafe west: the
+    //    player parks at the slab's TRUE east face.
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.driver.state().position[2] <= -5.0,
+        "reach the slab's latitude",
+    );
+    let strafe_west = MoveIntent {
+        strafe: -1,
+        ..idle()
+    };
+    let mut last_x = demo.driver.state().position[0];
+    for _ in 0..240 {
+        demo.tick(strafe_west, false);
+        let x = demo.driver.state().position[0];
+        if (x - last_x).abs() < 1e-4 {
+            break; // parked at the face
+        }
+        last_x = x;
+    }
+    let parked_x = demo.driver.state().position[0];
+    // The worked corner-contact geometry: the slab's east face is
+    // ANGLED 30° (x_face(z) = −4.9 − 1.732·(z+5)); the axis-aligned
+    // player box (±0.35) walking west contacts the face at its
+    // SOUTH edge (the face's most-eastern point in the box's z-span:
+    // x = −4.294 at z = −5.35), so the CENTER parks at ≈ −3.94
+    // (plus the SKIN margin). The AABB stand-in's face is −3.62 →
+    // the stand-in parks at ≈ −3.27 — the true face is ~0.6 m
+    // FURTHER WEST (the rotated cover genuinely juts past the
+    // stand-in's conservative box).
+    assert!(
+        (parked_x - -3.94).abs() < 0.25,
+        "the player parks at the TRUE rotated face's corner contact \
+         (x {parked_x:.2}, expected ≈ −3.94; the stand-in would park at ≈ −3.27)"
+    );
+    assert!(
+        parked_x < -3.5,
+        "the true face is further west than the stand-in's face \
+         (x {parked_x:.2} vs the stand-in's ≈ −3.27)"
+    );
+    // 3. The protection: 3000 ticks standing in the slab's shadow —
+    //    the adversary (well within aggro range) never aggros, never
+    //    attacks: the player untouched, the phase holds Active. (The
+    //    same passive player at the DEFAULT spawn — the pinned
+    //    failure scenario — dies at tick 299.)
+    for _ in 0..3_000 {
+        if demo.encounter.phase != EncounterPhase::Active {
+            break;
+        }
+        demo.tick(idle(), false);
+    }
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Active,
+        "the shadowed player survives the full hold (the event log: {:?})",
+        demo.encounter
+            .events
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        demo.encounter.counters.attacks_taken, 0,
+        "the cover's perception occlusion prevents every attack"
+    );
+    assert!(
+        (demo.encounter.player.current - demo.encounter.player.maximum).abs() < f32::EPSILON,
+        "the shadowed player is untouched"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(0).attacks_emitted,
+        0,
+        "the adversary never even entered the attack seam — the LOS \
+         occlusion (the query the LOS pair pins) kept it from aggroing"
+    );
+}
