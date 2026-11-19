@@ -1271,4 +1271,110 @@ mod tests {
         }
         assert!(parity(magnitude, 3.0 + SKIN - 2.5));
     }
+
+    /// The measurement note's own-run evidence (the GO §4
+    /// measured-performance requirement): the query-path costs at
+    /// Q = 512 on this pod, against SEAT E's Phase-0 collide-Q
+    /// baseline (the AABB path measured LINEAR with no broad-phase
+    /// rejection: segment_hit p50 ≈ 41/102/383/3195/22821 ns and
+    /// sweep_axis ≈ 32/42/149/1301/10214 ns at Q = 1/8/64/512/4096).
+    /// This measures THIS branch's paths on the same query class: the
+    /// AABB-only world (the byte-identity path — the existing loops
+    /// plus the empty rotated arm) and the rotated-extended world
+    /// (the six-compare cached-AABB pretest per collider, then the
+    /// local-frame narrow phase for the colliders whose band the
+    /// query crosses). The numbers PRINT as the delivery report's
+    /// evidence; the only assertions are generous sanity bounds —
+    /// characterization, not thresholds (the F-06 rule: thresholds
+    /// only after variance is measured).
+    #[test]
+    fn rotated_query_cost_characterization_at_q512() {
+        use crate::player::CollisionWorld;
+        const QUERIES: usize = 20_000;
+        // Two 512-collider grids (16 columns × 32 rows, 3 m spacing,
+        // spanning ±45 m): axis-aligned, and the same grid yaw-rotated.
+        let mut aabb_world = CollisionWorld::new(0.0);
+        let mut rotated_world = CollisionWorld::new(0.0);
+        for column in 0..16u32 {
+            for row in 0..32u32 {
+                let base = [-45.0 + column as f32 * 3.0, 0.0, -45.0 + row as f32 * 3.0];
+                aabb_world = aabb_world.with_box(base, 1.0, 2.0);
+                rotated_world = rotated_world.with_rotated_collider(
+                    RotatedCollider::from_base_yaw(base, 1.0, 1.0, 2.0, 0.785),
+                );
+            }
+        }
+        assert_eq!(aabb_world.colliders().len(), 512);
+        assert_eq!(rotated_world.rotated().len(), 512);
+
+        // The crossing ray: a long diagonal through the whole grid —
+        // every collider's broad phase runs, most narrow phases too.
+        let from = [-60.0, 1.0, -60.0];
+        let to = [60.0, 1.0, 60.0];
+        // The far ray: entirely beyond every collider's AABB — the
+        // pure broad-phase rejection cost per collider.
+        let far_from = [500.0, 1.0, 500.0];
+        let far_to = [510.0, 1.0, 510.0];
+
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = aabb_world.segment_hit(from, to, 0.0);
+        }
+        let aabb_cross_ns = start.elapsed().as_nanos() / QUERIES as u128;
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = rotated_world.segment_hit(from, to, 0.0);
+        }
+        let rotated_cross_ns = start.elapsed().as_nanos() / QUERIES as u128;
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = aabb_world.segment_hit(far_from, far_to, 0.0);
+        }
+        let aabb_far_ns = start.elapsed().as_nanos() / QUERIES as u128;
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = rotated_world.segment_hit(far_from, far_to, 0.0);
+        }
+        let rotated_far_ns = start.elapsed().as_nanos() / QUERIES as u128;
+
+        // The sweep: a player-sized box moving +X across the whole
+        // grid, from LEFT of its first column (the grid spans
+        // x ∈ [−45, 0] — starting left makes the move cross every
+        // column, engaging the clamps as well as the rejections).
+        let (min, max) = ([-49.4, 0.5, -0.4], [-48.6, 1.5, 0.4]);
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = aabb_world.sweep_axis(min, max, 0, 90.0);
+        }
+        let aabb_sweep_ns = start.elapsed().as_nanos() / QUERIES as u128;
+        let start = std::time::Instant::now();
+        for _ in 0..QUERIES {
+            let _ = rotated_world.sweep_axis(min, max, 0, 90.0);
+        }
+        let rotated_sweep_ns = start.elapsed().as_nanos() / QUERIES as u128;
+
+        println!(
+            "[collide-q512-characterization] segment_hit crossing: aabb {aabb_cross_ns} ns vs rotated {rotated_cross_ns} ns · \
+             far: aabb {aabb_far_ns} ns vs rotated {rotated_far_ns} ns · \
+             sweep_axis: aabb {aabb_sweep_ns} ns vs rotated {rotated_sweep_ns} ns"
+        );
+        // Generous sanity bounds only (characterization, not a gate).
+        for nanos in [aabb_cross_ns, rotated_cross_ns, aabb_far_ns, rotated_far_ns] {
+            assert!(
+                nanos < 500_000,
+                "the segment query stays bounded: {nanos} ns"
+            );
+        }
+        for nanos in [aabb_sweep_ns, rotated_sweep_ns] {
+            assert!(nanos < 500_000, "the sweep query stays bounded: {nanos} ns");
+        }
+        // The correctness cross-check: the rotated grid still resolves
+        // a bounded clamp.
+        let (allowed, hit) = rotated_world.sweep_axis(min, max, 0, 90.0);
+        println!("[collide-q512-cross-check] hit={hit} allowed={allowed}");
+        assert!(
+            hit && (0.0..90.0).contains(&allowed),
+            "the rotated grid resolves a bounded clamp: hit={hit} allowed={allowed}"
+        );
+    }
 }
