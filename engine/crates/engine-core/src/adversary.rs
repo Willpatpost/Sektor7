@@ -28,6 +28,22 @@
 //! finalizer — engine-core cannot reach engine-slice's `npc::mix64`);
 //! the world fingerprints under its own namespaced domain; wall-clock
 //! time never enters logical state.
+//!
+//! Cycle 4 capability A (2026-11-18, SEAT A): the H31-1 scheduler
+//! reconciliation and the multi-adversary contract —
+//! `cycle4/interfaces/COMBATANTS-INTERFACE.md` (v1). The installer
+//! schedules only ELIGIBLE adversaries (active state, no chain
+//! installed — idempotent); the state/payload guard matrix makes
+//! unauthorized activation STRUCTURALLY impossible (only the
+//! [`ADVERSARY_ACTIVATION_CURSOR`] payload wakes a DORMANT adversary;
+//! duplicates and stray routine schedules are inert); dormancy is a
+//! pre-scheduling composition state (`set_dormant` refuses a possibly-
+//! live chain); `reset` restores every combatant to construction
+//! state; `combatants`/`defeated_count`/`all_defeated` are the
+//! multi-candidate targeting and victory-condition hooks D and B
+//! consume. The C3.1 scenario traces are preserved byte-identical
+//! (no hashed field changed; the activation payload marker changes
+//! no state sequence in any legal flow).
 
 use crate::clock::Tick;
 use crate::combat::{
@@ -59,6 +75,23 @@ pub fn adversary_parts(payload: u64) -> Option<(usize, u64)> {
     }
     Some((((payload >> 32) & 0xFFFF) as usize, payload & 0xFFFF_FFFF))
 }
+
+/// The reserved cursor value that marks an ACTIVATION wake-up — the
+/// only payload kind that may transition a DORMANT adversary (the
+/// Cycle-4 combatants contract §3). Routine chains use cursors
+/// 0, 1, 2, … and never reach this value (an adversary would need
+/// 2^32−1 executed wake-ups first). Against every non-dormant state
+/// the activation payload is INERT (a duplicate activation cannot
+/// fork a chain); against DORMANT a routine payload is INERT (the
+/// H31-1 reconciliation: a stray schedule cannot activate a dormant
+/// adversary, whatever composed it).
+pub const ADVERSARY_ACTIVATION_CURSOR: u64 = 0xFFFF_FFFF;
+
+/// The adversary body's half-extents (m) — the placeholder body model
+/// the Cycle-3 demo used (`[0.45, 0.9, 0.45]`: a 0.9 × 1.8 × 0.9
+/// body on the ground plane), mirroring `player_box`'s role for the
+/// player. Per-adversary body variation is a later cycle.
+pub const ADVERSARY_BODY_HALF: [f32; 3] = [0.45, 0.9, 0.45];
 
 /// The behavior states. DORMANT adversaries hold no chain at all
 /// (activation is F's encounter scripting — `activation_spec`); DEFEATED
@@ -231,6 +264,15 @@ pub struct Adversary {
     /// policy — on encounter-relevant ticks; `attacks_emitted` counts
     /// the fires).
     pub last_attack: Option<HitResolution>,
+    /// The conservative scheduler mirror (the Cycle-4 combatants
+    /// contract §1): TRUE once the installer has scheduled this
+    /// adversary or any follow-up has been emitted — i.e. a live
+    /// chain MAY exist. Cleared only by [`AdversaryWorld::reset`].
+    /// NOT authoritative logical state (the spine's queue is the
+    /// scheduling authority) and deliberately NOT fingerprinted —
+    /// it exists to refuse `set_dormant` on a possibly-live chain
+    /// (dormancy is a pre-scheduling composition state).
+    pub scheduled: bool,
 }
 
 /// The adversary world: per-adversary state over the player module's
@@ -256,21 +298,7 @@ impl AdversaryWorld {
         let full_health =
             crate::combat::health_full(config.max_health).expect("AdversaryConfig.max_health");
         let adversaries = (0..config.count)
-            .map(|index| {
-                let position = circuit_waypoint(&config, index, 0);
-                Adversary {
-                    state: AdversaryState::Patrol,
-                    position,
-                    waypoint: 1,
-                    cursor: 0,
-                    cooldown_until: 0,
-                    los_lost: 0,
-                    health: full_health,
-                    perceived: None,
-                    attacks_emitted: 0,
-                    last_attack: None,
-                }
-            })
+            .map(|index| fresh_adversary(&config, index, full_health))
             .collect();
         AdversaryWorld {
             config,
@@ -278,6 +306,34 @@ impl AdversaryWorld {
             adversaries,
             player_position: spawn_center,
         }
+    }
+
+    /// The full restoration of every combatant (the Cycle-4
+    /// combatants contract §5): each adversary returns to its
+    /// CONSTRUCTION state — PATROL, full health, the seeded spawn
+    /// position and waypoint, zero cursor/cooldown/hysteresis
+    /// bookkeeping, no perceived position, no last attack, the
+    /// `scheduled` mirror cleared — and the player sample returns to
+    /// the spawn center. In-place and deterministic: the restored
+    /// world is fingerprint-identical to a fresh construction under
+    /// the same config (pinned by test).
+    ///
+    /// PAIRING RULE (binding): reset restores the WORLD, not the
+    /// spine — rebuild the spine around the reset world for exact
+    /// replay equivalence. Stale spine events are NOT inert after a
+    /// reset (every adversary is PATROL again, and a stale routine
+    /// event is a normal wake). The Cycle-3 demo's
+    /// reconstruct-everything reset remains the canonical simple
+    /// path; this primitive serves an in-place round reset paired
+    /// with a spine rebuild.
+    pub fn reset(&mut self) {
+        let spawn_center = self.config.spawn_center;
+        let full_health =
+            crate::combat::health_full(self.config.max_health).expect("AdversaryConfig.max_health");
+        for index in 0..self.adversaries.len() {
+            self.adversaries[index] = fresh_adversary(&self.config, index, full_health);
+        }
+        self.player_position = spawn_center;
     }
 
     pub fn config(&self) -> &AdversaryConfig {
@@ -304,6 +360,58 @@ impl AdversaryWorld {
                 )
             })
             .count()
+    }
+
+    /// How many adversaries are DEFEATED (terminal) — the victory
+    /// condition's numerator.
+    pub fn defeated_count(&self) -> usize {
+        self.adversaries
+            .iter()
+            .filter(|a| a.state == AdversaryState::Defeated)
+            .count()
+    }
+
+    /// The configured victory condition's engine read (the Cycle-4
+    /// combatants contract §5): TRUE exactly when at least one
+    /// adversary exists AND every one is DEFEATED. An empty world is
+    /// NOT "all defeated" — a vacuous win is not a win (a completion
+    /// check on an empty encounter is a composition bug, and this
+    /// read refuses to bless it).
+    pub fn all_defeated(&self) -> bool {
+        !self.adversaries.is_empty() && self.defeated_count() == self.adversaries.len()
+    }
+
+    /// The multi-candidate target slice (the Cycle-4 combatants
+    /// contract §4): one [`Combatant`] per NON-DEFEATED adversary —
+    /// id = `adversary_id_base + index`, hit box = the
+    /// [`ADVERSARY_BODY_HALF`] body model at the live position
+    /// (grounded like `player_box`). DORMANT adversaries are
+    /// INCLUDED (the engine does not gate activation — the encounter
+    /// layer's pre-activation press refusal is the guard); DEFEATED
+    /// bodies are not hittable (terminal integrity — an engine
+    /// guarantee, not policy). Allocates one Vec per call: fine at
+    /// fire-edge frequency (edge-triggered), never per-frame.
+    pub fn combatants(&self) -> Vec<Combatant> {
+        self.adversaries
+            .iter()
+            .enumerate()
+            .filter(|(_, adversary)| adversary.state != AdversaryState::Defeated)
+            .map(|(index, adversary)| Combatant {
+                id: self.config.adversary_id_base + index as CombatantId,
+                hit_box: StaticCollider {
+                    min: [
+                        adversary.position[0] - ADVERSARY_BODY_HALF[0],
+                        adversary.position[1],
+                        adversary.position[2] - ADVERSARY_BODY_HALF[2],
+                    ],
+                    max: [
+                        adversary.position[0] + ADVERSARY_BODY_HALF[0],
+                        adversary.position[1] + 2.0 * ADVERSARY_BODY_HALF[1],
+                        adversary.position[2] + ADVERSARY_BODY_HALF[2],
+                    ],
+                },
+            })
+            .collect()
     }
 
     /// The driver's once-per-logical-tick player sample. Invalid
@@ -352,9 +460,14 @@ impl AdversaryWorld {
         Some(outcome)
     }
 
-    /// F's activation schedule for a DORMANT adversary (the encounter
-    /// scripting entry): the first wake-up spec. Returns `None` when
-    /// the adversary is not dormant.
+    /// F's activation schedule for ONE dormant adversary (the
+    /// encounter scripting entry): the first wake-up spec, carrying
+    /// the ACTIVATION payload ([`ADVERSARY_ACTIVATION_CURSOR`] — the
+    /// Cycle-4 combatants contract §3: the only payload kind that
+    /// may wake a DORMANT adversary; inert against every other
+    /// state, so a duplicate activation cannot fork a chain).
+    /// Returns `None` when the adversary is not dormant (activation
+    /// authority is exclusive to the dormant state).
     pub fn activation_spec(&self, index: usize, due: Tick) -> Option<EventSpec> {
         let adversary = self.adversaries.get(index)?;
         if adversary.state != AdversaryState::Dormant {
@@ -364,28 +477,41 @@ impl AdversaryWorld {
             EventSpec::new(
                 EventClass::new(index as u16),
                 Schedule::AtLogicalTime { due },
-                adversary_payload(index, 0),
+                adversary_payload(index, ADVERSARY_ACTIVATION_CURSOR),
             )
             .in_field(Field::Far),
         )
     }
 
-    /// Sets the adversary to DORMANT (the Cycle-3.1 encounter-
-    /// composition surface, paired with [`Self::activation_spec`]):
-    /// an encounter that gates its start on its own line begins its
-    /// adversaries dormant — `install_adversary_schedules` then
-    /// schedules NOTHING for them (it schedules only non-dormant
-    /// adversaries), and the encounter schedules the first wake-up
-    /// through `activation_spec` at its activation moment. This is
-    /// an OPT-IN composition policy: naturally-active worlds (the
-    /// default PATROL start) never call it. Minimal and additive —
-    /// flagged for the Cycle-3.1 reviewer.
-    pub fn set_dormant(&mut self, index: usize) {
-        if let Some(adversary) = self.adversaries.get_mut(index) {
-            adversary.state = AdversaryState::Dormant;
-            adversary.perceived = None;
-            adversary.los_lost = 0;
+    /// Sets the adversary to DORMANT (the encounter-composition
+    /// surface, paired with [`Self::activation_spec`]): an encounter
+    /// that gates its start on its own line begins its adversaries
+    /// dormant — `install_adversary_schedules` then schedules NOTHING
+    /// for them (it schedules only eligible adversaries), and the
+    /// encounter schedules the first wake-up through
+    /// `activation_spec` at its activation moment.
+    ///
+    /// THE DORMANCY RULE (the Cycle-4 combatants contract §1 — the
+    /// H31-1 reconciliation): dormancy is a PRE-SCHEDULING
+    /// composition state. Returns `true` when the adversary is now
+    /// DORMANT (no chain was live); returns `false` — REFUSED, state
+    /// unchanged — when there is no such adversary, or when its
+    /// chain is or may be live (the conservative `scheduled` mirror:
+    /// installed or activated since construction/reset). A `false`
+    /// is a composition bug in the caller: construct dormant (or
+    /// [`Self::reset`] first), then schedule. Never silently leaves
+    /// live scheduled events attached to a newly dormant entity.
+    pub fn set_dormant(&mut self, index: usize) -> bool {
+        let Some(adversary) = self.adversaries.get_mut(index) else {
+            return false;
+        };
+        if adversary.scheduled {
+            return false;
         }
+        adversary.state = AdversaryState::Dormant;
+        adversary.perceived = None;
+        adversary.los_lost = 0;
+        true
     }
 
     /// The distance on the ground plane (the perception metric).
@@ -622,17 +748,38 @@ impl AdversaryWorld {
 
 impl World for AdversaryWorld {
     fn execute(&mut self, event: &Event, ctx: &mut ExecCtx) {
-        let Some((index, _cursor)) = adversary_parts(event.payload) else {
+        let Some((index, cursor)) = adversary_parts(event.payload) else {
             return;
         };
         if index >= self.adversaries.len() {
             return;
         }
+        // The state/payload guard matrix (the Cycle-4 combatants
+        // contract §3 — the H31-1 reconciliation): only the
+        // ACTIVATION payload may wake a DORMANT adversary, the
+        // activation payload is inert against every non-dormant
+        // state (a duplicate activation cannot fork a chain), and
+        // DEFEATED is terminal. The cursor advances on every
+        // executed event — the honest world mirror of the ledger
+        // (an inert event DID execute) — but an inert combination
+        // does no state-machine work and schedules no follow-up.
+        let activation = cursor == ADVERSARY_ACTIVATION_CURSOR;
+        let inert = match self.adversaries[index].state {
+            AdversaryState::Defeated => true,
+            AdversaryState::Dormant => !activation,
+            _ => activation,
+        };
         self.adversaries[index].cursor += 1;
+        if inert {
+            return;
+        }
         self.wake(index, ctx.executed_tick());
         let state = self.adversaries[index].state;
         let cadence = state.cadence(&self.config);
         if cadence > 0 {
+            // A live chain may exist from here on (the conservative
+            // `scheduled` mirror — the dormancy rule's guard).
+            self.adversaries[index].scheduled = true;
             ctx.follow_up_in_field(
                 state.lane(),
                 cadence,
@@ -719,11 +866,42 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Installs one routine chain per NON-DORMANT adversary — the seeded
+/// The construction-state adversary for `index` (shared verbatim by
+/// [`AdversaryWorld::new`] and [`AdversaryWorld::reset`] — the full
+/// restoration IS a reconstruction, no drift by construction).
+fn fresh_adversary(
+    config: &AdversaryConfig,
+    index: usize,
+    full_health: crate::combat::Health,
+) -> Adversary {
+    Adversary {
+        state: AdversaryState::Patrol,
+        position: circuit_waypoint(config, index, 0),
+        waypoint: 1,
+        cursor: 0,
+        cooldown_until: 0,
+        los_lost: 0,
+        health: full_health,
+        perceived: None,
+        attacks_emitted: 0,
+        last_attack: None,
+        scheduled: false,
+    }
+}
+
+/// Installs one routine chain per ELIGIBLE adversary — the seeded
 /// spread over the first patrol cadence, in the state's lane class.
-/// DORMANT adversaries are NOT scheduled (F activates them via
-/// `AdversaryWorld::activation_spec`); the installer therefore
-/// schedules exactly the adversaries that exist in an active state.
+/// ELIGIBLE (the Cycle-4 combatants contract §2 — the H31-1
+/// reconciliation, reconciling the implementation with its
+/// documentation): an ACTIVE behavior state (PATROL/AGGRO/ATTACK/
+/// RECOVER — NOT DORMANT, NOT DEFEATED) with NO chain installed
+/// since construction or reset. DORMANT adversaries are NOT
+/// scheduled (D activates them via
+/// `AdversaryWorld::activation_spec`); DEFEATED adversaries are not
+/// scheduled; an already-installed adversary is not re-scheduled —
+/// the installer is IDEMPOTENT (a second call adds nothing, so a
+/// double install cannot fork chains). The `scheduled` mirror is set
+/// for every adversary it schedules (the dormancy rule's guard).
 pub fn install_adversary_schedules(spine: &mut Spine<AdversaryWorld>) {
     let (seed, count, patrol_cadence) = {
         let world = spine.world();
@@ -734,8 +912,25 @@ pub fn install_adversary_schedules(spine: &mut Spine<AdversaryWorld>) {
         )
     };
     for index in 0..count {
+        // Eligibility (read before any mutation): an active state
+        // with no chain installed.
+        let eligible = {
+            let world = spine.world();
+            let adversary = &world.adversaries[index];
+            matches!(
+                adversary.state,
+                AdversaryState::Patrol
+                    | AdversaryState::Aggro
+                    | AdversaryState::Attack
+                    | AdversaryState::Recover
+            ) && !adversary.scheduled
+        };
+        if !eligible {
+            continue;
+        }
         let spread = patrol_cadence.max(1);
         let offset = mix64(seed ^ ((index as u64) << 32) ^ 0x5EED_0000) % spread;
+        spine.world_mut().adversaries[index].scheduled = true;
         spine
             .schedule(
                 EventSpec::new(
@@ -1907,5 +2102,577 @@ mod tests {
                 per_tick_us / cell.count as f64,
             );
         }
+    }
+
+    // ============================================ the Cycle-4 combatants
+    // contract regressions (the H31-1 reconciliation + the
+    // multi-adversary guarantees; fail-first documented in the
+    // delivery report — the H31-1 tests fail against the
+    // pre-reconciliation tree).
+
+    /// A spine over the config's adversaries, all DORMANT (the legal
+    /// pre-scheduling composition).
+    fn dormant_spine(config: AdversaryConfig) -> Spine<AdversaryWorld> {
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        for index in 0..spine.world().count() {
+            assert!(
+                spine.world_mut().set_dormant(index),
+                "pre-scheduling dormancy always applies"
+            );
+        }
+        spine
+    }
+
+    /// H31-1 (the recorded Cycle-3.1 follow-up, the reconciliation's
+    /// core regression): a ROUTINE payload scheduled against a
+    /// DORMANT adversary — exactly what the old unconditional
+    /// installer did — must be INERT. The adversary stays DORMANT
+    /// (no unauthorized activation, no early attacks, no chain), the
+    /// cursor honestly advances by exactly the drained events, and
+    /// nothing follows. Against the pre-reconciliation tree this
+    /// test FAILS (the old wake() transitioned any dormant wake into
+    /// PATROL — the Cycle-3.1 pre-activation defect's root cause).
+    #[test]
+    fn h31_1_routine_payload_cannot_activate_a_dormant_adversary() {
+        let config = scenario_config(1);
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        assert!(spine.world_mut().set_dormant(0));
+        // The defective composition, reproduced verbatim: the OLD
+        // installer's unconditional schedule — a ROUTINE payload
+        // (cursor 0) against the dormant adversary.
+        spine
+            .schedule(
+                EventSpec::new(
+                    EventClass::new(0),
+                    Schedule::AtLogicalTime { due: Tick(1) },
+                    adversary_payload(0, 0),
+                )
+                .in_field(Field::Far),
+            )
+            .expect("the hand-scheduled stray event is dependency-free");
+        let player = [5.0, 0.0, 0.0]; // Well within aggro range: an
+        // activated adversary WOULD perceive and pursue.
+        for _ in 0..20 {
+            spine.world_mut().set_player_position(player);
+            spine.run_tick();
+        }
+        let adversary = spine.world().adversary(0);
+        assert_eq!(
+            adversary.state,
+            AdversaryState::Dormant,
+            "the stray routine schedule never activates a dormant adversary"
+        );
+        assert_eq!(
+            adversary.attacks_emitted, 0,
+            "no unauthorized early attacks"
+        );
+        assert!(adversary.last_attack.is_none());
+        assert_eq!(
+            adversary.cursor, 1,
+            "the drained event advanced the cursor honestly — and no \
+             follow-up chain formed (exactly one execution)"
+        );
+        assert!(
+            adversary.perceived.is_none(),
+            "a dormant adversary never perceives"
+        );
+    }
+
+    /// The installer schedules ONLY eligible adversaries in a mixed
+    /// dormant/active world: the active ones wake (cursor advances,
+    /// the scheduled mirror set), the dormant ones receive NOTHING
+    /// (cursor stays zero — no event ever executed for them).
+    #[test]
+    fn installer_schedules_only_eligible_adversaries() {
+        let config = scenario_config(4);
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        // A mixed composition: 1 and 3 dormant, 0 and 2 active.
+        assert!(spine.world_mut().set_dormant(1));
+        assert!(spine.world_mut().set_dormant(3));
+        install_adversary_schedules(&mut spine);
+        let player = [5.0, 0.0, 0.0];
+        for _ in 0..10 {
+            spine.world_mut().set_player_position(player);
+            spine.run_tick();
+        }
+        for index in [0usize, 2] {
+            let adversary = spine.world().adversary(index);
+            assert_ne!(
+                adversary.state,
+                AdversaryState::Dormant,
+                "the active adversary {index} was scheduled and woke"
+            );
+            assert!(adversary.cursor > 0, "its chain executed");
+            assert!(adversary.scheduled, "the mirror was set at install");
+        }
+        for index in [1usize, 3] {
+            let adversary = spine.world().adversary(index);
+            assert_eq!(
+                adversary.state,
+                AdversaryState::Dormant,
+                "the dormant adversary {index} stays dormant"
+            );
+            assert_eq!(
+                adversary.cursor, 0,
+                "NOTHING was scheduled for the dormant adversary {index} \
+                 (the reconciled installer — the old form scheduled it \
+                 unconditionally)"
+            );
+            assert!(!adversary.scheduled);
+        }
+    }
+
+    /// The installer is idempotent: a second install adds nothing —
+    /// the double-installed world's trace and fingerprint are
+    /// IDENTICAL to the single-installed control (a fork would
+    /// double the wake rate and diverge both).
+    #[test]
+    fn installer_is_idempotent_double_install_forks_nothing() {
+        let run = |installs: usize| {
+            let config = scenario_config(3);
+            let mut spine = Spine::with_reservation(
+                AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+                200,
+                60,
+            );
+            for _ in 0..installs {
+                install_adversary_schedules(&mut spine);
+            }
+            let player = [5.0, 0.0, 0.0];
+            let mut trace: Vec<TraceRecord> = Vec::new();
+            for _ in 0..40 {
+                spine.world_mut().set_player_position(player);
+                spine.run_tick();
+                for index in 0..3 {
+                    let adversary = spine.world().adversary(index);
+                    trace.push((
+                        adversary.state.code(),
+                        adversary.position[0].to_bits(),
+                        adversary.position[2].to_bits(),
+                        adversary.attacks_emitted,
+                    ));
+                }
+            }
+            let mut fp = Fingerprinter::new();
+            spine.world().fingerprint(&mut fp);
+            (trace, fp.finish())
+        };
+        let (single_trace, single_fp) = run(1);
+        let (double_trace, double_fp) = run(2);
+        assert_eq!(single_trace, double_trace, "no fork: identical traces");
+        assert_eq!(single_fp, double_fp, "no fork: identical fingerprints");
+    }
+
+    /// The dormancy rule: `set_dormant` applies BEFORE any scheduling
+    /// and REFUSES once the chain is (or may be) live — the state is
+    /// unchanged on refusal, never silently leaving live events
+    /// attached. Out-of-range indices also refuse (false).
+    #[test]
+    fn set_dormant_refuses_a_live_chain() {
+        let config = scenario_config(2);
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        assert!(spine.world_mut().set_dormant(0), "pre-scheduling applies");
+        assert_eq!(spine.world().adversary(0).state, AdversaryState::Dormant);
+        install_adversary_schedules(&mut spine);
+        spine.run_tick();
+        // Adversary 1 was installed — its chain is live.
+        assert!(
+            !spine.world_mut().set_dormant(1),
+            "a live chain refuses dormancy"
+        );
+        assert_ne!(
+            spine.world().adversary(1).state,
+            AdversaryState::Dormant,
+            "the refusal leaves the state unchanged"
+        );
+        // Adversary 0 is dormant with NO chain — re-dormancy is the
+        // legal no-op (still dormant, still unscheduled).
+        assert!(
+            spine.world_mut().set_dormant(0),
+            "an unscheduled dormant adversary re-dorms as a no-op"
+        );
+        assert!(!spine.world_mut().set_dormant(9), "out of range refuses");
+    }
+
+    /// A duplicated activation cannot fork a chain: scheduling the
+    /// activation spec TWICE before the first executes leaves the
+    /// behavioral trace IDENTICAL to the single-activation control
+    /// (the first wakes the adversary; the duplicate is inert against
+    /// its then-active state) with the cursor exactly ONE higher —
+    /// the honest mirror of the single drained duplicate. A fork
+    /// would double the wake rate: the trace diverges and the cursor
+    /// grows without bound.
+    #[test]
+    fn duplicate_activation_cannot_fork_a_chain() {
+        let run = |activations: usize| {
+            let config = scenario_config(1);
+            let mut spine = Spine::with_reservation(
+                AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+                200,
+                60,
+            );
+            assert!(spine.world_mut().set_dormant(0));
+            for _ in 0..activations {
+                let spec = spine
+                    .world()
+                    .activation_spec(0, Tick(2))
+                    .expect("the dormant adversary activates");
+                spine.schedule(spec).expect("dependency-free");
+            }
+            let player = [5.0, 0.0, 0.0];
+            let mut trace: Vec<TraceRecord> = Vec::new();
+            for _ in 0..30 {
+                spine.world_mut().set_player_position(player);
+                spine.run_tick();
+                let adversary = spine.world().adversary(0);
+                trace.push((
+                    adversary.state.code(),
+                    adversary.position[0].to_bits(),
+                    adversary.position[2].to_bits(),
+                    adversary.attacks_emitted,
+                ));
+            }
+            (trace, spine.world().adversary(0).cursor)
+        };
+        let (single_trace, single_cursor) = run(1);
+        let (double_trace, double_cursor) = run(2);
+        assert_eq!(
+            single_trace, double_trace,
+            "the duplicate activation is behaviorally inert — identical traces"
+        );
+        assert_eq!(
+            double_cursor,
+            single_cursor + 1,
+            "exactly one drained duplicate execution — no fork (a fork would \
+             double the wake rate)"
+        );
+    }
+
+    /// Per-adversary INDIVIDUAL activation: activating one dormant
+    /// adversary among its dormant peers wakes exactly that one —
+    /// the others stay dormant with zero executions.
+    #[test]
+    fn individual_activation_among_dormant_peers() {
+        let config = scenario_config(3);
+        let mut spine = dormant_spine(config);
+        let spec = spine
+            .world()
+            .activation_spec(1, Tick(3))
+            .expect("adversary 1 is dormant");
+        spine.schedule(spec).expect("dependency-free");
+        let player = [5.0, 0.0, 0.0];
+        for _ in 0..15 {
+            spine.world_mut().set_player_position(player);
+            spine.run_tick();
+        }
+        let activated = spine.world().adversary(1);
+        assert_ne!(
+            activated.state,
+            AdversaryState::Dormant,
+            "the activated adversary woke"
+        );
+        assert!(activated.cursor > 0, "its chain carries");
+        for index in [0usize, 2] {
+            let peer = spine.world().adversary(index);
+            assert_eq!(
+                peer.state,
+                AdversaryState::Dormant,
+                "peer {index} was not activated"
+            );
+            assert_eq!(peer.cursor, 0, "peer {index} executed nothing");
+        }
+    }
+
+    /// Multiple attacks on ONE logical tick: three adversaries in
+    /// the ATTACK state, all woken on the same tick, each resolving
+    /// and surfacing its OWN hit resolution — deterministic,
+    /// independent, no shared scratch. The player is placed in range
+    /// of all three (a clean open world), so every resolution is a
+    /// Hit on the player's id with a per-adversary distance.
+    #[test]
+    fn multiple_adversaries_attack_on_one_logical_tick() {
+        let attack_cooldown = scenario_config(3).attack_cooldown;
+        let run = || {
+            let config = scenario_config(3);
+            let mut spine = Spine::with_reservation(
+                AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+                200,
+                60,
+            );
+            // All three in the ATTACK state, scheduled to wake on
+            // the SAME tick (direct state composition — the state
+            // machine's arrival paths are covered by the other
+            // regressions; this pins the same-tick seam itself).
+            for index in 0..3 {
+                spine.world_mut().adversaries[index].state = AdversaryState::Attack;
+                spine
+                    .schedule(
+                        EventSpec::new(
+                            EventClass::new(index as u16),
+                            Schedule::AtLogicalTime { due: Tick(5) },
+                            adversary_payload(index, 0),
+                        )
+                        .in_field(Field::Near),
+                    )
+                    .expect("dependency-free");
+            }
+            // The player at the spawn center — within attack range
+            // of every seeded circuit spawn? Not necessarily; the
+            // resolutions may be Hit or Clear per adversary — what
+            // is pinned is that ALL THREE resolve independently on
+            // the one tick.
+            spine.world_mut().set_player_position([0.0, 0.0, 0.0]);
+            for _ in 0..5 {
+                spine.run_tick();
+            }
+            let mut fp = Fingerprinter::new();
+            spine.world().fingerprint(&mut fp);
+            (
+                spine
+                    .world()
+                    .adversaries
+                    .iter()
+                    .map(|a| (a.attacks_emitted, a.last_attack.is_some(), a.cursor))
+                    .collect::<Vec<_>>(),
+                spine
+                    .world()
+                    .adversaries
+                    .iter()
+                    .map(|a| a.cooldown_until)
+                    .collect::<Vec<_>>(),
+                fp.finish(),
+            )
+        };
+        let (emitted, cooldowns, fp) = run();
+        let (emitted2, cooldowns2, fp2) = run();
+        for (index, (attacks, surfaced, cursor)) in emitted.iter().enumerate() {
+            assert_eq!(
+                *attacks, 1,
+                "adversary {index} attacked exactly once on the shared tick"
+            );
+            assert!(*surfaced, "adversary {index} surfaced its own resolution");
+            assert_eq!(*cursor, 1, "exactly one execution each — no forks");
+        }
+        assert_eq!(
+            cooldowns,
+            vec![5 + attack_cooldown; 3],
+            "every cooldown deadline anchored at the shared execution tick"
+        );
+        assert_eq!(emitted, emitted2, "double-run identical");
+        assert_eq!(cooldowns, cooldowns2);
+        assert_eq!(fp, fp2, "double-run identical fingerprint");
+    }
+
+    /// Three adversaries genuinely threatening through the real state
+    /// machine: with the player standing near the circuit center,
+    /// EVERY adversary perceives, pursues, and reaches the threat
+    /// states — multiple simultaneous threats in one encounter (the
+    /// GO's capability-A requirement at the simulation level).
+    #[test]
+    fn three_adversaries_threaten_simultaneously_through_the_state_machine() {
+        let config = scenario_config(3);
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        install_adversary_schedules(&mut spine);
+        spine.world_mut().set_player_position([0.0, 0.0, 0.0]);
+        for _ in 0..120 {
+            spine.run_tick();
+        }
+        let active = spine.world().active_count();
+        assert!(
+            active >= 2,
+            "most adversaries are actively threatening (active={active})"
+        );
+        let total_attacks: u64 = spine
+            .world()
+            .adversaries
+            .iter()
+            .map(|a| a.attacks_emitted)
+            .sum();
+        assert!(
+            total_attacks > 0,
+            "the encounter threatens: at least one landed attack window"
+        );
+    }
+
+    /// The multi-candidate targeting hook: `combatants()` — ids are
+    /// `base + index`, boxes are the body model at the live
+    /// positions, DORMANT adversaries are included (activation
+    /// gating is the encounter's), and DEFEATED bodies are excluded
+    /// (terminal integrity).
+    #[test]
+    fn combatants_slice_ids_boxes_and_terminal_exclusion() {
+        let config = scenario_config(3);
+        let id_base = config.adversary_id_base;
+        let max_health = config.max_health;
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        assert!(spine.world_mut().set_dormant(2));
+        // Defeat adversary 1 outright (the damage seam).
+        assert!(matches!(
+            spine
+                .world_mut()
+                .apply_player_hit(1, max_health)
+                .expect("the adversary exists"),
+            Ok(DamageOutcome::Defeated { .. })
+        ));
+        let combatants = spine.world().combatants();
+        assert_eq!(
+            combatants.len(),
+            2,
+            "the defeated body is not hittable; the dormant one is"
+        );
+        assert_eq!(combatants[0].id, id_base);
+        assert_eq!(combatants[1].id, id_base + 2);
+        for (index, combatant) in combatants.iter().enumerate() {
+            let source_index = if index == 0 { 0 } else { 2 };
+            let adversary = spine.world().adversary(source_index);
+            assert_eq!(
+                combatant.hit_box.min[0],
+                adversary.position[0] - ADVERSARY_BODY_HALF[0]
+            );
+            assert_eq!(
+                combatant.hit_box.max[1],
+                adversary.position[1] + 2.0 * ADVERSARY_BODY_HALF[1]
+            );
+            assert_eq!(
+                combatant.hit_box.min[2],
+                adversary.position[2] - ADVERSARY_BODY_HALF[2]
+            );
+        }
+    }
+
+    /// The victory-condition reads: `defeated_count` and
+    /// `all_defeated` (an empty world is NOT "all defeated" — a
+    /// vacuous win is not a win).
+    #[test]
+    fn all_defeated_and_defeated_count_reads() {
+        let empty = AdversaryWorld::new(
+            AdversaryConfig {
+                count: 0,
+                ..scenario_config(0)
+            },
+            CollisionWorld::new(0.0),
+        );
+        assert_eq!(empty.defeated_count(), 0);
+        assert!(!empty.all_defeated(), "an empty encounter is not a win");
+
+        let config = scenario_config(3);
+        let max_health = config.max_health;
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        assert!(!spine.world().all_defeated());
+        assert_eq!(spine.world().defeated_count(), 0);
+        for index in 0..2 {
+            assert!(matches!(
+                spine
+                    .world_mut()
+                    .apply_player_hit(index, max_health)
+                    .expect("the adversary exists"),
+                Ok(DamageOutcome::Defeated { .. })
+            ));
+        }
+        assert_eq!(spine.world().defeated_count(), 2);
+        assert!(!spine.world().all_defeated(), "two of three is not a win");
+        assert!(matches!(
+            spine
+                .world_mut()
+                .apply_player_hit(2, max_health)
+                .expect("the adversary exists"),
+            Ok(DamageOutcome::Defeated { .. })
+        ));
+        assert_eq!(spine.world().defeated_count(), 3);
+        assert!(
+            spine.world().all_defeated(),
+            "the configured victory condition"
+        );
+    }
+
+    /// The full restoration: after a scenario with aggro, damage,
+    /// defeat, and live chains, `reset()` returns EVERY combatant to
+    /// the construction state — the reset world's fingerprint is
+    /// IDENTICAL to a fresh construction's under the same config
+    /// (positions, health, bookkeeping, and the scheduled mirror).
+    #[test]
+    fn reset_restores_every_combatant_to_construction_state() {
+        let config = scenario_config(3);
+        let max_health = config.max_health;
+        let spawn_positions: Vec<[f32; 3]> = (0..3)
+            .map(|index| circuit_waypoint(&config, index, 0))
+            .collect();
+        let mut spine = Spine::with_reservation(
+            AdversaryWorld::new(config, CollisionWorld::new(0.0)),
+            200,
+            60,
+        );
+        install_adversary_schedules(&mut spine);
+        spine.world_mut().set_player_position([0.0, 0.0, 0.0]);
+        for _ in 0..60 {
+            spine.run_tick();
+        }
+        // Damage and defeat (varied per adversary).
+        let _ = spine.world_mut().apply_player_hit(0, 30.0);
+        let _ = spine.world_mut().apply_player_hit(1, max_health);
+        let before: Vec<_> = spine
+            .world()
+            .adversaries
+            .iter()
+            .map(|a| (a.state, a.health.current, a.cursor))
+            .collect();
+        assert!(
+            before.iter().any(|(_, _, cursor)| *cursor > 0),
+            "the scenario genuinely progressed before the reset"
+        );
+        spine.world_mut().reset();
+        for (index, expected_spawn) in spawn_positions.iter().enumerate() {
+            let adversary = spine.world().adversary(index);
+            assert_eq!(adversary.state, AdversaryState::Patrol);
+            assert_eq!(adversary.health.current, max_health);
+            assert_eq!(adversary.cursor, 0);
+            assert_eq!(adversary.cooldown_until, 0);
+            assert!(!adversary.scheduled, "the mirror cleared");
+            assert_eq!(
+                adversary.position, *expected_spawn,
+                "the seeded spawn position restored"
+            );
+        }
+        // The fingerprint-identity proof against a fresh
+        // construction (the world only — the spine is NOT rebuilt
+        // here, which is the documented pairing rule).
+        let mut reset_fp = Fingerprinter::new();
+        spine.world().fingerprint(&mut reset_fp);
+        let mut fresh_fp = Fingerprinter::new();
+        AdversaryWorld::new(scenario_config(3), CollisionWorld::new(0.0))
+            .fingerprint(&mut fresh_fp);
+        assert_eq!(
+            reset_fp.finish(),
+            fresh_fp.finish(),
+            "the reset world is fingerprint-identical to a fresh construction"
+        );
     }
 }
