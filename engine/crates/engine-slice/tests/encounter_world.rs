@@ -1302,7 +1302,8 @@ fn dormant_wave2_is_not_damageable_by_the_precision_weapon() {
         }
         demo.tick(idle(), true);
         assert_eq!(
-            demo.spine.world().adversary(other).health.current, other_health,
+            demo.spine.world().adversary(other).health.current,
+            other_health,
             "every dormant body is protected"
         );
     }
@@ -1348,9 +1349,13 @@ fn dormant_wave2_is_not_damageable_by_the_spread_weapon() {
         engine_core::adversary::AdversaryState::Dormant,
         "no defeat transition, no premature activation"
     );
-    assert_eq!(demo.encounter.counters.hits, 0);
-    // Multiple rays of the 5-ray fan intersecting the body at 4 m are
-    // each absorbed (the blocked counter carries them).
+    // NOTE: the volley's OTHER rays may legitimately damage ACTIVATED
+    // wave-1 adversaries converging nearby (the protection is the
+    // dormant body's, not the whole volley's) — the health assert
+    // above is the protection proof; the counters scope to it.
+    // Multiple rays of the 5-ray fan intersecting the dormant body at
+    // 4 m are each absorbed (the blocked counter and the per-ray
+    // feedback carry them).
     assert!(
         demo.encounter.counters.blocked >= 1,
         "the fan's intersecting rays are absorbed: {}",

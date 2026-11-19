@@ -1132,11 +1132,14 @@ impl EncounterDemo {
         // 5. The DEFEATED read (the engine's declaration, entered
         //    through `apply_player_hit`): the encounter arms the
         //    presentation drain, then declares the win when it
-        //    completes. Victory is EVERY adversary defeated (the
-        //    multi-adversary completion condition).
+        //    completes. Victory is EVERY adversary defeated — read
+        //    through the ENGINE's `all_defeated()`, which explicitly
+        //    REFUSES to declare an empty world victorious (the C4-R3
+        //    corrective: the previous inline `all()` over the index
+        //    range returned true for a zero-adversary population —
+        //    a silent empty victory the engine's contract rejects).
         if encounter.phase == EncounterPhase::Active {
-            let all_defeated = (0..spine.world().count())
-                .all(|index| spine.world().adversary(index).state == AdversaryState::Defeated);
+            let all_defeated = spine.world().all_defeated();
             if all_defeated {
                 if !encounter.adversary_defeated {
                     encounter.adversary_defeated = true;
@@ -1276,33 +1279,58 @@ impl EncounterDemo {
                         HitResolution::Hit {
                             target, distance, ..
                         } => {
-                            encounter.counters.hits += 1;
-                            encounter.last_hit_tick = Some(tick);
                             let index = usize::try_from(*target - ADVERSARY_ID_BASE)
                                 .unwrap_or(usize::MAX)
                                 .min(spine.world().count().saturating_sub(1));
-                            let applied = spine.world_mut().apply_player_hit(index, damage);
-                            match applied {
-                                Some(Ok(DamageOutcome::Wounded { remaining, .. })) => format!(
-                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
-                                     ({remaining:.0} hp left)"
-                                ),
-                                Some(Ok(DamageOutcome::Defeated { .. })) => format!(
-                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
-                                     (DEFEATED)"
-                                ),
-                                Some(Ok(DamageOutcome::Graze)) => format!(
-                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
-                                     (a graze)"
-                                ),
-                                Some(Err(error)) => format!(
-                                    "{prefix} — HIT adversary {index} but the damage \
-                                     refused ({error:?})"
-                                ),
-                                None => format!(
-                                    "{prefix} — HIT adversary {index} at {distance:.1} m \
-                                     (already defeated)"
-                                ),
+                            // THE INACTIVE-BODY POLICY (the C4-R2
+                            // corrective): a DORMANT, not-yet-activated
+                            // adversary's body is a NON-DAMAGEABLE
+                            // PHYSICAL OBSTRUCTION — it intercepts the
+                            // ray (collide-what-you-see: the visible
+                            // body is physically present) but the
+                            // encounter's damage policy refuses to
+                            // route weapon damage to it before ITS
+                            // activation event, with honest feedback.
+                            // The engine's dormant-damage capability
+                            // (`apply_player_hit` on a dormant
+                            // adversary) is PRESERVED for scenarios
+                            // that intentionally attack inactive
+                            // characters — this is the two-wave
+                            // encounter-composition layer's policy.
+                            if spine.world().adversary(index).state == AdversaryState::Dormant {
+                                encounter.counters.blocked += 1;
+                                format!(
+                                    "{prefix} — the DORMANT body of adversary {index} \
+                                     absorbs the shot (no damage before its activation)"
+                                )
+                            } else {
+                                encounter.counters.hits += 1;
+                                encounter.last_hit_tick = Some(tick);
+                                let applied = spine.world_mut().apply_player_hit(index, damage);
+                                match applied {
+                                    Some(Ok(DamageOutcome::Wounded { remaining, .. })) => {
+                                        format!(
+                                            "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                             ({remaining:.0} hp left)"
+                                        )
+                                    }
+                                    Some(Ok(DamageOutcome::Defeated { .. })) => format!(
+                                        "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                         (DEFEATED)"
+                                    ),
+                                    Some(Ok(DamageOutcome::Graze)) => format!(
+                                        "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                         (a graze)"
+                                    ),
+                                    Some(Err(error)) => format!(
+                                        "{prefix} — HIT adversary {index} but the damage \
+                                         refused ({error:?})"
+                                    ),
+                                    None => format!(
+                                        "{prefix} — HIT adversary {index} at {distance:.1} m \
+                                         (already defeated)"
+                                    ),
+                                }
                             }
                         }
                         HitResolution::Miss {
