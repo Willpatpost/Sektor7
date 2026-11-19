@@ -786,14 +786,28 @@ jobs:
           # /var/tmp/s7-cycle4-targets/int-gates-run9.log; the prior pin
           # 545/6/54 preserved above).
           expected=549
-          if [ "$(uname -s)" != "Linux" ]; then expected=549; fi
+          if [ "$(uname -s)" != "Linux" ]; then expected=548; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 6 / 53)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 6 / 54)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 6 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 6"; exit 1; }
-          [ "$results" -eq 53 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 53"; exit 1; }
+          # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
+          # the result-line check missed the batch-4 companion update
+          # (D's encounter_world binary added the 54th line — the local
+          # gates script got it, this workflow check did not); corrected
+          # from the run's actuals (ubuntu 549/6/54 — the counts and
+          # lines CORRECT; the ubuntu job failed ONLY on this stale
+          # 53). The Windows count is 548/6/54 — the PRE-EXISTING -1
+          # platform divergence at the baseline (the Cycle-3.1 pin:
+          # Linux 517 / Windows 516) was carried wrong through the
+          # batches 4-9 platform-uniform inferences; corrected from
+          # the actuals (516 + the 32 platform-uniform Cycle-4
+          # additions = 548), never by weakening a test — zero test
+          # failures on either platform (the three main jobs + macOS
+          # all green).
+          [ "$results" -eq 54 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 54"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
