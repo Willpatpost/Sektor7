@@ -381,17 +381,16 @@ fn per_tick_deltas(samples: &[TickSample], field: fn(&TickSample) -> u64) -> Vec
     deltas
 }
 
-/// The C3.1 dormant-start composition: every adversary dormant,
-/// nothing scheduled. `set_dormant` returns the COMBATANTS-INTERFACE
-/// v1 refusal bool on the integrated tree (unit on the
-/// pre-reconciliation tree); the plain statement form compiles against
-/// BOTH signatures — and a refusal is impossible at this point by
-/// composition ordering (nothing is scheduled yet; contract §1). The
-/// post-integration run relay strengthens these sites to assert the
-/// bool.
+/// The dormant-start composition: every adversary dormant, nothing
+/// scheduled. The COMBATANTS-INTERFACE v1 §1 rule: dormancy is a
+/// PRE-SCHEDULING state — a refusal means a chain is (or may be) live,
+/// which is a composition bug in the caller; asserted visibly.
 fn compose_all_dormant(spine: &mut Spine<AdversaryWorld>, population: usize) {
     for index in 0..population {
-        spine.world_mut().set_dormant(index);
+        assert!(
+            spine.world_mut().set_dormant(index),
+            "the dormant composition refused for index {index} — a live chain (contract §1)"
+        );
     }
 }
 
@@ -428,11 +427,12 @@ pub fn run_population_cell(spec: &PerfSweepSpec) -> CellOutcome {
         }
         Activity::InstallerServed { active_count } => {
             for index in active_count..spec.population {
-                // The plain statement form compiles against both the
-                // pre-reconciliation (unit) and integrated (bool)
-                // `set_dormant` signatures; refusal is impossible here
-                // by composition ordering (contract §1).
-                spine.world_mut().set_dormant(index);
+                // Contract §1: refusal means a live chain — impossible
+                // here (nothing is scheduled before this point).
+                assert!(
+                    spine.world_mut().set_dormant(index),
+                    "the dormant composition refused for index {index} — a live chain (contract §1)"
+                );
             }
             engine_core::adversary::install_adversary_schedules(&mut spine);
             vec![None; spec.population]
@@ -1019,6 +1019,66 @@ mod tests {
         assert_eq!(first.scheduled, second.scheduled);
         assert_eq!(first.world_fingerprint, second.world_fingerprint);
         assert_eq!(first.per_class_counts, second.per_class_counts);
+    }
+
+    /// The Phase-1 SEMANTIC proof on the integrated tree (SEAT A's
+    /// H31-1 reconciliation): an InstallerServed mix turns EXACTLY k
+    /// adversaries threatening — the reconciled installer skips the
+    /// dormant composition (pre-reconciliation it woke ALL of them),
+    /// and by 240 ticks (more than one full player orbit) every active
+    /// adversary has entered AGGRO with the de-aggro radius
+    /// unreachable, so exactly k are active and each holds exactly one
+    /// in-flight wake-up.
+    #[test]
+    fn the_installer_served_mix_activates_exactly_k() {
+        let spec = PerfSweepSpec {
+            name: "mix-tiny".into(),
+            population: 8,
+            activity: Activity::InstallerServed { active_count: 3 },
+            player_orbit: COMBAT_ORBIT,
+            duration_ticks: 240,
+            seed: 0xE_CEEE,
+        };
+        let outcome = run_population_cell(&spec);
+        assert!(
+            outcome.executed > 0,
+            "the k active chains must execute (executed={})",
+            outcome.executed
+        );
+        assert_eq!(
+            outcome.active_adversaries, 3,
+            "exactly k threatening — the dormant five were skipped by the installer (H31-1)"
+        );
+        assert_eq!(
+            outcome.samples.last().map(|sample| sample.pending),
+            Some(3),
+            "each active chain holds exactly one in-flight wake-up"
+        );
+    }
+
+    /// The per-adversary activation wave's semantic proof: k staggered
+    /// activations turn exactly k adversaries threatening (each
+    /// activation individually effective, no forking, the dormant
+    /// remainder untouched).
+    #[test]
+    fn the_activation_front_activates_exactly_k() {
+        let spec = PerfSweepSpec {
+            name: "front-tiny".into(),
+            population: 8,
+            activity: Activity::ActivationFront {
+                active_count: 3,
+                start_tick: 5,
+                stagger_ticks: 4,
+            },
+            player_orbit: COMBAT_ORBIT,
+            duration_ticks: 240,
+            seed: 0xE_CEEE,
+        };
+        let outcome = run_population_cell(&spec);
+        assert_eq!(
+            outcome.active_adversaries, 3,
+            "exactly k activated adversaries threatening"
+        );
     }
 
     /// The queued cell's chain executes exactly once per tick and the
