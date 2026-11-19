@@ -282,11 +282,13 @@ impl RotatedCollider {
     /// miss, a perpendicular axis whose gap never closes within the
     /// skin (resting contact does not block), a trajectory that opens
     /// a gapped axis, or an existing SAT overlap (the
-    /// depenetration's to resolve). The returned value may exceed
-    /// `|delta|` (a contact farther than this move — the caller's
-    /// comparison decides) or sit slightly negative (resting within
-    /// [`SKIN`] of the face — the tiny back-push the AABB path also
-    /// produces).
+    /// depenetration's to resolve). A contact that lies BEYOND this
+    /// move also returns `None` — the broad phase pretests the SWEPT
+    /// box (the move's own extent), so a farther contact is not this
+    /// sweep's business; the caller re-queries with a larger delta
+    /// when it needs one. The returned value may sit slightly
+    /// negative (resting within [`SKIN`] of the face — the tiny
+    /// back-push the AABB path also produces).
     pub fn sweep_axis_box(
         &self,
         min: [f32; 3],
@@ -297,7 +299,11 @@ impl RotatedCollider {
         if delta == 0.0 {
             return None;
         }
-        // The broad phase: the SWEPT box vs the cached world AABB.
+        // The broad phase: the SWEPT box vs the cached world AABB —
+        // strictly-disjoint rejection (an exact-touch approach is a
+        // contact the AABB path also clamps, via its `<=`/`>=` face
+        // conditions; the pretest must not be stricter than the query
+        // it guards).
         let mut swept_min = min;
         let mut swept_max = max;
         if delta > 0.0 {
@@ -305,7 +311,7 @@ impl RotatedCollider {
         } else {
             swept_min[axis] += delta;
         }
-        if (0..3).any(|a| swept_min[a] >= self.aabb_max[a] || swept_max[a] <= self.aabb_min[a]) {
+        if (0..3).any(|a| swept_min[a] > self.aabb_max[a] || swept_max[a] < self.aabb_min[a]) {
             return None;
         }
         let bottom = self.center[1] - self.half[1];
@@ -456,7 +462,10 @@ pub fn segment_rotated_hit(
 ) -> Option<(f32, [f32; 3])> {
     // The broad phase: the segment's margin-expanded bounding box vs
     // the cached world AABB (six compares after six min/max) —
-    // distant colliders never pay the local-frame transform.
+    // STRICTLY-DISJOINT rejection only, so a segment whose range
+    // merely TOUCHES the box (the exact corner/boundary-contact class
+    // the AABB slab path reports) still reaches the narrow phase: the
+    // pretest must never be stricter than the query it guards.
     let lo = [
         from[0].min(to[0]) - margin,
         from[1].min(to[1]) - margin,
@@ -467,7 +476,7 @@ pub fn segment_rotated_hit(
         from[1].max(to[1]) + margin,
         from[2].max(to[2]) + margin,
     ];
-    if (0..3).any(|a| hi[a] <= collider.aabb_min[a] || lo[a] >= collider.aabb_max[a]) {
+    if (0..3).any(|a| hi[a] < collider.aabb_min[a] || lo[a] > collider.aabb_max[a]) {
         return None;
     }
     let local_from = collider.to_local(from);
@@ -836,5 +845,430 @@ mod tests {
             segment_rotated_hit([0.0, 1.0, 0.0], [10.0, 1.0, 0.0], &collider, 0.0).unwrap();
         assert_eq!(t, 0.0);
         assert_eq!(normal, [0.0, 0.0, 0.0]);
+    }
+
+    /// The tangent class (§8): exact face contact is CLEAR (the
+    /// strict-overlap contract — contact at the skin margin never
+    /// counts as an overlap), a hair inside overlaps, and the same
+    /// holds at the diagonal face within named float error.
+    #[test]
+    fn tangent_contact_is_clear_and_a_hair_inside_overlaps() {
+        let axis_aligned = RotatedCollider::new([2.0, 1.0, 2.0], [1.0, 1.0, 1.0], 0.0).unwrap();
+        // Resting exactly ON the +X face (x = 3.0): clear.
+        assert!(!axis_aligned.overlaps_box([3.0, 0.5, 1.5], [3.4, 1.5, 2.5]));
+        // A hair inside (x = 2.99): overlaps.
+        assert!(axis_aligned.overlaps_box([2.99, 0.5, 1.5], [3.4, 1.5, 2.5]));
+        // Exactly ON the top (y = 2.0): clear; a hair below: overlaps.
+        assert!(!axis_aligned.overlaps_box([1.5, 2.0, 1.5], [2.5, 3.0, 2.5]));
+        assert!(axis_aligned.overlaps_box([1.5, 1.99, 1.5], [2.5, 3.0, 2.5]));
+
+        // The diagonal face: a small box whose SAT projection on the
+        // local-X axis is 0.1·(|cos|+|sin|) — the world-axis-aligned
+        // box's extents PROJECT onto the local axes, they do not map
+        // 1:1. The center sits at local x = −(2 + projection ∓ 1e-6):
+        // just beyond the face is clear, just inside overlaps.
+        let diagonal = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let (c, s) = diagonal.frame();
+        let projected_half = 0.1 * (c.abs() + s.abs());
+        for (offset, expected) in [(-1e-6f32, false), (1e-6, true)] {
+            let center = diagonal.to_world([-(2.0 + projected_half) + offset, 0.0, 0.0]);
+            let min = [center[0] - 0.1, 0.5, center[2] - 0.1];
+            let max = [center[0] + 0.1, 1.5, center[2] + 0.1];
+            assert_eq!(
+                diagonal.overlaps_box(min, max),
+                expected,
+                "local-x offset {offset}"
+            );
+        }
+    }
+
+    /// The near-parallel and perpendicular-gate sweep classes (§8): a
+    /// box outside the z-band never contacts along a pure X sweep
+    /// (the perpendicular SKIN gate); a box in the band approaching
+    /// the true face contacts SKIN-short; a box already SAT-overlapping
+    /// gets NO sweep clamp (the depenetration's domain); zero-delta is
+    /// refused; and an opening trajectory never contacts.
+    #[test]
+    fn sweep_axis_gates_near_parallel_and_perpendicular_cases() {
+        let diagonal = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        // (a) z-clear of the whole shape (world z = 4.0): the +X sweep
+        // never reaches it — the perpendicular world-Z gate.
+        let far = [0.0, 0.5, 3.75];
+        let far_max = [0.5, 1.5, 4.25];
+        assert_eq!(diagonal.sweep_axis_box(far, far_max, 0, 10.0), None);
+        assert_eq!(diagonal.sweep_axis_box(far, far_max, 0, -10.0), None);
+        // (b) in the z-band, approaching from the left along +X: a
+        // real SKIN-short contact against the true shape.
+        let near = [-6.0, 0.5, -0.25];
+        let near_max = [-5.5, 1.5, 0.25];
+        let face = diagonal.sweep_axis_box(near, near_max, 0, 10.0).unwrap();
+        assert!(face > 0.0 && face < 10.0, "a bounded contact {face}");
+        // Applying exactly the clamp leaves the box SKIN-clear.
+        let mut clamped = [near[0] + face, near[1], near[2]];
+        let mut clamped_max = [near_max[0] + face, near_max[1], near_max[2]];
+        clamped[0] += 0.5 * SKIN;
+        clamped_max[0] += 0.5 * SKIN;
+        assert!(!diagonal.overlaps_box(clamped, clamped_max));
+        // A full SKIN PAST the contact (net +2·SKIN from the
+        // SKIN-short clamp) re-overlaps: the clamp is exactly
+        // SKIN-short of the true contact, neither generous nor early.
+        clamped[0] += 1.5 * SKIN;
+        clamped_max[0] += 1.5 * SKIN;
+        assert!(
+            diagonal.overlaps_box(clamped, clamped_max),
+            "a full SKIN past the clamp re-overlaps (the clamp is SKIN-short, not generous)"
+        );
+        // (c) already SAT-overlapping (centered inside): no clamp.
+        let inside = [-0.25, 0.5, -0.25];
+        let inside_max = [0.25, 1.5, 0.25];
+        assert!(diagonal.overlaps_box(inside, inside_max));
+        assert_eq!(diagonal.sweep_axis_box(inside, inside_max, 0, 10.0), None);
+        // (d) zero delta: refused.
+        assert_eq!(diagonal.sweep_axis_box(near, near_max, 0, 0.0), None);
+        // (e) an opening trajectory (moving +X from beyond the +X
+        // local face, in the band): never contacts.
+        let past = diagonal.to_world([2.5, 0.0, 0.0]);
+        let opening = [past[0] - 0.25, 0.5, past[2] - 0.25];
+        let opening_max = [past[0] + 0.25, 1.5, past[2] + 0.25];
+        assert_eq!(diagonal.sweep_axis_box(opening, opening_max, 0, 10.0), None);
+    }
+
+    /// The vertical sweep (§8): falling onto a rotated top lands
+    /// SKIN-short of it, rising into a rotated bottom is clamped, and
+    /// resting horizontal contact within the skin never blocks a fall
+    /// (the perpendicular SKIN gates mirror the AABB path's).
+    #[test]
+    fn vertical_sweep_lands_skin_short_and_resting_never_blocks() {
+        let diagonal = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        // Falling from above the top (top = 2.0): clamp SKIN-short.
+        let above = [-0.25, 2.5, -0.25];
+        let above_max = [0.25, 3.0, 0.25];
+        let floor = diagonal.sweep_axis_box(above, above_max, 1, -5.0).unwrap();
+        assert!(
+            (floor - (-0.5 + SKIN)).abs() < 1e-6,
+            "lands SKIN-short {floor}"
+        );
+        // Resting horizontal contact: the same fall with the box
+        // nudged into the diagonal face band (within SKIN of the face
+        // on the perpendicular axes) must NOT block — the relaxed
+        // horizontal gate treats skin-contact as clear.
+        let resting = [-0.25, 2.5, 1.35];
+        let resting_max = [0.25, 3.0, 1.85];
+        // (the resting z sits the box against the upper-right edge
+        // region; the exact face position is irrelevant — the fall
+        // must clamp ONLY on the top, at the same SKIN-short value.)
+        let floor_rest = diagonal.sweep_axis_box(resting, resting_max, 1, -5.0);
+        let expected_floor = -0.5 + SKIN;
+        assert!(
+            matches!(floor_rest, Some(value) if (value - expected_floor).abs() < 1e-6),
+            "the resting fall clamps only on the top, SKIN-short: {floor_rest:?}"
+        );
+        // Rising into the bottom (bottom = 0.0) from below: clamped.
+        let below = [-0.25, -1.5, -0.25];
+        let below_max = [0.25, -1.0, 0.25];
+        let ceiling = diagonal.sweep_axis_box(below, below_max, 1, 5.0).unwrap();
+        assert!(
+            (ceiling - (1.0 - SKIN)).abs() < 1e-6,
+            "rises SKIN-short {ceiling}"
+        );
+        // Past the top already (falling from inside the vertical
+        // span): no vertical clamp from this collider.
+        let beside = [-0.25, 1.0, -0.25];
+        let beside_max = [0.25, 1.5, 0.25];
+        assert!(diagonal.overlaps_box(beside, beside_max));
+        assert_eq!(diagonal.sweep_axis_box(beside, beside_max, 1, -5.0), None);
+    }
+
+    /// The overlapping class (§8): a deep interpenetration resolves
+    /// through the NEAR face along its true normal, landing SKIN-clear
+    /// (never merely re-aligned, never through to the far side), and
+    /// the ground rule excludes a downward push that would cross the
+    /// ground plane (the AABB path's `neg_valid` mirrored).
+    #[test]
+    fn push_out_box_exits_through_the_near_face_skin_clear() {
+        let diagonal = RotatedCollider::new(
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        // A player box centered at local (−1.5, 0, 0) — deep in the
+        // −X-local side.
+        let center = diagonal.to_world([-1.5, 0.0, 0.0]);
+        let min = [center[0] - 0.3, 0.2, center[2] - 0.3];
+        let max = [center[0] + 0.3, 1.8, center[2] + 0.3];
+        assert!(diagonal.overlaps_box(min, max));
+        let (push, magnitude) = diagonal.push_out_box(min, max, 0.0).unwrap();
+        // The expected direction: the AWAY side of the local X axis,
+        // (−cos45, 0, +sin45) — a face normal, never a world axis.
+        let (c, s) = diagonal.frame();
+        let length = (push[0] * push[0] + push[2] * push[2]).sqrt();
+        assert!((push[0] / length + c).abs() < 1e-5, "the −X face normal");
+        assert!((push[2] / length - s).abs() < 1e-5, "the −X face normal");
+        assert!(push[1] == 0.0);
+        // The magnitude: the SAT depth on the local-X axis + SKIN.
+        let expected = 2.0 + 0.3 * (c + s) - 1.5 + SKIN;
+        assert!(
+            (magnitude - expected).abs() < 1e-3,
+            "{magnitude} vs {expected}"
+        );
+        // Landing SKIN-clear: the pushed box no longer overlaps.
+        let pushed_min = [min[0] + push[0], min[1] + push[1], min[2] + push[2]];
+        let pushed_max = [max[0] + push[0], max[1] + push[1], max[2] + push[2]];
+        assert!(!diagonal.overlaps_box(pushed_min, pushed_max));
+
+        // The ground rule: a box barely poking into a face resolves
+        // through the SMALLEST valid push — DOWN through a raised
+        // bottom face (the poke box straddles y = 1.0, the raised
+        // box's bottom) — but the same poke geometry against a box
+        // sitting ON the ground refuses the down push (crossing the
+        // ground plane) and resolves upward instead.
+        let raised = RotatedCollider::new(
+            [0.0, 2.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let poke_min = [-0.25, 0.9, -0.25];
+        let poke_max = [0.25, 1.05, 0.25];
+        assert!(raised.overlaps_box(poke_min, poke_max));
+        let (push, _) = raised.push_out_box(poke_min, poke_max, 0.0).unwrap();
+        assert!(
+            push[1] < 0.0 && push[0] == 0.0 && push[2] == 0.0,
+            "down through the raised bottom (the smallest valid push)"
+        );
+        let grounded = RotatedCollider::new(
+            [0.0, 0.0, 0.0],
+            [2.0, 1.0, 2.0],
+            std::f32::consts::FRAC_PI_4,
+        )
+        .unwrap();
+        let ground_poke_min = [-0.25, 0.9, -0.25];
+        let ground_poke_max = [0.25, 1.05, 0.25];
+        assert!(grounded.overlaps_box(ground_poke_min, ground_poke_max));
+        let (push, _) = grounded
+            .push_out_box(ground_poke_min, ground_poke_max, 0.0)
+            .unwrap();
+        assert!(
+            push[1] > 0.0 && push[0] == 0.0 && push[2] == 0.0,
+            "the down push would cross the ground plane — the up push wins instead"
+        );
+    }
+
+    /// The corner-tie class (§8): a segment entering exactly at a
+    /// corner (two faces closing at the identical t) resolves by axis
+    /// order X → Y → Z — the X face's normal, deterministically.
+    #[test]
+    fn segment_corner_tie_resolves_by_axis_order() {
+        // The yaw-0 box [1..3]×[0..2]×[1..3]: a segment aimed exactly
+        // at the (min-x, max-y) corner (1, 2) in the z=2 plane — both
+        // slabs close at t = 1.0.
+        let collider = RotatedCollider::new([2.0, 1.0, 2.0], [1.0, 1.0, 1.0], 0.0).unwrap();
+        let (t, normal) = segment_rotated_hit([-1.0, 3.0, 2.0], [1.0, 1.0, 2.0], &collider, 0.0)
+            .expect("the corner hit");
+        assert_eq!(t, 1.0);
+        assert_eq!(normal, [-1.0, 0.0, 0.0], "the X face wins the tie");
+    }
+
+    /// The degenerate segment class (§8): a zero-extent segment (from
+    /// == to) reports inside-start occlusion or a clean miss — never
+    /// a panic, never a synthetic entry.
+    #[test]
+    fn zero_extent_segments_report_inside_or_miss() {
+        let collider = RotatedCollider::new([0.0, 1.0, 0.0], [1.0, 1.0, 1.0], 0.785).unwrap();
+        let (t, normal) = segment_rotated_hit([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], &collider, 0.0)
+            .expect("a point inside the box is occluded");
+        assert_eq!((t, normal), (0.0, [0.0, 0.0, 0.0]));
+        assert_eq!(
+            segment_rotated_hit([5.0, 1.0, 5.0], [5.0, 1.0, 5.0], &collider, 0.0),
+            None
+        );
+    }
+
+    /// The 30°/45°/60° discriminators (§8): at every diagonal yaw, a
+    /// probe in the corner band (inside the world AABB, OUTSIDE the
+    /// true rotated shape) is CLEAR under the true queries and BLOCKED
+    /// under the AABB stand-in — the anti-"rotated visual over an
+    /// axis-aligned hitbox" regression, and its over-blocking mirror.
+    #[test]
+    fn the_true_shape_discriminates_against_the_stand_in_at_three_yaws() {
+        use crate::player::CollisionWorld;
+        for yaw_deg in [30.0f32, 45.0, 60.0] {
+            let yaw = yaw_deg.to_radians();
+            let collider = RotatedCollider::new([0.0, 1.0, 0.0], [2.0, 1.0, 2.0], yaw).unwrap();
+            let stand_in = CollisionWorld::new(0.0).with_collider(collider.world_aabb());
+            // The corner-band probe: centered at local (2.5, 0, 0) —
+            // beyond the +X face (|local x| = 2.5 > 2), inside the
+            // world AABB band (its x-extent along the local-X
+            // direction is 2·(|cos|+|sin|) ≥ 2.5 at these yaws... the
+            // band center world position:
+            let probe_center = collider.to_world([2.5, 0.0, 0.0]);
+            let min = [probe_center[0] - 0.1, 0.5, probe_center[2] - 0.1];
+            let max = [probe_center[0] + 0.1, 1.5, probe_center[2] + 0.1];
+            assert!(
+                !collider.overlaps_box(min, max),
+                "the true shape is clear at {yaw_deg}°"
+            );
+            assert!(
+                stand_in.box_overlaps(min, max),
+                "the stand-in blocks the corner band at {yaw_deg}°"
+            );
+            // The segment discriminator: a ray along the local +Z
+            // direction at local x = 2.5 — beyond the face for its
+            // entire length, crossing the world AABB.
+            let (c, s) = collider.frame();
+            let start = collider.to_world([2.5, 0.0, -20.0]);
+            let end = [start[0] + s * 40.0, start[1], start[2] + c * 40.0];
+            assert_eq!(
+                segment_rotated_hit(start, end, &collider, 0.0),
+                None,
+                "the true shape is clear at {yaw_deg}°"
+            );
+            assert!(
+                stand_in.segment_hit(start, end, 0.0).is_some(),
+                "the stand-in occludes at {yaw_deg}°"
+            );
+            // The control arm at local x = 1.5 (inside the true
+            // shape's x extent): BOTH block — the discriminator is
+            // the offset, not the direction.
+            let inside_start = collider.to_world([1.5, 0.0, 0.0]);
+            let inside_end = [
+                inside_start[0] + s * 40.0,
+                inside_start[1],
+                inside_start[2] + c * 40.0,
+            ];
+            assert!(
+                stand_in
+                    .segment_hit(inside_start, inside_end, 0.0)
+                    .is_some()
+            );
+            assert_eq!(
+                segment_rotated_hit(inside_start, inside_end, &collider, 0.0).map(|(t, _)| t),
+                Some(0.0),
+                "the control ray starts inside the true shape"
+            );
+        }
+    }
+
+    /// The yaw-0 parity bridges (§8): on exactly-representable values
+    /// (quarters), the rotated sweep and depenetration evaluate the
+    /// SAME mathematical quantities as the accepted AABB path over
+    /// the equivalent StaticCollider. The results agree to within one
+    /// f32 ulp — NOT always bit-identically, because the swept-SAT
+    /// computes `(|center projection| − extent sum) − SKIN` while the
+    /// AABB path computes `(face − SKIN) − player extent`: identical
+    /// algebra, a different operation association, occasionally one
+    /// rounding apart (measured here: 0.4999 vs 0.49989998). The
+    /// load-bearing byte-identity guarantee is structural and
+    /// separate — an EMPTY rotated list takes the exact existing code
+    /// paths, which every pre-existing passing test proves.
+    #[test]
+    fn sweep_and_push_parity_with_the_aabb_path_at_yaw_zero() {
+        use crate::player::CollisionWorld;
+        fn parity(a: f32, b: f32) -> bool {
+            (a - b).abs() < 1e-6
+        }
+        let center = [2.0, 1.0, 2.0];
+        let half = [1.0, 1.0, 1.0];
+        let rotated = RotatedCollider::new(center, half, 0.0).unwrap();
+        let world = CollisionWorld::new(0.0).with_collider(StaticCollider {
+            min: [1.0, 0.0, 1.0],
+            max: [3.0, 2.0, 3.0],
+        });
+        let rotated_world = CollisionWorld::new(0.0).with_rotated_collider(Some(rotated));
+
+        // Sweeps: approaching +X (hits), the same move short of the
+        // face (no contact within the move), approaching −X from the
+        // right, falling onto the top, rising into the bottom, moving
+        // away, and z-clear (the perpendicular gate).
+        let cases: [([f32; 3], [f32; 3], usize, f32); 7] = [
+            ([0.0, 0.5, 1.5], [0.5, 1.5, 2.5], 0, 5.0), // hits the −X face
+            ([0.0, 0.5, 1.5], [0.5, 1.5, 2.5], 0, 0.2), // short of the face
+            ([3.5, 0.5, 1.5], [4.0, 1.5, 2.5], 0, -5.0), // hits the +X face
+            ([1.5, 2.5, 1.5], [2.5, 3.0, 2.5], 1, -5.0), // lands on the top
+            ([1.5, -1.5, 1.5], [2.5, -1.0, 2.5], 1, 5.0), // rises into the bottom
+            ([3.5, 0.5, 1.5], [4.0, 1.5, 2.5], 0, 5.0), // moving away: clear
+            ([0.0, 0.5, 3.5], [0.5, 1.5, 4.0], 0, 5.0), // z-clear: gate
+        ];
+        for (min, max, axis, delta) in cases {
+            let rotated_face = rotated.sweep_axis_box(min, max, axis, delta);
+            let (aabb_allowed, aabb_hit) = world.sweep_axis(min, max, axis, delta);
+            let (rotated_allowed, rotated_hit) = rotated_world.sweep_axis(min, max, axis, delta);
+            // The world-level results agree (same geometry, both
+            // worlds, within the one-ulp association tolerance).
+            assert_eq!(rotated_hit, aabb_hit);
+            assert!(
+                parity(rotated_allowed, aabb_allowed),
+                "rotated {rotated_allowed} vs aabb {aabb_allowed}"
+            );
+            // The collider-level face agrees with the world's clamp
+            // whenever the collider reports one (cases 1, 3, 4, 5 —
+            // the same geometry clamps both worlds).
+            if let Some(face) = rotated_face {
+                assert!(
+                    aabb_hit,
+                    "the rotated collider clamps where the AABB path does not"
+                );
+                assert!(
+                    parity(face, aabb_allowed),
+                    "the collider face {face} matches the clamp {aabb_allowed}"
+                );
+            }
+            // Cases 2/6/7: no box clamp within the move — case 2's
+            // contact lies beyond delta (the broad phase pretests the
+            // SWEPT box, so the collider correctly reports None; the
+            // world-level behavior matches the AABB path's
+            // no-clamp); cases 6/7 cannot contact at all.
+            match (min, max, axis, delta) {
+                ([0.0, 0.5, 1.5], [0.5, 1.5, 2.5], 0, 0.2)
+                | ([3.5, 0.5, 1.5], [4.0, 1.5, 2.5], 0, 5.0)
+                | ([0.0, 0.5, 3.5], [0.5, 1.5, 4.0], 0, 5.0) => {
+                    assert_eq!(rotated_face, None);
+                }
+                _ => {}
+            }
+        }
+
+        // Depenetration: an unambiguous +X overlap resolves through
+        // the near face — the same push vector, within the same
+        // one-ulp association tolerance.
+        let overlap_min = [2.5, 0.5, 1.5];
+        let overlap_max = [3.0, 1.5, 2.5];
+        let expected_push = [3.0 + SKIN - 2.5, 0.0, 0.0];
+        let aabb_push = world
+            .depenetration(overlap_min, overlap_max)
+            .expect("the AABB push");
+        let rotated_push = rotated_world
+            .depenetration(overlap_min, overlap_max)
+            .expect("the rotated push");
+        for axis in 0..3 {
+            assert!(
+                parity(rotated_push[axis], aabb_push[axis]),
+                "axis {axis}: rotated {} vs aabb {}",
+                rotated_push[axis],
+                aabb_push[axis]
+            );
+            assert!(parity(aabb_push[axis], expected_push[axis]));
+        }
+        let (push, magnitude) = rotated.push_out_box(overlap_min, overlap_max, 0.0).unwrap();
+        for axis in 0..3 {
+            assert!(parity(push[axis], expected_push[axis]));
+        }
+        assert!(parity(magnitude, 3.0 + SKIN - 2.5));
     }
 }
