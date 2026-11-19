@@ -14,10 +14,11 @@
 
 use std::time::Duration;
 
-use engine_core::MoveIntent;
+use engine_core::{MoveIntent, WeaponId};
 use engine_slice::encounter_demo::{
     ACTIVATION_Z, ENCOUNTER_BOXES, EncounterDemo, EncounterPhase, encounter_fingerprint_hex,
-    run_encounter_failure_headless, run_encounter_winnable, run_encounter_winnable_headless,
+    encounter_single_config, run_encounter_failure_headless, run_encounter_wave_failure_headless,
+    run_encounter_wave_winnable_headless, run_encounter_winnable, run_encounter_winnable_headless,
 };
 
 fn idle() -> MoveIntent {
@@ -84,18 +85,21 @@ fn the_courtyard_layout_census() {
 #[test]
 fn pre_activation_protection_holds() {
     let mut demo = EncounterDemo::new();
-    // Thirty idle ticks: the dormant adversary must stay dormant —
-    // NOTHING was scheduled at construction.
+    // Thirty idle ticks: EVERY dormant adversary must stay dormant —
+    // NOTHING was scheduled at construction (the wave default: four
+    // adversaries, all dormant).
     for _ in 0..30 {
         demo.tick(idle(), false);
     }
     assert_eq!(demo.encounter.phase, EncounterPhase::Dormant);
-    assert_eq!(
-        demo.spine.world().adversary(0).state,
-        engine_core::adversary::AdversaryState::Dormant,
-        "nothing wakes a dormant adversary on its own"
-    );
-    assert_eq!(demo.spine.world().adversary(0).attacks_emitted, 0);
+    for index in 0..demo.spine.world().count() {
+        assert_eq!(
+            demo.spine.world().adversary(index).state,
+            engine_core::adversary::AdversaryState::Dormant,
+            "nothing wakes dormant adversary {index} on its own"
+        );
+        assert_eq!(demo.spine.world().adversary(index).attacks_emitted, 0);
+    }
     assert!(
         (demo.encounter.player.current - demo.encounter.player.maximum).abs() < f32::EPSILON,
         "no damage before activation"
@@ -105,7 +109,8 @@ fn pre_activation_protection_holds() {
     demo.tick(idle(), true);
     assert_eq!(demo.encounter.counters.fires, 0, "no shot resolves");
     assert_eq!(
-        demo.encounter.weapon_ready_at, 0,
+        demo.arsenal.ready_at(WeaponId::Precision),
+        0,
         "the refused press spends NO cooldown"
     );
     let last = demo.encounter.events.last().expect("an event");
@@ -158,7 +163,7 @@ fn activation_wakes_the_adversary_within_the_tick() {
 /// and post-terminal presses get the honest refusal.
 #[test]
 fn terminal_freeze_after_won() {
-    let mut demo = EncounterDemo::new();
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     run_encounter_winnable(&mut demo);
     let EncounterPhase::Won { tick: won_tick } = demo.encounter.phase else {
         panic!("the winnable script must WIN");
@@ -258,11 +263,13 @@ fn terminal_freeze_after_lost() {
 }
 
 /// D6c — the full-round reset: R rebuilds the dormant spine, the
-/// healths, and the weapon readiness, restoring the pre-activation
-/// protection EXACTLY — and a second round is winnable.
+/// healths, and the weapon readiness (G's NB-3 spine-rebuild
+/// pairing), restoring the pre-activation protection EXACTLY — and
+/// a second round is winnable. The single-adversary pinned
+/// configuration.
 #[test]
 fn full_round_reset_restores_the_protection() {
-    let mut demo = EncounterDemo::new();
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     run_encounter_winnable(&mut demo);
     assert!(demo.encounter.phase.is_terminal());
     demo.reset();
@@ -285,13 +292,19 @@ fn full_round_reset_restores_the_protection() {
     );
     assert!((demo.encounter.player.current - demo.encounter.player.maximum).abs() < f32::EPSILON);
     assert_eq!(
-        demo.encounter.weapon_ready_at, 0,
-        "the weapon is ready again"
+        demo.arsenal.ready_at(WeaponId::Precision),
+        0,
+        "the weapon is ready again (the fresh Arsenal)"
+    );
+    assert_eq!(
+        demo.arsenal.selected(),
+        WeaponId::Precision,
+        "the reset round starts on the precision weapon"
     );
     // The protection itself: a press on the reset round refuses.
     demo.tick(idle(), true);
     assert_eq!(demo.encounter.counters.fires, 0);
-    assert_eq!(demo.encounter.weapon_ready_at, 0);
+    assert_eq!(demo.arsenal.ready_at(WeaponId::Precision), 0);
     // The second round is winnable (the whole lifecycle again).
     run_encounter_winnable(&mut demo);
     assert!(matches!(demo.encounter.phase, EncounterPhase::Won { .. }));
@@ -464,12 +477,14 @@ fn failure_scenario_is_deterministic() {
 }
 
 /// The WEAPONS-INTERFACE §4 cooldown semantics at the encounter
-/// layer: the deadline is set ONLY on a successful fire
-/// (`now + cooldown`), a refused press spends NOTHING, and readiness
-/// is the pure comparison (ready again exactly at the deadline).
+/// layer (through SEAT B's Arsenal): the deadline is set ONLY on a
+/// successful fire (`now + cooldown`, the per-weapon deadline), a
+/// refused press spends NOTHING, and readiness is the pure
+/// comparison (ready again exactly at the deadline). The
+/// single-adversary pinned configuration.
 #[test]
 fn weapon_cooldown_deadline_semantics() {
-    let mut demo = EncounterDemo::new();
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     run_until(
         &mut demo,
         idle(),
@@ -485,23 +500,24 @@ fn weapon_cooldown_deadline_semantics() {
         "activate",
     );
     let cooldown = demo.config().weapon_cooldown_ticks;
+    let ready_at = |demo: &EncounterDemo| demo.arsenal.ready_at(WeaponId::Precision);
     // The first press resolves: the deadline lands.
     let fire_tick = demo.tick_index() + 1;
     demo.tick(idle(), true);
     assert_eq!(demo.encounter.counters.fires, 1);
-    assert_eq!(demo.encounter.weapon_ready_at, fire_tick + cooldown);
+    assert_eq!(ready_at(&demo), fire_tick + cooldown);
     // Presses during the cooldown: refused, the deadline unchanged.
     for _ in 0..5 {
         demo.tick(idle(), true);
     }
     assert_eq!(demo.encounter.counters.fires, 1, "still one fire");
     assert_eq!(
-        demo.encounter.weapon_ready_at,
+        ready_at(&demo),
         fire_tick + cooldown,
         "the refusals spend NO cooldown"
     );
     // Ready again exactly at the deadline tick.
-    while demo.tick_index() < demo.encounter.weapon_ready_at {
+    while demo.tick_index() < ready_at(&demo) {
         demo.tick(idle(), false);
     }
     demo.tick(idle(), true);
@@ -523,7 +539,10 @@ fn the_connected_live_frame_route() {
     let fast_frame = Duration::from_millis(8);
     let ordinary_frame = Duration::from_millis(17);
     let stall_frame = Duration::from_millis(100);
-    let mut demo = EncounterDemo::new();
+    // The single-adversary pinned configuration (the route's subject
+    // is the FRAME PATH itself — the wave composition has its own
+    // scenario regressions).
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
     demo.driver.set_trace_recording(false);
     let mut buffered_presses = 0usize;
     // Settle + walk to the activation line through mixed pacing.
@@ -579,5 +598,336 @@ fn the_connected_live_frame_route() {
         buffered_presses > 0 || demo.encounter.counters.fires > 0,
         "the fire edges all landed (buffered {})",
         buffered_presses
+    );
+}
+
+// ==================================================== the wave + weapons battery
+// (the R-0103 follow-up increment: the 4-adversary 2-wave composition
+// against A's integrated surface, and the weapons wiring against B's.)
+
+/// D2 — the wave staging's INDEPENDENCE: line A wakes ONLY wave 1
+/// (the first `wave1_count` adversaries); wave 2 stays DORMANT while
+/// the fight is live; the deeper line B wakes wave 2 — per-adversary
+/// later activation without duplicate chains (the activation events
+/// fire once each; A's payload matrix makes duplicates inert).
+#[test]
+fn wave_staging_activates_per_adversary_without_duplicates() {
+    let mut demo = EncounterDemo::new();
+    let wave1 = demo.config().wave1_count;
+    let count = demo.spine.world().count();
+    assert!(count >= 3, "the wave composition: at least 3 adversaries");
+    assert!(wave1 < count, "a second wave exists");
+    // Settle and cross line A.
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (wave staging)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "cross line A",
+    );
+    // Wave 1 wakes; wave 2 stays DORMANT (the independence).
+    for index in 0..wave1 {
+        assert_ne!(
+            demo.spine.world().adversary(index).state,
+            engine_core::adversary::AdversaryState::Dormant,
+            "wave-1 adversary {index} woke at line A"
+        );
+    }
+    for index in wave1..count {
+        assert_eq!(
+            demo.spine.world().adversary(index).state,
+            engine_core::adversary::AdversaryState::Dormant,
+            "wave-2 adversary {index} stays DORMANT before line B"
+        );
+        assert_eq!(demo.spine.world().adversary(index).attacks_emitted, 0);
+    }
+    // Hold the fight briefly (wave 1 live, wave 2 still dormant — no
+    // duplicate chains, no early attacks).
+    for _ in 0..60 {
+        demo.tick(idle(), false);
+    }
+    for index in wave1..count {
+        assert_eq!(
+            demo.spine.world().adversary(index).state,
+            engine_core::adversary::AdversaryState::Dormant,
+            "wave-2 adversary {index} is NOT woken by the live fight"
+        );
+    }
+    // Cross the deeper line B: wave 2 wakes (the activation event
+    // fires; each adversary leaves DORMANT within its wake cadence).
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.wave2_activated,
+        "cross line B",
+    );
+    assert!(demo.encounter.wave2_activated, "the once-guard");
+    // The once-guard: walking BACK above the line and re-crossing
+    // schedules nothing more (the wave-2 activation is single-shot).
+    let events_before = demo.encounter.events.len();
+    for _ in 0..30 {
+        demo.tick(
+            engine_core::MoveIntent {
+                strafe: 1,
+                ..idle()
+            },
+            false,
+        );
+    }
+    for _ in 0..60 {
+        demo.tick(
+            engine_core::MoveIntent {
+                strafe: -1,
+                ..idle()
+            },
+            false,
+        );
+    }
+    let wave2_events = demo
+        .encounter
+        .events
+        .iter()
+        .filter(|(_, line)| line.starts_with("wave 2 stirs"))
+        .count();
+    assert_eq!(wave2_events, 1, "the wave-2 activation fired exactly once");
+    assert!(demo.encounter.events.len() > events_before);
+}
+
+/// D2 — the wave victory requires ALL adversaries defeated: at the
+/// wave-1 exit (two of four down) the encounter HOLDS Active; the
+/// pinned wave scenario reaches WON with every adversary DEFEATED.
+#[test]
+fn wave_victory_requires_all_adversaries_defeated() {
+    let mut demo = EncounterDemo::new();
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (wave victory)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate",
+    );
+    // Fight wave 1 to completion (the wave winnable script's phase).
+    for _ in 0..6_000 {
+        if demo.encounter.phase != EncounterPhase::Active
+            || (0..demo.config().wave1_count).all(|index| {
+                demo.spine.world().adversary(index).state
+                    == engine_core::adversary::AdversaryState::Defeated
+            })
+        {
+            break;
+        }
+        let on_line = (0..demo.spine.world().count())
+            .any(|index| demo.spine.world().adversary(index).position[0].abs() <= 0.4);
+        let spread_ready = demo.arsenal.ready_at(WeaponId::Spread) <= demo.tick_index();
+        if spread_ready {
+            demo.apply_selection(WeaponId::Spread);
+            demo.tick(idle(), on_line);
+        } else {
+            demo.apply_selection(WeaponId::Precision);
+            demo.tick(idle(), demo.weapon_ready() && on_line);
+        }
+    }
+    // Wave 1 down, wave 2 dormant: NOT terminal — the encounter
+    // holds Active (victory requires ALL).
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Active,
+        "two of four defeated is not victory"
+    );
+}
+
+/// D2 — the same-tick multi-attack order: two adversaries attacking
+/// on ONE logical tick resolve in the index-ascending drain order
+/// (the deterministic same-tick ordering), pinned from the wave
+/// failure scenario's event log.
+#[test]
+fn same_tick_multi_attacks_resolve_in_index_order() {
+    let evidence = run_encounter_wave_failure_headless();
+    // Find a tick carrying two adversary attacks.
+    let mut by_tick = std::collections::HashMap::<u64, Vec<(usize, &str)>>::new();
+    for (tick, line) in parse_events(&evidence) {
+        if let Some(rest) = line.strip_prefix("adversary ") {
+            let index: usize = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(usize::MAX);
+            by_tick.entry(tick).or_default().push((index, line));
+        }
+    }
+    let same_tick = by_tick
+        .values()
+        .find(|attacks| attacks.len() >= 2)
+        .expect("the wave failure has same-tick multi-attacks");
+    let mut indices: Vec<usize> = same_tick.iter().map(|(index, _)| *index).collect();
+    let sorted = {
+        indices.sort_unstable();
+        indices
+    };
+    let original: Vec<usize> = same_tick.iter().map(|(index, _)| *index).collect();
+    assert_eq!(
+        original, sorted,
+        "same-tick attacks drain in index-ascending order: {same_tick:?}"
+    );
+}
+
+/// Parses the evidence record's event lines into (tick, line).
+fn parse_events(evidence: &str) -> Vec<(u64, &str)> {
+    let mut out = Vec::new();
+    for line in evidence.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("tick ")
+            && let Some((tick, event)) = rest.split_once(": ")
+            && let Ok(tick) = tick.parse::<u64>()
+        {
+            out.push((tick, event));
+        }
+    }
+    out
+}
+
+/// D3 — BOTH weapons used and mechanically distinct in the pinned
+/// wave scenario: the evidence carries single-shot precision lines
+/// AND multi-ray spread volleys, and the hits exceed the fires (the
+/// multi-ray character the precision weapon cannot produce).
+#[test]
+fn both_weapons_are_used_and_distinct_in_the_wave() {
+    let evidence = run_encounter_wave_winnable_headless();
+    assert!(evidence.contains("outcome: WON"), "the wave scenario wins");
+    let events = parse_events(&evidence);
+    let precision_lines = events
+        .iter()
+        .filter(|(_, line)| line.starts_with("fire ") && !line.contains(" ray "))
+        .count();
+    let spread_lines = events
+        .iter()
+        .filter(|(_, line)| line.contains(" ray "))
+        .count();
+    assert!(precision_lines > 0, "the precision weapon fired");
+    assert!(spread_lines > 0, "the spread weapon fired");
+    assert!(
+        evidence.contains("fires 18 · hits 31"),
+        "the pinned counters: hits exceed fires (the multi-ray volleys)"
+    );
+    assert!(
+        evidence.contains("attacks taken 11"),
+        "the pinned threatened win"
+    );
+}
+
+/// D5 — the wave scenarios' determinism: byte-identical double-runs
+/// with the pinned NEW traces (the wave policy is a NEW scenario —
+/// never a repin of the single-adversary guards).
+#[test]
+fn wave_scenarios_are_deterministic() {
+    let first = run_encounter_wave_winnable_headless();
+    let second = run_encounter_wave_winnable_headless();
+    assert_eq!(first, second, "the wave winnable double-run");
+    assert!(first.contains("outcome: WON at tick 451"));
+    assert!(first.contains("player-trace=eb04eecbda969ae1"));
+    assert!(first.contains("encounter-fingerprint=b818746374aabc3c"));
+    let first = run_encounter_wave_failure_headless();
+    let second = run_encounter_wave_failure_headless();
+    assert_eq!(first, second, "the wave failure double-run");
+    assert!(first.contains("outcome: LOST at tick 271"));
+    assert!(first.contains("player-trace=846ff726845311f3"));
+    assert!(first.contains("encounter-fingerprint=213d7f95c2301ec3"));
+}
+
+/// D3 — the weapon-selection battery at the encounter layer: the
+/// direct edges and the lifecycle refusals (DORMANT and terminal
+/// change NOTHING, honestly), the selection is instant and NEVER
+/// touches any cooldown (B's §2 guarantee, re-asserted here), and
+/// switching mid-cooldown and back leaves the original deadline in
+/// force exactly.
+#[test]
+fn weapon_selection_battery() {
+    let mut demo = EncounterDemo::new_with_config(encounter_single_config());
+    // Pre-activation: the selection is refused honestly.
+    demo.apply_selection(WeaponId::Spread);
+    assert_eq!(
+        demo.arsenal.selected(),
+        WeaponId::Precision,
+        "no change while dormant"
+    );
+    assert!(
+        demo.encounter
+            .last_selection_line
+            .as_deref()
+            .is_some_and(|line| line.starts_with("weapon switch refused — the adversaries")),
+        "the honest dormant refusal: {:?}",
+        demo.encounter.last_selection_line
+    );
+    // Activate and fire once (the precision deadline lands).
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (selection)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate (selection)",
+    );
+    demo.tick(idle(), true);
+    let precision_deadline = demo.arsenal.ready_at(WeaponId::Precision);
+    assert!(
+        precision_deadline > demo.tick_index(),
+        "the cooldown is live"
+    );
+    // Switch mid-cooldown: instant, and the ORIGINAL deadline holds.
+    demo.apply_selection(WeaponId::Spread);
+    assert_eq!(demo.arsenal.selected(), WeaponId::Spread);
+    assert_eq!(
+        demo.arsenal.ready_at(WeaponId::Precision),
+        precision_deadline,
+        "switching NEVER touches the other weapon's deadline"
+    );
+    // Switch back: still the original deadline (B's tested
+    // guarantee at the encounter layer).
+    demo.apply_selection(WeaponId::Precision);
+    assert_eq!(demo.arsenal.selected(), WeaponId::Precision);
+    assert_eq!(
+        demo.arsenal.ready_at(WeaponId::Precision),
+        precision_deadline,
+        "switching back leaves the original deadline in force exactly"
+    );
+    // The spread's own deadline is untouched by all of this.
+    assert_eq!(demo.arsenal.ready_at(WeaponId::Spread), 0);
+    // Post-terminal: the selection is refused honestly.
+    run_encounter_winnable(&mut demo);
+    assert!(demo.encounter.phase.is_terminal());
+    demo.apply_selection(WeaponId::Spread);
+    assert_eq!(
+        demo.arsenal.selected(),
+        WeaponId::Precision,
+        "no change after the terminal"
+    );
+    assert!(
+        demo.encounter
+            .last_selection_line
+            .as_deref()
+            .is_some_and(|line| line.starts_with("weapon switch refused — the encounter is over")),
+        "the honest terminal refusal"
     );
 }
