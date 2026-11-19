@@ -1482,13 +1482,49 @@ impl Default for CombatOptions {
     }
 }
 
-/// The event→cue mapping (C's published table, F's wiring): every
-/// fire plays `Cue::Fire`, a landed hit adds `Cue::Impact`, an
-/// adversary attack on the player plays `Cue::Damage`, the
-/// activation plays `Cue::Interact` (the candidate mapping), and the
-/// terminal phases play `Cue::EncounterComplete`. Cooldown refusals,
+/// The HUD health bar — the Cycle-4 feedback design §2's ASCII form
+/// (the overlay's glyph source is font8x8's ASCII-only legacy font:
+/// every non-ASCII code point renders as `?`, so the bar is
+/// `[####------]`-style `#`/`-` cells). A presentation-only rounding
+/// to the nearest of 10 cells; the numeric value beside the bar
+/// carries the precision. The degenerate `maximum == 0` (a
+/// born-defeated combatant) renders the empty bar.
+pub fn health_bar(current: f32, maximum: f32) -> String {
+    const CELLS: usize = 10;
+    let fraction = if maximum > 0.0 {
+        (current / maximum).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = ((fraction * CELLS as f32).round() as usize).min(CELLS);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(CELLS - filled))
+}
+
+/// The overlay-boundary ASCII sanitizer (the MINOR-1 fix, SEAT I's
+/// review): the embedded event-log text carries non-ASCII punctuation
+/// (the em-dash `—`, the middle dot `·`), and font8x8's ASCII-only
+/// legacy font renders every non-ASCII code point as `?` on screen —
+/// so the OVERLAY BOUNDARY maps the known vocabulary to ASCII
+/// equivalents. The console evidence records are NOT affected (they
+/// keep the original text — only the on-screen line is sanitized).
+pub fn overlay_ascii(line: &str) -> String {
+    line.replace('—', "-").replace('·', "|")
+}
+
+/// The event→cue mapping (C's published table + the Cycle-4 F
+/// additions, orchestrator-approved 2026-11-18): every fire plays
+/// `Cue::Fire`, a landed hit adds `Cue::Impact`, an adversary attack
+/// on the player plays `Cue::Damage`, the activation plays
+/// `Cue::Interact`, the encounter's victory plays
+/// `Cue::EncounterComplete`, and the defeat terminal plays
+/// `Cue::Defeat` (the approved victory/defeat split — the failure
+/// counterpart of the completion arpeggio). Cooldown refusals,
 /// grazes' quiet feedback, and the reset play nothing. `play` is
 /// non-blocking and idempotent when silent — no queueing needed.
+/// CONSUMPTION POINTS (at the w-int integration): a weapon-selection
+/// change event plays `Cue::WeaponSwitch`; a per-adversary defeat
+/// event (the multi-adversary partial-victory line, distinct from
+/// the encounter's terminal) plays `Cue::AdversaryDefeated`.
 fn play_cues_for(audio: &mut Audio, line: &str) {
     if line.starts_with("fire refused") {
         return;
@@ -1508,8 +1544,12 @@ fn play_cues_for(audio: &mut Audio, line: &str) {
         audio.play(Cue::Interact);
         return;
     }
-    if line.starts_with("ADVERSARY DEFEATED") || line.starts_with("PLAYER DEFEATED") {
+    if line.starts_with("ADVERSARY DEFEATED") {
         audio.play(Cue::EncounterComplete);
+        return;
+    }
+    if line.starts_with("PLAYER DEFEATED") {
+        audio.play(Cue::Defeat);
     }
 }
 
@@ -1648,6 +1688,15 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
     };
     let mut timing = FrameTiming::new();
     let mut scene_vertices: Vec<SceneVertex> = Vec::new();
+    // The defeat vignette's presentation-local anchor: the wall-clock
+    // moment the LOST terminal was first observed (NONE before it, and
+    // reset clears it) — a RENDER-LOOP-LOCAL value, deliberately NOT
+    // in the encounter state: the Cycle-3.1 terminal guard stays the
+    // single writer of the result; the vignette only READS the frozen
+    // phase and paces its presentation animation on the frame clock.
+    // The headless paths never construct it (the logical record is
+    // byte-identical with the vignette on or off).
+    let mut defeat_started_at: Option<Instant> = None;
 
     loop {
         let frame_start = Instant::now();
@@ -1661,6 +1710,7 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         if snapshot.keys_pressed.contains(&Keycode::R) {
             demo.reset();
             event_cursor = 0;
+            defeat_started_at = None;
         }
         let split = timing.begin_frame(frame_start, !snapshot.minimized);
 
@@ -1691,7 +1741,30 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
             continue;
         }
 
-        let pose = demo.camera_pose();
+        // The defeat vignette's presentation parameter (F's feedback
+        // design §4): 0 at the LOST observation, 1 after ~2 s of wall
+        // clock — PRESENTATION-ONLY (a render-loop read of the frozen
+        // phase; the guard's record, counters, and timestamps are
+        // untouched, and the headless paths never reach here).
+        if defeat_started_at.is_none()
+            && matches!(demo.encounter.phase, EncounterPhase::Lost { .. })
+        {
+            defeat_started_at = Some(frame_start);
+        }
+        let vignette = defeat_started_at.map(|lost_at| {
+            (frame_start.duration_since(lost_at).as_secs_f32() / 2.0).clamp(0.0, 1.0)
+        });
+
+        let mut pose = demo.camera_pose();
+        let third_person = demo.driver.state().camera_mode == CameraMode::ThirdPerson;
+        if let (Some(vignette), true) = (vignette, third_person) {
+            // The third-person defeat treatment: a slow descent and
+            // tilt of the camera toward the fallen player (the
+            // obstruction handling stays — the offsets compose after
+            // it). First person keeps the overlay-only treatment.
+            pose.position[1] -= 1.2 * vignette;
+            pose.pitch += 0.35 * vignette;
+        }
         let (width, height) = renderer.stats().extent;
         let aspect = if height == 0 {
             16.0 / 9.0
@@ -1702,9 +1775,24 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
         let projection = math::perspective(std::f32::consts::FRAC_PI_3, aspect, 0.1, 200.0);
         let view_proj = math::mul(&projection, &view);
 
-        // The visible arena + the adversary + the player proxy.
+        // The visible arena + the adversary + the player proxy. The
+        // vignette's proxy treatment: in third person the proxy's
+        // color desaturates toward the defeat gray over the same
+        // window (the last box is the proxy — the render_boxes
+        // contract).
         scene_vertices.clear();
-        for (min, max, color) in demo.render_boxes() {
+        let mut boxes = demo.render_boxes();
+        if let (Some(vignette), true, Some(last)) = (vignette, third_person, boxes.last_mut()) {
+            // The proxy treatment: the color desaturates toward the
+            // defeat gray over the vignette window.
+            let lerp = |from: f32, to: f32| from + (to - from) * vignette;
+            last.2 = [
+                lerp(last.2[0], 0.35),
+                lerp(last.2[1], 0.35),
+                lerp(last.2[2], 0.38),
+            ];
+        }
+        for (min, max, color) in boxes {
             push_rect_box(&mut scene_vertices, min, max, color);
         }
 
@@ -1713,13 +1801,19 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let stats = renderer.stats();
             let phase_line = match demo.encounter.phase {
-                EncounterPhase::Dormant => "DORMANT — cross the blue line to start".to_string(),
-                EncounterPhase::Active => "ACTIVE — the adversary pursues".to_string(),
+                EncounterPhase::Dormant => "DORMANT - cross the blue line to start".to_string(),
+                EncounterPhase::Active => "ACTIVE - the adversary pursues".to_string(),
                 EncounterPhase::Won { tick } => {
-                    format!("WON at tick {tick} — [R] reset for another round")
+                    format!("WON at tick {tick} - [R] reset for another round")
                 }
                 EncounterPhase::Lost { tick } => {
-                    format!("LOST at tick {tick} — [R] reset and fight back")
+                    // The defeat banner (the vignette's HUD side): the
+                    // result statistics composed from the FROZEN
+                    // counters — a presentation of the existing
+                    // record, never a new one.
+                    format!(
+                        "DEFEAT at tick {tick} - the adversary prevails | [R] try again"
+                    )
                 }
             };
             let adversary_state = match demo.spine.world().adversary(0).state {
@@ -1737,6 +1831,13 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 .rev()
                 .find_map(|(_, line)| line.starts_with("fire ").then(|| line.clone()))
                 .unwrap_or_else(|| "no fire yet".to_string());
+            // The MINOR-1 fix (SEAT I's review): the embedded event
+            // text carries non-ASCII punctuation (the em-dash —
+            // font8x8 renders every non-ASCII code point as '?'),
+            // so the OVERLAY BOUNDARY maps the vocabulary to ASCII
+            // (the console evidence records keep the original text —
+            // only the on-screen line is sanitized).
+            let last_fire = overlay_ascii(&last_fire);
             let damage_line = match (demo.encounter.last_damage_tick, demo.tick_index()) {
                 (Some(last), now) if now.saturating_sub(last) <= 90 => {
                     format!(
@@ -1746,15 +1847,37 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 }
                 _ => "no recent damage".to_string(),
             };
+            // CONSUMPTION POINT B (WEAPONS-INTERFACE v1 §3 — the
+            // weapon HUD block, at the w-int integration): compose
+            // the `WEAPON <name> [READY|<ready_at>]` block from the
+            // Arsenal reads — `selected()` (the discriminant),
+            // `is_ready(now)`, `ready_at(weapon)` — plus the other
+            // weapon's readiness sub-line. The single-adversary
+            // demonstration carries ONE implicit weapon, so the block
+            // is structural there; the wiring lands with B's
+            // compilable form (the orchestrator relays it).
+            // CONSUMPTION POINT A (COMBATANTS-INTERFACE v1 §4 — the
+            // multi-adversary block, at the w-int integration): one
+            // HUD line per NON-DEFEATED adversary from `combatants()`
+            // + the per-adversary reads (identity `id -
+            // adversary_id_base`, the state word, `health_bar`) with
+            // the defeat tally header (`defeated_count()`/`count()`)
+            // and the aim-selected target marker (D's targeting
+            // hook). The per-adversary lines and the
+            // `Cue::AdversaryDefeated` per-defeat wiring land with
+            // A's + D's compilable forms.
+            let player_bar = health_bar(demo.encounter.player.current, demo.encounter.player.maximum);
+            let adversary = demo.spine.world().adversary(0);
+            let adversary_bar = health_bar(adversary.health.current, adversary.health.maximum);
             format!(
-                "Sektor7 C3-P6 - combat encounter\nFPS {:.0} (cpu work p95 {:.2} ms)\n{} {} / Vulkan {}\n\
+                "Sektor7 C4 - combat encounter\nFPS {:.0} (cpu work p95 {:.2} ms)\n{} {} / Vulkan {}\n\
                  player ({:.2}, {:.2}, {:.2}) ground {} mode {}\n\
-                 encounter {} · round {}\n\
-                 player hp {:.0}/{:.0} · adversary hp {:.0}/{:.0} ({adversary_state})\n\
+                 encounter {} | round {}\n\
+                 player hp {:.0}/{:.0} {} | adversary hp {:.0}/{:.0} {} ({adversary_state})\n\
                  {}\n\
                  {}\n\
-                 fires {} · hits {} · blocked {} · out of range {}\n\
-                 move tick {} @ {} Hz · out {} · refused {}",
+                 fires {} | hits {} | blocked {} | out of range {}\n\
+                 move tick {} @ {} Hz | out {} | refused {}",
                 presented as f64 / elapsed,
                 math::percentile(&cpu_work_ms, 0.95),
                 stats.device_type,
@@ -1772,8 +1895,10 @@ pub fn run_combat_demo(options: CombatOptions) -> Result<(), String> {
                 demo.encounter.rounds + 1,
                 demo.encounter.player.current,
                 demo.encounter.player.maximum,
-                demo.spine.world().adversary(0).health.current,
-                demo.spine.world().adversary(0).health.maximum,
+                player_bar,
+                adversary.health.current,
+                adversary.health.maximum,
+                adversary_bar,
                 last_fire,
                 damage_line,
                 demo.encounter.fires,
