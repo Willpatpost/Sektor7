@@ -419,6 +419,37 @@ pub struct Spine<W: World> {
     /// constraint). Derived state; the held map is canonical.
     held_index: BTreeSet<(Tick, u64)>,
     suspension: SuspensionStats,
+    /// Reusable handler follow-up buffer — taken per execution, drained
+    /// into `schedule`, and returned with its capacity retained (the
+    /// F-02 caller-held-scratch discipline applied to the spine's
+    /// execution loop: collecting handler follow-ups costs no
+    /// allocation in steady state). Representation-internal and
+    /// fingerprint-invisible — the same class of state as
+    /// `max_executed_index`.
+    scratch_follow_ups: Vec<EventSpec>,
+}
+
+/// The waiter registration over explicitly split borrows — the form
+/// [`Spine::try_unblock`](Spine::try_unblock) uses to mutate the
+/// waiter map while reading the blocked map (disjoint fields, so a
+/// partially-blocked event is re-registered in place and never
+/// temporarily removed). Identical per-dependency iteration order and
+/// dedup to the method form.
+fn register_waiters_for_unmet_into(
+    waiting_on: &mut BTreeMap<u64, Vec<u64>>,
+    dependent: u64,
+    event: &Event,
+    is_executed: impl Fn(u64) -> bool,
+) {
+    for id in &event.depends_on {
+        if is_executed(id.seq) {
+            continue;
+        }
+        let waiters = waiting_on.entry(id.seq).or_default();
+        if !waiters.contains(&dependent) {
+            waiters.push(dependent);
+        }
+    }
 }
 
 impl<W: World> Spine<W> {
@@ -471,6 +502,7 @@ impl<W: World> Spine<W> {
             held: BTreeMap::new(),
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
+            scratch_follow_ups: Vec::new(),
         }
     }
 
@@ -736,23 +768,30 @@ impl<W: World> Spine<W> {
         let due = event.schedule.due();
         if due < self.clock {
             self.stats.late_arrivals += 1;
+            if self.diag.would_log(Level::Warn) {
+                self.diag.log(
+                    Level::Warn,
+                    format!(
+                        "late arrival {id}: due {due} behind clock {} — completeness claims above {due} are invalidated",
+                        self.clock
+                    ),
+                );
+            }
+        }
+        // The guard keeps a suppressed record from allocating at all
+        // (the would_log contract) — this site runs once per scheduled
+        // event in the live game.
+        if self.diag.would_log(Level::Trace) {
             self.diag.log(
-                Level::Warn,
+                Level::Trace,
                 format!(
-                    "late arrival {id}: due {due} behind clock {} — completeness claims above {due} are invalidated",
-                    self.clock
+                    "scheduled {id} class {} payload {} due {due} deps {}",
+                    event.class,
+                    event.payload,
+                    event.depends_on.len()
                 ),
             );
         }
-        self.diag.log(
-            Level::Trace,
-            format!(
-                "scheduled {id} class {} payload {} due {due} deps {}",
-                event.class,
-                event.payload,
-                event.depends_on.len()
-            ),
-        );
         self.unfinished.insert(seq);
         match event.field {
             Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
@@ -789,13 +828,15 @@ impl<W: World> Spine<W> {
         let pending = Pending::new(event);
         if pending.due < self.clock {
             self.stats.late_arrivals += 1;
-            self.diag.log(
-                Level::Warn,
-                format!(
-                    "late arrival {id}: due {} behind clock {} — completeness claims above {} are invalidated",
-                    pending.due, self.clock, pending.due
-                ),
-            );
+            if self.diag.would_log(Level::Warn) {
+                self.diag.log(
+                    Level::Warn,
+                    format!(
+                        "late arrival {id}: due {} behind clock {} — completeness claims above {} are invalidated",
+                        pending.due, self.clock, pending.due
+                    ),
+                );
+            }
         }
         self.unfinished.insert(seq);
         self.held_index.insert((pending.due, pending.seq));
@@ -1058,14 +1099,13 @@ impl<W: World> Spine<W> {
         for seq in to_resume {
             if let Some(pending) = self.held.remove(&seq) {
                 self.held_index.remove(&(pending.due, pending.seq));
-                let unmet = self.unmet_dependencies(&pending.event);
-                if unmet.is_empty() {
+                if !self.has_unmet_dependencies(&pending.event) {
                     match pending.event.field {
                         Field::Near => self.near_queue.push(Reverse(pending)),
                         Field::Far => self.far_queue.push(Reverse(pending)),
                     }
                 } else {
-                    self.register_waiters(seq, &unmet);
+                    self.register_waiters_for_unmet(seq, &pending.event);
                     self.blocked.insert(seq, pending.event);
                 }
                 resumed += 1;
@@ -1210,10 +1250,12 @@ impl<W: World> Spine<W> {
         let far_backlogged = self.lane_has_due_work(Field::Far);
         if executed >= self.budget && (near_backlogged || far_backlogged) {
             self.stats.budget_exhausted_ticks += 1;
-            self.diag.log(
-                Level::Info,
-                format!("budget exhausted at {} with due work remaining", self.clock),
-            );
+            if self.diag.would_log(Level::Info) {
+                self.diag.log(
+                    Level::Info,
+                    format!("budget exhausted at {} with due work remaining", self.clock),
+                );
+            }
         }
         self.lane_totals.near_executed += u64::from(near_executed);
         self.lane_totals.far_executed += u64::from(far_executed);
@@ -1733,8 +1775,7 @@ impl<W: World> Spine<W> {
             }
             .expect("queue head was just peeked");
             let event = pending.event;
-            let unmet = self.unmet_dependencies(&event);
-            if unmet.is_empty() {
+            if !self.has_unmet_dependencies(&event) {
                 self.execute_now(event);
                 executed += 1;
             } else {
@@ -1743,16 +1784,18 @@ impl<W: World> Spine<W> {
                 // done), and the parked event keeps capping the safe
                 // watermark until its dependencies resolve.
                 self.stats.blocked_transitions += 1;
-                self.diag.log(
-                    Level::Trace,
-                    format!(
-                        "blocked {} at {} ({} unmet dependencies)",
-                        event.id,
-                        self.clock,
-                        unmet.len()
-                    ),
-                );
-                self.register_waiters(event.id.seq, &unmet);
+                if self.diag.would_log(Level::Trace) {
+                    self.diag.log(
+                        Level::Trace,
+                        format!(
+                            "blocked {} at {} ({} unmet dependencies)",
+                            event.id,
+                            self.clock,
+                            self.unmet_dependency_count(&event)
+                        ),
+                    );
+                }
+                self.register_waiters_for_unmet(event.id.seq, &event);
                 self.blocked.insert(event.id.seq, event);
             }
         }
@@ -1804,19 +1847,29 @@ impl<W: World> Spine<W> {
         self.stats.executed += 1;
         if executed_tick > due {
             self.stats.late_executions += 1;
-            self.diag.log(
-                Level::Debug,
-                format!(
-                    "late execution {id}: due {due} executed {executed_tick} ({} ticks late)",
-                    executed_tick.as_u64() - due.as_u64()
-                ),
-            );
-        } else {
+            if self.diag.would_log(Level::Debug) {
+                self.diag.log(
+                    Level::Debug,
+                    format!(
+                        "late execution {id}: due {due} executed {executed_tick} ({} ticks late)",
+                        executed_tick.as_u64() - due.as_u64()
+                    ),
+                );
+            }
+        } else if self.diag.would_log(Level::Trace) {
+            // The guard keeps a suppressed record from allocating at all
+            // (the would_log contract) — this site runs once per executed
+            // event in the live game.
             self.diag
                 .log(Level::Trace, format!("executed {id} at {executed_tick}"));
         }
 
-        let follow_ups = {
+        // The reusable handler follow-up buffer (the scratch field's
+        // take/return protocol): seeded from `scratch_follow_ups` and
+        // returned below with its capacity retained, so a handler
+        // emitting one follow-up per wake (the adversary workload's
+        // shape) costs no allocation in steady state.
+        let mut follow_ups = {
             let unfinished = &self.unfinished;
             let next_seq = self.next_seq;
             let mut ctx = ExecCtx {
@@ -1824,23 +1877,26 @@ impl<W: World> Spine<W> {
                 unfinished,
                 next_seq,
                 field: event.field,
-                follow_ups: Vec::new(),
+                follow_ups: std::mem::take(&mut self.scratch_follow_ups),
             };
             self.world.execute(&event, &mut ctx);
             ctx.drain()
         };
-        for spec in follow_ups {
+        for spec in follow_ups.drain(..) {
             if let Err(error) = self.schedule(spec) {
                 // Handler follow-ups cannot return errors to their
                 // producer; rejection is reported through diagnostics and
                 // stats — never silently dropped (E-10 discipline).
                 self.stats.invalid_dropped += 1;
-                self.diag.log(
-                    Level::Error,
-                    format!("dropped invalid follow-up from {id}: {error:?}"),
-                );
+                if self.diag.would_log(Level::Error) {
+                    self.diag.log(
+                        Level::Error,
+                        format!("dropped invalid follow-up from {id}: {error:?}"),
+                    );
+                }
             }
         }
+        self.scratch_follow_ups = follow_ups;
 
         // Release dependents that were waiting on this event.
         if let Some(waiters) = self.waiting_on.remove(&event.id.seq) {
@@ -1850,43 +1906,86 @@ impl<W: World> Spine<W> {
         }
     }
 
-    fn unmet_dependencies(&self, event: &Event) -> Vec<EventId> {
+    /// Whether `event` still has unexecuted dependencies — the hot-path
+    /// emptiness question the drain and unblock paths ask. No
+    /// allocation: the Vec form this replaces allocated once per
+    /// blocked transition and once per unblock re-validation, while
+    /// both callers only ever needed this boolean (and, for suppressed
+    /// diagnostics, a count).
+    fn has_unmet_dependencies(&self, event: &Event) -> bool {
         event
             .depends_on
             .iter()
-            .copied()
-            .filter(|id| !self.is_executed_seq(id.seq))
-            .collect()
+            .any(|id| !self.is_executed_seq(id.seq))
     }
 
-    fn register_waiters(&mut self, dependent: u64, deps: &[EventId]) {
-        for dep in deps {
-            let waiters = self.waiting_on.entry(dep.seq).or_default();
-            if !waiters.contains(&dependent) {
-                waiters.push(dependent);
-            }
-        }
+    /// The number of `event`'s unexecuted dependencies — only for the
+    /// diagnostics at the blocked/unblocked sites, under the
+    /// `would_log` guard.
+    fn unmet_dependency_count(&self, event: &Event) -> usize {
+        event
+            .depends_on
+            .iter()
+            .filter(|id| !self.is_executed_seq(id.seq))
+            .count()
+    }
+
+    /// Registers `dependent` on every currently-unexecuted dependency
+    /// of `event` (deduplicated) — the fused unmet filter + waiter
+    /// registration the drain, unblock, resume, and restore paths
+    /// share. Identical per-dependency iteration order and dedup to
+    /// the slice form it replaces; allocation-free. Delegates to the
+    /// free-function form over split borrows.
+    fn register_waiters_for_unmet(&mut self, dependent: u64, event: &Event) {
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        register_waiters_for_unmet_into(&mut self.waiting_on, dependent, event, |seq| {
+            seq < next_seq && !unfinished.contains(&seq)
+        });
     }
 
     fn try_unblock(&mut self, seq: u64) {
-        let Some(event) = self.blocked.get(&seq) else {
+        // Disjoint-field borrows (the independent review's P1
+        // correction): the blocked entry is only PEEKED while any
+        // dependency remains unexecuted — a partial release
+        // re-registers waiters in place and the entry never leaves the
+        // map, so no B-tree node can be deallocated and reallocated
+        // per partial release (the removed-then-reinserted form this
+        // replaces paid allocator traffic exactly where the batch
+        // aimed to remove it, and could rebalance nodes besides).
+        // Structurally identical to the original pre-batch code:
+        // peek, revalidate, register without removal, return; the
+        // entry is removed only on the full-release path.
+        let Self {
+            blocked,
+            waiting_on,
+            unfinished,
+            next_seq,
+            diag,
+            near_queue,
+            far_queue,
+            ..
+        } = self;
+        let Some(event) = blocked.get(&seq) else {
             return;
         };
-        let unmet = self.unmet_dependencies(event);
-        if !unmet.is_empty() {
-            // Other dependencies remain; re-register (deduplicated).
-            self.register_waiters(seq, &unmet);
+        let is_executed = |seq: u64| seq < *next_seq && !unfinished.contains(&seq);
+        if event.depends_on.iter().any(|id| !is_executed(id.seq)) {
+            // Other dependencies remain; re-register (deduplicated) —
+            // in place, the entry stays blocked.
+            register_waiters_for_unmet_into(waiting_on, seq, event, is_executed);
             return;
         }
-        let Some(event) = self.blocked.remove(&seq) else {
+        let Some(event) = blocked.remove(&seq) else {
             return;
         };
         let due = event.schedule.due();
-        self.diag
-            .log(Level::Trace, format!("unblocked {} (due {due})", event.id));
+        if diag.would_log(Level::Trace) {
+            diag.log(Level::Trace, format!("unblocked {} (due {due})", event.id));
+        }
         match event.field {
-            Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
-            Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
+            Field::Near => near_queue.push(Reverse(Pending::new(event))),
+            Field::Far => far_queue.push(Reverse(Pending::new(event))),
         }
     }
 
@@ -2337,6 +2436,7 @@ impl<W: SaveWorld> Spine<W> {
             held: BTreeMap::new(),
             held_index: BTreeSet::new(),
             suspension: SuspensionStats::default(),
+            scratch_follow_ups: Vec::new(),
         };
 
         // Queues: heap layout is rebuild-order-dependent and invisible —
@@ -2351,24 +2451,24 @@ impl<W: SaveWorld> Spine<W> {
         }
 
         // Blocked obligations and their waiter registrations, through
-        // the live code paths (`unmet_dependencies` against the rebuilt
-        // executed set, `register_waiters` with its dedup) — identical
-        // structures by construction. A blocked obligation without
-        // unmet dependencies is not a live state (the release path
-        // would have returned it to its queue): rejected, not repaired.
-        // Waiter-vec order may differ from the original registration
-        // history; it is behaviorally invisible (queues are
-        // `(due, seq)`-keyed and no fingerprint hashes `waiting_on`) —
-        // proven so by the continuation-invisibility tests.
+        // the live code paths (`has_unmet_dependencies` against the
+        // rebuilt executed set, `register_waiters_for_unmet` with its
+        // dedup) — identical structures by construction. A blocked
+        // obligation without unmet dependencies is not a live state
+        // (the release path would have returned it to its queue):
+        // rejected, not repaired. Waiter-vec order may differ from the
+        // original registration history; it is behaviorally invisible
+        // (queues are `(due, seq)`-keyed and no fingerprint hashes
+        // `waiting_on`) — proven so by the continuation-invisibility
+        // tests.
         for event in blocked {
             let seq = event.id.seq;
-            let unmet = spine.unmet_dependencies(&event);
-            if unmet.is_empty() {
+            if !spine.has_unmet_dependencies(&event) {
                 return Err(SaveError::Integrity(
                     "spine-save/blocked-without-unmet-deps",
                 ));
             }
-            spine.register_waiters(seq, &unmet);
+            spine.register_waiters_for_unmet(seq, &event);
             spine.blocked.insert(seq, event);
         }
 

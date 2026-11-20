@@ -87,6 +87,17 @@ impl Diagnostics {
         self.min_level
     }
 
+    /// Whether a record at `level` would pass the threshold — the guard
+    /// for eager `format!` construction at hot-path call sites: wrapping
+    /// the message construction in `if diag.would_log(level)` keeps a
+    /// suppressed record from allocating at all, instead of building a
+    /// `String` the threshold immediately discards (the spine schedules
+    /// and executes events every tick; with `Level::Off` those message
+    /// constructions must cost nothing).
+    pub fn would_log(&self, level: Level) -> bool {
+        self.min_level != Level::Off && level >= self.min_level
+    }
+
     /// Records a message at `level` unless it falls below the threshold.
     /// More severe records always pass; `Off` suppresses everything.
     pub fn log(&mut self, level: Level, message: impl Into<String>) {
@@ -142,6 +153,17 @@ mod tests {
         let mut diag = Diagnostics::new(Level::Off);
         diag.log(Level::Error, "suppressed");
         assert!(diag.records().is_empty());
+    }
+
+    #[test]
+    fn would_log_matches_the_threshold_gates() {
+        let diag = Diagnostics::new(Level::Warn);
+        assert!(!diag.would_log(Level::Trace));
+        assert!(!diag.would_log(Level::Info));
+        assert!(diag.would_log(Level::Warn));
+        assert!(diag.would_log(Level::Error));
+        let off = Diagnostics::new(Level::Off);
+        assert!(!off.would_log(Level::Error));
     }
 
     #[test]
