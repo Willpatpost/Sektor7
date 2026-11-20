@@ -255,15 +255,27 @@ jobs:
           # combined gates: main 1100/2/31 + zero failures + every selftest
           # pin byte-identical per int-gates-run11.log; Windows 1049 =
           # the prior 1045 + the same 4, platform-uniform).
-          expected=1100
-          if [ "$(uname -s)" != "Linux" ]; then expected=1049; fi
+          # Perf-hardening batch 1 (s7-perf-hardening, 2026-11-20): +2
+          # engine-core tests platform-uniform — the Diagnostics::would_log
+          # unit + the spine main-path allocation gate (a NEW integration
+          # binary, spine_allocations, so result lines 31->32). Windows
+          # 1051/2/32 MEASURED locally with this step's own counting
+          # (cargo exit 0, zero non-ok lines); the heavy shard MEASURED
+          # unchanged at 552/6/54 with every engine-slice selftest pin
+          # byte-identical; Linux 1102 = the prior 1100 + the same 2
+          # (platform-uniform inference — this candidate run confirms it;
+          # the allocation gate's pinned count is likewise 8 on Windows
+          # and is corrected from Linux actuals if the harness adds a
+          # stray event there — never by weakening a test).
+          expected=1102
+          if [ "$(uname -s)" != "Linux" ]; then expected=1051; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
-          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 31)"
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 32)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
-          [ "$results" -eq 31 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 31"; exit 1; }
+          [ "$results" -eq 32 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 32"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
       # tests are cfg(test)-only (never feature-gated), and this
