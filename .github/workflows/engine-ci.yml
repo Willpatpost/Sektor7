@@ -255,8 +255,17 @@ jobs:
           # combined gates: main 1100/2/31 + zero failures + every selftest
           # pin byte-identical per int-gates-run11.log; Windows 1049 =
           # the prior 1045 + the same 4, platform-uniform).
-          expected=1100
-          if [ "$(uname -s)" != "Linux" ]; then expected=1049; fi
+          # Cycle 5 Codex handoff (7144f4bd, 2026-11-20): Linux 1102/2/31
+          # MEASURED at the candidate with this step's own awk (Codex's
+          # presentation work adds 2 engine-renderer lib tests, both
+          # platform-uniform, no new binaries: overlay.rs
+          # positioned_rectangles_and_text_share_resized_pixel_coordinates
+          # + vulkan.rs
+          # layered_upload_preserves_order_truncation_and_neighboring_slots;
+          # local verification per the C CI-counts delivery; Windows 1051 =
+          # the prior 1049 + the same 2).
+          expected=1102
+          if [ "$(uname -s)" != "Linux" ]; then expected=1051; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -805,14 +814,28 @@ jobs:
           # platform-uniform; the combined gates: heavy 553/6/54 + zero
           # failures + every selftest pin byte-identical per
           # int-gates-run11.log; Windows 552 = the prior 548 + the same 4).
-          expected=553
-          if [ "$(uname -s)" != "Linux" ]; then expected=552; fi
+          # Cycle 5 Codex handoff (7144f4bd, 2026-11-20): Linux 565/7/55
+          # MEASURED at the candidate with this step's own awk (Codex's
+          # presentation work adds 12 platform-uniform passed tests — the
+          # encounter_frame lib pair one_spread_trigger_plays_one_fire... +
+          # shoulder_view_centers_real_contact..., the 6-test
+          # encounter_visuals::tests battery, and the 4-test typed-event
+          # encounter_world growth 26 -> 30 — plus the NEW
+          # tests/render_encounter.rs integration binary carrying ONE
+          # #[ignore]d Vulkan framebuffer regression
+          # (encounter_camera_weapons_cover_and_resize_reach_pixels, the
+          # render_orientation/render_overflow lavapipe class): +12
+          # passed, +1 ignored, +1 result line; local verification per
+          # the C CI-counts delivery; Windows 564 = the prior 552 + the
+          # same 12, platform-uniform).
+          expected=565
+          if [ "$(uname -s)" != "Linux" ]; then expected=564; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
-          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 6 / 54)"
+          echo "heavy shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 7 / 55)"
           [ "$passed" -eq "$expected" ] || { echo "HEAVY SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
-          [ "$ignored" -eq 6 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 6"; exit 1; }
+          [ "$ignored" -eq 7 ] || { echo "HEAVY SHARD IGNORED MISMATCH: $ignored != 7"; exit 1; }
           # Cycle 4 close-out corrective (run 44478936088, 2026-11-19):
           # the result-line check missed the batch-4 companion update
           # (D's encounter_world binary added the 54th line — the local
@@ -827,7 +850,12 @@ jobs:
           # additions = 548), never by weakening a test — zero test
           # failures on either platform (the three main jobs + macOS
           # all green).
-          [ "$results" -eq 54 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 54"; exit 1; }
+          # Cycle 5 Codex handoff (7144f4bd): 54 -> 55 — the new
+          # tests/render_encounter.rs integration binary adds the 55th
+          # result line (its single framebuffer test is #[ignore]d in
+          # the plain run and executed by the dedicated framebuffer
+          # step; MEASURED at the candidate with the local heavy pass).
+          [ "$results" -eq 55 ] || { echo "HEAVY SHARD RESULT-LINE MISMATCH: $results != 55"; exit 1; }
       # (F-06, the 2026-11-12 quality audit — Agent C) The release-mode
       # render-path CPU canary: the comparative microbenchmark in
       # release mode on the llvipe runner — NO timing thresholds (the
