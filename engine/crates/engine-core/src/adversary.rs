@@ -286,6 +286,16 @@ pub struct AdversaryWorld {
     collision: CollisionWorld,
     adversaries: Vec<Adversary>,
     player_position: [f32; 3],
+    /// The per-adversary waypoint circuit, computed once at
+    /// construction — two positions per adversary, pure functions of
+    /// the immutable config, so the per-wake patrol lookups read the
+    /// cache instead of recomputing the seeded phase, `cos`, and
+    /// `sin` on every patrol wake. Derived state: value-identical to
+    /// `circuit_waypoint` by construction and never fingerprinted
+    /// (the fingerprint domain hashes adversary positions, not
+    /// waypoint sources); `reset` does not touch it because the
+    /// config cannot change.
+    waypoints: Vec<[[f32; 3]; 2]>,
 }
 
 impl AdversaryWorld {
@@ -300,11 +310,20 @@ impl AdversaryWorld {
         let adversaries = (0..config.count)
             .map(|index| fresh_adversary(&config, index, full_health))
             .collect();
+        let waypoints = (0..config.count)
+            .map(|index| {
+                [
+                    circuit_waypoint(&config, index, 0),
+                    circuit_waypoint(&config, index, 1),
+                ]
+            })
+            .collect();
         AdversaryWorld {
             config,
             collision,
             adversaries,
             player_position: spawn_center,
+            waypoints,
         }
     }
 
@@ -670,8 +689,7 @@ impl AdversaryWorld {
                     self.adversaries[index].los_lost = 0;
                     transition = Some(AdversaryState::Aggro);
                 } else {
-                    let target =
-                        circuit_waypoint(&self.config, index, self.adversaries[index].waypoint);
+                    let target = self.waypoints[index][self.adversaries[index].waypoint];
                     if Self::ground_distance(self.adversaries[index].position, target)
                         <= self.config.speed * self.config.tick_seconds * cadence as f32
                     {

@@ -238,10 +238,21 @@ impl RotatedCollider {
         max: [f32; 3],
         ground_y: f32,
     ) -> Option<([f32; 3], f32)> {
-        if !self.overlaps_box(min, max) {
+        // The overlap gate inlined from `overlaps_box` with a SINGLE
+        // `horizontal_sat` evaluation: the gate previously re-entered
+        // `overlaps_box`, whose own SAT pass recomputed the exact
+        // projections the candidate generation below consumes — the
+        // same arithmetic, now computed once.
+        if (0..3).any(|a| min[a] >= self.aabb_max[a] || max[a] <= self.aabb_min[a]) {
+            return None;
+        }
+        if min[1] >= self.center[1] + self.half[1] || max[1] <= self.center[1] - self.half[1] {
             return None;
         }
         let (projection, extent_sum) = self.horizontal_sat(min, max);
+        if !(0..4).all(|u| projection[u].abs() < extent_sum[u]) {
+            return None;
+        }
         let (c, s) = (self.cos_yaw, self.sin_yaw);
         let mut best: Option<([f32; 3], f32)> = None;
         // The horizontal face axes, in the fixed candidate order: the

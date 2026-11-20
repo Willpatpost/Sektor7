@@ -46,7 +46,15 @@ ARM64) with a five-job CI:
   fingerprints, canonical wire primitives + full-fidelity spine round-trip;
   plus the Cycle-1 **player movement/collision prototype module**
   (kinematic mechanics, std-only, behind a narrow `CollisionWorld` query
-  contract — §8 scope).
+  contract — §8 scope); plus the perf-hardening **zero-allocation main
+  path** (2026-11-20): diagnostics construction is threshold-gated
+  (`Diagnostics::would_log` — a suppressed record allocates nothing),
+  handler follow-ups collect into a reused scratch, and the
+  unmet-dependency paths are allocation-free — gated by the
+  `spine_allocations` integration test (a counting global allocator
+  pinning the main path's structural allocation events at 8 for its
+  scripted scenario, down from 52 measured before the change; every
+  fingerprint and scenario pin byte-identical).
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium

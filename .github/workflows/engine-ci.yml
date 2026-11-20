@@ -264,15 +264,34 @@ jobs:
           # layered_upload_preserves_order_truncation_and_neighboring_slots;
           # local verification per the C CI-counts delivery; Windows 1051 =
           # the prior 1049 + the same 2).
-          expected=1102
-          if [ "$(uname -s)" != "Linux" ]; then expected=1051; fi
+          # Perf-hardening batch 1 (s7-perf-hardening, 2026-11-20): +2
+          # engine-core tests platform-uniform — the Diagnostics::would_log
+          # unit + the spine main-path allocation gate (a NEW integration
+          # binary, spine_allocations, so result lines 31->32). MEASURED
+          # at the perf candidate (Windows 1051/2/32 there; the branch's
+          # own five-job CI run 44823508081 confirmed all pins on
+          # Linux and macOS ARM64); heavy unchanged by the perf branch.
+          # COMBINED INTEGRATION (s7-perf-integration, 2026-11-20): main
+          # 1104/1053/2/32 = Cycle 5's 1102/1051/2/31 + the perf branch's
+          # same 2 platform-uniform engine-core tests, and result lines
+          # 31->32 (the new spine_allocations binary). NOTE: both parents
+          # independently measured 1102 (different +2s) — the union is
+          # 1104, NOT the auto-merged 1102. Heavy carries Cycle 5's
+          # 565/564 (+7 ignored, 55 lines) UNCHANGED (the perf branch
+          # adds no engine-slice tests). Windows MEASURED locally at this
+          # combined tree with this step's own counting; Linux = the same
+          # +2 platform-uniform, confirmed by this candidate's own run —
+          # a mismatch is corrected from actuals, never by weakening a
+          # test.
+          expected=1104
+          if [ "$(uname -s)" != "Linux" ]; then expected=1053; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
-          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 31)"
+          echo "main shard: $passed passed, $ignored ignored, $results test-result lines (expected $expected / 2 / 32)"
           [ "$passed" -eq "$expected" ] || { echo "MAIN SHARD COUNT MISMATCH: $passed != $expected"; exit 1; }
           [ "$ignored" -eq 2 ] || { echo "MAIN SHARD IGNORED MISMATCH: $ignored != 2"; exit 1; }
-          [ "$results" -eq 31 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 31"; exit 1; }
+          [ "$results" -eq 32 ] || { echo "MAIN SHARD RESULT-LINE MISMATCH: $results != 32"; exit 1; }
       # (V2X-CP3-B-P1 F3, extended to B-R1a2) The FEATURE-DISABLED
       # production-path regression: the B-P1 and B-R1a2 production
       # tests are cfg(test)-only (never feature-gated), and this
