@@ -429,6 +429,29 @@ pub struct Spine<W: World> {
     scratch_follow_ups: Vec<EventSpec>,
 }
 
+/// The waiter registration over explicitly split borrows — the form
+/// [`Spine::try_unblock`](Spine::try_unblock) uses to mutate the
+/// waiter map while reading the blocked map (disjoint fields, so a
+/// partially-blocked event is re-registered in place and never
+/// temporarily removed). Identical per-dependency iteration order and
+/// dedup to the method form.
+fn register_waiters_for_unmet_into(
+    waiting_on: &mut BTreeMap<u64, Vec<u64>>,
+    dependent: u64,
+    event: &Event,
+    is_executed: impl Fn(u64) -> bool,
+) {
+    for id in &event.depends_on {
+        if is_executed(id.seq) {
+            continue;
+        }
+        let waiters = waiting_on.entry(id.seq).or_default();
+        if !waiters.contains(&dependent) {
+            waiters.push(dependent);
+        }
+    }
+}
+
 impl<W: World> Spine<W> {
     pub fn new(world: W, budget: u32) -> Self {
         Self::with_diagnostics(world, budget, Diagnostics::new(Level::Off))
@@ -1911,44 +1934,58 @@ impl<W: World> Spine<W> {
     /// of `event` (deduplicated) — the fused unmet filter + waiter
     /// registration the drain, unblock, resume, and restore paths
     /// share. Identical per-dependency iteration order and dedup to
-    /// the slice form it replaces; allocation-free.
+    /// the slice form it replaces; allocation-free. Delegates to the
+    /// free-function form over split borrows.
     fn register_waiters_for_unmet(&mut self, dependent: u64, event: &Event) {
-        for id in &event.depends_on {
-            if self.is_executed_seq(id.seq) {
-                continue;
-            }
-            let waiters = self.waiting_on.entry(id.seq).or_default();
-            if !waiters.contains(&dependent) {
-                waiters.push(dependent);
-            }
-        }
+        let unfinished = &self.unfinished;
+        let next_seq = self.next_seq;
+        register_waiters_for_unmet_into(&mut self.waiting_on, dependent, event, |seq| {
+            seq < next_seq && !unfinished.contains(&seq)
+        });
     }
 
     fn try_unblock(&mut self, seq: u64) {
-        // Taken first so the unmet re-validation and the waiter
-        // registration run on an owned event (no &self/&mut self borrow
-        // overlap); a still-blocked event returns to the map under the
-        // same key — a BTreeMap remove+reinsert is behaviorally
-        // invisible (keyed lookup; iteration order is key order, never
-        // insertion history) and no fingerprint hashes `blocked`'s
-        // insertion history.
-        let Some(event) = self.blocked.remove(&seq) else {
+        // Disjoint-field borrows (the independent review's P1
+        // correction): the blocked entry is only PEEKED while any
+        // dependency remains unexecuted — a partial release
+        // re-registers waiters in place and the entry never leaves the
+        // map, so no B-tree node can be deallocated and reallocated
+        // per partial release (the removed-then-reinserted form this
+        // replaces paid allocator traffic exactly where the batch
+        // aimed to remove it, and could rebalance nodes besides).
+        // Structurally identical to the original pre-batch code:
+        // peek, revalidate, register without removal, return; the
+        // entry is removed only on the full-release path.
+        let Self {
+            blocked,
+            waiting_on,
+            unfinished,
+            next_seq,
+            diag,
+            near_queue,
+            far_queue,
+            ..
+        } = self;
+        let Some(event) = blocked.get(&seq) else {
             return;
         };
-        if self.has_unmet_dependencies(&event) {
-            // Other dependencies remain; re-register (deduplicated).
-            self.register_waiters_for_unmet(seq, &event);
-            self.blocked.insert(seq, event);
+        let is_executed = |seq: u64| seq < *next_seq && !unfinished.contains(&seq);
+        if event.depends_on.iter().any(|id| !is_executed(id.seq)) {
+            // Other dependencies remain; re-register (deduplicated) —
+            // in place, the entry stays blocked.
+            register_waiters_for_unmet_into(waiting_on, seq, event, is_executed);
             return;
         }
+        let Some(event) = blocked.remove(&seq) else {
+            return;
+        };
         let due = event.schedule.due();
-        if self.diag.would_log(Level::Trace) {
-            self.diag
-                .log(Level::Trace, format!("unblocked {} (due {due})", event.id));
+        if diag.would_log(Level::Trace) {
+            diag.log(Level::Trace, format!("unblocked {} (due {due})", event.id));
         }
         match event.field {
-            Field::Near => self.near_queue.push(Reverse(Pending::new(event))),
-            Field::Far => self.far_queue.push(Reverse(Pending::new(event))),
+            Field::Near => near_queue.push(Reverse(Pending::new(event))),
+            Field::Far => far_queue.push(Reverse(Pending::new(event))),
         }
     }
 

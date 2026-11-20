@@ -2,7 +2,13 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port]
+    # s7-perf-hardening (perf batch 1): a CANDIDATE-VALIDATION trigger,
+    # added on this branch only so the five-job gates produce measured
+    # Linux/macOS actuals at the exact candidate SHA (the independent
+    # review's P1: cross-platform evidence must be measured, not
+    # inferred). REMOVED at integration — the merged workflow keeps
+    # only the mainline branches.
+    branches: [main, stage5, macos-port, s7-perf-hardening]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
@@ -269,8 +275,12 @@ jobs:
           # unit + the spine main-path allocation gate (a NEW integration
           # binary, spine_allocations, so result lines 31->32). MEASURED
           # at the perf candidate (Windows 1051/2/32 there; the branch's
-          # own five-job CI run 44823508081 confirmed all pins on
-          # Linux and macOS ARM64); heavy unchanged by the perf branch.
+          # own five-job CI runs 44821585225 + 44823508081 confirmed all
+          # pins on Linux and macOS ARM64); heavy unchanged by the perf
+          # branch. The allocation gate's pinned values (harness v3:
+          # cold 18 events / 6880 bytes, warm 9 / 3024, pre-batch
+          # baseline 87 / 12990 on the same scenario) were confirmed on
+          # all three platforms by run 44823508081.
           # COMBINED INTEGRATION (s7-perf-integration, 2026-11-20): main
           # 1104/1053/2/32 = Cycle 5's 1102/1051/2/31 + the perf branch's
           # same 2 platform-uniform engine-core tests, and result lines
