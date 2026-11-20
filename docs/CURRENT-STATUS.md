@@ -54,11 +54,12 @@ ARM64) with a five-job CI:
   and the unmet-dependency paths are allocation-free — gated by the
   `spine_allocations` integration test (a counting global allocator
   pinning BOTH allocation events and bytes for a multi-dependency
-  scenario: cold window 23 events / 7640 bytes on a fresh spine, warm
-  window 8 / 2720 in steady state, down from 52 events before the
-  change; every fingerprint and scenario pin byte-identical, and the
-  measured sustained-load execution cost dropped p50 1.24 -> 0.51
-  ms/window with identical trace digests).
+  scenario, engine-side attribution only: cold window 18 events /
+  6880 bytes on a fresh spine, warm window 9 / 3024 in steady state,
+  against 87 / 12990 for the SAME scenario measured on the
+  pre-optimization implementation; every fingerprint and scenario pin
+  byte-identical, and the measured sustained-load execution cost
+  dropped p50 1.24 -> 0.51 ms/window with identical trace digests).
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
