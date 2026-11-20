@@ -1175,3 +1175,299 @@ fn cover_hides_the_player_from_the_adversary() {
          occlusion (the query the LOS pair pins) kept it from aggroing"
     );
 }
+
+// ==================================================== the C4-R2/R3 corrective battery
+// (the final-review corrective: the dormant wave-2 damageability MAJOR and
+// the empty-population victory MINOR. The inactive-body POLICY chosen and
+// documented: a dormant, not-yet-activated adversary's body is a
+// NON-DAMAGEABLE PHYSICAL OBSTRUCTION — it intercepts rays (collide-what-
+// you-see: the visible body is physically present) but the encounter's
+// damage policy refuses to route weapon damage to it before ITS activation
+// event, with honest feedback. The reusable engine's dormant-damage
+// capability (apply_player_hit on a dormant adversary) is PRESERVED —
+// other scenarios may intentionally attack inactive characters; this is
+// the ENCOUNTER-COMPOSITION layer's two-wave policy.)
+
+/// Places the player 4 m from a target along the first cardinal offset
+/// with a CLEAR eye-to-body line (deterministic: the seeded positions
+/// are fixed; the test self-validates its setup by asserting the
+/// chosen line is clear).
+fn park_with_clear_line(demo: &mut EncounterDemo, target: [f32; 3]) {
+    let eye_height = demo.driver.config().eye_height;
+    let body_eye = [target[0], target[1] + 1.0, target[2]];
+    let world = engine_slice::encounter_demo::encounter_arena_world();
+    let offsets: [[f32; 3]; 4] = [
+        [0.0, 0.0, 4.0],
+        [0.0, 0.0, -4.0],
+        [4.0, 0.0, 0.0],
+        [-4.0, 0.0, 0.0],
+    ];
+    for offset in offsets {
+        let stand = [target[0] + offset[0], 0.0, target[2] + offset[2]];
+        let eye = [stand[0], eye_height, stand[2]];
+        let clear = world.segment_hit(eye, body_eye, 0.0).is_none()
+            && world.segment_hit(body_eye, eye, 0.0).is_none();
+        if clear {
+            demo.driver.state_mut().position = stand;
+            // Face the target: the engine's look at yaw θ is
+            // (−sin θ, 0, −cos θ); the direction to the target is
+            // −offset/|offset|, so sin θ = offset_x/|offset| and
+            // cos θ = offset_z/|offset| — yaw = atan2(offset_x,
+            // offset_z).
+            let yaw = f32::atan2(offset[0], offset[2]);
+            demo.driver.state_mut().yaw = yaw;
+            return;
+        }
+    }
+    panic!("no clear 4 m cardinal line to the target {target:?}");
+}
+
+/// C4-R2 regressions 1+2+3+5 — THE CORE: wave 1 active, wave 2 dormant;
+/// aim at a dormant wave-2 adversary from a clear position through the
+/// REAL fire mapping and damage-application path; fire the PRECISION
+/// weapon: zero unauthorized health loss, no defeat transition, no
+/// premature activation — the dormant body absorbs the shot with honest
+/// feedback. (The fail-first form at the reviewed candidate d021b43:
+/// this test FAILED there — the precision shot wounded the dormant
+/// body, the exact defect.)
+#[test]
+fn dormant_wave2_is_not_damageable_by_the_precision_weapon() {
+    let mut demo = EncounterDemo::new();
+    // Wave 1 active, wave 2 dormant (regression 2).
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (dormant protection)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate wave 1",
+    );
+    let wave1 = demo.config().wave1_count;
+    for index in wave1..demo.spine.world().count() {
+        assert_eq!(
+            demo.spine.world().adversary(index).state,
+            engine_core::adversary::AdversaryState::Dormant,
+            "wave-2 adversary {index} is dormant before line B"
+        );
+    }
+    // Aim at the dormant adversary `wave1` from a clear position
+    // (regression 3) through the real fire path (regression 1's path).
+    let target_position = demo.spine.world().adversary(wave1).position;
+    let health_before = demo.spine.world().adversary(wave1).health.current;
+    park_with_clear_line(&mut demo, target_position);
+    demo.tick(idle(), true);
+    // The shot fired and was ABSORBED by the dormant body (the honest
+    // feedback), with ZERO unauthorized effects (regression 5).
+    assert_eq!(
+        demo.encounter.counters.fires, 1,
+        "the precision shot fired through the real path"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(wave1).health.current,
+        health_before,
+        "the dormant body takes ZERO weapon damage before its activation"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(wave1).state,
+        engine_core::adversary::AdversaryState::Dormant,
+        "no defeat transition and no premature activation"
+    );
+    assert_eq!(demo.spine.world().adversary(wave1).attacks_emitted, 0);
+    assert_eq!(
+        demo.encounter.counters.hits, 0,
+        "the absorbed shot is not a damageable hit"
+    );
+    assert_eq!(demo.encounter.counters.blocked, 1);
+    let last = demo.encounter.events.last().expect("the feedback line");
+    assert!(
+        last.1.contains("DORMANT body of adversary") && last.1.contains("absorbs the shot"),
+        "the honest absorbed-shot feedback: {:?}",
+        last
+    );
+    // The other dormant body is equally protected.
+    if wave1 + 1 < demo.spine.world().count() {
+        let other = wave1 + 1;
+        let other_position = demo.spine.world().adversary(other).position;
+        let other_health = demo.spine.world().adversary(other).health.current;
+        park_with_clear_line(&mut demo, other_position);
+        // Wait out the precision cooldown, then fire again.
+        while demo.tick_index() < demo.arsenal.ready_at(WeaponId::Precision) {
+            demo.tick(idle(), false);
+        }
+        demo.tick(idle(), true);
+        assert_eq!(
+            demo.spine.world().adversary(other).health.current,
+            other_health,
+            "every dormant body is protected"
+        );
+    }
+}
+
+/// C4-R2 regression 4 — the SPREAD weapon at a dormant target: multiple
+/// rays intersecting the dormant body are ALL absorbed, the per-ray
+/// damage model never routes, and the volley's feedback is honest.
+#[test]
+fn dormant_wave2_is_not_damageable_by_the_spread_weapon() {
+    let mut demo = EncounterDemo::new();
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (spread protection)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate wave 1 (spread)",
+    );
+    let wave1 = demo.config().wave1_count;
+    let target_position = demo.spine.world().adversary(wave1).position;
+    let health_before = demo.spine.world().adversary(wave1).health.current;
+    park_with_clear_line(&mut demo, target_position);
+    demo.apply_selection(WeaponId::Spread);
+    demo.tick(idle(), true);
+    assert_eq!(
+        demo.encounter.counters.fires, 1,
+        "the spread volley fired through the real path"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(wave1).health.current,
+        health_before,
+        "the dormant body takes ZERO spread damage (no per-ray routing)"
+    );
+    assert_eq!(
+        demo.spine.world().adversary(wave1).state,
+        engine_core::adversary::AdversaryState::Dormant,
+        "no defeat transition, no premature activation"
+    );
+    // NOTE: the volley's OTHER rays may legitimately damage ACTIVATED
+    // wave-1 adversaries converging nearby (the protection is the
+    // dormant body's, not the whole volley's) — the health assert
+    // above is the protection proof; the counters scope to it.
+    // Multiple rays of the 5-ray fan intersecting the dormant body at
+    // 4 m are each absorbed (the blocked counter and the per-ray
+    // feedback carry them).
+    assert!(
+        demo.encounter.counters.blocked >= 1,
+        "the fan's intersecting rays are absorbed: {}",
+        demo.encounter.counters.blocked
+    );
+    let absorbed_lines = demo
+        .encounter
+        .events
+        .iter()
+        .filter(|(_, line)| line.contains("DORMANT body") && line.contains("absorbs"))
+        .count();
+    assert!(
+        absorbed_lines >= 1,
+        "the honest per-ray absorbed feedback: {absorbed_lines} lines"
+    );
+}
+
+/// C4-R2 regression 6 — crossing line B through REAL movement makes
+/// wave 2 normally targetable: the previously-protected body takes
+/// weapon damage through the same real fire path.
+#[test]
+fn crossing_line_b_makes_wave2_attackable() {
+    let mut demo = EncounterDemo::new();
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (line B)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate wave 1 (line B)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.wave2_activated,
+        "cross line B through real movement",
+    );
+    // Wave 2 wakes on its cadence; wait for the first wave-2 adversary
+    // to leave DORMANT, then fire at it from a clear position.
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| {
+            d.spine.world().adversary(d.config().wave1_count).state
+                != engine_core::adversary::AdversaryState::Dormant
+        },
+        "wave 2 wakes",
+    );
+    let wave1 = demo.config().wave1_count;
+    let target_position = demo.spine.world().adversary(wave1).position;
+    let health_before = demo.spine.world().adversary(wave1).health.current;
+    park_with_clear_line(&mut demo, target_position);
+    while demo.tick_index() < demo.arsenal.ready_at(WeaponId::Precision) {
+        demo.tick(idle(), false);
+    }
+    demo.tick(idle(), true);
+    assert_eq!(demo.encounter.counters.fires, 1);
+    assert!(
+        demo.spine.world().adversary(wave1).health.current < health_before,
+        "the ACTIVATED wave-2 adversary takes normal weapon damage"
+    );
+    assert_eq!(demo.encounter.counters.hits, 1);
+}
+
+/// C4-R3 — the empty-population victory boundary: an encounter with
+/// ZERO adversaries never declares victory (the engine's
+/// `all_defeated()` refuses an empty world; the encounter now uses
+/// that read). The encounter constructs, activates at line A, and
+/// honestly stays Active — no panic, no silent win.
+#[test]
+fn empty_population_never_wins() {
+    let mut config = encounter_single_config();
+    config.adversary_count = 0;
+    config.wave1_count = 0;
+    let mut demo = EncounterDemo::new_with_config(config);
+    assert_eq!(demo.spine.world().count(), 0);
+    // The engine read itself refuses the empty world.
+    assert!(
+        !demo.spine.world().all_defeated(),
+        "the engine's all_defeated refuses an empty world"
+    );
+    run_until(
+        &mut demo,
+        idle(),
+        false,
+        |d| d.driver.state().on_ground,
+        "settle (empty)",
+    );
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate the empty encounter",
+    );
+    // Two hundred ticks: no victory, no panic — the honest unresolved
+    // state (nothing to defeat is not victory).
+    for _ in 0..200 {
+        demo.tick(idle(), false);
+    }
+    assert_eq!(
+        demo.encounter.phase,
+        EncounterPhase::Active,
+        "an empty population never wins"
+    );
+    assert_eq!(demo.encounter.terminal, None, "no terminal record");
+}
