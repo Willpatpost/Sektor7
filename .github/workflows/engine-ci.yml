@@ -2,7 +2,13 @@ name: engine-ci
 
 on:
   push:
-    branches: [main, stage5, macos-port]
+    # s7-perf-hardening (perf batch 1): a CANDIDATE-VALIDATION trigger,
+    # added on this branch only so the five-job gates produce measured
+    # Linux/macOS actuals at the exact candidate SHA (the independent
+    # review's P1: cross-platform evidence must be measured, not
+    # inferred). REMOVED at integration — the merged workflow keeps
+    # only the mainline branches.
+    branches: [main, stage5, macos-port, s7-perf-hardening]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
@@ -262,11 +268,15 @@ jobs:
           # 1051/2/32 MEASURED locally with this step's own counting
           # (cargo exit 0, zero non-ok lines); the heavy shard MEASURED
           # unchanged at 552/6/54 with every engine-slice selftest pin
-          # byte-identical; Linux 1102 = the prior 1100 + the same 2
-          # (platform-uniform inference — this candidate run confirms it;
-          # the allocation gate's pinned count is likewise 8 on Windows
-          # and is corrected from Linux actuals if the harness adds a
-          # stray event there — never by weakening a test).
+          # byte-identical. Linux 1102 = the prior 1100 + the same 2 is
+          # a PLATFORM-UNIFORM INFERENCE, not a measurement — this
+          # candidate's own CI run (the branch trigger added for that
+          # purpose) produces the Linux actual, and a mismatch is
+          # corrected from actuals, never by weakening a test. The
+          # allocation gate's pinned values (cold 23 events/7640 bytes,
+          # warm 8/2720 on the v2 multi-dependency scenario) are
+          # Windows-measured; the same CI run confirms them on
+          # Linux and macOS ARM64.
           expected=1102
           if [ "$(uname -s)" != "Linux" ]; then expected=1051; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)

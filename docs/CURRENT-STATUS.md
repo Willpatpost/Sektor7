@@ -49,12 +49,16 @@ ARM64) with a five-job CI:
   contract — §8 scope); plus the perf-hardening **zero-allocation main
   path** (2026-11-20): diagnostics construction is threshold-gated
   (`Diagnostics::would_log` — a suppressed record allocates nothing),
-  handler follow-ups collect into a reused scratch, and the
-  unmet-dependency paths are allocation-free — gated by the
+  handler follow-ups collect into a reused scratch, partially-released
+  blocked events re-register in place (never removed-and-reinserted),
+  and the unmet-dependency paths are allocation-free — gated by the
   `spine_allocations` integration test (a counting global allocator
-  pinning the main path's structural allocation events at 8 for its
-  scripted scenario, down from 52 measured before the change; every
-  fingerprint and scenario pin byte-identical).
+  pinning BOTH allocation events and bytes for a multi-dependency
+  scenario: cold window 23 events / 7640 bytes on a fresh spine, warm
+  window 8 / 2720 in steady state, down from 52 events before the
+  change; every fingerprint and scenario pin byte-identical, and the
+  measured sustained-load execution cost dropped p50 1.24 -> 0.51
+  ms/window with identical trace digests).
 - **`engine-persist`** — the persistence stack: SHA-256 content-addressed
   revision store; `CanonicalMedium` boundary with **two production mediums
   carrying distinct durability contracts** — SQLiteMedium
