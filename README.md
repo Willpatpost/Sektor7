@@ -3,6 +3,15 @@
 A cyberpunk FPS-RPG set in one neon night-district — fixer jobs, ripperdoc
 chrome, hovercars, and mercs who don't ask questions.
 
+> **The engine has its own repo now.** The original engine built in
+> this repository was extracted on 2026-11-20 (main @ `2640b64`) into
+> [**PostRust**](https://github.com/Willpatpost/PostRust) — with its
+> full commit history, tests, and five-job CI. This repository is the
+> **game**: the design reference below, the Godot main line, and the
+> game design docs. The engine's pre-extraction history remains
+> preserved in this repository's git history and branches; all engine
+> development happens in PostRust.
+
 This repo holds two lines of the same game:
 
 - **`browser/`** — the original Three.js + Vite vertical slice. Complete,
