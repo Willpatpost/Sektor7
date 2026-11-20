@@ -2,13 +2,12 @@ name: engine-ci
 
 on:
   push:
-    # s7-perf-hardening (perf batch 1): a CANDIDATE-VALIDATION trigger,
-    # added on this branch only so the five-job gates produce measured
-    # Linux/macOS actuals at the exact candidate SHA (the independent
-    # review's P1: cross-platform evidence must be measured, not
-    # inferred). REMOVED at integration — the merged workflow keeps
-    # only the mainline branches.
-    branches: [main, stage5, macos-port, s7-perf-hardening]
+    # s7-perf-integration (perf batch 1 → Cycle-5 main): a
+    # CANDIDATE-VALIDATION trigger, added on this branch only so the
+    # five-job gates produce measured Linux/macOS actuals at the exact
+    # candidate SHA. REMOVED at the merge to main — the merged workflow
+    # keeps only the mainline branches.
+    branches: [main, stage5, macos-port, s7-perf-integration]
     paths:
       - "engine/**"
       - ".github/workflows/engine-ci.yml"
