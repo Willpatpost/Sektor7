@@ -623,7 +623,18 @@ pub fn camera_pose_obstructed(
     config: &PlayerConfig,
     world: &CollisionWorld,
 ) -> CameraPose {
-    let mut pose = camera_pose(state, config);
+    constrain_camera_pose(camera_pose(state, config), state, config, world)
+}
+
+/// Apply the player's camera collision policy to a caller's desired world pose.
+/// Shoulder offsets and other view translations must precede this query so
+/// the complete eye-to-camera segment is tested against the same geometry.
+pub fn constrain_camera_pose(
+    mut pose: CameraPose,
+    state: &PlayerState,
+    config: &PlayerConfig,
+    world: &CollisionWorld,
+) -> CameraPose {
     if state.camera_mode != CameraMode::ThirdPerson {
         return pose;
     }

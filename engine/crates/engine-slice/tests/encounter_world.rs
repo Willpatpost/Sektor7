@@ -20,6 +20,9 @@ use engine_slice::encounter_demo::{
     encounter_single_config, run_encounter_failure_headless, run_encounter_wave_failure_headless,
     run_encounter_wave_winnable_headless, run_encounter_winnable, run_encounter_winnable_headless,
 };
+use engine_slice::encounter_events::{
+    EVENT_CAPACITY, MAX_EVENT_AGE_TICKS, PresentationEvent, RayImpact, Volley,
+};
 
 fn idle() -> MoveIntent {
     MoveIntent::default()
@@ -30,6 +33,222 @@ fn forward() -> MoveIntent {
         forward: 1,
         ..idle()
     }
+}
+
+fn take_events(demo: &mut EncounterDemo) -> Vec<(u64, PresentationEvent)> {
+    let now = demo.tick_index();
+    let mut events = Vec::new();
+    demo.encounter
+        .presentation
+        .drain(now, |tick, event| events.push((tick, event.clone())));
+    events
+}
+
+fn one_volley(demo: &mut EncounterDemo) -> Volley {
+    let mut volleys = take_events(demo).into_iter().filter_map(|(_, e)| match e {
+        PresentationEvent::Fired(volley) => Some(volley),
+        _ => None,
+    });
+    let fired = volleys.next().expect("one accepted trigger pull");
+    assert!(volleys.next().is_none());
+    fired
+}
+
+#[test]
+fn typed_volley_follows_one_trigger_and_uses_the_resolved_body_point() {
+    use engine_slice::encounter_demo::{ADVERSARY_ID_BASE, adversary_body};
+    let mut config = encounter_single_config();
+    config.adversary_speed = 0.0;
+    let mut demo = EncounterDemo::new_with_config(config);
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate",
+    );
+    let target = demo.spine.world().adversary(0).position;
+    park_with_clear_line(&mut demo, target);
+    take_events(&mut demo);
+    demo.tick(idle(), true);
+    let first_tick = demo.tick_index();
+    let precision = one_volley(&mut demo);
+    assert_eq!(
+        (precision.id, precision.weapon, precision.origin),
+        (1, WeaponId::Precision, demo.eye())
+    );
+    assert_eq!(precision.rays.len(), 1);
+    assert_eq!(precision.rays[0].direction, precision.aim);
+    assert_eq!(
+        precision.rays[0].impact,
+        RayImpact::Adversary {
+            target: ADVERSARY_ID_BASE,
+            damaged: true,
+            defeated: false
+        }
+    );
+    let (_, max) = adversary_body(target);
+    let contact = precision.rays[0].endpoint;
+    assert_eq!(&contact[..2], &demo.eye()[..2]);
+    assert!(
+        (contact[2] - max[2]).abs() < 1e-5,
+        "ray stops at the target's front face: {contact:?}"
+    );
+    demo.apply_selection(WeaponId::Spread);
+    demo.apply_selection(WeaponId::Spread);
+    demo.tick(idle(), true);
+    let second_tick = demo.tick_index();
+    let emitted = take_events(&mut demo);
+    assert_eq!(
+        emitted[0],
+        (first_tick, PresentationEvent::Switched(WeaponId::Spread))
+    );
+    let [(tick, PresentationEvent::Fired(spread))] = &emitted[1..] else {
+        panic!("one volley after one switch: {emitted:?}")
+    };
+    assert_eq!(
+        (*tick, spread.id, spread.weapon),
+        (second_tick, 2, WeaponId::Spread)
+    );
+    assert_eq!(spread.rays.len(), 5);
+    assert_eq!(spread.rays[2].direction, precision.aim);
+    assert!(
+        spread
+            .rays
+            .windows(2)
+            .all(|r| r[0].direction != r[1].direction)
+    );
+    demo.apply_selection(WeaponId::Precision);
+    demo.tick(idle(), true);
+    assert_eq!(
+        take_events(&mut demo),
+        vec![(
+            second_tick,
+            PresentationEvent::Switched(WeaponId::Precision)
+        )]
+    );
+    assert_eq!(
+        demo.arsenal.ready_at(WeaponId::Precision),
+        first_tick + config.weapon_cooldown_ticks
+    );
+    assert_eq!(
+        demo.arsenal.ready_at(WeaponId::Spread),
+        second_tick + config.spread_cooldown_ticks
+    );
+}
+
+#[test]
+fn typed_cover_range_and_clear_results_stop_at_their_respective_endpoints() {
+    use engine_slice::encounter_demo::encounter_arena_world;
+    let mut config = encounter_single_config();
+    config.adversary_spawn = [-5.0, 0.0, -9.0];
+    config.adversary_speed = 0.0;
+    config.spread_range = 1.0;
+    config.spread_cooldown_ticks = 1;
+    let mut demo = EncounterDemo::new_with_config(config);
+    run_until(
+        &mut demo,
+        forward(),
+        false,
+        |d| d.encounter.phase == EncounterPhase::Active,
+        "activate",
+    );
+    let target = demo.spine.world().adversary(0).position;
+    let stand = [-5.5, 0.0, -1.0];
+    demo.driver.state_mut().position = stand;
+    demo.driver.state_mut().yaw = (stand[0] - target[0]).atan2(stand[2] - target[2]);
+    demo.tick(idle(), true);
+    let covered = one_volley(&mut demo);
+    let ray = covered.rays[0];
+    assert_eq!(ray.impact, RayImpact::Cover);
+    let end = std::array::from_fn(|i| covered.origin[i] + covered.aim[i] * config.weapon_range);
+    let t = encounter_arena_world()
+        .segment_hit(covered.origin, end, 0.0)
+        .expect("rotated slab blocks the target");
+    for (i, endpoint) in ray.endpoint.iter().enumerate() {
+        assert!(
+            (endpoint - (covered.origin[i] + covered.aim[i] * (t * config.weapon_range))).abs()
+                < 1e-4
+        );
+    }
+    assert!(
+        ray.endpoint[2] > target[2],
+        "cover intercepts in front of target"
+    );
+    park_with_clear_line(&mut demo, target);
+    demo.apply_selection(WeaponId::Spread);
+    demo.tick(idle(), true);
+    let short = one_volley(&mut demo);
+    assert_eq!(short.rays[2].impact, RayImpact::OutOfRange);
+    assert!(short.rays.iter().any(|ray| ray.impact == RayImpact::Miss));
+    for ray in &short.rays {
+        let delta = std::array::from_fn::<_, 3, _>(|i| ray.endpoint[i] - short.origin[i]);
+        let distance = delta.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (distance - config.spread_range).abs() < 1e-5,
+            "finite range for non-unit rays"
+        );
+    }
+}
+
+#[test]
+fn stalled_consumers_drop_whole_volleys_and_reset_discards_previous_round() {
+    let mut config = encounter_single_config();
+    config.adversary_count = 0;
+    config.spread_cooldown_ticks = 0;
+    config.spread_rays = engine_core::MAX_SPREAD_RAYS;
+    let mut stalled = EncounterDemo::new_with_config(config);
+    let mut live = EncounterDemo::new_with_config(config);
+    for demo in [&mut stalled, &mut live] {
+        run_until(
+            demo,
+            forward(),
+            false,
+            |d| d.encounter.phase == EncounterPhase::Active,
+            "activate",
+        );
+        demo.apply_selection(WeaponId::Spread);
+        take_events(demo);
+    }
+    let prior = stalled.encounter.presentation.stats();
+    for _ in 0..2 * EVENT_CAPACITY {
+        stalled.tick(idle(), true);
+        live.tick(idle(), true);
+        let delivered = one_volley(&mut live);
+        assert_eq!(delivered.rays.len(), config.spread_rays as usize);
+    }
+    let before = stalled.encounter.presentation.stats();
+    assert_eq!(before.queued, EVENT_CAPACITY);
+    assert_eq!(before.dropped - prior.dropped, EVENT_CAPACITY as u64);
+    let seen = take_events(&mut stalled);
+    assert_eq!(seen.len(), MAX_EVENT_AGE_TICKS as usize);
+    assert_eq!(
+        stalled.encounter.presentation.stats().stale - prior.stale,
+        EVENT_CAPACITY as u64 - MAX_EVENT_AGE_TICKS
+    );
+    for (i, (_, event)) in seen.iter().enumerate() {
+        let PresentationEvent::Fired(shot) = event else {
+            panic!("expected a volley")
+        };
+        assert_eq!(shot.id as usize, 2 * EVENT_CAPACITY - seen.len() + i + 1);
+        assert_eq!(
+            shot.rays.len(),
+            config.spread_rays as usize,
+            "every surviving volley is complete"
+        );
+    }
+    assert_eq!(
+        encounter_fingerprint_hex(&stalled),
+        encounter_fingerprint_hex(&live)
+    );
+    stalled.tick(idle(), true);
+    stalled.reset();
+    assert_eq!(stalled.encounter.presentation.stats(), Default::default());
+    stalled.tick(idle(), true);
+    assert_eq!(
+        take_events(&mut stalled),
+        vec![(1, PresentationEvent::RoundStarted)]
+    );
 }
 
 /// Runs a scripted phase until the condition holds (the headless
@@ -120,6 +339,10 @@ fn pre_activation_protection_holds() {
         "the honest refusal line: {:?}",
         last
     );
+    assert!(
+        take_events(&mut demo).is_empty(),
+        "no stale banner or combat cue"
+    );
 }
 
 /// The activation: crossing the line flips the phase AND the
@@ -174,10 +397,22 @@ fn terminal_freeze_after_won() {
     let adversary_state = demo.spine.world().adversary(0).state;
     let spine_clock = demo.spine_clock().0;
     let events_len = demo.encounter.events.len();
+    assert!(
+        take_events(&mut demo)
+            .iter()
+            .any(|(tick, e)| *tick == won_tick
+                && matches!(
+                    e,
+                    PresentationEvent::Terminal(
+                        engine_slice::encounter_demo::EncounterOutcome::Won
+                    )
+                ))
+    );
     // Fifty post-terminal ticks WITH fire presses: nothing may move.
     for _ in 0..50 {
         demo.tick(idle(), true);
     }
+    assert!(take_events(&mut demo).is_empty());
     assert_eq!(demo.encounter.phase, EncounterPhase::Won { tick: won_tick });
     assert_eq!(demo.encounter.counters, counters, "the counters freeze");
     assert_eq!(
@@ -1371,6 +1606,21 @@ fn dormant_wave2_is_not_damageable_by_the_spread_weapon() {
         absorbed_lines >= 1,
         "the honest per-ray absorbed feedback: {absorbed_lines} lines"
     );
+    let volley = one_volley(&mut demo);
+    let dormant_id = engine_slice::encounter_demo::ADVERSARY_ID_BASE + wave1 as u32;
+    assert_eq!(volley.rays.len(), 5);
+    assert!(
+        volley
+            .rays
+            .iter()
+            .any(|r| r.impact == RayImpact::Dormant { target: dormant_id })
+    );
+    let absorbed_rays = volley
+        .rays
+        .iter()
+        .filter(|r| matches!(r.impact, RayImpact::Dormant { .. }))
+        .count();
+    assert_eq!(absorbed_rays, absorbed_lines);
 }
 
 /// C4-R2 regression 6 — crossing line B through REAL movement makes
@@ -1470,4 +1720,38 @@ fn empty_population_never_wins() {
         "an empty population never wins"
     );
     assert_eq!(demo.encounter.terminal, None, "no terminal record");
+}
+
+#[test]
+fn cover_and_body_depth_faces_have_consistent_clockwise_winding() {
+    use engine_slice::encounter_demo::{
+        ENCOUNTER_BOXES, build_encounter_vertices_into, cover_slab, push_rotated_box,
+    };
+    let check = |vertices: &[engine_renderer::scene::SceneVertex], center: [f32; 3]| {
+        for triangle in vertices.as_chunks::<3>().0 {
+            let [a, b, c] = [triangle[0].pos, triangle[1].pos, triangle[2].pos];
+            let u: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
+            let v: [f32; 3] = std::array::from_fn(|i| c[i] - a[i]);
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let orientation: f32 = (0..3).map(|i| n[i] * (a[i] - center[i])).sum();
+            assert!(
+                orientation < 0.,
+                "a face is culled from outside: {a:?} {b:?} {c:?}"
+            );
+        }
+    };
+    let mut vertices = Vec::new();
+    let slab = cover_slab();
+    push_rotated_box(&mut vertices, &slab, [1.; 3]);
+    check(&vertices, slab.center);
+    build_encounter_vertices_into(&mut vertices, &EncounterDemo::new());
+    let b = ENCOUNTER_BOXES[0];
+    check(
+        &vertices[..36],
+        std::array::from_fn(|i| (b.min[i] + b.max[i]) * 0.5),
+    );
 }

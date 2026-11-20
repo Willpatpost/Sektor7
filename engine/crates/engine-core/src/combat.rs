@@ -201,6 +201,43 @@ pub enum HitResolution {
     Refused(AttackRefusal),
 }
 
+fn unit_direction(direction: [f32; 3]) -> Result<[f32; 3], AttackRefusal> {
+    if !direction.iter().all(|v| v.is_finite()) {
+        return Err(AttackRefusal::NonFiniteDirection);
+    }
+    let [x, y, z] = direction;
+    let length = (x * x + y * y + z * z).sqrt();
+    if length == 0.0 || !length.is_finite() {
+        return Err(AttackRefusal::ZeroDirection);
+    }
+    Ok(direction.map(|v| v / length))
+}
+
+fn point_at(origin: [f32; 3], unit: [f32; 3], distance: f32) -> [f32; 3] {
+    std::array::from_fn(|i| origin[i] + unit[i] * distance)
+}
+
+impl HitResolution {
+    /// World-space end of a resolved ray. Contacts carry their actual entry
+    /// point. A clear ray ends at the original request's range, using the same
+    /// normalization as the collision segment. No collision query is performed.
+    pub fn endpoint(&self, origin: [f32; 3], direction: [f32; 3], range: f32) -> Option<[f32; 3]> {
+        let point = match *self {
+            Self::Hit { point, .. }
+            | Self::Miss {
+                kind: MissKind::Occluded { point, .. },
+            } => point,
+            Self::Miss {
+                kind: MissKind::Clear,
+            } if range.is_finite() && range >= 0.0 => {
+                point_at(origin, unit_direction(direction).ok()?, range)
+            }
+            _ => return None,
+        };
+        point.iter().all(|v| v.is_finite()).then_some(point)
+    }
+}
+
 /// Whether a box satisfies the extent validity contract: all
 /// coordinates finite, `min <= max` on every axis (shared by the
 /// target-skip rule and the public primitive's skip rule).
@@ -273,16 +310,10 @@ pub fn resolve_attack(
     if !request.origin.iter().all(|v| v.is_finite()) {
         return HitResolution::Refused(AttackRefusal::NonFiniteOrigin);
     }
-    if !request.direction.iter().all(|v| v.is_finite()) {
-        return HitResolution::Refused(AttackRefusal::NonFiniteDirection);
-    }
-    let direction_len = (request.direction[0] * request.direction[0]
-        + request.direction[1] * request.direction[1]
-        + request.direction[2] * request.direction[2])
-        .sqrt();
-    if direction_len == 0.0 || !direction_len.is_finite() {
-        return HitResolution::Refused(AttackRefusal::ZeroDirection);
-    }
+    let look = match unit_direction(request.direction) {
+        Ok(look) => look,
+        Err(reason) => return HitResolution::Refused(reason),
+    };
     if !request.profile.range.is_finite() || request.profile.range < 0.0 {
         return HitResolution::Refused(AttackRefusal::InvalidProfile(ProfileField::Range));
     }
@@ -291,16 +322,7 @@ pub fn resolve_attack(
             ProfileField::OcclusionMargin,
         ));
     }
-    let look = [
-        request.direction[0] / direction_len,
-        request.direction[1] / direction_len,
-        request.direction[2] / direction_len,
-    ];
-    let to = [
-        request.origin[0] + look[0] * request.profile.range,
-        request.origin[1] + look[1] * request.profile.range,
-        request.origin[2] + look[2] * request.profile.range,
-    ];
+    let to = point_at(request.origin, look, request.profile.range);
     // Occlusion first (the existing public exact-slab query): t in
     // [0, 1] of the segment maps to meters along the trace.
     let wall_t = world.segment_hit(request.origin, to, request.profile.occlusion_margin);
@@ -332,21 +354,13 @@ pub fn resolve_attack(
         Some((target, distance)) => HitResolution::Hit {
             target,
             distance,
-            point: [
-                request.origin[0] + look[0] * distance,
-                request.origin[1] + look[1] * distance,
-                request.origin[2] + look[2] * distance,
-            ],
+            point: point_at(request.origin, look, distance),
         },
         None => match wall_distance {
             Some(distance) => HitResolution::Miss {
                 kind: MissKind::Occluded {
                     distance,
-                    point: [
-                        request.origin[0] + look[0] * distance,
-                        request.origin[1] + look[1] * distance,
-                        request.origin[2] + look[2] * distance,
-                    ],
+                    point: point_at(request.origin, look, distance),
                 },
             },
             None => HitResolution::Miss {

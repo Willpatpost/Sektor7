@@ -392,6 +392,11 @@ jobs:
         shell: bash
         run: |
           SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_orientation -- --ignored --nocapture
+      - name: Encounter and legacy scene framebuffer regressions (Linux Vulkan)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=offscreen cargo test -p engine-slice --test render_scene_separation --test render_encounter -- --ignored --nocapture
       # (Cycle-2 corrective integration, N1 at integrator discretion) The
       # playable-world presentation smoke: the interactive demo's render
       # path under the offscreen software ICD with validation on — the

@@ -731,6 +731,14 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|arg| arg == "--benchmark-encounter") {
+        if let Err(error) = engine_slice::encounter_benchmark::run() {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if args.iter().any(|arg| arg == "--encounter") {
         // [cycle4-D] The integrated encounter (the crossfire
         // courtyard): the Cycle-4 capability-D demonstration — the

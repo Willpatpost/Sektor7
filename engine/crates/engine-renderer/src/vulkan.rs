@@ -68,6 +68,7 @@ use ash::khr;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
+use crate::SceneLayer;
 use crate::config::{
     DemoScenePreference, DynamicClamp, FRAMES_IN_FLIGHT, PresentModePreference, RenderConfig,
     dynamic_geometry_clamp, resolve_present_mode,
@@ -1589,48 +1590,6 @@ impl PipelineState {
         Ok(())
     }
 
-    /// Writes overlay vertices into the frame slot's region of the
-    /// persistently mapped buffer (corrective finding B): each slot owns
-    /// a disjoint byte range, and the caller writes a slot's region only
-    /// after that slot's fence wait, so in-flight submissions never read
-    /// a region being rewritten. The copy length is the frame's ONE
-    /// capacity decision (`drawn` — F-03 Step 1): the draw consumes the
-    /// same value, so the copy can never disagree with the draw and can
-    /// never leave the slot.
-    pub(crate) fn write_overlay(&mut self, slot: usize, vertices: &[OverlayVertex], drawn: u32) {
-        let slot_bytes = self.overlay_slot_bytes as usize;
-        let byte_len = drawn as usize * std::mem::size_of::<OverlayVertex>();
-        debug_assert!(byte_len <= slot_bytes);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                vertices.as_ptr() as *const u8,
-                (self.overlay_mapped as *mut u8).add(slot * slot_bytes),
-                byte_len,
-            );
-        }
-    }
-
-    /// Writes one frame slot's dynamic region-scene vertices into that
-    /// slot's disjoint region of the persistently mapped buffer — the
-    /// same fenced-slot discipline as [`Self::write_overlay`]: called
-    /// during command recording, after this slot's fence wait, so
-    /// in-flight submissions never read a region being rewritten. The
-    /// copy length is the frame's ONE capacity decision (`drawn` —
-    /// F-03 Step 1): the draw consumes the same value, so the copy can
-    /// never disagree with the draw and can never leave the slot.
-    pub(crate) fn write_region_scene(&mut self, slot: usize, vertices: &[SceneVertex], drawn: u32) {
-        let slot_bytes = self.region_slot_bytes as usize;
-        let byte_len = drawn as usize * std::mem::size_of::<SceneVertex>();
-        debug_assert!(byte_len <= slot_bytes);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                vertices.as_ptr() as *const u8,
-                (self.region_mapped as *mut u8).add(slot * slot_bytes),
-                byte_len,
-            );
-        }
-    }
-
     pub(crate) fn destroy(&mut self, ctx: &VulkanContext) {
         unsafe {
             if !self.overlay_mapped.is_null() {
@@ -2358,6 +2317,32 @@ impl FrameState {
     }
 }
 
+/// Copies consecutive triangle batches into one fenced, persistently mapped
+/// slot. Both copy lengths and draws consume the same F-03 clamp decision.
+/// Returns the number of copied vertices from the first batch.
+///
+/// # Safety
+/// `mapped` must be the live host-coherent mapping for the buffer of `T`
+/// vertices, with at least `slot + 1` slots each holding `capacity` vertices.
+/// The caller must own this slot (its preceding GPU submission has completed).
+unsafe fn upload_layers<T: bytemuck::Pod>(
+    mapped: *mut core::ffi::c_void,
+    slot: usize,
+    capacity: u32,
+    first: &[T],
+    second: &[T],
+) -> (DynamicClamp, u32) {
+    let clamp = dynamic_geometry_clamp(first.len().saturating_add(second.len()), capacity);
+    let first_len = first.len().min(clamp.drawn as usize);
+    let second_len = clamp.drawn as usize - first_len;
+    unsafe {
+        let dest = mapped.cast::<T>().add(slot * capacity as usize);
+        std::ptr::copy_nonoverlapping(first.as_ptr(), dest, first_len);
+        std::ptr::copy_nonoverlapping(second.as_ptr(), dest.add(first_len), second_len);
+    }
+    (clamp, first_len as u32)
+}
+
 /// Outcome of one `render_frame` call.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct FrameOutcome {
@@ -2376,6 +2361,7 @@ pub(crate) struct FrameOutcome {
     /// reads 0 until the lazy region buffer allocates. Nonzero omitted
     /// counts are REPORTED upstream, never fatal here.
     pub region: DynamicClamp,
+    pub foreground_drawn: u32,
     pub overlay: DynamicClamp,
 }
 
@@ -2396,8 +2382,9 @@ pub(crate) fn render_frame(
     demo_scene: DemoScenePreference,
     view_proj: &[[f32; 4]; 4],
     region_vertices: &[SceneVertex],
-    overlay_vertices: &[OverlayVertex],
-    overlay_enabled: bool,
+    foreground: Option<SceneLayer<'_>>,
+    hud: &[OverlayVertex],
+    debug_overlay: &[OverlayVertex],
 ) -> Result<FrameOutcome, RendererError> {
     let mut outcome = FrameOutcome::default();
     let slot = frames.frame_slot;
@@ -2425,7 +2412,8 @@ pub(crate) fn render_frame(
     // allocated on first use only, outside command recording — the
     // default renderer path (no dynamic region geometry) pays no
     // allocation, mapping, or memory cost.
-    if !region_vertices.is_empty() {
+    let foreground_vertices = foreground.map_or(&[][..], |layer| layer.vertices);
+    if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
         pipes.ensure_region_capacity(ctx)?;
     }
 
@@ -2602,12 +2590,51 @@ pub(crate) fn render_frame(
             },
         },
     ];
+    // Both scene layers fit in the existing mapped slot. Copy directly from
+    // their retained application buffers without concatenating CPU geometry.
+    let mut world_drawn = 0;
+    if !region_vertices.is_empty() || !foreground_vertices.is_empty() {
+        (outcome.region, world_drawn) = unsafe {
+            upload_layers(
+                pipes.region_mapped,
+                slot,
+                pipes.region_capacity,
+                region_vertices,
+                foreground_vertices,
+            )
+        };
+        outcome.foreground_drawn = outcome.region.drawn - world_drawn;
+    }
+    outcome.overlay.capacity = pipes.overlay_capacity;
+    if !hud.is_empty() || !debug_overlay.is_empty() {
+        (outcome.overlay, _) = unsafe {
+            upload_layers(
+                pipes.overlay_mapped,
+                slot,
+                pipes.overlay_capacity,
+                hud,
+                debug_overlay,
+            )
+        };
+    }
+
+    // Disjoint window-depth intervals allow self-occlusion in both layers
+    // using one depth attachment, without a clear, barrier or extra pass.
+    // The gap at the boundary also accommodates fixed-point depth formats.
+    // Even D16 gives a viewmodel 4096 depth levels. Leave one full
+    // D16 quantum between intervals, including both clip-plane endpoints.
+    const FOREGROUND_MAX_DEPTH: f32 = 1.0 / 16.0;
+    let world_min_depth = if outcome.foreground_drawn > 0 {
+        FOREGROUND_MAX_DEPTH + 1.0 / 65535.0
+    } else {
+        0.0
+    };
     let viewport = vk::Viewport {
         x: 0.0,
         y: 0.0,
         width: extent.width as f32,
         height: extent.height as f32,
-        min_depth: 0.0,
+        min_depth: world_min_depth,
         max_depth: 1.0,
     };
     let scissor = vk::Rect2D {
@@ -2676,37 +2703,33 @@ pub(crate) fn render_frame(
                 .cmd_draw_indexed(command, pipes.scene_index_count, 1, 0, 0, 0);
         }
 
-        // Dynamic region scene (Stage 4 graphical integration): drawn
-        // through the already-bound scene pipeline (same vertex layout
-        // and view-projection push constants) from the per-slot
-        // persistently mapped buffer — the overlay's fenced-slot
-        // dynamic-update pattern applied to scene geometry.
-        //
-        // F-03 Step 1 (fail-visible over fail-silent): ONE capacity
-        // decision per frame per buffer, computed HERE at the record
-        // step and held in one local that BOTH the upload bound and the
-        // draw count consume — one physical truncation is counted
-        // exactly once (the two historical silent min() clamps can
-        // neither disagree nor double-count), no out-of-bounds copy, no
-        // inflated draw count. The overlay buffer always exists (its
-        // capacity is reportable on every recorded frame); the region
-        // buffer is lazy — its capacity reads 0 until the first
-        // non-empty region frame.
-        outcome.overlay.capacity = pipes.overlay_capacity;
-        if !region_vertices.is_empty() {
-            let clamp = dynamic_geometry_clamp(region_vertices.len(), pipes.region_capacity);
-            pipes.write_region_scene(slot, region_vertices, clamp.drawn);
-            outcome.region = clamp;
+        if outcome.region.drawn > 0 {
             let region_offset = (slot as vk::DeviceSize) * pipes.region_slot_bytes;
             ctx.device
                 .cmd_bind_vertex_buffers(command, 0, &[pipes.region_vbo], &[region_offset]);
-            ctx.device.cmd_draw(command, clamp.drawn, 1, 0, 0);
+            if world_drawn > 0 {
+                ctx.device.cmd_draw(command, world_drawn, 1, 0, 0);
+            }
+            if let Some(layer) = foreground.filter(|_| outcome.foreground_drawn > 0) {
+                let near_viewport = vk::Viewport {
+                    min_depth: 0.0,
+                    max_depth: FOREGROUND_MAX_DEPTH,
+                    ..viewport
+                };
+                ctx.device.cmd_set_viewport(command, 0, &[near_viewport]);
+                ctx.device.cmd_push_constants(
+                    command,
+                    pipes.scene_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(layer.view_proj),
+                );
+                ctx.device
+                    .cmd_draw(command, outcome.foreground_drawn, 1, world_drawn, 0);
+            }
         }
 
-        if overlay_enabled && !overlay_vertices.is_empty() {
-            let clamp = dynamic_geometry_clamp(overlay_vertices.len(), pipes.overlay_capacity);
-            pipes.write_overlay(slot, overlay_vertices, clamp.drawn);
-            outcome.overlay = clamp;
+        if outcome.overlay.drawn > 0 {
             ctx.device.cmd_bind_pipeline(
                 command,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -2715,7 +2738,7 @@ pub(crate) fn render_frame(
             let overlay_offset = (slot as vk::DeviceSize) * pipes.overlay_slot_bytes;
             ctx.device
                 .cmd_bind_vertex_buffers(command, 0, &[pipes.overlay_vbo], &[overlay_offset]);
-            ctx.device.cmd_draw(command, clamp.drawn, 1, 0, 0);
+            ctx.device.cmd_draw(command, outcome.overlay.drawn, 1, 0, 0);
         }
 
         ctx.device.cmd_end_render_pass(command);
@@ -3062,6 +3085,28 @@ pub(crate) fn consume_recreate(needs_recreate: &mut bool) -> bool {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn layered_upload_preserves_order_truncation_and_neighboring_slots() {
+        // Use canaries in the surrounding slots; this exercises the exact
+        // pointer arithmetic and F-03 decision used by both vertex buffers.
+        let mut storage = [0u32; 12];
+        for (first, second, expected, first_count, omitted) in [
+            (&[10, 11][..], &[20, 21, 22][..], [10, 11, 20, 21], 2, 1),
+            (&[1, 2, 3, 4, 5], &[8], [1, 2, 3, 4], 4, 2),
+            (&[], &[3, 4], [3, 4, 0, 0], 0, 0),
+        ] {
+            storage.fill(0);
+            let (decision, split) =
+                unsafe { super::upload_layers(storage.as_mut_ptr().cast(), 1, 4, first, second) };
+            assert_eq!(&storage[4..8], &expected);
+            assert_eq!(&storage[..4], &[0; 4]);
+            assert_eq!(&storage[8..], &[0; 4]);
+            assert_eq!(split, first_count);
+            assert_eq!(decision.truncated, omitted);
+            assert_eq!(decision.supplied, decision.drawn + omitted);
+        }
+    }
 
     #[test]
     fn timestamp_gate_requires_support_and_a_resolved_sample() {

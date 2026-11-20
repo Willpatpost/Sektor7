@@ -7,12 +7,35 @@ use ash::vk;
 use sdl3::video::Window as SdlWindow;
 
 use crate::config::{RenderConfig, present_mode_str};
-use crate::overlay::build_overlay_vertices_into;
+use crate::overlay::{OverlayVertex, build_overlay_vertices_into};
 use crate::scene::SceneVertex;
 use crate::vulkan::{
     self, CapturedFrame, FrameState, PipelineState, RendererError, SwapchainState, VulkanContext,
     drain_validation_messages, pick_depth_format, pick_surface_format,
 };
+
+/// A batch of triangles with its own transform into clip space. A
+/// foreground batch typically supplies camera-local vertices and a projection.
+#[derive(Debug, Clone, Copy)]
+pub struct SceneLayer<'a> {
+    pub vertices: &'a [SceneVertex],
+    pub view_proj: &'a [[f32; 4]; 4],
+}
+
+/// Actual dynamic uploads and draws recorded in this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryStats {
+    /// World plus foreground vertices.
+    pub scene_drawn: u32,
+    /// Portion of `scene_drawn` used by the foreground.
+    pub foreground_drawn: u32,
+    /// HUD plus diagnostic vertices.
+    pub overlay_drawn: u32,
+    pub scene_omitted: u32,
+    pub overlay_omitted: u32,
+    pub dynamic_draw_calls: u32,
+    pub uploaded_bytes: u64,
+}
 
 /// Per-frame result surfaced to the application.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -25,6 +48,7 @@ pub struct FrameResult {
     /// poll and try again next frame.
     pub deferred: bool,
     pub gpu_render_ms: Option<f64>,
+    pub geometry: GeometryStats,
 }
 
 /// Long-lived renderer statistics (Stage 2 authorization, item 4).
@@ -229,17 +253,41 @@ impl Renderer {
         overlay_text: Option<&str>,
         window_size: (u32, u32),
     ) -> Result<FrameResult, RendererError> {
+        self.render_layers(
+            view_proj,
+            region_scene,
+            None,
+            &[],
+            overlay_text,
+            window_size,
+        )
+    }
+
+    /// Draws the world, an optional foreground with independent depth,
+    /// and one screen-space batch. World and foreground share the same
+    /// scene slot, in that order. HUD and diagnostics share the overlay
+    /// slot in that order. All supplied batches are triangle lists (three
+    /// vertices per primitive). The diagnostics toggle controls only the text.
+    pub fn render_layers(
+        &mut self,
+        view_proj: &[[f32; 4]; 4],
+        world: &[SceneVertex],
+        foreground: Option<SceneLayer<'_>>,
+        hud: &[OverlayVertex],
+        debug_text: Option<&str>,
+        window_size: (u32, u32),
+    ) -> Result<FrameResult, RendererError> {
         // The F-05 overlay-vertex reuse (the audit's measured
         // candidate): the glyph vertices are rebuilt into the
         // renderer's own retained buffer — the capacity from the
         // first frames is reused every frame (no per-frame
         // allocation or growth; the vertex content is identical).
         if self.overlay_enabled {
-            if let Some(text) = overlay_text {
+            if let Some(text) = debug_text {
                 build_overlay_vertices_into(
                     &mut self.overlay_vertices,
                     text,
-                    (self.swapchain.extent.width, self.swapchain.extent.height),
+                    window_size,
                     self.overlay_color,
                 );
             } else {
@@ -259,9 +307,10 @@ impl Renderer {
             self.config.replace_pipelines,
             self.config.demo_scene,
             view_proj,
-            region_scene,
+            world,
+            foreground,
+            hud,
             overlay,
-            self.overlay_enabled,
         )?;
         // F-03 Step 1: accumulate the frame's capacity decisions —
         // cumulative omitted vertices, peak supplied, and the per-slot
@@ -321,6 +370,18 @@ impl Renderer {
             suboptimal: outcome.suboptimal,
             deferred: outcome.deferred,
             gpu_render_ms: outcome.gpu_render_ms,
+            geometry: GeometryStats {
+                scene_drawn: outcome.region.drawn,
+                foreground_drawn: outcome.foreground_drawn,
+                overlay_drawn: outcome.overlay.drawn,
+                scene_omitted: outcome.region.truncated,
+                overlay_omitted: outcome.overlay.truncated,
+                dynamic_draw_calls: u32::from(outcome.region.drawn > outcome.foreground_drawn)
+                    + u32::from(outcome.foreground_drawn > 0)
+                    + u32::from(outcome.overlay.drawn > 0),
+                uploaded_bytes: u64::from(outcome.region.drawn) * size_of::<SceneVertex>() as u64
+                    + u64::from(outcome.overlay.drawn) * size_of::<OverlayVertex>() as u64,
+            },
         })
     }
 

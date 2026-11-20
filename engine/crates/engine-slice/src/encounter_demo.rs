@@ -54,11 +54,12 @@ use engine_renderer::{
     DemoScenePreference, PresentModePreference, RenderConfig, Renderer, ValidationPreference,
 };
 use engine_shell::{
-    Audio, AudioStatus, Cue, DriverPreference, InputSnapshot, Keycode, MouseButton, ShellApp,
+    Audio, AudioStatus, DriverPreference, InputSnapshot, Keycode, MouseButton, ShellApp,
     ShellConfig,
 };
 
-use crate::combat_demo::{health_bar, overlay_ascii};
+use crate::encounter_events::{PresentationEvent, PresentationStream, RayFact, RayImpact, Volley};
+use crate::encounter_frame::EncounterFrame;
 use crate::frame_timing::FrameTiming;
 use crate::math;
 use crate::playable_demo::{map_playable_input, playable_player_config};
@@ -547,6 +548,8 @@ pub struct EncounterState {
     /// (tick, line) — the deterministic event log, labels per the
     /// ratified EVENT-TIMESTAMPS contract (round-scoped, 1-based).
     pub events: Vec<(u64, String)>,
+    /// Disposable render/audio output, outside the authoritative fingerprint.
+    pub presentation: PresentationStream,
     /// The immutable terminal record, captured once at the freeze.
     pub terminal: Option<TerminalRecord>,
     /// Whether the next executed tick logs the round banner (set by
@@ -571,6 +574,7 @@ impl EncounterState {
             last_fire_line: None,
             last_selection_line: None,
             events: Vec::new(),
+            presentation: PresentationStream::default(),
             terminal: None,
             round_banner_pending: true,
         }
@@ -738,6 +742,9 @@ impl EncounterDemo {
             return;
         }
         if self.arsenal.select(weapon) {
+            self.encounter
+                .presentation
+                .push(self.ticks, PresentationEvent::Switched(weapon));
             self.encounter.last_selection_line =
                 Some(format!("weapon selected — {}", weapon_word(weapon)));
         }
@@ -935,6 +942,9 @@ impl EncounterDemo {
         //     round's FIRST executed tick — never at 0, per T1).
         if encounter.round_banner_pending {
             encounter.round_banner_pending = false;
+            encounter
+                .presentation
+                .push(tick, PresentationEvent::RoundStarted);
             Self::log(
                 encounter,
                 tick,
@@ -981,6 +991,9 @@ impl EncounterDemo {
                 format!("encounter activated — {count} adversary stirring")
             };
             Self::log(encounter, tick, activation_line);
+            encounter
+                .presentation
+                .push(tick, PresentationEvent::Activated);
         }
         if encounter.phase == EncounterPhase::Active
             && !encounter.wave2_activated
@@ -1058,6 +1071,9 @@ impl EncounterDemo {
                             Ok(DamageOutcome::Wounded { remaining, .. }) => {
                                 encounter.counters.attacks_taken += 1;
                                 encounter.last_damage_tick = Some(tick);
+                                encounter
+                                    .presentation
+                                    .push(tick, PresentationEvent::PlayerDamaged);
                                 Self::log(
                                     encounter,
                                     tick,
@@ -1071,6 +1087,9 @@ impl EncounterDemo {
                             Ok(DamageOutcome::Defeated { .. }) => {
                                 encounter.counters.attacks_taken += 1;
                                 encounter.last_damage_tick = Some(tick);
+                                encounter
+                                    .presentation
+                                    .push(tick, PresentationEvent::PlayerDamaged);
                                 Self::log(
                                     encounter,
                                     tick,
@@ -1150,6 +1169,9 @@ impl EncounterDemo {
                 }
                 if encounter.drain_remaining == 0 {
                     encounter.phase = EncounterPhase::Won { tick };
+                    encounter
+                        .presentation
+                        .push(tick, PresentationEvent::Terminal(EncounterOutcome::Won));
                     encounter.terminal = Some(TerminalRecord {
                         outcome: EncounterOutcome::Won,
                         tick,
@@ -1174,6 +1196,9 @@ impl EncounterDemo {
         //    resolves player-first via the step order above).
         if encounter.phase == EncounterPhase::Active && encounter.player.is_defeated() {
             encounter.phase = EncounterPhase::Lost { tick };
+            encounter
+                .presentation
+                .push(tick, PresentationEvent::Terminal(EncounterOutcome::Lost));
             encounter.terminal = Some(TerminalRecord {
                 outcome: EncounterOutcome::Lost,
                 tick,
@@ -1223,20 +1248,7 @@ impl EncounterDemo {
         // The target mapping (the encounter's policy): the live
         // adversary boxes, skipping DEFEATED bodies.
         let mut targets = Vec::with_capacity(spine.world().count());
-        for index in 0..spine.world().count() {
-            let adversary = spine.world().adversary(index);
-            if adversary.state == AdversaryState::Defeated {
-                continue;
-            }
-            let (body_min, body_max) = adversary_body(adversary.position);
-            targets.push(Combatant {
-                id: ADVERSARY_ID_BASE + index as u32,
-                hit_box: StaticCollider {
-                    min: body_min,
-                    max: body_max,
-                },
-            });
-        }
+        encounter_targets(&mut targets, spine.world());
         // THE CONTEXT (the contract's §3 FireContext form): THIS
         // tick's eye + look direction (camera-agnostic — the same
         // request in both camera modes), the targets, the shared
@@ -1261,6 +1273,7 @@ impl EncounterDemo {
                 encounter.counters.fires += 1;
                 let fire_index = encounter.counters.fires;
                 let volley = shots.len();
+                let mut rays = encounter.presentation.ray_buffer(volley);
                 let damage = match weapon {
                     WeaponId::Precision => config.weapon_damage,
                     WeaponId::Spread => config.spread_damage,
@@ -1275,6 +1288,7 @@ impl EncounterDemo {
                     } else {
                         format!("fire {fire_index} ray {ray}")
                     };
+                    let impact;
                     let line = match &shot.resolution {
                         HitResolution::Hit {
                             target, distance, ..
@@ -1299,6 +1313,7 @@ impl EncounterDemo {
                             // encounter-composition layer's policy.
                             if spine.world().adversary(index).state == AdversaryState::Dormant {
                                 encounter.counters.blocked += 1;
+                                impact = Some(RayImpact::Dormant { target: *target });
                                 format!(
                                     "{prefix} — the DORMANT body of adversary {index} \
                                      absorbs the shot (no damage before its activation)"
@@ -1307,6 +1322,18 @@ impl EncounterDemo {
                                 encounter.counters.hits += 1;
                                 encounter.last_hit_tick = Some(tick);
                                 let applied = spine.world_mut().apply_player_hit(index, damage);
+                                impact = Some(RayImpact::Adversary {
+                                    target: *target,
+                                    damaged: matches!(
+                                        applied,
+                                        Some(Ok(DamageOutcome::Wounded { .. }
+                                            | DamageOutcome::Defeated { .. }))
+                                    ),
+                                    defeated: matches!(
+                                        applied,
+                                        Some(Ok(DamageOutcome::Defeated { .. }))
+                                    ),
+                                });
                                 match applied {
                                     Some(Ok(DamageOutcome::Wounded { remaining, .. })) => {
                                         format!(
@@ -1337,6 +1364,7 @@ impl EncounterDemo {
                             kind: MissKind::Occluded { .. },
                         } => {
                             encounter.counters.blocked += 1;
+                            impact = Some(RayImpact::Cover);
                             format!("{prefix} — BLOCKED by cover")
                         }
                         HitResolution::Miss {
@@ -1363,22 +1391,51 @@ impl EncounterDemo {
                             }
                             if reachable {
                                 encounter.counters.out_of_range += 1;
+                                impact = Some(RayImpact::OutOfRange);
                                 format!("{prefix} — out of range")
                             } else {
                                 encounter.counters.misses += 1;
+                                impact = Some(RayImpact::Miss);
                                 format!("{prefix} — wide (no target on the line)")
                             }
                         }
                         HitResolution::Refused(reason) => {
+                            impact = None;
                             format!("{prefix} — refused ({reason:?})")
                         }
                     };
+                    if let (Some(impact), Some(endpoint)) = (
+                        impact,
+                        shot.resolution.endpoint(
+                            origin,
+                            shot.direction,
+                            weapons.spec(weapon).profile.range,
+                        ),
+                    ) {
+                        rays.push(RayFact {
+                            direction: shot.direction,
+                            endpoint,
+                            impact,
+                        });
+                    } else {
+                        encounter.presentation.invalid_ray();
+                    }
                     last_line = Some(line.clone());
                     Self::log(encounter, tick, line);
                 }
                 if let Some(line) = last_line {
                     encounter.last_fire_line = Some(line);
                 }
+                encounter.presentation.push(
+                    tick,
+                    PresentationEvent::Fired(Volley {
+                        id: fire_index,
+                        weapon,
+                        origin,
+                        aim,
+                        rays,
+                    }),
+                );
             }
             FireOutcome::Refused(reason) => {
                 let line = match reason {
@@ -1421,6 +1478,22 @@ impl EncounterDemo {
             self.driver.config(),
             self.driver.world(),
         )
+    }
+}
+
+/// Rebuilds the live hittable roster. Dormant bodies physically absorb shots.
+pub(crate) fn encounter_targets(out: &mut Vec<Combatant>, world: &AdversaryWorld) {
+    out.clear();
+    for index in 0..world.count() {
+        let adversary = world.adversary(index);
+        if adversary.state == AdversaryState::Defeated {
+            continue;
+        }
+        let (min, max) = adversary_body(adversary.position);
+        out.push(Combatant {
+            id: ADVERSARY_ID_BASE + index as u32,
+            hit_box: StaticCollider { min, max },
+        });
     }
 }
 
@@ -1974,103 +2047,36 @@ impl Default for EncounterOptions {
     }
 }
 
-/// The cue wiring (C's published mapping; the event log lines are
-/// the observation points): Fire on every accepted fire, Impact on
-/// a hit, Damage on damage applied to the player, Interact on the
-/// activation, EncounterComplete on the terminal capture. `play` is
-/// non-blocking and idempotent when silent — no queueing needed.
-fn play_cues_for(audio: &mut Audio, line: &str) {
-    if line.starts_with("fire refused") {
-        return;
-    }
-    if line.starts_with("fire ") {
-        audio.play(Cue::Fire);
-        if line.contains("HIT") && !line.contains("graze") {
-            audio.play(Cue::Impact);
-            // F's activation (R-0118): the per-adversary defeat beat —
-            // a fire line whose hit DEFEATED an adversary carries the
-            // partial-victory sting (distinct from the encounter's
-            // completion, which the terminal line handles below).
-            if line.contains("(DEFEATED)") {
-                audio.play(Cue::AdversaryDefeated);
+/// Eight corners are indexed by the high X, Y and Z bits respectively.
+fn box_corners(min: [f32; 3], max: [f32; 3]) -> [[f32; 3]; 8] {
+    std::array::from_fn(|i| {
+        std::array::from_fn(|axis| {
+            if i & (1 << axis) == 0 {
+                min[axis]
+            } else {
+                max[axis]
             }
-        }
-        return;
-    }
-    if line.starts_with("adversary") && line.contains("player takes") {
-        audio.play(Cue::Damage);
-        return;
-    }
-    if line.starts_with("encounter activated") || line.starts_with("round ") {
-        audio.play(Cue::Interact);
-        return;
-    }
-    if line.starts_with("ALL ADVERSARIES DEFEATED") {
-        // F's cue split (the presentation-side alignment): the
-        // player's defeat carries its own Defeat cue; the encounter's
-        // completion keeps EncounterComplete.
-        audio.play(Cue::AdversaryDefeated);
-        audio.play(Cue::EncounterComplete);
-        return;
-    }
-    if line.starts_with("PLAYER DEFEATED") {
-        audio.play(Cue::Defeat);
-    }
+        })
+    })
 }
 
-/// Appends an axis-aligned box as non-indexed triangle vertices (the
-/// established demo literal — same face order, winding, and
-/// shading).
-fn push_rect_box(vertices: &mut Vec<SceneVertex>, min: [f32; 3], max: [f32; 3], color: [f32; 3]) {
-    let shade = |multiplier: f32| {
-        [
-            color[0] * multiplier,
-            color[1] * multiplier,
-            color[2] * multiplier,
-        ]
-    };
-    let face = |vertices: &mut Vec<SceneVertex>, quad: [[f32; 3]; 4], face_color: [f32; 3]| {
-        for position in [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]] {
-            vertices.push(SceneVertex {
-                pos: position,
-                col: face_color,
-            });
-        }
-    };
-    let [x0, y0, z0] = min;
-    let [x1, y1, z1] = max;
-    // Top and bottom.
-    face(
-        vertices,
-        [[x0, y1, z1], [x0, y1, z0], [x1, y1, z0], [x1, y1, z1]],
-        shade(1.0),
-    );
-    face(
-        vertices,
-        [[x0, y0, z0], [x0, y0, z1], [x1, y0, z1], [x1, y0, z0]],
-        shade(0.45),
-    );
-    // Sides.
-    face(
-        vertices,
-        [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]],
-        shade(0.80),
-    );
-    face(
-        vertices,
-        [[x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [x0, y0, z1]],
-        shade(0.80),
-    );
-    face(
-        vertices,
-        [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
-        shade(0.65),
-    );
-    face(
-        vertices,
-        [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
-        shade(0.65),
-    );
+/// Clockwise faces as seen from outside, matching the Vulkan scene pipeline.
+/// Both oriented cover and axis-aligned bodies use the same winding.
+fn append_box(vertices: &mut Vec<SceneVertex>, corners: [[f32; 3]; 8], color: [f32; 3]) {
+    for ([a, b, c, d], light) in [
+        ([6, 2, 3, 7], 1.0),
+        ([0, 4, 5, 1], 0.45),
+        ([0, 1, 3, 2], 0.80),
+        ([5, 4, 6, 7], 0.80),
+        ([4, 0, 2, 6], 0.65),
+        ([1, 5, 7, 3], 0.65),
+    ] {
+        let col = color.map(|v| v * light);
+        vertices.extend([a, b, c, a, c, d].map(|i| SceneVertex {
+            pos: corners[i],
+            col,
+        }));
+    }
 }
 
 /// The visible world: the courtyard boxes, the ROTATED cover pieces
@@ -2080,13 +2086,22 @@ fn push_rect_box(vertices: &mut Vec<SceneVertex>, min: [f32; 3], max: [f32; 3], 
 /// awareness feedback), and the player proxy in third person.
 pub fn encounter_render_boxes(demo: &EncounterDemo) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     let mut boxes = Vec::new();
+    visit_encounter_boxes(demo, true, |min, max, color| boxes.push((min, max, color)));
+    boxes
+}
+
+fn visit_encounter_boxes(
+    demo: &EncounterDemo,
+    box_proxy: bool,
+    mut visit: impl FnMut([f32; 3], [f32; 3], [f32; 3]),
+) {
     for class_box in ENCOUNTER_BOXES {
         let color = match class_box.role {
             EncounterRole::Perimeter => [0.35, 0.35, 0.40],
             EncounterRole::CentralBlock => [0.42, 0.38, 0.32],
             EncounterRole::WingWall => [0.30, 0.32, 0.38],
         };
-        boxes.push((class_box.min, class_box.max, color));
+        visit(class_box.min, class_box.max, color);
     }
     for index in 0..demo.spine.world().count() {
         let adversary = demo.spine.world().adversary(index);
@@ -2098,14 +2113,13 @@ pub fn encounter_render_boxes(demo: &EncounterDemo) -> Vec<([f32; 3], [f32; 3], 
             AdversaryState::Defeated => [0.12, 0.12, 0.14],
         };
         let (min, max) = adversary_body(adversary.position);
-        boxes.push((min, max, color));
+        visit(min, max, color);
     }
-    if demo.driver.state().camera_mode == CameraMode::ThirdPerson {
+    if box_proxy && demo.driver.state().camera_mode == CameraMode::ThirdPerson {
         let state = demo.driver.state();
         let (min, max) = engine_core::player_box(state.position, demo.driver.config());
-        boxes.push((min, max, [0.20, 0.80, 0.35]));
+        visit(min, max, [0.20, 0.80, 0.35]);
     }
-    boxes
 }
 
 /// The rotated cover pieces' visual colors (the slab — cool stone;
@@ -2122,10 +2136,14 @@ pub fn cover_render_pieces() -> [(RotatedCollider, [f32; 3]); 2] {
 /// (cleared first) — the shared presentation seam (the playable
 /// demo's discipline).
 pub fn build_encounter_vertices_into(out: &mut Vec<SceneVertex>, demo: &EncounterDemo) {
+    build_arena(out, demo, true);
+}
+
+pub(crate) fn build_arena(out: &mut Vec<SceneVertex>, demo: &EncounterDemo, box_proxy: bool) {
     out.clear();
-    for (min, max, color) in encounter_render_boxes(demo) {
-        push_rect_box(out, min, max, color);
-    }
+    visit_encounter_boxes(demo, box_proxy, |min, max, color| {
+        append_box(out, box_corners(min, max), color)
+    });
     // The rotated cover pieces: the TRUE rotated visual geometry,
     // built from the collider's own frame (never an axis-aligned
     // stand-in — the GO §4 hard rule).
@@ -2134,102 +2152,14 @@ pub fn build_encounter_vertices_into(out: &mut Vec<SceneVertex>, demo: &Encounte
     }
 }
 
-/// Appends a rotated box as non-indexed triangle vertices — the
-/// rotated analog of `push_rect_box`: the eight corners from the
-/// collider's own `to_world` over the local ±half corners, the same
-/// six-face decomposition (top ×1.0, bottom ×0.45, the local-X side
-/// faces ×0.80, the local-Z side faces ×0.65), the same winding
-/// discipline per face.
+/// Append the exact collision shape, including its rotation, to the world batch.
 pub fn push_rotated_box(
     vertices: &mut Vec<SceneVertex>,
     collider: &RotatedCollider,
     color: [f32; 3],
 ) {
-    let shade = |multiplier: f32| {
-        [
-            color[0] * multiplier,
-            color[1] * multiplier,
-            color[2] * multiplier,
-        ]
-    };
-    let [hx, hy, hz] = collider.half;
-    // The local-frame corners (y up), mapped to world through the
-    // collider's own cached frame.
-    let corner = |lx: f32, ly: f32, lz: f32| collider.to_world([lx, ly, lz]);
-    let top = hy;
-    let bottom = -hy;
-    // One quad face emitter (two triangles, the established order).
-    let face = |vertices: &mut Vec<SceneVertex>, quad: [[f32; 3]; 4], face_color: [f32; 3]| {
-        for position in [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]] {
-            vertices.push(SceneVertex {
-                pos: position,
-                col: face_color,
-            });
-        }
-    };
-    // Top (local-X × local-Z plane, CCW from above) and bottom.
-    face(
-        vertices,
-        [
-            corner(-hx, top, hz),
-            corner(-hx, top, -hz),
-            corner(hx, top, -hz),
-            corner(hx, top, hz),
-        ],
-        shade(1.0),
-    );
-    face(
-        vertices,
-        [
-            corner(-hx, bottom, -hz),
-            corner(-hx, bottom, hz),
-            corner(hx, bottom, hz),
-            corner(hx, bottom, -hz),
-        ],
-        shade(0.45),
-    );
-    // The local-X side faces.
-    face(
-        vertices,
-        [
-            corner(-hx, bottom, -hz),
-            corner(-hx, top, -hz),
-            corner(hx, top, -hz),
-            corner(hx, bottom, -hz),
-        ],
-        shade(0.80),
-    );
-    face(
-        vertices,
-        [
-            corner(hx, bottom, hz),
-            corner(hx, top, hz),
-            corner(-hx, top, hz),
-            corner(-hx, bottom, hz),
-        ],
-        shade(0.80),
-    );
-    // The local-Z side faces.
-    face(
-        vertices,
-        [
-            corner(-hx, bottom, hz),
-            corner(-hx, top, hz),
-            corner(-hx, top, -hz),
-            corner(-hx, bottom, -hz),
-        ],
-        shade(0.65),
-    );
-    face(
-        vertices,
-        [
-            corner(hx, bottom, -hz),
-            corner(hx, top, -hz),
-            corner(hx, top, hz),
-            corner(hx, bottom, hz),
-        ],
-        shade(0.65),
-    );
+    let corners = box_corners(collider.half.map(|v| -v), collider.half);
+    append_box(vertices, corners.map(|p| collider.to_world(p)), color);
 }
 
 /// The interactive integrated encounter (`--encounter`): the
@@ -2243,7 +2173,7 @@ pub fn push_rotated_box(
 /// against the same `EncounterHud` read).
 pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     let shell_config = ShellConfig {
-        title: "Sektor7 original engine — Cycle 4 integrated encounter".to_string(),
+        title: "Cycle 5 — Courtyard encounter".to_string(),
         width: 1280,
         height: 720,
         target_fps: 60,
@@ -2256,7 +2186,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
     // here — never in the headless paths; a missing device degrades
     // to the observable Silent status, never an error.
     let mut audio = Audio::initialize(app.platform());
-    let mut event_cursor: usize = 0;
+    let mut frame = EncounterFrame::default();
 
     // The scene-separation idiom: a game scene — the default omitted
     // renderer with the demo's OWN geometry.
@@ -2275,7 +2205,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
 
     {
         let stats = renderer.stats();
-        println!("Sektor7 Cycle 4 D — the integrated encounter");
+        println!("Cycle 5 — courtyard encounter");
         println!(
             "  device: {} {} (Vulkan {})",
             stats.device_type, stats.gpu_name, stats.api_version
@@ -2301,7 +2231,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
              scene is omitted"
         );
         println!(
-            "  controls: WASD move · mouse look · LMB fire · C camera · R reset · \
+            "  controls: WASD move · mouse look · LMB fire · 1 precision / 2 spread / Q cycle · C camera · R reset · \
              O overlay · Esc/close quit"
         );
         println!(
@@ -2321,21 +2251,8 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         ))
     };
     let mut timing = FrameTiming::new();
-    let mut scene_vertices: Vec<SceneVertex> = Vec::new();
-    // F's activation (R-0118) — the presentation-local state, the same
-    // discipline the --combat vignette review verified:
-    // (a) the defeat vignette's wall-clock anchor (the LOST
-    //     observation moment; the R reset clears it; NEVER in the
-    //     encounter state — the terminal guard stays the single
-    //     writer; the headless paths never construct it);
-    // (b) the weapon-selection observation cursor (the previous
-    //     frame's selection line — the WeaponSwitch cue fires when
-    //     D's HUD data shows a NEW "weapon selected" line; the
-    //     selection is HUD data, never an event-log line, so the
-    //     observation point is the HUD read, not the event drain).
-    let mut defeat_started_at: Option<std::time::Instant> = None;
-    let mut prev_selection_line: Option<String> = None;
-
+    let mut diagnostic = String::new();
+    let mut diagnostic_at = None;
     loop {
         let frame_start = std::time::Instant::now();
         let snapshot = app.frame();
@@ -2357,9 +2274,7 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
             // interactive path never records (the cadence-dependent
             // live input is not a determinism surface).
             demo.driver.set_trace_recording(false);
-            event_cursor = 0;
-            defeat_started_at = None;
-            prev_selection_line = None;
+            diagnostic_at = None;
         }
         // The weapon-selection edges (policy state — the honest
         // lifecycle refusals live in `apply_selection`): the direct
@@ -2378,203 +2293,57 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         // transition together at each executed logical tick.
         demo.advance_frame(split.sim_advance, mapped.intent, mapped.fire_pressed);
 
+        frame.observe(&mut demo, split.sim_advance, |cue| {
+            if !snapshot.minimized {
+                audio.play(cue);
+            }
+        });
         if snapshot.minimized {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
 
-        // The cue drain (the event log's new lines are the
-        // observation points).
-        while event_cursor < demo.encounter.events.len() {
-            let (_, line) = &demo.encounter.events[event_cursor];
-            play_cues_for(&mut audio, line);
-            event_cursor += 1;
-        }
-
-        // F's activation (R-0118): the WeaponSwitch cue at the
-        // selection observation point — D's HUD data carries the
-        // selection feedback line (never an event-log line), so the
-        // cue fires when a NEW "weapon selected" line appears in the
-        // HUD read (the refused switches play nothing — the honest
-        // text-only feedback, the established refusal discipline).
-        let hud_peek = demo.hud();
-        if hud_peek
-            .last_selection_line
-            .as_ref()
-            .is_some_and(|selection| {
-                selection.starts_with("weapon selected")
-                    && prev_selection_line.as_deref() != Some(selection.as_str())
-            })
-        {
-            audio.play(Cue::WeaponSwitch);
-        }
-        prev_selection_line = hud_peek.last_selection_line.clone();
-
-        // F's activation (R-0118): the defeat vignette's presentation
-        // parameter — 0 at the LOST observation, 1 after ~2 s of wall
-        // clock. PRESENTATION-ONLY (a render-loop read of the frozen
-        // phase; the guard's record/counters/timestamps untouched;
-        // the headless paths never reach here — the byte-identical
-        // encounter traces are the no-logical-effect proof).
-        if defeat_started_at.is_none() && matches!(hud_peek.phase, EncounterPhase::Lost { .. }) {
-            defeat_started_at = Some(frame_start);
-        }
-        let vignette = defeat_started_at.map(|lost_at| {
-            (frame_start.duration_since(lost_at).as_secs_f32() / 2.0).clamp(0.0, 1.0)
-        });
-
-        let mut pose = demo.camera_pose();
-        let third_person = demo.driver.state().camera_mode == CameraMode::ThirdPerson;
-        if let (Some(vignette), true) = (vignette, third_person) {
-            // The third-person defeat treatment (the --combat
-            // vignette's exact form): a slow descent and tilt of the
-            // camera toward the fallen player, composing AFTER the
-            // obstruction handling. First person keeps the
-            // overlay-only treatment.
-            pose.position[1] -= 1.2 * vignette;
-            pose.pitch += 0.35 * vignette;
-        }
-        let (width, height) = renderer.stats().extent;
-        let aspect = if height == 0 {
-            16.0 / 9.0
-        } else {
-            width as f32 / height as f32
-        };
-        let view = math::camera_view(pose.position, pose.yaw, pose.pitch, pose.roll);
-        let projection = math::perspective(std::f32::consts::FRAC_PI_3, aspect, 0.1, 200.0);
-        let view_proj = math::mul(&projection, &view);
-
-        build_encounter_vertices_into(&mut scene_vertices, &demo);
-
-        let overlay_text = renderer.overlay_enabled().then(|| {
-            let elapsed = start.elapsed().as_secs_f64().max(0.001);
-            let stats = renderer.stats();
-            let hud = demo.hud();
-            // F's activation (R-0118): the refined presentation, the
-            // feedback design §2's layout over D's EncounterHud data
-            // — ASCII throughout (the font8x8 constraint), the health
-            // bars, the weapon block with the readiness surface, the
-            // per-adversary lines with the defeat tally, and the
-            // terminal record display. The embedded HUD lines (the
-            // fire/selection feedback) route through the
-            // overlay_ascii boundary sanitizer.
-            let phase_word = match hud.phase {
-                EncounterPhase::Dormant => "DORMANT - cross the line to start".to_string(),
-                EncounterPhase::Active => "ACTIVE - the adversaries pursue".to_string(),
-                EncounterPhase::Won { tick } => {
-                    format!("VICTORY at tick {tick} - [R] reset for another round")
+        let size = app.window().size_in_pixels();
+        frame.prepare(&demo, size);
+        let debug = renderer.overlay_enabled().then(|| {
+            use std::fmt::Write;
+            // Sampling text at 4 Hz keeps formatting and percentile sorting off
+            // the per-frame hot path. Gameplay readouts update independently.
+            if diagnostic_at
+                .is_none_or(|t| frame_start.duration_since(t) >= Duration::from_millis(250))
+            {
+                diagnostic_at = Some(frame_start);
+                diagnostic.clear();
+                let stats = renderer.stats();
+                let _ = writeln!(
+                    diagnostic,
+                    "CPU {:.2}  GPU {:.2} ms p95",
+                    math::percentile(&cpu_work_ms, 0.95),
+                    stats.gpu_ms_p95()
+                );
+                let _ = writeln!(
+                    diagnostic,
+                    "Round {}  Tick {}",
+                    demo.encounter.rounds + 1,
+                    demo.tick_index()
+                );
+                for i in 0..demo.spine.world().count() {
+                    let adversary = demo.spine.world().adversary(i);
+                    let _ = writeln!(
+                        diagnostic,
+                        "{} {:8} {:3.0}/{:.0}",
+                        ADVERSARY_ID_BASE + i as u32,
+                        adversary_state_word(adversary.state),
+                        adversary.health.current,
+                        adversary.health.maximum
+                    );
                 }
-                EncounterPhase::Lost { tick } => {
-                    // The defeat banner (the vignette's HUD side):
-                    // composed from the FROZEN terminal record.
-                    format!("DEFEAT at tick {tick} - the adversaries prevail | [R] try again")
-                }
-            };
-            let defeated = hud
-                .adversaries
-                .iter()
-                .filter(|line| line.state == "DEFEATED")
-                .count();
-            let mut text = format!(
-                "Sektor7 C4 - integrated encounter\nFPS {:.0} (cpu work p95 {:.2} ms)\n\
-                 {} {} / Vulkan {}\n\
-                 ------------------------------------------------\n\
-                 encounter {} | round {} | adversaries {}/{} defeated\n",
-                presented as f64 / elapsed,
-                math::percentile(&cpu_work_ms, 0.95),
-                stats.device_type,
-                stats.gpu_name,
-                stats.api_version,
-                phase_word,
-                hud.rounds + 1,
-                defeated,
-                hud.adversaries.len(),
-            );
-            // The weapon block (WEAPONS-INTERFACE §3): the selected
-            // weapon's identity + readiness; the readiness bar's
-            // target tick when cooling.
-            let weapon_block = if hud.weapon.ready {
-                format!("WEAPON  {} READY", weapon_word(hud.weapon.selected))
-            } else {
-                format!(
-                    "WEAPON  {} cooling (ready at tick {})",
-                    weapon_word(hud.weapon.selected),
-                    hud.weapon.ready_at
-                )
-            };
-            text.push_str(&weapon_block);
-            text.push_str(" | [1] precision | [2] spread | Q cycle\n");
-            // The per-adversary lines (COMBATANTS-INTERFACE §4): the
-            // identity, the state word, the health bar, and the
-            // threat marker (the attack-ready read).
-            for adversary in &hud.adversaries {
-                text.push_str(&format!(
-                    "  adversary {} {} hp {} {:.0}/{:.0}{}\n",
-                    adversary.id,
-                    adversary.state,
-                    health_bar(adversary.health.0, adversary.health.1),
-                    adversary.health.0,
-                    adversary.health.1,
-                    if adversary.attack_ready {
-                        " *READY*"
-                    } else {
-                        ""
-                    }
-                ));
             }
-            // The player block.
-            text.push_str(&format!(
-                "PLAYER  hp {} {:.0}/{:.0} | {} person\n",
-                health_bar(hud.player_health.0, hud.player_health.1),
-                hud.player_health.0,
-                hud.player_health.1,
-                hud.player_mode,
-            ));
-            // The counters + the embedded feedback lines (the
-            // boundary-sanitized event text).
-            text.push_str(&format!(
-                "fires {} | hits {} | blocked {} | out of range {} | attacks taken {}\n",
-                hud.counters.fires,
-                hud.counters.hits,
-                hud.counters.blocked,
-                hud.counters.out_of_range,
-                hud.counters.attacks_taken,
-            ));
-            if let Some(line) = &hud.last_selection_line {
-                text.push_str(&overlay_ascii(line));
-                text.push('\n');
-            }
-            if let Some(line) = &hud.last_fire_line {
-                text.push_str(&overlay_ascii(line));
-                text.push('\n');
-            }
-            // The terminal record display (the frozen read).
-            if let Some(record) = hud.terminal {
-                let outcome_word = match record.outcome {
-                    EncounterOutcome::Won => "VICTORY",
-                    EncounterOutcome::Lost => "DEFEAT",
-                };
-                text.push_str(&format!(
-                    "encounter {} at tick {} | fires {} | hits {} | attacks taken {}\n",
-                    outcome_word,
-                    record.tick,
-                    record.counters.fires,
-                    record.counters.hits,
-                    record.counters.attacks_taken
-                ));
-            }
-            text.push_str("[R] reset | [C] camera | [O] overlay\n");
-            text
+            diagnostic.as_str()
         });
-
-        let frame_result = renderer
-            .render_frame(
-                &view_proj,
-                &scene_vertices,
-                overlay_text.as_deref(),
-                app.window_size(),
-            )
-            .map_err(|error| format!("{error}"))?;
+        let frame_result = frame
+            .draw(&mut renderer, debug, size)
+            .map_err(|error| error.to_string())?;
 
         if frame_result.deferred {
             std::thread::sleep(Duration::from_millis(50));
@@ -2644,7 +2413,23 @@ pub fn run_encounter_demo(options: EncounterOptions) -> Result<(), String> {
         "controller state is transient (not persisted); offscreen CI runs are a \
          correctness smoke, not a substitute for a human-played run"
     );
+    println!(
+        "presentation events {:?}; effects {:?}",
+        demo.encounter.presentation.stats(),
+        frame.visuals.stats()
+    );
     let stats = renderer.stats();
+    println!(
+        "GPU p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({} timestamps); peak scene/HUD vertices {}/{}; omitted {}/{}",
+        stats.gpu_ms_p50(),
+        stats.gpu_ms_p95(),
+        stats.gpu_ms_p99(),
+        stats.gpu_sample_count(),
+        stats.region_supplied_peak_vertices,
+        stats.overlay_supplied_peak_vertices,
+        stats.region_truncated_vertices,
+        stats.overlay_truncated_vertices
+    );
     if stats.validation_active && stats.validation_errors > 0 {
         return Err(format!(
             "validation layer reported {} error(s) while active — see the messages above",
