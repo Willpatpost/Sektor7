@@ -249,8 +249,14 @@ jobs:
           # selftest pin byte-identical —
           # /var/tmp/s7-cycle4-targets/int-gates-run8.log; the prior pin
           # 1073/1022 preserved above).
-          expected=1096
-          if [ "$(uname -s)" != "Linux" ]; then expected=1045; fi
+          # Cycle 4 corrective combined (c58eecf): Linux 1100/2/31 MEASURED
+          # at the combined tip with this step's own awk (C4-R1's margin
+          # broad-phase corrective adds 4 engine-core lib regressions; the
+          # combined gates: main 1100/2/31 + zero failures + every selftest
+          # pin byte-identical per int-gates-run11.log; Windows 1049 =
+          # the prior 1045 + the same 4, platform-uniform).
+          expected=1100
+          if [ "$(uname -s)" != "Linux" ]; then expected=1049; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-main.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-main.log)
           results=$(grep -c 'test result:' tests-main.log || true)
@@ -787,6 +793,15 @@ jobs:
           # 545/6/54 preserved above).
           expected=549
           if [ "$(uname -s)" != "Linux" ]; then expected=548; fi
+          # Cycle 4 corrective combined (c58eecf): Linux 553/6/54 MEASURED
+          # at the combined tip (C4-R2/R3's encounter corrective grows the
+          # encounter_world battery 22 -> 26 within its existing result
+          # line — the dormant-wave + zero-adversary regressions;
+          # platform-uniform; the combined gates: heavy 553/6/54 + zero
+          # failures + every selftest pin byte-identical per
+          # int-gates-run11.log; Windows 552 = the prior 548 + the same 4).
+          expected=553
+          if [ "$(uname -s)" != "Linux" ]; then expected=552; fi
           passed=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="passed;") s+=$i} END {print s+0}' tests-heavy.log)
           ignored=$(awk '/test result: ok/ {for(i=1;i<NF;i++) if($(i+1)=="ignored;") s+=$i} END {print s+0}' tests-heavy.log)
           results=$(grep -c 'test result:' tests-heavy.log || true)
